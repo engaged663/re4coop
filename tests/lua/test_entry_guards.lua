@@ -1,0 +1,61 @@
+-- The entry script must stay quiet outside RE4 and explain itself when the plugin is missing.
+local T = require("testlib")
+local mock = require("mock_reframework")
+
+local function run_entry()
+    for name in pairs(package.loaded) do
+        if name:find("^re4coop") then package.loaded[name] = nil end
+    end
+    dofile(TEST_ROOT .. "/lua/reframework/autorun/re4coop.lua")
+end
+
+T.run("disabled_outside_re4", function()
+    mock.install({ game_name = "re2" })
+    run_entry()
+    T.eq(#mock.callbacks.frame + #mock.callbacks.entry + #mock.callbacks.ui, 0, "registers nothing")
+end)
+
+T.run("explains_missing_plugin", function()
+    mock.install()
+    local saved = re4coop_net
+    re4coop_net = nil
+    local ok, err = pcall(run_entry)
+    re4coop_net = saved
+    T.check(ok, "no error without the plugin: " .. tostring(err))
+    T.eq(#mock.callbacks.frame, 0, "no per-frame work")
+    T.eq(#mock.callbacks.ui, 1, "one UI panel")
+    mock.callbacks.ui[1]()
+    local found = false
+    for _, s in ipairs(mock.imgui_texts) do
+        if s:find("re4coop_net.dll is not loaded") then found = true end
+    end
+    T.check(found, "tells the user what to install")
+end)
+
+T.run("partner_with_other_protocol_version_is_flagged", function()
+    local P = require("re4coop.protocol")
+    local Session = require("re4coop.session")
+    local Config = require("re4coop.config")
+    local sent = {}
+    local fake_net = {
+        state = function() return "idle" end, role = function() return "none" end,
+        poll = function() return {} end, send = function(b) sent[#sent + 1] = b return true end,
+        stats = function() return { state = "connected" } end,
+    }
+    local fake_game = { area_name = function() return "" end }
+    local s = Session.new({ net = fake_net, game = fake_game, clock = function() return 0 end,
+        settings = Config.load(nil) })
+    s.partner_connected = true
+    s:handle_message(string.pack("<BI2", P.T.HELLO, P.VERSION + 1), 0)
+    T.eq(s.compatible, false, "marked incompatible")
+    local warned = false
+    for _, m in ipairs(s.messages) do
+        if m.text:find("update both") then warned = true end
+    end
+    T.check(warned, "user told to update")
+    -- Game messages are ignored while incompatible.
+    s:handle_message(P.encode_chat("hi"), 0)
+    T.eq(#s.messages, 1, "chat ignored while incompatible")
+end)
+
+T.finish()

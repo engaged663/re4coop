@@ -1,0 +1,42 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  linux-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build -j
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure (MSVC x64)
+        run: cmake -S . -B build -A x64
+      - name: Build
+        run: cmake --build build --config Release
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+      - name: Package
+        shell: pwsh
+        run: |
+          cmake --install build --config Release --prefix dist
+          Copy-Item README.md, LICENSE dist/
+          New-Item -ItemType Directory -Force dist/licenses | Out-Null
+          Copy-Item third_party/lua-5.4.3/LICENSE dist/licenses/lua-LICENSE.txt
+          Copy-Item third_party/reframework/LICENSE dist/licenses/reframework-LICENSE.txt
+          Compress-Archive -Path dist/* -DestinationPath re4coop-${{ github.sha }}.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: re4coop-windows
+          path: re4coop-${{ github.sha }}.zip
