@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(re4coop VERSION 0.1.0 LANGUAGES C CXX)
+project(re4coop VERSION 0.1.1 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -69,6 +69,15 @@ if(RE4COOP_BUILD_TESTS)
     # Runs Lua test scripts with the real re4coop_net bindings and the mod's Lua modules.
     add_executable(re4coop_lua_runner plugin/tests/lua_runner.cpp)
     target_link_libraries(re4coop_lua_runner PRIVATE re4coop_net_core)
+
+    # Loads the real DLL like REFramework's PluginLoader (version/game gate, init, Lua callback
+    # with a Lua state from a separate Lua copy). Windows only, since the plugin is a Windows DLL.
+    if(WIN32)
+        add_executable(re4coop_test_plugin_load plugin/tests/test_plugin_load.cpp)
+        target_include_directories(re4coop_test_plugin_load PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/reframework/include)
+        target_link_libraries(re4coop_test_plugin_load PRIVATE re4coop_lua)
+        add_test(NAME plugin_load COMMAND re4coop_test_plugin_load $<TARGET_FILE:re4coop_net>)
+    endif()
 
     file(GLOB RE4COOP_LUA_TESTS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tests/lua/test_*.lua)
     foreach(test_script ${RE4COOP_LUA_TESTS})

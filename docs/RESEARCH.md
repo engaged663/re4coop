@@ -55,7 +55,11 @@ These shaped the design:
   "same major, required minor ≤ framework minor". The fields we use (`on_lua_state_created`,
   `on_lua_state_destroyed`, `log_info`) have kept the same layout since plugin API **1.3**
   (2022, before RE4R shipped). We therefore request 1.3, so any RE4-capable REFramework build
-  loads the plugin. `game_name = "re4"` stops it loading in other games.
+  loads the plugin. `game_name = "RE4"` stops it loading in other games. The comparison is
+  case-sensitive and uses REFramework's *build target* name, which is uppercase `"RE4"` in both
+  the old per-game builds and the v2 universal build. Lua's `reframework:get_game_name()`
+  returns lowercase `"re4"` instead. v0.1.0 mixed the two up and was rejected as "for a
+  different game". `test_plugin_load` now pins the value.
 * **"Reset Scripts" destroys the Lua state.** Anything that must survive (the UDP session) lives
   in the plugin. The reloaded script resumes it. We tested this path (`tests/lua/test_integration.lua`).
 * **Threads.** `re.on_frame` runs during present (render side). `re.on_application_entry`

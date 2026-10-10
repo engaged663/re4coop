@@ -32,7 +32,11 @@ extern "C" __declspec(dllexport) void reframework_plugin_required_version(REFram
     version->major = REFRAMEWORK_PLUGIN_VERSION_MAJOR;
     version->minor = 3;
     version->patch = 0;
-    version->game_name = "re4";
+    // Case-sensitive match against REFramework's *target* name: "RE4" in both the old per-game
+    // builds (REFRAMEWORK_GAME_NAME = build target) and the v2 universal build
+    // (GameIdentity::target_name()). Not to be confused with Lua's
+    // reframework:get_game_name(), which returns the lowercase "re4".
+    version->game_name = "RE4";
 }
 
 extern "C" __declspec(dllexport) bool reframework_plugin_initialize(const REFrameworkPluginInitializeParam* param) {

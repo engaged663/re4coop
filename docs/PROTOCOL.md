@@ -52,7 +52,7 @@ Session rules:
 | `stats()` | Table: `rtt_ms, peer, peer_name, bytes_sent, bytes_recv, resends, reliable_in_flight, …` |
 | `local_addresses()` | Array of this PC's LAN IPv4 addresses |
 | `time()` | Monotonic seconds (`os.clock` is CPU time, so don't use it for networking) |
-| `max_payload()`, `version()` | `1388`; `"0.1.0", 1` |
+| `max_payload()`, `version()` | `1388`; `"0.1.1", 1` |
 | `new_session()` | An independent session object with the same methods (tests/tools) |
 
 ## Game messages (game protocol version 1)

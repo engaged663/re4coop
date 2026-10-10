@@ -7,7 +7,7 @@ T.run("api_surface", function()
         T.eq(type(re4coop_net[name]), "function", name)
     end
     local v, proto = re4coop_net.version()
-    T.eq(v, "0.1.0", "plugin version")
+    T.eq(v, require("re4coop.protocol").MOD_VERSION, "plugin and script versions match")
     T.eq(proto, 1, "net protocol")
     T.eq(re4coop_net.max_payload(), 1388, "max payload")
     T.eq(re4coop_net.state(), "idle", "idle at start")

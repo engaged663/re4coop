@@ -4,7 +4,7 @@
 local P = {}
 
 P.VERSION = 1            -- bump on any incompatible change to the layouts below
-P.MOD_VERSION = "0.1.0"
+P.MOD_VERSION = "0.1.1"
 
 P.T = {
     HELLO = 1,          -- reliable, both directions, right after connecting

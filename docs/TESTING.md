@@ -11,6 +11,7 @@ cd build && ctest --output-on-failure
 | Test | What it proves |
 |---|---|
 | `native_transport` (`plugin/tests/test_net.cpp`) | Handshake, names, binary-safe payloads, size limits. 1,500 reliable messages each way under **30% simulated packet loss** arrive exactly once and in order. Password, session-full and version-mismatch rejections. Reconnect after a partner restart. Graceful leave and rejoin. Connect timeout, link timeout, LAN address listing |
+| `plugin_load` (Windows) | Loads `re4coop_net.dll` exactly like REFramework's PluginLoader: version and **game-name gate (`"RE4"`)**, initialization, then the Lua callback on a state owned by a *separate* Lua copy. Lua errors unwind across the DLL boundary, and UDP loopback works through the DLL |
 | `lua_test_bindings` | The `re4coop_net` C API: bad arguments raise catchable Lua errors, failures return `nil, message` (port in use, double host, unresolvable host), binary-safe payloads between two sessions |
 | `lua_test_protocol` | Every game message round-trips. Snapshots chunk under the datagram limit. Truncated or garbage input never raises |
 | `lua_test_interp` | Interpolation, brief extrapolation, out-of-order packets, partner clock restarts |

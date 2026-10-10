@@ -89,8 +89,8 @@ cmake -S . -B build-win -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-w64.cmake && cmake --
 
 **Releasing:** bump the version in `lua/reframework/autorun/re4coop/protocol.lua`
 (`MOD_VERSION`), `plugin/src/lua_api.hpp` (`kVersion`) and `CMakeLists.txt`, then push a
-matching tag (`git tag v0.1.0 && git push origin v0.1.0`). CI builds the MSVC zip, checks the
-versions and attaches `re4coop-v0.1.0.zip` + `.sha256` to a draft GitHub Release for you to
+matching tag (`git tag v0.1.1 && git push origin v0.1.1`). CI builds the MSVC zip, checks the
+versions and attaches `re4coop-v0.1.1.zip` + `.sha256` to a draft GitHub Release for you to
 publish.
 
 ## Repository layout

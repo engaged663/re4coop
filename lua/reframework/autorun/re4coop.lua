@@ -7,7 +7,7 @@ local function log_info(msg)
     if log and log.info then log.info("[re4coop] " .. msg) end
 end
 
-if reframework:get_game_name() ~= "re4" then
+if tostring(reframework:get_game_name()):lower() ~= "re4" then
     log_info("not RE4, co-op script disabled")
     return
 end
