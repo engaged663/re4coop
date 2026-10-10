@@ -1,5 +1,7 @@
 name: build
 
+# Every push builds and tests on Linux and Windows. Pushing a tag like v0.1.0 additionally
+# attaches re4coop-v0.1.0.zip (MSVC build) to a *draft* GitHub Release for review.
 on:
   push:
   pull_request:
@@ -19,8 +21,18 @@ jobs:
 
   windows:
     runs-on: windows-latest
+    permissions:
+      contents: write # create the draft release on tag pushes
     steps:
       - uses: actions/checkout@v4
+      - name: Check tag matches the mod version
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}".TrimStart('v')
+          $lua = (Select-String -Path lua/reframework/autorun/re4coop/protocol.lua -Pattern 'P\.MOD_VERSION = "([^"]+)"').Matches[0].Groups[1].Value
+          $cpp = (Select-String -Path plugin/src/lua_api.hpp -Pattern 'kVersion = "([^"]+)"').Matches[0].Groups[1].Value
+          if ($tag -ne $lua -or $tag -ne $cpp) { throw "tag $tag does not match script version $lua / plugin version $cpp" }
       - name: Configure (MSVC x64)
         run: cmake -S . -B build -A x64
       - name: Build
@@ -30,13 +42,41 @@ jobs:
       - name: Package
         shell: pwsh
         run: |
+          $name = if ("${{ github.ref_type }}" -eq "tag") { "re4coop-${{ github.ref_name }}" } else { "re4coop-${{ github.sha }}" }
           cmake --install build --config Release --prefix dist
           Copy-Item README.md, LICENSE dist/
           New-Item -ItemType Directory -Force dist/licenses | Out-Null
           Copy-Item third_party/lua-5.4.3/LICENSE dist/licenses/lua-LICENSE.txt
           Copy-Item third_party/reframework/LICENSE dist/licenses/reframework-LICENSE.txt
-          Compress-Archive -Path dist/* -DestinationPath re4coop-${{ github.sha }}.zip
+          Compress-Archive -Path dist/* -DestinationPath "$name.zip"
+          $hash = (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $name.zip" | Out-File -Encoding ascii "$name.zip.sha256"
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [IO.Compression.ZipFile]::OpenRead("$PWD/$name.zip")
+          $zip.Entries | ForEach-Object { "{0,10}  {1}" -f $_.Length, $_.FullName }
+          $zip.Dispose()
+          "sha256: $hash"
+          "PACKAGE=$name" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
       - uses: actions/upload-artifact@v4
         with:
           name: re4coop-windows
-          path: re4coop-${{ github.sha }}.zip
+          path: |
+            ${{ env.PACKAGE }}.zip
+            ${{ env.PACKAGE }}.zip.sha256
+      - name: Draft GitHub release
+        if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          name: re4coop ${{ github.ref_name }}
+          files: |
+            ${{ env.PACKAGE }}.zip
+            ${{ env.PACKAGE }}.zip.sha256
+          body: |
+            LAN co-op for Resident Evil 4 (2023), built with MSVC from ${{ github.sha }}.
+
+            **Install:** install REFramework for RE4, then extract this zip into the game folder (next to `re4.exe`) so that `reframework/plugins/re4coop_net.dll` and `reframework/autorun/re4coop.lua` exist. Both players need the same version.
+
+            **Play:** both load the same chapter. Host: REFramework menu (Insert) → *RE4 Co-op (LAN)* → *Host game*. Partner: type the host's IP → *Join game*. Allow `re4.exe` through Windows Firewall (UDP 33040).
+
+            See the README for internet play, troubleshooting and known limitations.
