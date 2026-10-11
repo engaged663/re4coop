@@ -8,6 +8,8 @@
 -- Every game call is wrapped in pcall so a game patch degrades features instead of
 -- throwing errors every frame.
 
+local P = require("re4coop.protocol")
+
 local Game = {}
 Game.__index = Game
 
@@ -71,7 +73,9 @@ function Game.new(log)
     self.joint_sel = nil  -- cached ghost joint selection for the current player transform
     self.area_probe = nil
     self.puppet = nil
+    self.pickup_events = {} -- filled by the DropItem callback hooks, drained by take_pickup_events()
     self:probe()
+    self:install_pickup_hooks()
     return self
 end
 
@@ -275,17 +279,15 @@ function Game:capabilities()
     return self.caps
 end
 
--- Reads an object's `_ID` field (chainsaw.ContextID: _Category, _Kind, _Group, _Index - field
--- names from the RE4 RSZ schema). Characters and DropItems both carry one. Returns a plain
--- table or nil if it cannot be read.
+-- chainsaw.ContextID (a class: _Category, _Kind, _Group, _Index - confirmed by the research
+-- dump) to a plain table, or nil.
 local function read_field(obj, name)
     local ok, v = pcall(function() return obj:get_field(name) end)
     if ok then return v end
     return nil
 end
 
-function Game:read_context_id(obj)
-    local id = read_field(obj, "_ID")
+local function context_id_table(id)
     if id == nil then return nil end
     local group, index = tonumber(read_field(id, "_Group")), tonumber(read_field(id, "_Index"))
     if group == nil or index == nil then return nil end
@@ -295,6 +297,20 @@ function Game:read_context_id(obj)
         group = group,
         index = index,
     }
+end
+
+-- An object's own `_ID`. For characters and drop items this is a runtime counter (the dump
+-- showed enemies 12:312, 12:987, 12:1053 and items 12:192..486), so it is NOT the same on
+-- both machines - use it only as a local identity.
+function Game:read_context_id(obj)
+    return context_id_table(read_field(obj, "_ID"))
+end
+
+-- CharacterContext.get_SpawnerID(): the level spawner that created this character. Spawners
+-- are placed in level data, so this is the cross-machine identity for an enemy - although one
+-- spawner may create several enemies (enemy_sync only trusts it when unique).
+function Game:read_spawner_id(ctx)
+    return context_id_table(self:call(ctx, "get_SpawnerID"))
 end
 
 -------------------------------------------------------------------------------
@@ -312,14 +328,20 @@ function Game:is_cutscene()
     return gui ~= nil and self:call(gui, "get_IsPlayingEvent") == true
 end
 
-function Game:get_component(game_object, type_name)
-    local t = self.typeof_cache and self.typeof_cache[type_name]
+-- sdk.typeof(name), cached (false when the type does not exist).
+function Game:typeof(type_name)
+    self.typeof_cache = self.typeof_cache or {}
+    local t = self.typeof_cache[type_name]
     if t == nil then
         local ok, ty = pcall(sdk.typeof, type_name)
         t = ok and ty or false
-        self.typeof_cache = self.typeof_cache or {}
         self.typeof_cache[type_name] = t
     end
+    return t
+end
+
+function Game:get_component(game_object, type_name)
+    local t = self:typeof(type_name)
     if not t then return nil end
     return self:call(game_object, "getComponent(System.Type)", t)
 end
@@ -427,6 +449,7 @@ function Game:read_player_state()
         st.dead = self:call(hp, "get_IsLive") == false
     end
     st.cutscene = self:is_cutscene()
+    st.stage = tonumber(self:call(ctx, "get_CurrentStageID"))
     st.aiming = self:call(ctx, "get_IsHolding") == true
     return st
 end
@@ -481,9 +504,13 @@ function Game:list_enemies()
             if pos ~= nil and hp ~= nil then
                 local id = ctx:get_address()
                 ctx_by_id[id] = ctx
-                -- A context's ID never changes, so read it once per context.
+                -- A context's spawner never changes, so read it once per context. A spawner
+                -- with a runtime ID (P.ctx_is_runtime) is no use across machines.
                 local cid = old_ids[id]
-                if cid == nil then cid = self:read_context_id(ctx) or false end
+                if cid == nil then
+                    cid = self:read_spawner_id(ctx) or false
+                    if cid and P.ctx_is_runtime(cid) then cid = false end
+                end
                 ids[id] = cid
                 if cid then with_id = with_id + 1 end
                 out[#out + 1] = {
@@ -502,7 +529,7 @@ function Game:list_enemies()
     self.enemy_ctx = ctx_by_id
     self.enemy_context_ids = ids
     if #out > 0 then
-        self:cap("enemy_context_id", with_id > 0, ("%d of %d enemies expose chainsaw.ContextID"):format(with_id, #out))
+        self:cap("enemy_spawner_id", with_id > 0, ("%d of %d enemies have a level SpawnerID"):format(with_id, #out))
     end
     return out
 end
@@ -619,42 +646,42 @@ local function array_elements(arr)
     return out
 end
 
+-- Every component of a type in the loaded scene (via.Scene.findComponents), or nil, reason.
+function Game:find_components(type_name)
+    local scene = self:current_scene()
+    if scene == nil then return nil, "no current scene" end
+    local t = self:typeof(type_name)
+    if not t then return nil, type_name .. " type not found" end
+    local ok, comps = pcall(function() return scene:call("findComponents(System.Type)", t) end)
+    if not ok or comps == nil then return nil, "findComponents(" .. type_name .. ") failed" end
+    return array_elements(comps)
+end
+
 -- Every chainsaw.DropItem in the loaded scene:
 -- { {id, item_id, count, pos, ctx}, ... }. Field names (_ID, _ItemData.ItemID/Count) come
 -- from the RE4 RSZ schema; the scene search is the engine's via.Scene.findComponents.
 function Game:list_pickups()
-    local scene = self:current_scene()
-    if scene == nil then
-        self:cap("pickups", false, "no current scene")
-        return nil
-    end
-    local t = self.typeof_cache and self.typeof_cache["chainsaw.DropItem"]
-    if t == nil then
-        local ok, ty = pcall(sdk.typeof, "chainsaw.DropItem")
-        t = ok and ty or false
-        self.typeof_cache = self.typeof_cache or {}
-        self.typeof_cache["chainsaw.DropItem"] = t
-    end
-    if not t then
-        self:cap("pickups", false, "chainsaw.DropItem type not found")
-        return nil
-    end
-    local okF, comps = pcall(function() return scene:call("findComponents(System.Type)", t) end)
-    if not okF or comps == nil then
-        self:cap("pickups", false, "findComponents(chainsaw.DropItem) failed")
+    local comps, why = self:find_components("chainsaw.DropItem")
+    if comps == nil then
+        self:cap("pickups", false, why)
         return nil
     end
 
-    local out, go_by_id, unreadable = {}, {}, 0
-    for _, comp in ipairs(array_elements(comps)) do
+    local out, go_by_id, comp_by_id, unreadable = {}, {}, {}, 0
+    for _, comp in ipairs(comps) do
         local go = self:call(comp, "get_GameObject")
         local transform = go and self:call(go, "get_Transform")
         local pos = transform and v3(self:call(transform, "get_Position"))
         local data = read_field(comp, "_ItemData")
         local item_id = data and tonumber(read_field(data, "ItemID"))
+        if item_id == 0 then
+            -- Level-placed items showed ItemID 0 in their save data; ask the item itself.
+            item_id = tonumber(self:call(comp, "getItemID")) or 0
+        end
         if go ~= nil and pos ~= nil and item_id ~= nil then
             local id = comp:get_address()
             go_by_id[id] = go
+            comp_by_id[id] = comp
             out[#out + 1] = {
                 id = id,
                 item_id = item_id,
@@ -667,8 +694,69 @@ function Game:list_pickups()
         end
     end
     self.pickup_objects = go_by_id
+    self.pickup_comps = comp_by_id
     self:cap("pickups", #out > 0 or unreadable == 0,
         ("%d drop items readable, %d unreadable"):format(#out, unreadable))
+    return out
+end
+
+-- The game's own pickup callbacks: static chainsaw.DropItem.onAcceptPickup(user_id, item_id)
+-- and onAcceptOccupied(user_id, item_id, arg). REFramework passes a static method's
+-- parameters from args[2] on (args[1] is the VM context). The hook only records the item's
+-- ContextID; items_sync counts a key item as taken when a callback named it AND it left the
+-- scene, which is exact where the vanish heuristic can only guess.
+local PICKUP_CALLBACKS = { "onAcceptPickup", "onAcceptOccupied" }
+local MAX_PICKUP_EVENTS = 64
+
+function Game:install_pickup_hooks()
+    self.pickup_hooks = 0
+    self.pickup_hook_calls = 0
+    self.recent_pickup_events = {}
+    if type(sdk) ~= "table" or type(sdk.hook) ~= "function" or type(sdk.to_managed_object) ~= "function" then
+        self:cap("pickup_hook", false, "sdk.hook unavailable")
+        return
+    end
+    local td = find_type("chainsaw.DropItem")
+    local events = self.pickup_events
+    local game = self
+    local function record(args, name)
+        game.pickup_hook_calls = game.pickup_hook_calls + 1
+        if #events >= MAX_PICKUP_EVENTS then return end
+        local okI, item = pcall(sdk.to_managed_object, args[3])
+        local key = okI and item ~= nil and P.ctx_key(context_id_table(item)) or nil
+        if key == nil then return end
+        local okU, user = pcall(sdk.to_managed_object, args[2])
+        local ev = {
+            key = key,
+            user = okU and user ~= nil and P.ctx_key(context_id_table(user)) or nil,
+            via = name,
+        }
+        events[#events + 1] = ev
+        local recent = game.recent_pickup_events -- kept for the research log
+        recent[#recent + 1] = ev
+        if #recent > 8 then table.remove(recent, 1) end
+    end
+    local hooked = {}
+    for _, name in ipairs(PICKUP_CALLBACKS) do
+        local okM, m = pcall(function() return td and td:get_method(name) end)
+        if okM and m ~= nil then
+            local ok = pcall(sdk.hook, m, function(args) pcall(record, args, name) end,
+                function(retval) return retval end)
+            if ok then hooked[#hooked + 1] = name end
+        end
+    end
+    self.pickup_hooks = #hooked
+    self:cap("pickup_hook", #hooked > 0, #hooked > 0 and ("DropItem." .. table.concat(hooked, ", "))
+        or "DropItem pickup callbacks not found")
+end
+
+-- Pickup callbacks since the last call: { {key=<ctx key>, user=<ctx key>, via=<name>}, ... },
+-- or nil when no hook is installed.
+function Game:take_pickup_events()
+    if (self.pickup_hooks or 0) == 0 then return nil end
+    local out = {}
+    for i, e in ipairs(self.pickup_events) do out[i] = e end
+    for i = #self.pickup_events, 1, -1 do self.pickup_events[i] = nil end
     return out
 end
 
@@ -836,19 +924,34 @@ end
 -- method signatures.
 local DUMP_TYPES = {
     CHARACTER_MANAGER, GUI_MANAGER, HIT_POINT, "chainsaw.CharacterContext", "chainsaw.EnemyBaseContext",
-    "chainsaw.PlayerBaseContext", "chainsaw.EnemyManager", "chainsaw.ContextID",
+    "chainsaw.PlayerBaseContext", "chainsaw.PartnerBaseContext", "chainsaw.EnemyManager", "chainsaw.ContextID",
     "chainsaw.HateController", "chainsaw.HateTargetInfo", "chainsaw.HateControllerUserData",
     "chainsaw.EnemyAttackPermitManager", "chainsaw.PartnerAttackTargetSelector",
-    "chainsaw.DropItemManager", "chainsaw.DropItem", "chainsaw.DropItemContext", "chainsaw.RandomDrop",
+    "chainsaw.DropItemManager", "chainsaw.DropItemManager.GenerateItemOption", "chainsaw.DropItem",
+    "chainsaw.DropItemContext", "chainsaw.RandomDrop", "chainsaw.RandomDrop.ItemResult", "chainsaw.Item",
     "chainsaw.GmOptionDropItem", "chainsaw.GmOptionGenerateDropItem",
     "chainsaw.InteractGetPickupItem", "chainsaw.InteractManager", "chainsaw.InventoryManager",
     "chainsaw.ItemManager", "chainsaw.ItemDefinitionManager", "chainsaw.GmKeyItemCase", "chainsaw.GmUseItemGate",
     "chainsaw.ScenarioFlagManager", "chainsaw.ChapterSceneManager", "chainsaw.LocationSceneManager",
-    "chainsaw.CampaignManager", "chainsaw.GameSituationManager", "chainsaw.GimmickManager",
+    "chainsaw.CampaignManager", "chainsaw.GameSituationManager", "chainsaw.GimmickManager", "chainsaw.StageIdentifier",
     "chainsaw.CharacterSpawnController", "chainsaw.SpawnController", "chainsaw.PartnerNpcSpawnParam",
+    "chainsaw.CharacterSpawnParam", "chainsaw.HitController", "chainsaw.HitController.DamageInfo",
+    "chainsaw.CharacterDamageInfo", "chainsaw.MotionController", "chainsaw.AnimationController",
+    "chainsaw.TargetSensor", "chainsaw.TargetMarker", "chainsaw.StayAreaController",
     "via.motion.Motion", "via.motion.TreeLayer", "via.motion.MotionFsm2", "via.behaviortree.BehaviorTree",
     "via.physics.CharacterController",
 }
+
+-- Enums whose values the next features need (spawning a partner character that enemies can
+-- target, targeting, drops, chapters). Values come from the enum's static literal fields.
+local DUMP_ENUMS = {
+    "chainsaw.CharacterKindID", "chainsaw.CharacterUsePurposeFlag", "chainsaw.ChapterID",
+    "chainsaw.CharacterControlIndex", "chainsaw.character.PauseLayer",
+    "chainsaw.HateTargetInfo.FindSourceType", "chainsaw.HateTargetInfo.FindStateType",
+    "chainsaw.ContextID.EntityCategory", "chainsaw.RandomDrop.DropType", "chainsaw.CampaignManager.Difficulty",
+    "chainsaw.CharacterManager.PlayerKind", "chainsaw.CharacterManager.PlayerNo", "chainsaw.StageID",
+}
+local ENUM_MAX_VALUES = 4000
 
 local SINGLETONS_TO_CHECK = {
     CHARACTER_MANAGER, GUI_MANAGER, "chainsaw.EnemyManager", "chainsaw.DropItemManager", "chainsaw.InteractManager",
@@ -856,6 +959,14 @@ local SINGLETONS_TO_CHECK = {
     "chainsaw.ChapterSceneManager", "chainsaw.LocationSceneManager", "chainsaw.CampaignManager",
     "chainsaw.GameSituationManager", "chainsaw.GimmickManager", "chainsaw.EnemyAttackPermitManager",
 }
+
+-- The type dump is rewritten on every click but keeps every type described by earlier runs
+-- (enemy and component types differ per area). Each click also appends a compact snapshot
+-- of the live game to the research log, so runs in different areas all survive.
+local TYPEDUMP_FILE = "re4coop_typedump.json"
+local RESEARCH_LOG_FILE = "re4coop_research_log.json"
+local RESEARCH_LOG_MAX = 60
+local MAX_AREAS_SEEN = 200
 
 local function method_signature(m)
     local okName, name = pcall(m.get_name, m)
@@ -895,6 +1006,84 @@ local function describe_type(td, depth)
     return out
 end
 
+-- name -> value for an enum's literals.
+local function enum_values(td)
+    local out, n = {}, 0
+    local ok, fields = pcall(td.get_fields, td)
+    for _, f in ipairs(ok and fields or {}) do
+        if field_is_static(f) then
+            local okN, name = pcall(f.get_name, f)
+            local okV, v = pcall(f.get_data, f, nil)
+            if okN and name ~= nil and okV and v ~= nil then
+                out[name] = type(v) == "number" and v or tostring(v)
+                n = n + 1
+                if n >= ENUM_MAX_VALUES then
+                    out["(truncated)"] = true
+                    break
+                end
+            end
+        end
+    end
+    return out
+end
+
+-- A JSON-safe summary of one value read from the game.
+local function plain_value(v)
+    local t = type(v)
+    if t == "number" then
+        if v ~= v or v == math.huge or v == -math.huge then return tostring(v) end
+        return v
+    elseif t == "boolean" or t == "string" or v == nil then
+        return v
+    end
+    local name = type_name_of(v)
+    if name == "via.GameObject" then
+        local ok, n = pcall(function() return v:call("get_Name") end)
+        return "GameObject " .. tostring(ok and n or "?")
+    elseif name == "chainsaw.ContextID" then
+        return "ContextID " .. tostring(P.ctx_key(context_id_table(v)))
+    end
+    local okX, x = pcall(function() return v.x end)
+    if okX and type(x) == "number" then
+        local _, y = pcall(function() return v.y end)
+        local _, z = pcall(function() return v.z end)
+        return { x = x, y = type(y) == "number" and y or 0, z = type(z) == "number" and z or 0 }
+    end
+    return name or tostring(v)
+end
+
+-- Instance field values of an object (own type and parents), for structures whose meaning
+-- is not known yet (HateTargetInfo, StageIdentifier, ...).
+local function snapshot_fields(obj, max_fields)
+    local out, n = {}, 0
+    local _, td = type_name_of(obj)
+    for _, t in ipairs(td and type_hierarchy(td, 4) or {}) do
+        local ok, fields = pcall(t.get_fields, t)
+        for _, f in ipairs(ok and fields or {}) do
+            local okN, name = pcall(f.get_name, f)
+            if okN and name ~= nil and out[name] == nil and not field_is_static(f) then
+                local okV, v = pcall(function() return obj:get_field(name) end)
+                if okV then
+                    local pv = plain_value(v)
+                    if pv == nil then pv = "nil" end
+                    out[name] = pv
+                else
+                    out[name] = "?"
+                end
+                n = n + 1
+                if n >= max_fields then return out end
+            end
+        end
+    end
+    return out
+end
+
+local function round_pos(p)
+    if p == nil then return nil end
+    local function r(v) return math.floor(v * 100 + 0.5) / 100 end
+    return { x = r(p.x), y = r(p.y), z = r(p.z) }
+end
+
 -- Type names of every component on a GameObject (what drives an enemy, a pickup, ...).
 function Game:component_names(go)
     if go == nil then return nil end
@@ -907,9 +1096,128 @@ function Game:component_names(go)
     return out
 end
 
--- Writes reframework/data/re4coop_typedump.json: signatures of the types above, which
--- singletons exist right now, live component lists and sample IDs. Attach it to reports.
-function Game:dump_types()
+-- Identity, stage and state of one character context.
+function Game:character_sample(ctx)
+    local body = self:call(ctx, "get_BodyGameObject")
+    local hp = self:call(ctx, "get_HitPoint")
+    local spawner = self:read_spawner_id(ctx)
+    return {
+        type = type_name_of(ctx),
+        kind_id = plain_value(self:call(ctx, "get_KindID")),
+        id = P.ctx_key(self:read_context_id(ctx)),
+        spawner = P.ctx_key(spawner),
+        spawner_runtime = P.ctx_is_runtime(spawner),
+        stage = plain_value(self:call(ctx, "get_CurrentStageID")),
+        pos = round_pos(v3(self:call(ctx, "get_Position"))),
+        hp = hp and tonumber(self:call(hp, "get_CurrentHitPoint")) or nil,
+        max_hp = hp and tonumber(self:call(hp, "get_DefaultHitPoint")) or nil,
+        body = body and plain_value(body) or nil,
+    }
+end
+
+-- Motion layer 0 of a character (what animation is playing), for animation sync.
+function Game:motion_sample(ctx)
+    local body = self:call(ctx, "get_BodyGameObject")
+    local motion = body and self:get_component(body, "via.motion.Motion")
+    if motion == nil then return nil end
+    local layer = self:call(motion, "getLayer", 0)
+    return {
+        layers = tonumber(self:call(motion, "getLayerCount")),
+        bank = layer and tonumber(self:call(layer, "get_MotionBankID")) or nil,
+        motion = layer and tonumber(self:call(layer, "get_MotionID")) or nil,
+        frame = layer and tonumber(self:call(layer, "get_Frame")) or nil,
+    }
+end
+
+-- One compact snapshot of the live game for the research log.
+function Game:research_snapshot(extra)
+    local snap = { enemies = {}, pickups = {}, hate = {} }
+    local okT, t = pcall(os.date, "!%Y-%m-%dT%H:%M:%SZ")
+    snap.time = okT and t or nil
+    snap.chapter = self:area_name()
+    local campaign = singleton("chainsaw.CampaignManager")
+    if campaign ~= nil then
+        snap.difficulty = plain_value(self:call(campaign, "get_CurrentDifficulty"))
+        local sid = self:call(campaign, "get_CurrentStageIdentifier")
+        if sid ~= nil then snap.stage_identifier = snapshot_fields(sid, 16) end
+    end
+
+    local player = self:player_context()
+    if player ~= nil then
+        snap.player = self:character_sample(player)
+        snap.player.motion = self:motion_sample(player)
+    end
+    local cm = singleton(CHARACTER_MANAGER)
+    local partner = cm and self:call(cm, "getPartnerContextRef")
+    if partner ~= nil then
+        snap.partner = self:character_sample(partner)
+        snap.partner.components = self:component_names(self:call(partner, "get_BodyGameObject"))
+    end
+
+    local enemies = self:list_enemies() or {}
+    for i, e in ipairs(enemies) do
+        if i > 30 then break end
+        local ctx = self.enemy_ctx[e.id]
+        local sample = ctx and self:character_sample(ctx) or { type = e.kind }
+        sample.alive = e.alive
+        sample.find_state = ctx and plain_value(self:call(ctx, "get_TargetFindState")) or nil
+        sample.find_source = ctx and plain_value(self:call(ctx, "get_TargetFindSource")) or nil
+        if i == 1 and ctx ~= nil then sample.motion = self:motion_sample(ctx) end
+        snap.enemies[i] = sample
+    end
+
+    -- HateController is not on an enemy's body GameObject: find where it lives.
+    for i, hc in ipairs(self:find_components("chainsaw.HateController") or {}) do
+        if i > 8 then break end
+        local go = self:call(hc, "get_GameObject")
+        local transform = go and self:call(go, "get_Transform")
+        local target = self:call(hc, "get_CurrentTarget")
+        snap.hate[i] = {
+            game_object = go and plain_value(go) or nil,
+            pos = transform and round_pos(v3(self:call(transform, "get_Position"))) or nil,
+            find_state = plain_value(self:call(hc, "get_FindState")),
+            total_attention = plain_value(self:call(hc, "get_TotalAttention")),
+            current_target = target and snapshot_fields(target, 16) or nil,
+        }
+    end
+
+    for i, p in ipairs(self:list_pickups() or {}) do
+        if i > 40 then break end
+        local comp = self.pickup_comps and self.pickup_comps[p.id]
+        local data = comp and read_field(comp, "_ItemData")
+        snap.pickups[i] = {
+            item_id = p.item_id,
+            save_item_id = data and tonumber(read_field(data, "ItemID")) or nil,
+            count = p.count,
+            key_item = Game.is_key_item(p.item_id),
+            id = P.ctx_key(p.ctx),
+            pos = round_pos(p.pos),
+            stage = comp and plain_value(self:call(comp, "getStage")) or nil,
+            lost = comp and plain_value(read_field(comp, "_IsLostItem")) or nil,
+        }
+    end
+
+    snap.pickup_hook = {
+        hooks = self.pickup_hooks or 0,
+        calls = self.pickup_hook_calls or 0,
+        player_id = player and P.ctx_key(self:read_context_id(player)) or nil,
+        recent = self.recent_pickup_events,
+    }
+    snap.hp_writer = self.hp_writer and self.hp_writer.label or nil
+    if extra ~= nil then snap.session = extra end
+    return snap
+end
+
+local function load_json(name)
+    local ok, t = pcall(json.load_file, name)
+    if ok and type(t) == "table" then return t end
+    return nil
+end
+
+-- Writes reframework/data/re4coop_typedump.json (signatures, enum values, capabilities, the
+-- latest live sample) and appends to reframework/data/re4coop_research_log.json. `extra` is
+-- the session's sync state. Returns ok, number of runs so far.
+function Game:dump_types(extra)
     local names, seen = {}, {}
     local function want(n)
         if n and not seen[n] then
@@ -939,7 +1247,7 @@ function Game:dump_types()
     live.enemies = {}
     for i, e in ipairs(enemies) do
         if i > 12 then break end
-        live.enemies[i] = { kind = e.kind, hp = e.hp, max_hp = e.max_hp, alive = e.alive, context_id = e.ctx }
+        live.enemies[i] = { kind = e.kind, hp = e.hp, max_hp = e.max_hp, alive = e.alive, spawner_id = e.ctx }
         want(e.kind)
     end
     local first = enemies[1] and self.enemy_ctx[enemies[1].id]
@@ -949,6 +1257,9 @@ function Game:dump_types()
             if c:find("Hate", 1, true) or c:find("Behavior", 1, true) or c:find("Motion", 1, true) then want(c) end
         end
     end
+    local cm = singleton(CHARACTER_MANAGER)
+    local partner = cm and self:call(cm, "getPartnerContextRef")
+    if partner ~= nil then want(type_name_of(partner)) end
 
     local pickups = self:list_pickups() or {}
     live.pickups = {}
@@ -960,11 +1271,16 @@ function Game:dump_types()
         live.pickup_components = self:component_names(self.pickup_objects[pickups[1].id])
     end
 
+    local prev = load_json(TYPEDUMP_FILE)
     local dump = {
         game = reframework:get_game_name(),
+        mod_version = P.MOD_VERSION,
+        runs = (prev and tonumber(prev.runs) or 0) + 1,
         capabilities = self.caps,
         live = live,
         types = {},
+        enums = {},
+        areas_seen = {},
     }
     for _, n in ipairs(names) do
         local td = find_type(n)
@@ -975,8 +1291,34 @@ function Game:dump_types()
             dump.types[n] = "not found"
         end
     end
-    local ok = pcall(json.dump_file, "re4coop_typedump.json", dump)
-    return ok
+    for _, n in ipairs(DUMP_ENUMS) do
+        local td = find_type(n)
+        dump.enums[n] = td and enum_values(td) or "not found"
+    end
+    -- Keep what earlier runs found (types seen only in other areas).
+    if prev ~= nil and type(prev.types) == "table" then
+        for n, d in pairs(prev.types) do
+            if dump.types[n] == nil then dump.types[n] = d end
+        end
+    end
+    local area = tostring(self:area_name() or "?") .. " / stage " .. tostring(ctx and plain_value(self:call(ctx, "get_CurrentStageID")) or "?")
+    local area_known = false
+    for _, a in ipairs(prev and type(prev.areas_seen) == "table" and prev.areas_seen or {}) do
+        if #dump.areas_seen < MAX_AREAS_SEEN then dump.areas_seen[#dump.areas_seen + 1] = a end
+        if a == area then area_known = true end
+    end
+    if not area_known and #dump.areas_seen < MAX_AREAS_SEEN then dump.areas_seen[#dump.areas_seen + 1] = area end
+    local ok = pcall(json.dump_file, TYPEDUMP_FILE, dump)
+
+    local okS, snap = pcall(self.research_snapshot, self, extra)
+    if not okS then snap = { error = tostring(snap) } end
+    snap.run = dump.runs
+    local log = load_json(RESEARCH_LOG_FILE)
+    local runs = log and type(log.runs) == "table" and log.runs or {}
+    runs[#runs + 1] = snap
+    while #runs > RESEARCH_LOG_MAX do table.remove(runs, 1) end
+    local okL = pcall(json.dump_file, RESEARCH_LOG_FILE, { mod_version = P.MOD_VERSION, runs = runs })
+    return ok and okL, dump.runs
 end
 
 return Game

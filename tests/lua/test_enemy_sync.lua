@@ -218,23 +218,75 @@ T.run("position_snapping_when_enabled", function()
     T.eq(pair.client_world.calls.move, moves, "no repeated snapping once close")
 end)
 
-T.run("pairs_by_context_id_even_when_spawns_differ", function()
+-- Three enemies that both machines see near their spawn points: spatial pairing succeeds
+-- and, since their spawner IDs agree, builds trust in spawner pairing.
+local function build_spawner_trust(pair)
+    for i = 1, 3 do
+        local k = { category = 3, kind = 0, group = 900, index = i }
+        pair.host_world:spawn("chainsaw.Ch1c0z0Context", 100 + i * 10, 0, 0, 100, k)
+        pair.client_world:spawn("chainsaw.Ch1c0z0Context", 100 + i * 10 + 0.5, 0, 0, 100, k)
+    end
+    pair:step(5)
+end
+
+T.run("pairs_by_spawner_id_once_trusted", function()
     local pair = make_pair()
-    -- Same level enemies, but the client loaded later and saw them 8-12 m away from where the
-    -- host first saw them: spatial pairing would fail (3 m radius), the ContextID does not.
-    local ka, kb = { category = 2, kind = 1, group = 300, index = 1 }, { category = 2, kind = 1, group = 300, index = 2 }
+    build_spawner_trust(pair)
+    T.check(pair.client:spawner_trusted(), "trusted after 3 agreeing spatial pairs")
+    -- The client arrived later and saw these 8-12 m from where the host first saw them:
+    -- spatial pairing would fail (3 m radius), the spawner ID does not.
+    local ka, kb = { category = 3, kind = 0, group = 300, index = 1 }, { category = 3, kind = 0, group = 300, index = 2 }
     local ha = pair.host_world:spawn("chainsaw.Ch1c0z0Context", 0, 0, 0, 100, ka)
     local hb = pair.host_world:spawn("chainsaw.Ch1c0z0Context", 1, 0, 0, 100, kb)
     local cb = pair.client_world:spawn("chainsaw.Ch1c0z0Context", 9, 0, 6, 100, kb)
     local ca = pair.client_world:spawn("chainsaw.Ch1c0z0Context", 12, 0, 0, 100, ka)
     pair:step(5)
-    T.eq(pair.client.net_of[ca.id], pair.host.net_of[ha.id], "A paired by ID")
-    T.eq(pair.client.net_of[cb.id], pair.host.net_of[hb.id], "B paired by ID (not swapped)")
-    T.check(pair.client.counters.id_matches >= 2, "ID matches counted")
+    T.eq(pair.client.net_of[ca.id], pair.host.net_of[ha.id], "A paired by spawner")
+    T.eq(pair.client.net_of[cb.id], pair.host.net_of[hb.id], "B paired by spawner (not swapped)")
+    T.check(pair.client.counters.id_matches >= 2, "spawner matches counted")
     pair.client_world:damage(cb, 25)
     pair:step(5)
     T.eq(hb.hp, 75, "damage lands on the right enemy")
     T.eq(ha.hp, 100, "not on the other one")
+end)
+
+T.run("spawner_ids_unused_until_trusted", function()
+    local pair = make_pair()
+    local k = { category = 3, kind = 0, group = 300, index = 1 }
+    pair.host_world:spawn("chainsaw.Ch1c0z0Context", 0, 0, 0, 100, k)
+    local c = pair.client_world:spawn("chainsaw.Ch1c0z0Context", 12, 0, 0, 100, k)
+    pair:step(5)
+    T.eq(pair.client.net_of[c.id], nil, "no pairing by an unproven ID")
+end)
+
+T.run("one_disagreement_disables_spawner_pairing", function()
+    local pair = make_pair()
+    build_spawner_trust(pair)
+    -- An enemy that both see at the same spot, but the spawner IDs differ: IDs are not a
+    -- reliable cross-machine identity after all.
+    pair.host_world:spawn("chainsaw.Ch1c0z0Context", 300, 0, 0, 100, { category = 3, kind = 0, group = 1, index = 1 })
+    pair.client_world:spawn("chainsaw.Ch1c0z0Context", 300.2, 0, 0, 100, { category = 3, kind = 0, group = 1, index = 2 })
+    pair:step(5)
+    T.check(not pair.client:spawner_trusted(), "trust revoked")
+    local k = { category = 3, kind = 0, group = 77, index = 7 }
+    pair.host_world:spawn("chainsaw.Ch1c0z0Context", 400, 0, 0, 100, k)
+    local c = pair.client_world:spawn("chainsaw.Ch1c0z0Context", 412, 0, 0, 100, k)
+    pair:step(5)
+    T.eq(pair.client.net_of[c.id], nil, "no spawner pairing after a disagreement")
+end)
+
+T.run("shared_spawner_id_pairs_by_position_only", function()
+    local pair = make_pair()
+    build_spawner_trust(pair)
+    -- A wave spawner created two enemies: same spawner ID, so the ID identifies neither.
+    local k = { category = 3, kind = 0, group = 55, index = 1 }
+    local h1 = pair.host_world:spawn("chainsaw.Ch1c0z0Context", 0, 0, 0, 100, k)
+    local h2 = pair.host_world:spawn("chainsaw.Ch1c0z0Context", 6, 0, 0, 100, k)
+    local c2 = pair.client_world:spawn("chainsaw.Ch1c0z0Context", 6.3, 0, 0, 100, k)
+    local c1 = pair.client_world:spawn("chainsaw.Ch1c0z0Context", 0.2, 0, 0, 100, k)
+    pair:step(5)
+    T.eq(pair.client.net_of[c1.id], pair.host.net_of[h1.id], "first paired by position")
+    T.eq(pair.client.net_of[c2.id], pair.host.net_of[h2.id], "second paired by position")
 end)
 
 T.run("context_id_guarded_by_kind_and_distance", function()
@@ -250,6 +302,17 @@ end)
 
 T.run("unpaired_damage_found_by_context_id", function()
     local pair = make_pair()
+    -- Untrusted: the report carries no spawner ID.
+    local k0 = { category = 3, kind = 0, group = 6, index = 6 }
+    pair.host_world:spawn("chainsaw.Ch1c0z0Context", 500, 0, 0, 100, k0)
+    local c0 = pair.client_world:spawn("chainsaw.Ch1c0z0Context", 510, 0, 0, 100, k0)
+    pair.client:tick(pair.now, pair.client_world:list(), pair.client_world)
+    pair.client_world:damage(c0, 5)
+    pair.client:tick(pair.now + 0.05, pair.client_world:list(), pair.client_world)
+    T.eq(assert(P.decode(pair.to_host[1])).ctx, nil, "no spawner ID before trust")
+    pair.to_host = {}
+    build_spawner_trust(pair)
+    pair.to_host = {}
     local k = { category = 2, kind = 1, group = 7, index = 7 }
     local h = pair.host_world:spawn("chainsaw.Ch1c0z0Context", 0, 0, 0, 100, k)
     local c = pair.client_world:spawn("chainsaw.Ch1c0z0Context", 10, 0, 0, 100, k)

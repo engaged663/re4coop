@@ -108,6 +108,10 @@ local function draw_status(session, status)
         if status.partner_area then
             imgui.text_colored("Partner chapter/area: " .. status.partner_area, COLOR_DIM)
         end
+        if status.partner_stage or status.local_stage then
+            imgui.text_colored(("Stage: you %s, partner %s"):format(tostring(status.local_stage or "?"),
+                tostring(status.partner_stage or "?")), COLOR_DIM)
+        end
         if status.enemies then
             local e = status.enemies
             imgui.text(("Enemies: %d local, %d paired%s"):format(e.local_count, e.paired,
@@ -197,14 +201,27 @@ local function draw_diagnostics(game, session_status)
             local c = session_status.enemies.counters
             imgui.text(("enemy sync: damage sent %d, applied %d, failed %d | hp mirrored %d, failed %d | kills %d | id pairs %d"):format(
                 c.damage_sent, c.damage_applied, c.damage_failed, c.hp_applied, c.hp_failed, c.kills_applied, c.id_matches))
+            local tr = session_status.enemies.spawner_trust
+            if tr then
+                imgui.text(("spawner IDs: %s (agree %d, disagree %d)"):format(
+                    session_status.enemies.spawner_trusted and "trusted" or "not trusted yet", tr.agree, tr.disagree))
+            end
         end
         if session_status and session_status.items then
             local c = session_status.items.counters
             imgui.text(("key items: tracked %d | taken by me %d, by partner %d | removed %d, remove failed %d"):format(
                 session_status.items.tracked, c.taken_by_me, c.taken_by_partner, c.removed, c.remove_failed))
+            imgui.text(("pickup detection: game callback %s | confirmed %d, heuristic %d, unconfirmed ignored %d"):format(
+                session_status.items.hook or "?", c.confirmed, c.heuristic, c.unconfirmed_ignored))
         end
-        if imgui.button("Write research dump (reframework/data/re4coop_typedump.json)") then
-            dump_result = game:dump_types() and "written - please send this file" or "failed (see REFramework log)"
+        if imgui.button("Write research dump (adds a run to reframework/data/)") then
+            local extra = session_status and {
+                role = session_status.role, enemies = session_status.enemies, items = session_status.items,
+                local_stage = session_status.local_stage, partner_stage = session_status.partner_stage,
+            } or nil
+            local ok, runs = game:dump_types(extra)
+            dump_result = ok and ("run %d saved - send re4coop_typedump.json and re4coop_research_log.json"):format(runs)
+                or "failed (see REFramework log)"
         end
         if dump_result then
             imgui.same_line()

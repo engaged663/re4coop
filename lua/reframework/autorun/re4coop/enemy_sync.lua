@@ -71,6 +71,7 @@ function EnemySync:reset()
 
     self.counters = { damage_sent = 0, damage_applied = 0, damage_failed = 0, kills_applied = 0, hp_applied = 0,
         hp_failed = 0, snaps = 0, id_matches = 0 }
+    self.trust = { agree = 0, disagree = 0 } -- spawner-ID pairing evidence this session
 end
 
 function EnemySync:kind_hash(kind)
@@ -113,23 +114,50 @@ function EnemySync:observe(now, enemies)
 end
 
 -- Local enemy that is the same level enemy as a remote one. `taken` excludes enemies
--- already paired.
---  1. Same chainsaw.ContextID (assigned by level data) and same kind, with the spawn points
---     no further apart than ID_MATCH_RADIUS - the guard keeps a wrong pairing impossible if
---     IDs ever turn out not to be identical across machines.
+-- already paired. Returns id, how ("spawner" | "spatial").
+--
+--  1. Same spawner (CharacterContext.get_SpawnerID, from level data) and same kind, when that
+--     spawner ID belongs to exactly one candidate (a spawner can create several enemies), the
+--     spawn points are within ID_MATCH_RADIUS, and - when `require_trust` - spawner pairing
+--     has been confirmed this session (see note_spatial_pair).
 --  2. Otherwise the closest enemy of the same kind whose spawn (or current position) is
 --     within the match radius.
 local ID_MATCH_RADIUS = 25.0
+local TRUST_AFTER = 3 -- spatial pairings whose spawner IDs agreed before spawner pairing is used
 
-function EnemySync:find_match(kind_hash, spawn_pos, cur_pos, taken, want_alive, ctx)
+function EnemySync:spawner_trusted()
+    return self.trust.agree >= TRUST_AFTER and self.trust.disagree == 0
+end
+
+-- Records whether a pairing made by position also agrees on spawner ID. One disagreement
+-- disables spawner pairing for the session: then the IDs are not a cross-machine identity.
+function EnemySync:note_spatial_pair(remote_ctx, local_id)
+    local e = self.by_id[local_id]
+    local a, b = self.P.ctx_key(remote_ctx), e and self.P.ctx_key(e.ctx)
+    if a == nil or b == nil then return end
+    if a == b then
+        self.trust.agree = self.trust.agree + 1
+    else
+        self.trust.disagree = self.trust.disagree + 1
+    end
+end
+
+function EnemySync:find_match(kind_hash, spawn_pos, cur_pos, taken, want_alive, ctx, require_trust)
     local key = self.P.ctx_key(ctx)
-    if key ~= nil then
+    if key ~= nil and (not require_trust or self:spawner_trusted()) then
+        local found, count = nil, 0
         for id, e in pairs(self.by_id) do
-            if e.kind_hash == kind_hash and not taken[id] and (not want_alive or e.alive)
-                and self.P.ctx_key(e.ctx) == key and dist(self.spawn[id] or e.pos, spawn_pos) <= ID_MATCH_RADIUS then
-                self.counters.id_matches = self.counters.id_matches + 1
-                return id
+            if e.kind_hash == kind_hash and self.P.ctx_key(e.ctx) == key then
+                count = count + 1
+                if not taken[id] and (not want_alive or e.alive)
+                    and dist(self.spawn[id] or e.pos, spawn_pos) <= ID_MATCH_RADIUS then
+                    found = id
+                end
             end
+        end
+        if found ~= nil and count == 1 then
+            self.counters.id_matches = self.counters.id_matches + 1
+            return found, "spawner"
         end
     end
     local radius = self.settings.match_radius or 3.0
@@ -145,7 +173,7 @@ function EnemySync:find_match(kind_hash, spawn_pos, cur_pos, taken, want_alive, 
             end
         end
     end
-    return best
+    return best, best and "spatial" or nil
 end
 
 -------------------------------------------------------------------------------
@@ -327,7 +355,9 @@ function EnemySync:client_tick(now, enemies, game)
                     pos = self.spawn[e.id] or e.pos,
                     amount = expected - e.hp,
                     flags = lethal and P.DAMAGE_FLAGS.LETHAL or 0,
-                    ctx = e.ctx,
+                    -- The host has no evidence of its own about spawner IDs: only send one
+                    -- once this session has proven they match across machines.
+                    ctx = self:spawner_trusted() and e.ctx or nil,
                 }), true)
                 self.counters.damage_sent = self.counters.damage_sent + 1
             end
@@ -347,13 +377,22 @@ function EnemySync:client_tick(now, enemies, game)
     table.sort(unpaired)
     local taken = {}
     for id in pairs(self.net_of) do taken[id] = true end
+    local remote_key_count = {}
+    for _, r in pairs(self.remote) do
+        local key = self.P.ctx_key(r.ctx)
+        if key ~= nil then remote_key_count[key] = (remote_key_count[key] or 0) + 1 end
+    end
     for _, net_id in ipairs(unpaired) do
         local r = self.remote[net_id]
-        local id = self:find_match(r.kind_hash, r.spawn or r.pos, r.alive and r.pos or nil, taken, true, r.ctx)
+        local key = self.P.ctx_key(r.ctx)
+        -- A spawner ID shared by several host enemies identifies none of them.
+        local ctx = (key ~= nil and remote_key_count[key] == 1) and r.ctx or nil
+        local id, how = self:find_match(r.kind_hash, r.spawn or r.pos, r.alive and r.pos or nil, taken, true, ctx, true)
         if id ~= nil then
             self.local_of[net_id] = id
             self.net_of[id] = net_id
             taken[id] = true
+            if how == "spatial" then self:note_spatial_pair(r.ctx, id) end
         end
     end
 
@@ -424,7 +463,8 @@ function EnemySync:summary()
         for _ in pairs(self.local_of) do n_paired = n_paired + 1 end
         for _ in pairs(self.remote) do n_remote = n_remote + 1 end
     end
-    return { role = self.role, local_count = n_local, paired = n_paired, remote_count = n_remote, counters = self.counters }
+    return { role = self.role, local_count = n_local, paired = n_paired, remote_count = n_remote, counters = self.counters,
+        spawner_trust = self.trust, spawner_trusted = self:spawner_trusted() }
 end
 
 return EnemySync

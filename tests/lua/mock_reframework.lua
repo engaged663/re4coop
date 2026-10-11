@@ -50,6 +50,20 @@ function TypeDef:get_field(name)
             return {
                 get_name = function() return fname end,
                 get_type = function() return { get_full_name = function() return ftype end } end,
+                is_static = function() return false end,
+            }
+        end
+        if td.static_values[name] ~= nil then
+            -- Enum literal: static field whose data is the value (field:get_data(nil)).
+            local fname, value, owner = name, td.static_values[name], td.name
+            return {
+                get_name = function() return fname end,
+                get_type = function() return { get_full_name = function() return owner end } end,
+                is_static = function() return true end,
+                get_data = function(_, obj)
+                    assert(obj == nil, "static field read with an object")
+                    return value
+                end,
             }
         end
         td = td.parent and classes[td.parent] or nil
@@ -64,12 +78,14 @@ end
 function TypeDef:get_fields()
     local out = {}
     for name in pairs(self.fields) do out[#out + 1] = self:get_field(name) end
+    for name in pairs(self.static_values) do out[#out + 1] = self:get_field(name) end
     return out
 end
 
 -- class(name, parent, { method = {nparams, fn, param_types} }, { field = type })
 local function class(name, parent, methods, fields)
-    local td = setmetatable({ name = name, parent = parent, methods = {}, fields = fields or {} }, TypeDef)
+    local td = setmetatable({ name = name, parent = parent, methods = {}, fields = fields or {}, static_values = {} },
+        TypeDef)
     for mname, spec in pairs(methods or {}) do
         td.methods[mname] = make_method(mname, spec[1], spec[2], spec[3])
     end
@@ -78,6 +94,13 @@ local function class(name, parent, methods, fields)
 end
 M.class = class
 M.classes = classes
+
+-- An enum type: its literals are static fields.
+local function enum(name, values)
+    local td = class(name, "System.Object", {})
+    td.static_values = values
+    return td
+end
 
 local Managed = {}
 Managed.__index = Managed
@@ -136,7 +159,7 @@ function M.install(opts)
     opts = opts or {}
     classes = {}
     M.classes = classes
-    local world = { singletons = {}, enemies = {}, drops = {}, gui_event = false, created = {} }
+    local world = { singletons = {}, enemies = {}, drops = {}, components = {}, gui_event = false, created = {} }
     M.world = world
 
     class("System.Object", nil, {})
@@ -163,8 +186,10 @@ function M.install(opts)
         get_Transform = { 0, function(self) return self.transform end },
         ["getComponent(System.Type)"] = { 1, function(self, t)
             if t.name == "via.physics.CharacterController" then return self.cc end
+            if t.name == "via.motion.Motion" then return self.motion end
             return nil
         end },
+        get_Name = { 0, function(self) return self.name or "GameObject" end },
         destroy = { 1, function(self)
             self.destroyed = true
             if self.on_destroy then self.on_destroy() end
@@ -173,17 +198,44 @@ function M.install(opts)
     })
     class("chainsaw.DropItem", "System.Object", {
         get_GameObject = { 0, function(self) return self.go end },
-    }, { _ID = "chainsaw.ContextID", _ItemData = "chainsaw.DropItemContext.SaveData" })
+        -- Level-placed items keep ItemID 0 in _ItemData; getItemID() knows the real one.
+        getItemID = { 0, function(self) return self.real_item_id or self.__fields._ItemData.f.ItemID end },
+        -- Static pickup callbacks (the game calls them; the mod only hooks them).
+        onAcceptPickup = { 2, function() end, { "chainsaw.ContextID", "chainsaw.ContextID" } },
+        onAcceptOccupied = { 3, function() end, { "chainsaw.ContextID", "chainsaw.ContextID", "System.Int32" } },
+        getStage = { 0, function(self) return self.stage or 40210 end },
+    }, { _ID = "chainsaw.ContextID", _ItemData = "chainsaw.DropItemContext.SaveData", _IsLostItem = "System.Boolean" })
     class("via.Scene", "System.Object", {
         ["findComponents(System.Type)"] = { 1, function(_, t)
+            local comps = {}
             if t.name == "chainsaw.DropItem" then
-                local comps = {}
                 for _, d in ipairs(world.drops) do comps[#comps + 1] = d end
-                return M.array(comps)
             end
-            return M.array({})
+            for _, c in ipairs(world.components[t.name] or {}) do comps[#comps + 1] = c end
+            return M.array(comps)
         end },
     })
+    class("via.motion.TreeLayer", "System.Object", {
+        get_MotionBankID = { 0, function(self) return self.bank end },
+        get_MotionID = { 0, function(self) return self.motion end },
+        get_Frame = { 0, function(self) return self.frame end },
+    })
+    class("via.motion.Motion", "System.Object", {
+        getLayer = { 1, function(self, i) return self.layers[i + 1] end, { "System.UInt32" } },
+        getLayerCount = { 0, function(self) return #self.layers end },
+    })
+    class("chainsaw.HateTargetInfo", "System.Object", {}, { _Target = "via.GameObject", _Hate = "System.Single" })
+    class("chainsaw.HateController", "System.Object", {
+        get_GameObject = { 0, function(self) return self.go end },
+        get_CurrentTarget = { 0, function(self) return self.target end },
+        get_FindState = { 0, function() return 2 end },
+        get_TotalAttention = { 0, function() return 0.5 end },
+    })
+    class("chainsaw.StageIdentifier", "System.Object", {}, { _StageID = "chainsaw.StageID", _AreaNo = "System.Int32" })
+    enum("chainsaw.CharacterKindID", { ch0a0z0 = 100000, ch3a8z0 = 380000, ch1c0z0 = 1120000 })
+    enum("chainsaw.CharacterUsePurposeFlag", { None = 0, Player = 1, Partner = 2 })
+    enum("chainsaw.ContextID.EntityCategory", { Character = 0, Gimmick = 1, DropItem = 2, StaticItem = 3 })
+    enum("chainsaw.StageID", { st40_200 = 40200, st40_210 = 40210 })
     class("via.SceneManager", "System.Object", {})
 
     -- HitPoint variants (opts):
@@ -222,6 +274,12 @@ function M.install(opts)
         get_Position = { 0, function(self) return vec(self.pos.x, self.pos.y, self.pos.z) end },
         get_HitPoint = { 0, function(self) return self.hitpoint end },
         get_BodyGameObject = { 0, function(self) return self.body end },
+        -- Level spawner that created the character (nil for characters without one).
+        get_SpawnerID = { 0, function(self) return self.spawner end },
+        get_CurrentStageID = { 0, function(self) return self.stage or world.stage or 40100 end },
+        get_KindID = { 0, function(self) return self.kind_id or 0 end },
+        get_TargetFindState = { 0, function() return 1 end },
+        get_TargetFindSource = { 0, function() return 0 end },
     }
     class("chainsaw.CharacterContext", "System.Object", ctx_methods, { _ID = "chainsaw.ContextID" })
     class("chainsaw.PlayerBaseContext", "chainsaw.CharacterContext", {
@@ -230,6 +288,8 @@ function M.install(opts)
     class("chainsaw.EnemyBaseContext", "chainsaw.CharacterContext", {})
     class("chainsaw.Ch1c0z0Context", "chainsaw.EnemyBaseContext", {})
     class("chainsaw.Ch1d0z0Context", "chainsaw.EnemyBaseContext", {})
+    class("chainsaw.PartnerBaseContext", "chainsaw.CharacterContext", {})
+    class("chainsaw.Ch3a8z0Context", "chainsaw.PartnerBaseContext", {}) -- Ashley
 
     class("System.Collections.Generic.List`1<chainsaw.EnemyBaseContext>", "System.Object", {
         get_Count = { 0, function(self) return #world.enemies end },
@@ -239,6 +299,7 @@ function M.install(opts)
 
     class("chainsaw.CharacterManager", "System.Object", {
         getPlayerContextRef = { 0, function() return world.player end },
+        getPartnerContextRef = { 0, function() return world.partner end },
         get_EnemyContextList = { 0, function() return enemy_list end },
     })
     class("chainsaw.GuiManager", "System.Object", {
@@ -246,6 +307,12 @@ function M.install(opts)
     })
     class("chainsaw.CampaignManager", "System.Object", {
         get_CurrentChapter = { 0, function() return world.chapter or 1 end },
+        get_CurrentDifficulty = { 0, function() return 20 end },
+        get_CurrentStageIdentifier = { 0, function()
+            local sid = new("chainsaw.StageIdentifier")
+            sid.__fields._StageID, sid.__fields._AreaNo = world.stage or 40100, 3
+            return sid
+        end },
     })
     class("chainsaw.EnemyManager", "System.Object", {})
     class("via.Prefab", "System.Object", {
@@ -286,7 +353,16 @@ function M.install(opts)
         call_object_func = function(obj, name, ...) return obj:call(name, ...) end,
         typeof = function(name) return { name = name } end,
         create_instance = function(name) return new(name) end,
+        to_managed_object = function(ptr) return ptr end,
     }
+    -- sdk.hook: pre-functions are kept per method name and run by M.fire_hooks().
+    M.hooks = {}
+    if not opts.no_hook then
+        _G.sdk.hook = function(method, pre, post)
+            M.hooks[method.name] = M.hooks[method.name] or {}
+            table.insert(M.hooks[method.name], { pre = pre, post = post })
+        end
+    end
     _G.Vector3f = { new = function(x, y, z) return vec(x, y, z) end }
     _G.Quaternion = { new = function(w, x, y, z) return { x = x, y = y, z = z, w = w } end }
 
@@ -366,10 +442,14 @@ function M.array(items)
     })
 end
 
--- context_id: optional {group, index, kind, category} exposed through the `_ID` field.
-function M.make_character(type_name, pos, hp, context)
+-- spawner: optional {group, index, kind, category} returned by get_SpawnerID() (level data,
+-- the same on every machine). The `_ID` field is a runtime counter, like in the game.
+local next_runtime_index = 300
+function M.make_character(type_name, pos, hp, spawner)
     local ctx = new(type_name, { pos = vec(pos.x, pos.y, pos.z), hp = hp, max_hp = hp, yaw = 0 })
-    ctx.__fields._ID = context_id(context)
+    next_runtime_index = next_runtime_index + 1
+    ctx.__fields._ID = context_id({ category = 2, kind = 0, group = 12, index = next_runtime_index })
+    ctx.spawner = context_id(spawner)
     ctx.hitpoint = new("chainsaw.HitPoint", { owner = ctx })
     if classes["chainsaw.HitPoint"]:get_field(M.hp_field_name) then
         -- Field-backed HP: keep ctx.hp in sync with writes through set_field.
@@ -392,8 +472,12 @@ function M.make_character(type_name, pos, hp, context)
         get_element = function(_, i) return elems[i + 1] end,
     })
     body.transform = transform
+    body.name = type_name:match("([^.]+)Context$") or type_name
     body.cc = new("via.physics.CharacterController", { owner = ctx })
-    body.components = { transform, body.cc }
+    body.motion = new("via.motion.Motion", {
+        layers = { new("via.motion.TreeLayer", { bank = 100, motion = 1201, frame = 12.5 }) },
+    })
+    body.components = { transform, body.motion, body.cc }
     ctx.body = body
     return ctx
 end
@@ -409,8 +493,43 @@ function M.make_drop_item(item_id, pos, context, count)
     comp.go = go
     comp.__fields._ID = context_id(context)
     comp.__fields._ItemData = value_type({ ItemID = item_id, Count = count or 1 })
+    comp.__fields._IsLostItem = false
     table.insert(M.world.drops, comp)
     return comp
+end
+
+-- An enemy's HateController: a component on its own GameObject, targeting `target_go`.
+function M.make_hate_controller(name, pos, target_go)
+    local owner = { pos = vec(pos.x, pos.y, pos.z) }
+    local go = new("via.GameObject", { owner = owner, name = name })
+    go.transform = new("via.Transform", { owner = owner })
+    local hc = new("chainsaw.HateController", { go = go })
+    if target_go ~= nil then
+        hc.target = new("chainsaw.HateTargetInfo")
+        hc.target.__fields._Target, hc.target.__fields._Hate = target_go, 3.5
+    end
+    local list = M.world.components["chainsaw.HateController"] or {}
+    list[#list + 1] = hc
+    M.world.components["chainsaw.HateController"] = list
+    return hc
+end
+
+-- Runs the hooks installed on a method with REFramework's argument layout for a static method:
+-- args[1] = VM context, args[2..] = parameters.
+function M.fire_hooks(method_name, ...)
+    local args = { "vmctx", ... }
+    for _, h in ipairs(M.hooks[method_name] or {}) do
+        local r = h.pre(args)
+        assert(r == nil, "pre-hook must let the original run")
+        assert(h.post("retval") == "retval", "post-hook must pass the return value through")
+    end
+end
+
+-- The local player picks a drop item up: the game reports it, then removes the item.
+function M.pickup(comp)
+    local player = M.world.player
+    M.fire_hooks("onAcceptPickup", player and player.__fields._ID, comp.__fields._ID)
+    return M.remove_drop(comp)
 end
 
 -- The player picks it up / the area unloads it: it leaves the scene.

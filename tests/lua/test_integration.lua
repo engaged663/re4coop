@@ -183,8 +183,37 @@ T.run("key_items_exist_once", function()
     ok = T.wait_until(function() return client_game.removed[1] == FUEL end, step, 5)
     T.check(ok, "client's Boat Fuel removed")
     T.check(host_messages_contain("Partner picked up a key item"), "host was told about the Cog")
+
+    -- Host picks up the Church Insignia 20 m from where the game says it stands (the proximity
+    -- heuristic would refuse): the game's DropItem.onAcceptPickup callback confirms it.
+    local INSIGNIA = 119257600
+    local herb_h = mock.make_drop_item(112800000, { x = 0, y = 0, z = 1 }, { category = 2, kind = 0, group = 12, index = 90 })
+    local ins_ctx = { category = 3, kind = 0, group = 40210, index = 6 }
+    local ins_h = mock.make_drop_item(INSIGNIA, { x = 20, y = 0, z = 0 }, ins_ctx)
+    client_game.pickups = { { id = 3, item_id = INSIGNIA, pos = { x = 20, y = 0, z = 0 }, ctx = ins_ctx } }
+    run_for(0.6)
+    mock.pickup(herb_h) -- an ordinary pickup proves the callback
+    run_for(0.6)
+    mock.pickup(ins_h)
+    ok = T.wait_until(function() return client_game.removed[2] == INSIGNIA end, step, 5)
+    T.check(ok, "client's Church Insignia removed via the confirmed pickup")
     client_game.player.pos = { x = 10, y = 0, z = 4 }
     run_for(0.5) -- let the host's view of the client catch up
+end)
+
+T.run("research_dump_button_while_connected", function()
+    mock.press["Write research dump (adds a run to reframework/data/)"] = true
+    host_frame()
+    local log = mock.files["re4coop_research_log.json"]
+    T.check(log ~= nil and #log.runs == 1, "research log written from the UI")
+    T.eq(log.runs[1].session.role, "host", "session state included")
+    T.check(log.runs[1].session.items.counters.confirmed >= 1, "item sync counters included")
+    T.eq(mock.files["re4coop_typedump.json"].runs, 1, "type dump written")
+    local shown = false
+    for _, t in ipairs(mock.imgui_texts) do
+        if t:find("run 1 saved", 1, true) then shown = true end
+    end
+    T.check(shown, "UI confirms the run")
 end)
 
 T.run("chat_and_teleport", function()

@@ -45,12 +45,30 @@ T.run("player_roundtrip_with_joints", function()
     T.eq(m.max_hp, 1000, "max_hp")
     T.eq(m.flags, P.PLAYER_FLAGS.AIMING, "flags")
     T.eq(m.area_hash, 42, "area hash")
+    T.eq(m.stage, nil, "no stage sent")
     T.eq(#m.joints, 25, "joint count")
     for i = 1, 25 do
         T.near(m.joints[i].x, joints[i].x, 0.006, "joint x")
         T.near(m.joints[i].y, joints[i].y, 0.006, "joint y")
         T.near(m.joints[i].z, joints[i].z, 0.006, "joint z")
     end
+end)
+
+T.run("player_stage_roundtrip", function()
+    local base = { time = 1, pos = { x = 0, y = 0, z = 0 }, rot = { x = 0, y = 0, z = 0, w = 1 } }
+    base.stage = 40210
+    base.flags = P.PLAYER_FLAGS.CUTSCENE
+    local m = assert(P.decode(P.encode_player(base)))
+    T.eq(m.stage, 40210, "stage")
+    T.check((m.flags & P.PLAYER_FLAGS.CUTSCENE) ~= 0, "other flags kept")
+    T.check((m.flags & P.PLAYER_FLAGS.HAS_STAGE) ~= 0, "stage flag set")
+    base.stage = 0
+    T.eq(assert(P.decode(P.encode_player(base))).stage, 0, "stage 0 is a real value")
+    base.stage = 1.5
+    T.eq(assert(P.decode(P.encode_player(base))).stage, nil, "non-integer stage is not sent")
+    base.stage = nil
+    base.flags = P.PLAYER_FLAGS.HAS_STAGE -- a stale flag without a stage
+    T.eq(assert(P.decode(P.encode_player(base))).stage, nil, "flag cleared without a stage")
 end)
 
 T.run("player_joint_cap_and_clamp", function()

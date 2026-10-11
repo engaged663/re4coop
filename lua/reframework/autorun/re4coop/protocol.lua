@@ -3,8 +3,8 @@
 
 local P = {}
 
-P.VERSION = 2            -- bump on any incompatible change to the layouts below
-P.MOD_VERSION = "0.2.0"
+P.VERSION = 3            -- bump on any incompatible change to the layouts below
+P.MOD_VERSION = "0.3.0"
 
 P.T = {
     HELLO = 1,          -- reliable, both directions, right after connecting
@@ -22,6 +22,7 @@ P.PLAYER_FLAGS = {
     DEAD = 1,
     CUTSCENE = 2,
     AIMING = 4,
+    HAS_STAGE = 8, -- the message carries the player's chainsaw.StageID
 }
 
 P.ENEMY_FLAGS = {
@@ -52,8 +53,8 @@ local function clamp_i16(v)
     return v
 end
 
--- chainsaw.ContextID {category, kind, group, index} identifies a character or item context.
--- Level data assigns it, so placed enemies/items carry the same ID on both machines.
+-- chainsaw.ContextID {category, kind, group, index} identifies a character, spawner or item.
+-- IDs from level data are the same on both machines; runtime ones are not (ctx_is_runtime).
 local function ctx_fields(ctx)
     if ctx == nil then return 0, 0, 0, 0 end
     return ctx.group or 0, ctx.index or 0, (ctx.kind or 0) & 0xFF, (ctx.category or 0) & 0xFF
@@ -61,6 +62,17 @@ end
 
 local function ctx_from(group, index, kind, category)
     return { group = group, index = index, kind = kind, category = category }
+end
+
+-- ContextIDs in this group are handed out at runtime, in load order: the research dump showed
+-- enemies 12:312, 12:987, 12:1053 and drop items 12:192..486, while level-placed items carry
+-- their stage (3:0:40210:13). Two machines can give the same runtime number to different
+-- objects, or agree for a while and then drift apart, so these never identify anything
+-- across the network.
+P.RUNTIME_CONTEXT_GROUP = 12
+
+function P.ctx_is_runtime(ctx)
+    return ctx ~= nil and ctx.group == P.RUNTIME_CONTEXT_GROUP
 end
 
 -- Stable string key for a ContextID table, or nil.
@@ -87,16 +99,25 @@ function P.encode_hello(m)
         m.name or "", m.area or "", m.flags or 0)
 end
 
--- m = { time, pos={x,y,z}, rot={x,y,z,w}, hp, max_hp, flags, area_hash, joints={{x,y,z},...} }
+-- m = { time, pos={x,y,z}, rot={x,y,z,w}, hp, max_hp, flags, area_hash, stage, joints={{x,y,z},...} }
 -- Joint positions are absolute world positions; they are sent relative to pos.
+-- stage: the player's chainsaw.StageID (nil if unknown).
+local PLAYER_HEADER = "<Bdfffffffff BI4i4B"
 function P.encode_player(m)
     local pos, rot = m.pos, m.rot
     local joints = m.joints or {}
     local n = math.min(#joints, P.MAX_JOINTS)
+    local flags = (m.flags or 0) & ~P.PLAYER_FLAGS.HAS_STAGE
+    local stage = math.tointeger(m.stage)
+    if stage ~= nil and stage >= -0x80000000 and stage <= 0x7FFFFFFF then
+        flags = flags | P.PLAYER_FLAGS.HAS_STAGE
+    else
+        stage = 0
+    end
     local parts = {
-        string.pack("<Bdfffffffff BI4B", P.T.PLAYER, m.time or 0,
+        string.pack(PLAYER_HEADER, P.T.PLAYER, m.time or 0,
             pos.x, pos.y, pos.z, rot.x, rot.y, rot.z, rot.w,
-            m.hp or 0, m.max_hp or 0, m.flags or 0, m.area_hash or 0, n)
+            m.hp or 0, m.max_hp or 0, flags, m.area_hash or 0, stage, n)
     }
     for i = 1, n do
         local j = joints[i]
@@ -190,13 +211,14 @@ decoders[P.T.HELLO] = function(data)
 end
 
 decoders[P.T.PLAYER] = function(data)
-    local _, time, px, py, pz, qx, qy, qz, qw, hp, max_hp, flags, area_hash, n, off =
-        string.unpack("<Bdfffffffff BI4B", data)
+    local _, time, px, py, pz, qx, qy, qz, qw, hp, max_hp, flags, area_hash, stage, n, off =
+        string.unpack(PLAYER_HEADER, data)
     local m = {
         time = time,
         pos = { x = px, y = py, z = pz },
         rot = { x = qx, y = qy, z = qz, w = qw },
         hp = hp, max_hp = max_hp, flags = flags, area_hash = area_hash,
+        stage = (flags & P.PLAYER_FLAGS.HAS_STAGE) ~= 0 and stage or nil,
         joints = {},
     }
     for i = 1, n do

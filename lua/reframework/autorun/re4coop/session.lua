@@ -28,6 +28,12 @@ local TP_WATCH_SECONDS = 4.0    -- after a teleport, re-teleport if we fell thro
 local TP_FALL_TOLERANCE = 4.0   -- metres below the target that count as "fell"
 local TP_MAX_TRIES = 3
 local LOCAL_POS_FRESH = 0.5     -- seconds a local position stays usable for pickup/left-behind logic
+-- Partners in different stages (chainsaw.StageID) count as separated from this fraction of
+-- the far-away distance on: a partner waiting just behind a door you cannot open is in
+-- another stage but may never get far away. Stage borders can run through one area (the
+-- research dump showed items from stages 40200 and 40210 loaded together), so players a few
+-- metres apart in different stages are not separated.
+local STAGE_APART_FACTOR = 0.5
 
 local function dist3(a, b)
     local dx, dy, dz = a.x - b.x, a.y - b.y, a.z - b.z
@@ -50,6 +56,7 @@ function Session.new(opts)
     self.local_skeleton_sig = nil
     self.local_dead = false
     self.local_cutscene = false
+    self.local_stage = nil
     self.last_item_tick = -math.huge
     self.keys_down = {}
     self.left_behind = nil
@@ -261,14 +268,15 @@ function Session:update_left_behind(now)
         return
     end
     local d = dist3(partner.pos, mine)
-    if d < s.left_behind_distance then
+    local other_stage = partner.stage ~= nil and self.local_stage ~= nil and partner.stage ~= self.local_stage
+    if d < s.left_behind_distance and not (other_stage and d >= s.left_behind_distance * STAGE_APART_FACTOR) then
         self.far_since = nil
         self.left_behind = nil
         return
     end
     self.far_since = self.far_since or now
     if now - self.far_since >= s.left_behind_seconds and now >= self.prompt_snoozed_until then
-        self.left_behind = { distance = d }
+        self.left_behind = { distance = d, other_stage = other_stage }
     else
         self.left_behind = nil
     end
@@ -322,6 +330,7 @@ function Session:status()
         partner_area = self.partner_hello and self.partner_hello.area or nil,
         partner_age = self.interp:age(now),
         last_error = self.last_error,
+        local_stage = self.local_stage,
     }
     local remote = self.interp:sample(now)
     if remote ~= nil then
@@ -329,6 +338,7 @@ function Session:status()
         st.partner_hp = remote.hp
         st.partner_max_hp = remote.max_hp
         st.partner_flags = remote.flags
+        st.partner_stage = remote.stage
         local mine = self.last_local_pos
         if mine ~= nil then
             local dx, dy, dz = remote.pos.x - mine.x, remote.pos.y - mine.y, remote.pos.z - mine.z
@@ -457,6 +467,7 @@ function Session:send_player_state(now)
     self.last_local_pos = st.pos
     self.last_local_pos_time = now
     self.local_cutscene = st.cutscene and true or false
+    self.local_stage = st.stage
     self:watch_teleport(now, st.pos)
 
     if st.parents ~= nil then
@@ -480,6 +491,7 @@ function Session:send_player_state(now)
         hp = st.hp, max_hp = st.max_hp,
         flags = flags,
         area_hash = P.hash(self.game:area_name() or ""),
+        stage = st.stage,
         joints = st.joints,
     }), false)
 
@@ -496,6 +508,8 @@ function Session:update()
         self:handle_event(ev, now)
     end
     if not self.partner_connected or not self.compatible then
+        -- Pickup callbacks from before the partner joined are stale by the time we sync.
+        if self.game.take_pickup_events then self.game:take_pickup_events() end
         return
     end
 
@@ -513,10 +527,14 @@ function Session:update()
         end
     end
 
-    if s.share_key_items and self.game.list_pickups and now - self.last_item_tick >= ITEM_TICK_INTERVAL then
+    if self.game.list_pickups and now - self.last_item_tick >= ITEM_TICK_INTERVAL then
         self.last_item_tick = now
-        local pos = self:fresh_local_pos(now)
-        self.item_sync:tick(now, self.game:list_pickups(), pos, self.game, pos ~= nil and not self.local_cutscene)
+        local accepted = self.game.take_pickup_events and self.game:take_pickup_events() or nil
+        if s.share_key_items then
+            local pos = self:fresh_local_pos(now)
+            self.item_sync:tick(now, self.game:list_pickups(), pos, self.game,
+                pos ~= nil and not self.local_cutscene, accepted)
+        end
     end
 
     self:update_left_behind(now)

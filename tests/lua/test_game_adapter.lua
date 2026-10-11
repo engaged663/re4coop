@@ -56,8 +56,8 @@ T.run("lists_and_modifies_enemies_via_setter", function()
     T.eq(list[1].kind, "chainsaw.Ch1c0z0Context", "kind is the runtime context type")
     T.eq(list[2].max_hp, 300, "max hp")
     T.check(list[1].ctx ~= nil and list[1].ctx.group == 4100 and list[1].ctx.index == 7
-        and list[1].ctx.kind == 1 and list[1].ctx.category == 2, "chainsaw.ContextID read from _ID")
-    T.eq(list[2].ctx, nil, "enemy without readable ID")
+        and list[1].ctx.kind == 1 and list[1].ctx.category == 2, "spawner ContextID read via get_SpawnerID")
+    T.eq(list[2].ctx, nil, "enemy without a spawner")
     T.check(game:enemy_set_hp(list[1].id, 41.6), "set hp")
     T.eq(world.enemies[1].hp, 42, "rounded for the Int32 setter")
     T.check(game:capabilities().enemy_set_hp.ok, "writer verified after a successful write")
@@ -201,10 +201,77 @@ T.run("survives_missing_types", function()
     T.check(game:read_player_state() == nil, "exception swallowed")
 end)
 
-T.run("research_dump", function()
+T.run("pickup_callbacks_hooked", function()
     local game = fresh_game()
-    mock.make_drop_item(119235200, { x = 3, y = 0, z = 1 }, { category = 5, kind = 0, group = 9, index = 2 })
-    T.check(game:dump_types(), "dump written")
+    T.check(game:capabilities().pickup_hook.ok, "hook capability")
+    T.eq(#mock.hooks.onAcceptPickup, 1, "onAcceptPickup hooked once")
+    T.eq(#mock.hooks.onAcceptOccupied, 1, "onAcceptOccupied hooked once")
+    T.eq(#game:take_pickup_events(), 0, "nothing yet")
+    local herb = mock.make_drop_item(112800000, { x = 1, y = 0, z = 0 }, { category = 2, kind = 0, group = 12, index = 77 })
+    mock.pickup(herb)
+    local ev = game:take_pickup_events()
+    T.eq(#ev, 1, "one event")
+    T.eq(ev[1].key, "2:0:12:77", "item ContextID read from args[3]")
+    T.eq(ev[1].user, "2:0:12:" .. game:read_context_id(mock.world.player).index, "user ContextID from args[2]")
+    T.eq(ev[1].via, "onAcceptPickup", "callback name")
+    T.eq(#game:take_pickup_events(), 0, "drained")
+    mock.fire_hooks("onAcceptPickup", nil, nil) -- unreadable arguments are ignored
+    T.eq(#game:take_pickup_events(), 0, "nil args ignored")
+    for i = 1, 100 do mock.fire_hooks("onAcceptPickup", nil, mock.value_type({ _Group = 12, _Index = i })) end
+    T.eq(#game:take_pickup_events(), 64, "queue is bounded")
+
+    local level_item = mock.make_drop_item(0, { x = 2, y = 0, z = 0 }, { category = 3, kind = 0, group = 40210, index = 13 })
+    level_item.real_item_id = 119235200
+    local found
+    for _, p in ipairs(game:list_pickups()) do
+        if p.ctx and p.ctx.group == 40210 then found = p end
+    end
+    T.eq(found and found.item_id, 119235200, "ItemID 0 in save data: getItemID() used")
+
+    local nohook = fresh_game({ no_hook = true })
+    T.eq(nohook:take_pickup_events(), nil, "no hook: nil")
+    T.check(not nohook:capabilities().pickup_hook.ok, "capability reports it")
+end)
+
+T.run("runtime_spawner_ids_are_ignored", function()
+    local _, world = fresh_game()
+    world.enemies[2].spawner = mock.value_type({ _Category = 0, _Kind = 0, _Group = 12, _Index = 55 })
+    local game = require("re4coop.game").new(function() end)
+    local list = game:list_enemies()
+    T.check(list[1].ctx ~= nil, "level spawner kept")
+    T.eq(list[2].ctx, nil, "runtime spawner dropped")
+end)
+
+-- Only what REFramework's json.dump_file can write: finite numbers, strings, booleans,
+-- arrays and string-keyed tables.
+local function check_json_safe(v, path)
+    local t = type(v)
+    if t == "number" then
+        T.check(v == v and v ~= math.huge and v ~= -math.huge, "finite number at " .. path)
+    elseif t == "table" then
+        T.check(getmetatable(v) == nil, "plain table at " .. path)
+        local n = #v
+        for k, x in pairs(v) do
+            local ok = type(k) == "string" or (math.type(k) == "integer" and k >= 1 and k <= n)
+            T.check(ok, "key " .. tostring(k) .. " at " .. path)
+            check_json_safe(x, path .. "." .. tostring(k))
+        end
+    else
+        T.check(t == "string" or t == "boolean", t .. " at " .. path)
+    end
+end
+
+T.run("research_dump", function()
+    local game, world = fresh_game()
+    world.stage = 40200
+    world.enemies[1].stage = 40200
+    world.partner = mock.make_character("chainsaw.Ch3a8z0Context", { x = 2, y = 0, z = 3 }, 600,
+        { category = 1, kind = 0, group = 40200, index = 1 })
+    mock.make_hate_controller("ch1c0z0_hate", { x = 5, y = 0, z = 0 }, world.player.body)
+    local cog = mock.make_drop_item(119235200, { x = 3, y = 0, z = 1 }, { category = 3, kind = 0, group = 40200, index = 2 })
+    local ok, runs = game:dump_types({ role = "host", items = { hook = "confirmed" } })
+    T.check(ok, "dump written")
+    T.eq(runs, 1, "first run")
     local dump = mock.files["re4coop_typedump.json"]
     local hp = dump and dump.types["chainsaw.HitPoint"]
     T.check(type(hp) == "table", "HitPoint described")
@@ -214,13 +281,75 @@ T.run("research_dump", function()
     end
     T.check(sig_found, "full method signatures (return type, parameter types)")
     T.check(dump.types["chainsaw.Ch1c0z0Context"] ~= nil, "live enemy type included")
-    T.eq(dump.types["chainsaw.HateController"], "not found", "types missing in this build are listed as such")
+    T.check(dump.types["chainsaw.Ch3a8z0Context"] ~= nil, "live partner type included")
+    T.eq(dump.types["chainsaw.HateControllerUserData"], "not found", "types missing in this build are listed as such")
     T.check(dump.live.singletons["chainsaw.CharacterManager"] == true, "singleton presence")
-    T.check(dump.live.enemies[1].context_id.group == 4100, "enemy context IDs")
+    T.check(dump.live.enemies[1].spawner_id.group == 4100, "enemy spawner IDs")
     T.check(dump.live.pickups[1].key_item == true, "pickup samples")
     T.check(dump.live.pickup_components and dump.live.pickup_components[2] == "chainsaw.DropItem", "pickup components")
     T.check(dump.live.enemy_components and dump.live.enemy_components[1] == "via.Transform", "enemy components")
     T.check(#dump.live.hp_writers > 0, "HP writer candidates listed")
+    T.eq(dump.enums["chainsaw.CharacterKindID"].ch3a8z0, 380000, "enum values from static literals")
+    T.eq(dump.enums["chainsaw.ContextID.EntityCategory"].StaticItem, 3, "ContextID categories")
+    T.eq(dump.enums["chainsaw.ChapterID"], "not found", "missing enum listed as such")
+    T.eq(dump.areas_seen[1], "1 / stage 40200", "area recorded")
+    check_json_safe(dump, "typedump")
+
+    local log = mock.files["re4coop_research_log.json"]
+    T.eq(#log.runs, 1, "one run logged")
+    local r = log.runs[1]
+    T.eq(r.run, 1, "run number")
+    T.eq(r.difficulty, 20, "difficulty")
+    T.eq(r.stage_identifier._StageID, 40200, "stage identifier fields")
+    T.eq(r.player.type, "chainsaw.PlayerBaseContext", "player sample")
+    T.eq(r.player.motion.motion, 1201, "player motion layer 0")
+    T.eq(r.partner.type, "chainsaw.Ch3a8z0Context", "partner from getPartnerContextRef")
+    T.eq(r.partner.spawner, "1:0:40200:1", "partner spawner")
+    T.check(r.partner.components ~= nil, "partner components")
+    T.eq(r.enemies[1].spawner, "2:1:4100:7", "enemy spawner key")
+    T.eq(r.enemies[1].stage, 40200, "enemy stage")
+    T.check(r.enemies[1].id:find("^2:0:12:") ~= nil, "runtime enemy ID")
+    T.eq(r.enemies[1].motion.bank, 100, "first enemy motion")
+    T.eq(r.enemies[1].find_state, 1, "enemy find state")
+    T.eq(r.hate[1].game_object, "GameObject ch1c0z0_hate", "HateController's GameObject")
+    T.eq(r.hate[1].current_target._Target, "GameObject PlayerBase", "current target read")
+    T.eq(r.pickups[1].stage, 40210, "pickup stage")
+    T.eq(r.pickups[1].id, "3:0:40200:2", "pickup level ID")
+    T.eq(r.pickup_hook.hooks, 2, "hooks installed")
+    T.eq(r.session.items.hook, "confirmed", "session state included")
+    check_json_safe(log, "research_log")
+
+    -- Second run in another area: a different enemy type; the first run's types and log
+    -- entry survive.
+    mock.pickup(cog)
+    world.chapter, world.stage = 2, 40300
+    world.enemies = { mock.make_character("chainsaw.Ch1d0z0Context", { x = 1, y = 0, z = 1 }, 300) }
+    mock.classes["chainsaw.Ch1c0z0Context"] = nil -- gone from this area's loaded types
+    local ok2, runs2 = game:dump_types(nil)
+    T.check(ok2, "second dump written")
+    T.eq(runs2, 2, "second run")
+    dump = mock.files["re4coop_typedump.json"]
+    T.eq(dump.runs, 2, "run count kept")
+    T.check(type(dump.types["chainsaw.Ch1c0z0Context"]) == "table", "type from the first area kept")
+    T.check(dump.types["chainsaw.Ch1d0z0Context"] ~= nil, "new area's type added")
+    T.eq(#dump.areas_seen, 2, "both areas listed")
+    log = mock.files["re4coop_research_log.json"]
+    T.eq(#log.runs, 2, "both runs logged")
+    T.eq(log.runs[1].chapter, "1", "first area's snapshot kept")
+    T.eq(log.runs[2].chapter, "2", "second area's snapshot")
+    T.eq(log.runs[2].pickup_hook.calls, 1, "hook call counted")
+    T.eq(log.runs[2].pickup_hook.recent[1].key, "3:0:40200:2", "recent pickup callback")
+    check_json_safe(log, "research_log 2")
+
+    -- A full log drops its oldest run.
+    local full = {}
+    for i = 1, 60 do full[i] = { run = 100 + i } end
+    mock.files["re4coop_research_log.json"] = { runs = full }
+    game:dump_types()
+    log = mock.files["re4coop_research_log.json"]
+    T.eq(#log.runs, 60, "log capped at 60 runs")
+    T.eq(log.runs[1].run, 102, "oldest run dropped")
+    T.eq(log.runs[60].run, 3, "newest run appended")
 end)
 
 T.finish()

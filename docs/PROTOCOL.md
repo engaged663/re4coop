@@ -52,24 +52,40 @@ Session rules:
 | `stats()` | Table: `rtt_ms, peer, peer_name, bytes_sent, bytes_recv, resends, reliable_in_flight, …` |
 | `local_addresses()` | Array of this PC's LAN IPv4 addresses |
 | `time()` | Monotonic seconds (`os.clock` is CPU time, so don't use it for networking) |
-| `max_payload()`, `version()` | `1388`; `"0.2.0", 1` |
+| `max_payload()`, `version()` | `1388`; `"0.3.0", 1` |
 | `new_session()` | An independent session object with the same methods (tests/tools) |
 
-## Game messages (game protocol version 2)
+## Game messages (game protocol version 3)
 
 The first byte is the message type. Formats use Lua `string.pack` notation.
 
 | Type | Name | Channel | Direction | Format |
 |---|---|---|---|---|
 | 1 | HELLO | reliable | both, on connect | `<B I2 s1 s1 s1 B`: type, game protocol version, mod version, player name, chapter/area, flags (1 = reply requested) |
-| 2 | PLAYER | unreliable, 20 Hz | both | `<B d fff ffff ff B I4 B` + `hhh` × n: time, position, rotation quaternion (x,y,z,w), HP, max HP, flags (1 dead, 2 cutscene, 4 aiming), area hash, joint count, joints as int16 cm offsets from position |
+| 2 | PLAYER | unreliable, 20 Hz | both | `<B d fff ffff ff B I4 i4 B` + `hhh` × n: time, position, rotation quaternion (x,y,z,w), HP, max HP, flags (1 dead, 2 cutscene, 4 aiming, 8 has stage), area hash, `chainsaw.StageID` (valid when flag 8 is set), joint count, joints as int16 cm offsets from position |
 | 3 | SKELETON | reliable, on change | both | `<B B` + `B` × n: parent index (1-based) of each joint in PLAYER, 0 = none |
-| 4 | ENEMY_SNAPSHOT | unreliable, 10 Hz | host → client | `<B d B B B` + n × `<I2 I4 fff fff f f f B i4 i4 B B`: time, chunk, chunks, count; then net id, kind hash (FNV-1a of context type name), position, spawn position, yaw, HP, max HP, flags (1 alive, 2 has ContextID), `chainsaw.ContextID` group, index, kind, category. 25 entries per chunk |
-| 5 | ENEMY_DAMAGE | reliable | client → host | `<B I2 I4 fff f B i4 i4 B B`: net id (0 = unpaired), kind hash, spawn position, amount, flags (1 lethal, 2 has ContextID), ContextID |
+| 4 | ENEMY_SNAPSHOT | unreliable, 10 Hz | host → client | `<B d B B B` + n × `<I2 I4 fff fff f f f B i4 i4 B B`: time, chunk, chunks, count; then net id, kind hash (FNV-1a of context type name), position, spawn position, yaw, HP, max HP, flags (1 alive, 2 has ContextID), the enemy's **spawner** `chainsaw.ContextID` (`CharacterContext.get_SpawnerID()`) as group, index, kind, category. 25 entries per chunk |
+| 5 | ENEMY_DAMAGE | reliable | client → host | `<B I2 I4 fff f B i4 i4 B B`: net id (0 = unpaired), kind hash, spawn position, amount, flags (1 lethal, 2 has ContextID), spawner ContextID (sent only once spawner IDs are trusted, see below) |
 | 6 | ENEMY_DEAD | reliable | host → client | `<B I2`: net id |
 | 7 | CHAT | reliable | both | `<B s2`: text (≤ 512 bytes) |
 | 8 | NOTIFY | reliable | both | `<B B s1`: code (1 died, 2 revived, 3 teleported, 4 info), text |
-| 9 | ITEM_TAKEN | reliable | both | `<B I4 fff B i4 i4 B B`: item ID, position, flags (1 has ContextID), ContextID of the `chainsaw.DropItem`. The receiver removes its copy of that key item |
+| 9 | ITEM_TAKEN | reliable | both | `<B I4 fff B i4 i4 B B`: item ID, position, flags (1 has ContextID), ContextID of the `chainsaw.DropItem` (level IDs only). The receiver removes its copy of that key item |
+
+### ContextIDs on the wire
+
+`chainsaw.ContextID` is `{category, kind, group, index}`. The research dump showed two kinds:
+
+* **Level IDs**, the same on both machines: level-placed items (`3:0:40210:13`, group =
+  stage) and, presumably, level spawners.
+* **Runtime IDs** in group 12, handed out in load order: every enemy's own `_ID`
+  (`0:0:12:987`) and every spawned drop item (`2:0:12:486`). Two machines can give the same
+  number to different objects, or agree for a while and then drift apart.
+
+Runtime IDs are never used across the network: enemies are identified by their spawner's ID
+(ignored if it is a runtime ID), and ITEM_TAKEN carries a ContextID only if it is a level
+ID. A spawner may create several enemies, so the client pairs by spawner ID only when that ID
+is unique among the enemies of that kind on both sides, within 25 m, and only after three
+position-based pairings agreed with the spawner IDs and none disagreed.
 
 Compatibility: only the `version` field of HELLO is guaranteed across game protocol versions.
 A peer with a different version gets an "update both" message, and its game messages are

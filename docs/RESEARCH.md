@@ -181,7 +181,7 @@ What v0.2 builds on that:
 | Feature | How | Verified by |
 |---|---|---|
 | HP sync during fights | Self-verifying HP writer. A candidate is used only after reading HP back proves the write. A no-op write never counts. Names containing default/max/rate/damage/… are excluded, so max HP is never touched | Tests with a working setter under another name, a broken setter, a field-only build and a max-HP decoy |
-| Exact enemy pairing | `chainsaw.ContextID` first, with spatial fallback | Tests with spawns 8–12 m apart, ID+kind mismatch, ID too far away |
+| Exact enemy pairing | `chainsaw.ContextID` first, with spatial fallback (replaced in v0.3: enemy `_ID`s turned out to be runtime counters, see §3.3) | Tests with spawns 8–12 m apart, ID+kind mismatch, ID too far away |
 | Key items exist once | Scan `chainsaw.DropItem` 4×/s. An item that vanishes while you stood within 4 m of it, moments before, was picked up. Your partner's copy is destroyed (and destroyed again if the area reloads it). Area unloads far away are ignored, which prevents softlocks | `test_items_sync.lua`, integration test |
 | No softlock | Partner ≥ 35 m away for 6 s outside cutscenes → HUD prompt. **F6** teleports, **F7** hides it for 2 min. If you fall through not-yet-loaded ground, it re-teleports up to 3 times | `test_progression.lua`, integration test |
 
@@ -199,6 +199,81 @@ Still needing **method signatures from the user's build**, collected by the in-g
   no longer match what you pick up.
 * **Chapter/area awareness:** `ChapterSceneManager`/`LocationSceneManager` getters, to replace
   the distance heuristic in the left-behind prompt.
+
+### 3.3 Third research round: the in-game dump (v0.3)
+
+The first `re4coop_typedump.json` from the game gave method signatures for every listed type.
+What it showed, and what v0.3 does with it:
+
+**Identity.** `chainsaw.ContextID` is a class `{_Category, _Kind, _Group, _Index, _Code}`.
+Enemies' own `_ID`s were `0:0:12:312`, `0:0:12:987`, `0:0:12:1053`, and spawned drop items
+`2:0:12:192…486`. These are **runtime counters** handed out in load order, not level data,
+so the v0.2 assumption was wrong for enemies. Level-placed items do carry level IDs, with the
+stage as group (`3:0:40200:0…2`, `3:0:40210:12…13`). v0.3:
+
+* identifies enemies by `CharacterContext.get_SpawnerID()`, the level spawner's ContextID.
+  Spawner IDs are ignored if they are runtime IDs. A spawner can create several enemies, so
+  the client pairs by spawner ID only when the ID is unique among same-kind enemies on both
+  sides, within 25 m, and only after three position-based pairings agreed with spawner IDs and
+  none disagreed. Same save + same load order can make runtime counters agree for a while
+  and then drift, which is why the trust gate exists;
+* never sends a runtime ID for key items: they match by item ID + position, or by a level ID;
+* reads `DropItem.getItemID()` when `_ItemData.ItemID` is 0, which it was for every
+  level-placed item in the dump.
+
+**Pickups.** `static DropItem.onAcceptPickup(user_id: ContextID, item_id: ContextID)` and
+`onAcceptOccupied(user_id, item_id, arg)` are the game's pickup callbacks. v0.3 hooks both.
+For a static method REFramework passes the parameters from `args[2]` on (`args[1]` is the VM
+context; checked in REFramework's `HookManager.cpp`). A key item counts as taken when a
+callback named its ContextID **and** it left the scene within 3 s of it. The v0.2 proximity
+heuristic only runs until a callback has been seen to match a vanished pickup. After that the
+callbacks are the only signal, so an area unload can no longer be mistaken for a pickup.
+
+**Stages and warping.** `CharacterContext.get_CurrentStageID() → chainsaw.StageID`. v0.3 sends
+it in PLAYER. The teleport prompt also appears when the partner has been in another stage for
+the prompt delay and is at least half the far-away distance away (17.5 m by default). Stage
+borders can run through one area (the dump had items from stages 40200 and 40210 loaded at
+the same time), so a smaller distance would prompt players who are only a house apart.
+`CharacterManager.requestWarp(contextID, pos: Nullable<vec3>, rot: Nullable<Quaternion>,
+stage: StageIdentifier)` together with `CampaignManager.get_CurrentStageIdentifier()` is the
+game's own stage-aware warp. It could replace the transform teleport for cross-stage
+teleports once `StageIdentifier`'s layout is known (it is in the new research log).
+
+**HP.** `HitPoint` has `set_CurrentHitPoint(Int32)` and `<CurrentHitPoint>k__BackingField`,
+plus `addDamage(Int32)`, `recovery(Int32)`, `dead()` and `Invincible`/`NoDamage`/`NoDeath`/
+`Immortal` flags. The dump was taken before any partial hit was synced, so `enemy_set_hp`
+read "untested". The writer verifies itself on the first synced hit.
+
+**Targeting.** `chainsaw.HateController` (a `via.Behavior`) has `find(target: GameObject,
+source)`, `addHate(target: GameObject, add_hate: Single)`, `attention(…)`, `lose(target)` and
+`get_CurrentTarget() → HateTargetInfo`. It is **not** among the 58 components on an enemy's
+body GameObject, so the research log now searches the scene for it. `CharacterManager` has
+`getPartnerContextRef()`, `PlayerAndPartnerContextList` and `requestSpawn(spawnerContextID,
+contextID, CharacterKindID, CharacterUsePurposeFlag, costumePresetID)`. Next step: on the host,
+spawn a partner-purpose character that follows the remote player and is registered like
+Ashley/Luis, then feed it to `HateController.find/addHate`. This needs the
+`CharacterKindID`/`CharacterUsePurposeFlag` values, which the new dump reads from the enums'
+static fields. Client enemies become puppets of the host's only after that works. Otherwise
+they would never attack the client.
+
+**Drops.** `DropItemManager.generateRandomDrop(droptype, cc, pos, stage, order, option)`,
+`requestGenerateLostItem(itemdata: chainsaw.Item, pos, stage: StageID, option:
+GenerateItemOption)` and `RandomDrop.calcRandom(droptype, cc, inventory, order) →
+ItemResult`. Plan: the host reports its roll, and the client spawns that item with
+`requestGenerateLostItem`. The client suppresses its own roll only after it has verified such
+a spawn once.
+
+**The dump tool itself.** v0.2 overwrote `re4coop_typedump.json` on every click, so of many
+runs in different areas only the last one's live data survived (type signatures are the same
+everywhere). v0.3 keeps everything:
+
+* `re4coop_typedump.json` merges types described by earlier runs, adds enum values and lists
+  every area dumped so far;
+* every click appends a snapshot to `re4coop_research_log.json` (last 60 runs): stage
+  identifier, difficulty, the partner character (type, kind, spawner, components), up to 30
+  enemies (kind, spawner, stage, find state), where HateControllers live and what they
+  target, motion layer 0 of the player and the first enemy, pickups (both item IDs, stage,
+  lost flag), pickup-callback activity, and the session's sync counters.
 
 ### 3.1 Prior art
 
@@ -233,9 +308,10 @@ Still needing **method signatures from the user's build**, collected by the in-g
   and each machine runs its own AI.
   * The host numbers its enemies. Every 100 ms it broadcasts `{id, kind, ContextID, position,
     spawn position, HP, alive}`, plus recently killed enemies every 0.5 s for up to 3 min.
-  * The client pairs each host enemy with its own copy by **`chainsaw.ContextID`**, falling back
-    to **kind + spawn point** (deterministic level spawns), never current position, because the
-    two copies chase different players.
+  * The client pairs each host enemy with its own copy by **kind + spawn point**
+    (deterministic level spawns), or by the enemy's **spawner ContextID** once spawner IDs have
+    proven reliable (§3.3). It never pairs by current position, because the two copies chase
+    different players.
   * Damage the client deals is detected by HP polling (`expected HP − current HP`). It is sent
     as `ENEMY_DAMAGE`, which the host applies. The client never *raises* HP to the host's value
     (that would undo damage still in flight). It only lowers HP and applies deaths. Deaths are
@@ -243,21 +319,21 @@ Still needing **method signatures from the user's build**, collected by the in-g
     cleared.
   * Optional position snapping (off by default) pulls the client's copies to the host's
     positions.
-* **Key items exist once** (§3.2): whoever picks one up keeps it, and the partner's copy is
-  removed.
-* **Left-behind prompt** (§3.2): offers a teleport (F6) when the partner has been far away for a
-  while, so the player without the key item is never stuck.
+* **Key items exist once** (§3.2, §3.3): whoever picks one up keeps it, and the partner's copy
+  is removed. Pickups are confirmed by the game's own pickup callback.
+* **Left-behind prompt** (§3.2, §3.3): offers a teleport (F6) when the partner has been far
+  away, or in another stage, for a while, so the player without the key item is never stuck.
 * **Utilities**: teleport to partner (transform + `CharacterController.warp`), chat, notices
   ("partner is down", "teleported to you"), and a diagnostics panel with the research dump.
 
-### 4.1 Known limitations (v0.2)
+### 4.1 Known limitations (v0.3)
 
 * The partner is a ghost overlay, not a 3D character model. The experimental prefab puppet
   only follows position and rotation and is not animated.
 * Enemies only target the local player, so each machine's copy of an enemy fights its own
   player. You don't see the partner's fight, and enemies don't choose between the two players.
-  Positions are not synced except by optional snapping. This needs the research dump (§3.2).
-* Random drops are rolled separately on each machine (§3.2).
+  Positions are not synced except by optional snapping. The next step is planned in §3.3.
+* Random drops are rolled separately on each machine (plan in §3.3).
 * Story flags, doors and cutscenes are not synced. Key items are shared once, and the
   left-behind prompt brings the other player along.
 * Pausing or opening the inventory pauses only your game. The connection survives because the
@@ -269,11 +345,12 @@ Still needing **method signatures from the user's build**, collected by the in-g
 
 ## 5. Roadmap
 
-1. **In-game validation of v0.2** with the checklist in [TESTING.md](TESTING.md), and collecting
-   `re4coop_typedump.json` from the research dump.
-2. With the dump: partner as an enemy target on the host (`HateController`), then client enemies
-   as host puppets (AI off, transform + motion layer from the host), then identical drops
-   (`DropItemManager`/`RandomDrop`).
+1. **In-game validation of v0.3** with the checklist in [TESTING.md](TESTING.md), and collecting
+   `re4coop_typedump.json` + `re4coop_research_log.json` from several areas.
+2. With the log: partner as an enemy target on the host (partner-purpose character +
+   `HateController.find/addHate`), then client enemies as host puppets (AI off, transform +
+   motion layer from the host), then identical drops (`generateRandomDrop` →
+   `requestGenerateLostItem`), then stage-aware teleports via `CharacterManager.requestWarp`.
 3. Event-driven damage via `chainsaw.EnemyManager.notifyHitDamage` hooks, to remove polling
    latency.
 4. An animated partner puppet: spawn the partner's character body prefab with AI components

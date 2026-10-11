@@ -33,7 +33,7 @@ local function make_game(x)
     local g = { pos = { x = x, y = 0, z = 0 }, keys = {}, teleports = {}, cutscene = false, floor = nil }
     function g:read_player_state()
         return { pos = { x = self.pos.x, y = self.pos.y, z = self.pos.z }, rot = { x = 0, y = 0, z = 0, w = 1 },
-            hp = 100, max_hp = 100, cutscene = self.cutscene }
+            hp = 100, max_hp = 100, cutscene = self.cutscene, stage = self.stage }
     end
     function g:list_enemies() return {} end
     function g:area_name() return "" end
@@ -85,6 +85,28 @@ T.run("prompt_appears_after_partner_stays_far", function()
     w.ga.pos = { x = 5, y = 0, z = 0 }
     w:advance(1)
     T.eq(w.sb.left_behind, nil, "prompt clears when back together")
+end)
+
+T.run("different_stage_prompts_at_shorter_distance", function()
+    local w = make_world() -- far-away distance 35 m: another stage counts from 17.5 m
+    w.ga.stage, w.gb.stage = 40200, 40200
+    w.ga.pos = { x = 20, y = 0, z = 0 } -- through a door, same stage: not "far"
+    w:advance(8)
+    T.eq(w.sb.left_behind, nil, "same stage at 20 m: no prompt")
+    w.ga.stage = 40210 -- the door led into the next stage
+    w:advance(3)
+    T.eq(w.sb.left_behind, nil, "not before left_behind_seconds")
+    w:advance(4)
+    T.check(w.sb.left_behind ~= nil and w.sb.left_behind.other_stage, "prompt: partner in another stage")
+    T.eq(w.sb:status().partner_stage, 40210, "partner stage in status")
+    T.eq(w.sb:status().local_stage, 40200, "own stage in status")
+    w.ga.pos = { x = 10, y = 0, z = 0 } -- e.g. looting a house that belongs to the next stage
+    w:advance(8)
+    T.eq(w.sb.left_behind, nil, "10 m apart across a stage border: no prompt")
+    w.ga.pos = { x = 20, y = 0, z = 0 }
+    w.ga.stage = nil -- stage unreadable on A: distance rule only
+    w:advance(8)
+    T.eq(w.sb.left_behind, nil, "unknown stage falls back to distance")
 end)
 
 T.run("f6_teleports_and_notifies_partner", function()

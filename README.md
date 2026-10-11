@@ -4,7 +4,7 @@ An open-source [REFramework](https://github.com/praydog/REFramework) mod that co
 copies of **Resident Evil 4 (2023)** directly by IP address over UDP, so two players can go
 through the campaign together on a LAN, or over the internet with a forwarded port or a VPN.
 
-> **Status: v0.2, experimental.** The networking, sync logic and scripts are covered by
+> **Status: v0.3, experimental.** The networking, sync logic and scripts are covered by
 > automated tests, including end-to-end runs against a mock of REFramework. They have **not yet
 > been verified inside the running game.** Some RE4 method names are probed at runtime (see
 > [docs/RESEARCH.md](docs/RESEARCH.md)). Please run the
@@ -16,13 +16,13 @@ through the campaign together on a LAN, or over the internet with a forwarded po
 |---|---|
 | **Direct IP connection** | Host on a UDP port (default `33040`). The partner joins with `IP` or `IP:port`. Optional session password |
 | **See your partner** | Their real skeleton is drawn as a "ghost" (interpolated, 20 Hz), with name tag, distance and HP bar |
-| **Shared enemies** | The host is authoritative. Damage you deal is applied to the host's copy, and HP and kills sync back during the fight. Enemies are paired by the game's own `ContextID`. Rooms the host already cleared stay cleared for a partner who arrives later |
-| **Key items exist once** | Whoever picks up a key item keeps it, and it disappears from the partner's world |
-| **Never stuck** | When your partner has been far away for a few seconds (e.g. they opened a door that needs their key item), press **F6** to teleport to them, or **F7** to hide the prompt |
+| **Shared enemies** | The host is authoritative. Damage you deal is applied to the host's copy, and HP and kills sync back during the fight. Enemies are paired by spawn point and, once proven reliable, by their level spawner's ID. Rooms the host already cleared stay cleared for a partner who arrives later |
+| **Key items exist once** | Whoever picks up a key item keeps it, and it disappears from the partner's world. Pickups are confirmed by the game's own pickup callback |
+| **Never stuck** | When your partner has been far away, or in another stage, for a few seconds (e.g. they opened a door that needs their key item), press **F6** to teleport to them, or **F7** to hide the prompt |
 | **Teleport to partner** | One click, for after doors and cutscenes |
 | **Chat & notices** | In the REFramework menu. "Partner is down", "teleported to you"… |
 | **Survives hiccups** | Reliable channel with retransmits. Pauses and loading screens don't drop you. Rejoin after a disconnect or game restart. "Reset Scripts" keeps the session |
-| **Diagnostics** | A capability list and a one-click type dump to fix things after game patches |
+| **Diagnostics** | A capability list and a one-click research dump that collects game internals across runs, for fixing things after game patches and building the next features |
 
 How it works and why: [docs/RESEARCH.md](docs/RESEARCH.md). Wire format: [docs/PROTOCOL.md](docs/PROTOCOL.md).
 
@@ -32,8 +32,9 @@ How it works and why: [docs/RESEARCH.md](docs/RESEARCH.md). Wire format: [docs/P
   is off by default.
 * Each game runs its own enemy AI: enemies attack the player on their own machine, and you
   don't see your partner's fight. Outcomes (HP, deaths) are what's shared. Making enemies
-  target both players needs game internals that the in-game research dump will provide.
-* Random drops are rolled separately on each machine (same reason).
+  target both players is the next step ([plan](docs/RESEARCH.md#33-third-research-round-the-in-game-dump-v03)).
+  It needs enum values that the v0.3 research dump collects.
+* Random drops are rolled separately on each machine (planned the same way).
 * Story events, doors and cutscenes are not synced. Key items are shared once, and the F6
   prompt regroups you.
 * Pausing or opening the inventory pauses only your own game.
@@ -93,8 +94,8 @@ cmake -S . -B build-win -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-w64.cmake && cmake --
 
 **Releasing:** bump the version in `lua/reframework/autorun/re4coop/protocol.lua`
 (`MOD_VERSION`), `plugin/src/lua_api.hpp` (`kVersion`) and `CMakeLists.txt`, then push a
-matching tag (`git tag v0.2.0 && git push origin v0.2.0`). CI builds the MSVC zip, checks the
-versions and attaches `re4coop-v0.2.0.zip` + `.sha256` to a draft GitHub Release for you to
+matching tag (`git tag v0.3.0 && git push origin v0.3.0`). CI builds the MSVC zip, checks the
+versions and attaches `re4coop-v0.3.0.zip` + `.sha256` to a draft GitHub Release for you to
 publish.
 
 ## Repository layout
@@ -119,7 +120,7 @@ docs/                  research, protocol, testing
 | "could not reach host" | Wrong IP or port, the host didn't click *Host game*, or a firewall is blocking it (see above). Both must be on the same network or VPN |
 | "Partner runs re4coop X…" | Install the same release on both PCs |
 | No ghost, but connected | The partner is on the title screen or loading, or in a different chapter (the HUD warns you). Check the *Options* toggles |
-| Enemies not syncing | Open *Diagnostics*. If `enemy_set_hp`/`enemy_list` show `[--]` after a few hits, click *Write research dump* and send `reframework/data/re4coop_typedump.json` |
+| Enemies not syncing | Open *Diagnostics*. If `enemy_set_hp`/`enemy_list` show `[--]` after a few hits, click *Write research dump* and send `reframework/data/re4coop_typedump.json` and `re4coop_research_log.json` |
 | Teleport prompt shows too often or too late | *Options → Progression*: distance and seconds sliders, or switch it off |
 
 ## Credits
