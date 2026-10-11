@@ -30,12 +30,15 @@ end
 
 Interp.nlerp_quat = nlerp_quat
 
+-- opts.blend(state_a, state_b, t) -> state replaces the default blend (position, rotation,
+-- joint positions). t runs past 1 while extrapolating.
 function Interp.new(opts)
     opts = opts or {}
     return setmetatable({
         delay = opts.delay or 0.1,          -- seconds of buffering
         max_extrapolate = opts.max_extrapolate or 0.25,
         capacity = opts.capacity or 32,
+        blend = opts.blend or Interp.blend,
         snapshots = {},                     -- sorted by remote time
         offset = nil,                       -- estimate of (local clock - remote clock)
         last_push_local = nil,
@@ -85,8 +88,7 @@ function Interp:age(local_now)
     return local_now - self.last_push_local
 end
 
-local function blend(a, b, t)
-    local sa, sb = a.state, b.state
+function Interp.blend(sa, sb, t)
     local out = {}
     for k, v in pairs(t < 0.5 and sa or sb) do
         out[k] = v -- discrete fields (hp, flags...) come from the nearer snapshot
@@ -122,7 +124,7 @@ function Interp:sample(local_now)
         if target <= b.time then
             local span = b.time - a.time
             local t = span > 0 and (target - a.time) / span or 1
-            return blend(a, b, t)
+            return self.blend(a.state, b.state, t)
         end
     end
 
@@ -131,7 +133,7 @@ function Interp:sample(local_now)
     local span = b.time - a.time
     if span <= 0 then return b.state end
     local over = math.min(target - b.time, self.max_extrapolate)
-    return blend(a, b, 1 + over / span)
+    return self.blend(a.state, b.state, 1 + over / span)
 end
 
 return Interp

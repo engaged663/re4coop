@@ -1,20 +1,31 @@
 -- game.lua against the mocked REFramework object model.
 local T = require("testlib")
 local mock = require("mock_reframework")
+local P = require("re4coop.protocol")
+
+local clock_now = 0
+local function clock() return clock_now end
 
 local function fresh_game(opts)
     package.loaded["re4coop.game"] = nil
     local world = mock.install(opts)
-    world.player = mock.make_character("chainsaw.PlayerBaseContext", { x = 1, y = 2, z = 3 }, 1200)
+    world.player = mock.make_player({ x = 1, y = 2, z = 3 })
     world.enemies = {
         mock.make_character("chainsaw.Ch1c0z0Context", { x = 5, y = 0, z = 0 }, 100,
             { category = 2, kind = 1, group = 4100, index = 7 }),
         mock.make_character("chainsaw.Ch1d0z0Context", { x = 0, y = 0, z = 8 }, 300),
     }
-    return require("re4coop.game").new(function() end), world
+    return require("re4coop.game").new(function() end, clock), world
 end
 
-T.run("reads_player_state_and_skeleton", function()
+local function index_of(list, name)
+    for i, v in ipairs(list) do
+        if v == name or (type(v) == "table" and v.name == name) then return i end
+    end
+    return nil
+end
+
+T.run("reads_player_state", function()
     local game, world = fresh_game()
     world.player.aiming = true
     world.gui_event = true
@@ -25,28 +36,179 @@ T.run("reads_player_state_and_skeleton", function()
     T.eq(st.dead, false, "alive")
     T.eq(st.aiming, true, "aiming")
     T.eq(st.cutscene, true, "cutscene via GuiManager.get_IsPlayingEvent")
-    -- 22 mock joints minus root, a finger and a twist helper.
-    T.eq(#st.joints, 19, "big bones selected")
-    T.eq(#st.parents, 19, "parents for each joint")
-    T.eq(st.parents[1], 0, "Hip has no selected parent (root skipped)")
-    T.eq(st.parents[2], 1, "Spine_0 -> Hip")
-    local names = game.joint_sel.names
-    local has_forearm = false
-    for _, n in ipairs(names) do
-        if n == "L_Forearm" then has_forearm = true end
-        T.check(not n:find("Finger") and not n:find("Twist"), "excluded helper bone " .. n)
-    end
-    T.check(has_forearm, "forearm kept")
-    -- R_Hand's parent chain: R_Hand -> R_Forearm, all selected.
-    local idx = {}
-    for i, n in ipairs(names) do idx[n] = i end
-    T.eq(st.parents[idx["R_Hand"]], idx["R_Forearm"], "R_Hand -> R_Forearm")
-    T.eq(st.parents[idx["L_Hand"]], idx["L_Forearm"], "L_Hand -> L_Forearm")
-
+    T.check(st.rot ~= nil, "body rotation")
     world.player.hp = 0
     T.eq(game:read_player_state().dead, true, "dead when HitPoint.get_IsLive is false")
     world.player = nil
     T.check(game:read_player_state() == nil, "nil without a player (menus/loading)")
+end)
+
+T.run("describes_the_local_character", function()
+    local game, world = fresh_game()
+    local desc = assert(game:avatar_descriptor(0))
+    T.eq(desc.char_id, "ch0a0z0", "character id from the body object's name")
+    T.eq(desc.body_name, "ch0a0z0_body", "body name")
+    T.eq(#desc.parts, 3, "three costume parts (body, face, hair); the weapon is gear")
+    local body = desc.parts[index_of(desc.parts, "cha000_00")]
+    T.eq(body.mesh, mock.MESH.body, "mesh path from Mesh.getMesh")
+    T.eq(body.mdf, mock.MDF.body_dirty, "material path from Mesh.get_Material")
+    T.eq(body.parent, 0, "attached to the body")
+    T.check((body.flags & P.PART_FLAGS.SAME_JOINTS) ~= 0, "follows the body's joints")
+    T.check((body.flags & P.PART_FLAGS.MAIN) ~= 0, "the body mesh carries the main skeleton")
+    -- Joints: the whole body skeleton, then joints only the face and hair have.
+    T.eq(desc.joints[1].name, "root", "skeleton first")
+    T.eq(#desc.joints, #mock.LEON_JOINTS + 3 + 2, "body + Jaw/L_Eye/R_Eye + Hair_0/Hair_1")
+    T.check(desc.joint_index["Jaw"] ~= nil and desc.joint_index["Hair_1"] ~= nil, "face and hair joints included")
+    local hip = desc.joints[desc.joint_index["Hip"]]
+    T.check((hip.flags & P.JOINT_FLAGS.TRANSLATE) ~= 0, "hip height travels")
+    T.check((desc.joints[desc.joint_index["L_Hand"]].flags & P.JOINT_FLAGS.TRANSLATE) == 0, "hands rotate only")
+    -- Cached between scans, rescanned after the interval.
+    T.check(game:avatar_descriptor(0.5) == desc, "cached")
+    clock_now = 2
+    T.check(game:avatar_descriptor(2) == desc, "same object when nothing changed")
+    mock.find("cha000_20")[1].components[2].mesh_path = "_chainsaw/character/ch/cha0/cha000/21/cha000_21.mesh"
+    local changed = game:avatar_descriptor(4)
+    T.check(changed ~= desc and changed.sig ~= desc.sig, "new description after a costume change")
+    world.player = nil
+    T.check(game:avatar_descriptor(6) == nil, "no player, no avatar")
+end)
+
+T.run("finds_the_weapon_and_reads_the_pose", function()
+    local game, world = fresh_game()
+    local desc = assert(game:avatar_descriptor(0))
+    local gear = assert(game:gear_descriptor(0))
+    T.eq(#gear.weapons, 1, "one weapon")
+    T.eq(gear.weapons[1].name, "wp4000", "SG-09 R")
+    T.eq(gear.weapons[1].mesh, mock.MESH.sg09, "weapon mesh for the fallback")
+    T.eq(#gear.weapons[1].joints, #mock.WEAPON_JOINTS, "weapon joints")
+
+    game:request_pose()
+    game:capture_pose_late(0.1)
+    local pose = assert(game:take_pose(0.1))
+    T.eq(pose.sig, desc.sig, "pose made with the current description")
+    T.eq(pose.gear_sig, gear.sig, "and gear")
+    T.near(pose.root_pos.x, 1, 1e-6, "root position")
+    local j = world.player.body.transform.joints[5]
+    T.near(pose.q[5 * 4 - 3], j.lrot.x, 1e-9, "joint 5 local rotation x")
+    T.near(pose.q[5 * 4], j.lrot.w, 1e-9, "joint 5 local rotation w")
+    T.eq(#pose.q, #desc.joints * 4, "every joint")
+    T.eq(#pose.tpos >= 1, true, "translations")
+    local w = pose.weapons[1]
+    T.eq(w.attach, desc.joint_index["R_WepHand"], "weapon glued to the R_WepHand joint")
+    T.near(w.pos.z, 0.12, 1e-6, "offset from the hand")
+    T.near(w.rot.y, 0.7071068, 1e-6, "rotation from the hand")
+    T.eq(w.flags, P.WEAPON_FLAGS.VISIBLE, "drawn")
+    T.eq(#w.q, #mock.WEAPON_JOINTS * 4, "weapon joints (slide...)")
+    world.player.weapon.draw_self = false
+    game:request_pose()
+    game:capture_pose_late(0.2)
+    T.eq(game:take_pose(0.2).weapons[1].flags, 0, "holstered/hidden weapon")
+
+    -- Not parented to the player: found in the scene when within reach.
+    mock.set_parent(world.player.weapon.transform, nil)
+    world.player.weapon.transform.wpos = mock.vec(1.5, 2, 3)
+    world.player.weapon.draw_self = true
+    clock_now = 10
+    local g2 = assert(game:gear_descriptor(10))
+    T.eq(g2.weapons[1] and g2.weapons[1].name, "wp4000", "scene lookup")
+    game:request_pose()
+    game:capture_pose_late(10)
+    local p2 = game:take_pose(10)
+    T.eq(p2.weapons[1].attach, 0, "free-standing weapon")
+    T.near(p2.weapons[1].pos.x, 0.5, 1e-6, "relative to the root")
+end)
+
+T.run("never_reads_joints_of_a_rebuilt_skeleton", function()
+    local game, world = fresh_game()
+    assert(game:avatar_descriptor(0))
+    T.check(game:read_pose(0) ~= nil, "pose")
+    mock.destroy(mock.find("cha000_20")[1]) -- costume change removes the hair part
+    T.check(game:read_pose(0.1) == nil, "part gone: no read through its old joints")
+    T.check(game.avatar == nil, "rescan requested")
+    local desc = assert(game:avatar_descriptor(0.2))
+    T.eq(#desc.parts, 2, "rescanned without the hair")
+    T.check(game:read_pose(0.2) ~= nil, "reads again")
+    mock.add_joints(world.player.body.transform, { "root", "Hip" }) -- skeleton rebuilt
+    T.check(game:read_pose(0.3) == nil, "body skeleton changed: no read")
+end)
+
+T.run("pose_read_in_place_when_prepare_rendering_is_missing", function()
+    local game = fresh_game()
+    assert(game:avatar_descriptor(0))
+    game:request_pose()
+    T.check(game:take_pose(0) ~= nil, "no PrepareRendering seen yet: read directly")
+    game:capture_pose_late(1.0)
+    game:request_pose()
+    T.check(game:take_pose(1.1) == nil, "waits for the end-of-frame capture")
+end)
+
+T.run("captures_sounds_effects_and_shots", function()
+    local game, world = fresh_game()
+    game:avatar_descriptor(0)
+    game:gear_descriptor(0)
+    game:set_capture(true)
+    T.eq(game:capabilities().sound_mirror.ok, true, "trigger overloads hooked")
+    T.eq(game:capabilities().effect_mirror.ok, true, "requestEffect overloads hooked")
+    T.eq(game:capabilities().shots.ok, true, "chainsaw.Gun.shoot hooked")
+
+    local ctx = world.player
+    clock_now = 1.0
+    ctx.sound:call("trigger(System.UInt32)", 1234)
+    ctx.sound:call("trigger(System.UInt32, via.GameObject)", 99, ctx.body)
+    ctx.gun_sound:call("trigger(via.GameObject, System.UInt32, via.GameObject, System.UInt32, via.wwise.RequestInfo, System.Boolean, System.Boolean, System.Boolean, System.Int32)",
+        ctx.weapon, 555, ctx.weapon, 0, mock.new("via.wwise.RequestInfo"), false, false, false, 0)
+    ctx.gun_effect:call("requestEffect(System.UInt32, System.UInt32)", 15, 3)
+    ctx.gun_effect:call("requestEffect(System.Collections.Generic.IEnumerable`1<via.effect.script.EPVStandardData.Element>, via.GameObject)",
+        mock.new("System.Object"), ctx.weapon)
+    ctx.gun:call("shoot")
+    ctx.gun:call("shoot") -- same frame: one shot
+    -- Somebody else's sound container is not ours.
+    local other = mock.make_go("ch1c0z0_body")
+    mock.add_component(other, "via.wwise.WwiseContainer"):call("trigger(System.UInt32)", 8)
+
+    local ev = game:drain_events()
+    T.eq(#ev, 5, "four mirrored calls + one shot; the list overload and the enemy's sound are skipped")
+    T.eq(ev[1].kind, P.EVENT.CALL, "call")
+    T.eq(ev[1].part, P.REF.BODY, "on the body")
+    T.eq(ev[1].comp_type, P.hash("chainsaw.WwiseContainerApp"), "component type")
+    T.eq(ev[1].comp_idx, 1, "first container of that type")
+    T.eq(ev[1].method, P.hash("via.wwise.WwiseContainer::trigger(System.UInt32)"), "overload")
+    T.eq(ev[1].args[1].value, 1234, "trigger id")
+    T.eq(ev[1].time, 1.0, "timestamp")
+    T.eq(ev[2].args[2].tag, P.ARG.OBJ, "GameObject argument travels as a reference")
+    T.eq(ev[2].args[2].value, P.REF.BODY, "the body")
+    T.eq(ev[3].part, P.REF.WEAPON_BASE + 1, "weapon slot 1")
+    T.eq(ev[3].method, 0, "RequestInfo cannot travel: replayed with the simplest overload")
+    T.eq(ev[3].args[1].value, 555, "trigger id kept")
+    T.eq(ev[4].args[1].value, 15, "effect container id")
+    T.eq(ev[4].args[2].value, 3, "effect element id")
+    T.eq(ev[5].kind, P.EVENT.SHOT, "shot")
+    T.eq(ev[5].slot, 1, "from slot 1")
+    T.eq(game.counters.calls_skipped, 1, "list-based effect overload skipped")
+    T.eq(#game:drain_events(), 0, "drained")
+
+    -- The head (logic) object's voice container.
+    ctx.voice:call("trigger(System.UInt32)", 4242)
+    local v = game:drain_events()
+    T.eq(v[1].part, P.REF.HEAD, "head reference")
+
+    game:set_capture(false)
+    ctx.sound:call("trigger(System.UInt32)", 1)
+    ctx.gun:call("shoot")
+    T.eq(#game:drain_events(), 0, "nothing captured while not connected")
+end)
+
+T.run("finds_prefabs", function()
+    local game = fresh_game()
+    T.eq(game:find_body_prefab("ch0a0z0"), mock.PREFAB.leon_body, "Leon")
+    T.eq(game:find_body_prefab("ch3a8z0"), mock.PREFAB.ada_body, "Ada lives in the _mercenaries content")
+    T.check(game:find_body_prefab("ch9z9z9") == nil, "unknown character")
+    T.check(game:find_body_prefab("../../evil") == nil, "path characters rejected")
+    T.eq(game:find_weapon_prefab("wp4000"), mock.PREFAB.sg09, "weapon")
+    T.eq(game:find_weapon_prefab("wp4000_mc"), mock.PREFAB.sg09_mc, "Mercenaries variant")
+    T.eq(game:find_weapon_prefab("wp4000_ao"), mock.PREFAB.sg09, "missing variant falls back to the base weapon")
+    T.check(game:find_weapon_prefab("knife") == nil, "not a weapon id")
+    T.eq(game:muzzle_flash_prefab(), mock.PREFAB.muzzle, "muzzle flash effect")
 end)
 
 T.run("lists_and_modifies_enemies_via_setter", function()
@@ -195,10 +357,18 @@ T.run("survives_missing_types", function()
     world.singletons["chainsaw.CharacterManager"] = nil
     T.check(game:read_player_state() == nil, "no player")
     T.check(game:list_enemies() == nil, "no enemies")
+    T.check(game:avatar_descriptor(0) == nil, "no avatar")
     -- A method that throws inside the game must not propagate.
     mock.classes["chainsaw.CharacterContext"].methods.get_Position.fn = function() error("engine exception") end
     world.singletons["chainsaw.CharacterManager"] = mock.new("chainsaw.CharacterManager")
     T.check(game:read_player_state() == nil, "exception swallowed")
+    -- Without sdk.hook the mirrors report it instead of failing.
+    local saved = sdk.hook
+    sdk.hook = nil
+    local g2 = require("re4coop.game").new(function() end, clock)
+    g2:set_capture(true)
+    sdk.hook = saved
+    T.eq(g2:capabilities().sound_mirror.ok, false, "no hook support reported")
 end)
 
 T.run("pickup_callbacks_hooked", function()
@@ -269,7 +439,8 @@ T.run("research_dump", function()
         { category = 1, kind = 0, group = 40200, index = 1 })
     mock.make_hate_controller("ch1c0z0_hate", { x = 5, y = 0, z = 0 }, world.player.body)
     local cog = mock.make_drop_item(119235200, { x = 3, y = 0, z = 1 }, { category = 3, kind = 0, group = 40200, index = 2 })
-    local ok, runs = game:dump_types({ role = "host", items = { hook = "confirmed" } })
+    game:avatar_descriptor(0)
+    local ok, runs = game:dump_types({ role = "host", items = { hook = "confirmed" }, partner_model = { state = "idle" } })
     T.check(ok, "dump written")
     T.eq(runs, 1, "first run")
     local dump = mock.files["re4coop_typedump.json"]
@@ -293,6 +464,9 @@ T.run("research_dump", function()
     T.eq(dump.enums["chainsaw.ContextID.EntityCategory"].StaticItem, 3, "ContextID categories")
     T.eq(dump.enums["chainsaw.ChapterID"], "not found", "missing enum listed as such")
     T.eq(dump.areas_seen[1], "1 / stage 40200", "area recorded")
+    T.check(type(dump.player) == "table" and #dump.player.objects >= 5, "player hierarchy described")
+    T.eq(dump.player.objects[1].name, "ch0a0z0_body", "body first")
+    T.check(#dump.player.pose_joints > 0, "pose joint names")
     check_json_safe(dump, "typedump")
 
     local log = mock.files["re4coop_research_log.json"]
@@ -312,11 +486,12 @@ T.run("research_dump", function()
     T.eq(r.enemies[1].motion.bank, 100, "first enemy motion")
     T.eq(r.enemies[1].find_state, 1, "enemy find state")
     T.eq(r.hate[1].game_object, "GameObject ch1c0z0_hate", "HateController's GameObject")
-    T.eq(r.hate[1].current_target._Target, "GameObject PlayerBase", "current target read")
+    T.eq(r.hate[1].current_target._Target, "GameObject ch0a0z0_body", "current target read")
     T.eq(r.pickups[1].stage, 40210, "pickup stage")
     T.eq(r.pickups[1].id, "3:0:40200:2", "pickup level ID")
     T.eq(r.pickup_hook.hooks, 2, "hooks installed")
     T.eq(r.session.items.hook, "confirmed", "session state included")
+    T.eq(r.session.partner_model.state, "idle", "partner model status included")
     check_json_safe(log, "research_log")
 
     -- Second run in another area: a different enemy type; the first run's types and log

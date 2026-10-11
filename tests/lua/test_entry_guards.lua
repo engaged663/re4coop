@@ -58,4 +58,33 @@ T.run("partner_with_other_protocol_version_is_flagged", function()
     T.eq(#s.messages, 1, "chat ignored while incompatible")
 end)
 
+T.run("partner_in_another_chapter_is_flagged", function()
+    local P = require("re4coop.protocol")
+    local Session = require("re4coop.session")
+    local Config = require("re4coop.config")
+    local fake_net = {
+        state = function() return "idle" end, role = function() return "none" end,
+        poll = function() return {} end, send = function() return true end,
+        stats = function() return { state = "connected" } end,
+    }
+    local my_area = "5"
+    local fake_game = { area_name = function() return my_area end }
+    local s = Session.new({ net = fake_net, game = fake_game, clock = function() return 0 end,
+        settings = Config.load(nil) })
+    s.partner_connected = true
+    local function player_in(area)
+        s:handle_message(P.encode_player({ time = 0, pos = { x = 0, y = 0, z = 0 }, rot = { x = 0, y = 0, z = 0, w = 1 },
+            area_hash = P.hash(area) }), 0)
+    end
+    player_in("5")
+    T.eq(s:partner_elsewhere(), false, "same chapter")
+    player_in("7")
+    T.eq(s:partner_elsewhere(), true, "different chapter")
+    player_in("")
+    T.eq(s:partner_elsewhere(), false, "partner's chapter unknown")
+    player_in("7")
+    my_area = nil
+    T.eq(s:partner_elsewhere(), false, "our chapter unknown")
+end)
+
 T.finish()

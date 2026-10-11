@@ -2,7 +2,8 @@
 --
 -- Dependencies are injected so the whole thing runs in tests without the game:
 --   net    : re4coop_net (or a Session object from re4coop_net.new_session())
---   game   : adapter from game.lua (or a fake) - read_player_state, list_enemies, ...
+--   game   : adapter from game.lua (or a fake) - read_player_state, list_enemies, the
+--            avatar capture methods listed in avatar.lua, ...
 --   clock  : function() -> seconds
 --   settings : live config table (see config.lua)
 
@@ -10,6 +11,7 @@ local P = require("re4coop.protocol")
 local Interp = require("re4coop.interp")
 local EnemySync = require("re4coop.enemy_sync")
 local ItemSync = require("re4coop.items_sync")
+local Avatar = require("re4coop.avatar")
 
 local Session = {}
 Session.__index = Session
@@ -40,6 +42,8 @@ local function dist3(a, b)
     return math.sqrt(dx * dx + dy * dy + dz * dz)
 end
 
+local EMPTY = {}
+
 function Session.new(opts)
     local self = setmetatable({}, Session)
     self.net = opts.net
@@ -48,12 +52,19 @@ function Session.new(opts)
     self.settings = opts.settings
     self.log_sink = opts.log or function() end
     self.messages = {}       -- chat + notices shown in the UI/HUD: {time, text, kind}
+    self.frag_id = 0
+    self.avatar_tx = Avatar.new_sender({
+        protocol = P,
+        settings = self.settings,
+        send = function(bytes, reliable) return self:send(bytes, reliable) end,
+        send_large = function(bytes) return self:send_large(bytes) end,
+    })
+    self.avatar_rx = Avatar.new_receiver({ protocol = P, settings = self.settings })
     self:reset_peer()
     self.role = "none"
     self.last_error = nil
     self.last_player_send = -math.huge
     self.last_enemy_tick = -math.huge
-    self.local_skeleton_sig = nil
     self.local_dead = false
     self.local_cutscene = false
     self.local_stage = nil
@@ -73,7 +84,7 @@ function Session.new(opts)
         if state == "connected" then
             self.partner_connected = true
             self.partner_name = self.net.stats().peer_name
-            self:send_hello(true) -- we lost the partner's HELLO/SKELETON in the reload
+            self:send_hello(true) -- we lost the partner's HELLO and character in the reload
             self:add_message("Resumed existing co-op session after script reload", "info")
         end
     end
@@ -106,10 +117,11 @@ function Session:reset_peer()
     self.partner_name = nil
     self.partner_hello = nil
     self.partner_state = nil     -- last decoded PLAYER message
-    self.partner_parents = nil   -- skeleton parent table
     self.compatible = true
     self.interp = Interp.new({ delay = (self.settings and self.settings.interp_delay) or 0.1 })
-    self.local_skeleton_sig = nil
+    self.reassembler = P.new_reassembler()
+    self.avatar_tx:reset()
+    self.avatar_rx:reset()
     if self.enemy_sync then self.enemy_sync:reset() end
 end
 
@@ -199,7 +211,25 @@ function Session:send(bytes, reliable)
     if not ok then
         self:log("send failed: %s", tostring(err))
     end
-    return ok
+    return ok and true or false
+end
+
+-- Reliable send of a message that may be bigger than one datagram.
+function Session:send_large(bytes)
+    if #bytes <= P.MAX_PAYLOAD then
+        return self:send(bytes, true)
+    end
+    if not self.partner_connected then return false end
+    self.frag_id = (self.frag_id + 1) & 0xFFFF
+    local pieces, err = P.fragment(bytes, self.frag_id)
+    if pieces == nil then
+        self:log("not sent: %s", tostring(err))
+        return false
+    end
+    for _, piece in ipairs(pieces) do
+        if not self:send(piece, true) then return false end
+    end
+    return true
 end
 
 function Session:send_chat(text)
@@ -331,6 +361,9 @@ function Session:status()
         partner_age = self.interp:age(now),
         last_error = self.last_error,
         local_stage = self.local_stage,
+        avatar_tx = self.avatar_tx.counters,
+        avatar_rx = self.avatar_rx.counters,
+        partner_character = self.avatar_rx.avatar and self.avatar_rx.avatar.char_id or nil,
     }
     local remote = self.interp:sample(now)
     if remote ~= nil then
@@ -355,15 +388,42 @@ function Session:status()
     return st
 end
 
--- Interpolated partner state for rendering (ghost/puppet), or nil.
+-- Interpolated partner PLAYER state (position, HP, flags) for the name tag, or nil.
 function Session:partner_render_state()
     if not self.partner_connected then return nil end
     local now = self.clock()
     local age = self.interp:age(now)
     if age == nil or age > 3.0 then return nil end
-    local st = self.interp:sample(now)
-    if st == nil then return nil end
-    return st, self.partner_parents
+    return self.interp:sample(now)
+end
+
+-- The partner's character for the 3D model: { avatar, gear, pose } or nil.
+function Session:partner_avatar(now)
+    if not self.partner_connected or not self.compatible then return nil end
+    now = now or self.clock()
+    local st = self.avatar_rx:state(now)
+    if st ~= nil and st.pose ~= nil then
+        local age = self.avatar_rx:age(now)
+        if age == nil or age > 3.0 then st.pose = nil end -- frozen partner: hide, keep the model
+    end
+    return st
+end
+
+-- True when both games know their chapter and they differ: the partner's model would
+-- stand in the wrong map.
+function Session:partner_elsewhere()
+    local m = self.partner_state
+    if m == nil or m.area_hash == nil then return false end
+    local mine = self.game:area_name()
+    local unknown = P.hash("")
+    if mine == nil or mine == "" or m.area_hash == unknown then return false end
+    return m.area_hash ~= P.hash(mine)
+end
+
+-- Sounds/effects/shots due now on the partner's (delayed) timeline.
+function Session:take_partner_events(now)
+    if not self.partner_connected or not self.compatible then return EMPTY end
+    return self.avatar_rx:take_events(now or self.clock())
 end
 
 -------------------------------------------------------------------------------
@@ -376,7 +436,6 @@ function Session:send_hello(want_reply)
         area = self.game:area_name() or "",
         flags = want_reply and P.HELLO_FLAGS.WANT_REPLY or 0,
     }), true)
-    self.local_skeleton_sig = nil -- force a SKELETON resend
 end
 
 function Session:handle_event(ev, now)
@@ -384,6 +443,9 @@ function Session:handle_event(ev, now)
         self.partner_connected = true
         self.partner_name = ev.name
         self.interp:clear()
+        self.avatar_tx:reset()
+        self.avatar_rx:reset()
+        self.reassembler = P.new_reassembler()
         if self.enemy_sync then self.enemy_sync:reset() end
         self:add_message(("%s connected (%s)"):format(ev.name or "Partner", ev.peer or "?"), "good")
         self:send_hello()
@@ -416,12 +478,20 @@ function Session:handle_message(data, now)
         return
     end
     local T = P.T
+    if m.type == T.FRAG then
+        local full = self.reassembler:push(m)
+        if full ~= nil then
+            self:handle_message(full, now)
+        end
+        return
+    end
     if m.type == T.HELLO then
         self.partner_hello = m
         self.partner_name = m.name ~= "" and m.name or self.partner_name
-        -- A HELLO means the partner (re)started its session state: resend our skeleton, and
-        -- re-introduce ourselves if it asked.
-        self.local_skeleton_sig = nil
+        -- A HELLO means the partner (re)started its session state: describe our character
+        -- again, expect theirs again, and re-introduce ourselves if it asked.
+        self.avatar_tx:reset()
+        self.avatar_rx:reset()
         if m.flags ~= nil and (m.flags & P.HELLO_FLAGS.WANT_REPLY) ~= 0 then
             self:send_hello(false)
         end
@@ -448,14 +518,14 @@ function Session:handle_message(data, now)
         if prev ~= nil and dead and (prev.flags & P.PLAYER_FLAGS.DEAD) == 0 then
             self:add_message((self.partner_name or "Partner") .. " is down!", "error")
         end
-    elseif m.type == T.SKELETON then
-        self.partner_parents = m.parents
     elseif m.type == T.CHAT then
         self:add_message(("%s: %s"):format(self.partner_name or "Partner", m.text), "chat")
     elseif m.type == T.NOTIFY then
         self:add_message(m.text, "info")
     elseif m.type == T.ITEM_TAKEN then
         self.item_sync:on_message(m)
+    elseif self.avatar_rx:on_message(m, now) then
+        return
     elseif self.enemy_sync and self.settings.sync_enemies then
         self.enemy_sync:on_message(m, now, self.game)
     end
@@ -470,15 +540,6 @@ function Session:send_player_state(now)
     self.local_stage = st.stage
     self:watch_teleport(now, st.pos)
 
-    if st.parents ~= nil then
-        local sig = table.concat(st.parents, ",")
-        if sig ~= self.local_skeleton_sig then
-            if self:send(P.encode_skeleton(st.parents), true) then
-                self.local_skeleton_sig = sig
-            end
-        end
-    end
-
     local flags = 0
     if st.dead then flags = flags | P.PLAYER_FLAGS.DEAD end
     if st.cutscene then flags = flags | P.PLAYER_FLAGS.CUTSCENE end
@@ -492,7 +553,6 @@ function Session:send_player_state(now)
         flags = flags,
         area_hash = P.hash(self.game:area_name() or ""),
         stage = st.stage,
-        joints = st.joints,
     }), false)
 
     if st.dead and not self.local_dead then
@@ -507,7 +567,9 @@ function Session:update()
     for _, ev in ipairs(self.net.poll()) do
         self:handle_event(ev, now)
     end
-    if not self.partner_connected or not self.compatible then
+    local active = self.partner_connected and self.compatible
+    if self.game.set_capture then self.game:set_capture(active and self.settings.share_character ~= false) end
+    if not active then
         -- Pickup callbacks from before the partner joined are stale by the time we sync.
         if self.game.take_pickup_events then self.game:take_pickup_events() end
         return
@@ -517,6 +579,10 @@ function Session:update()
     if now - self.last_player_send >= 1.0 / (s.player_hz or 20) then
         self.last_player_send = now
         self:send_player_state(now)
+    end
+
+    if s.share_character ~= false and self.game.avatar_descriptor then
+        self.avatar_tx:tick(now, self.game)
     end
 
     if self.enemy_sync and s.sync_enemies and now - self.last_enemy_tick >= 1.0 / (s.enemy_tick_hz or 20) then
@@ -541,6 +607,14 @@ function Session:update()
     self:handle_hotkeys(now)
 end
 
+-- Messages that only update state (no game objects) and may be handled while the game
+-- loop is not running (title screen, loading).
+local OFFLINE_SAFE = {
+    [P.T.CHAT] = true, [P.T.NOTIFY] = true, [P.T.HELLO] = true, [P.T.PLAYER] = true,
+    [P.T.ITEM_TAKEN] = true, -- only recorded here; the pickup is removed on the next game tick
+    [P.T.FRAG] = true, [P.T.AVATAR] = true, [P.T.GEAR] = true, [P.T.POSE] = true, [P.T.ACTIONS] = true,
+}
+
 -- Keeps connect/disconnect events flowing while the game thread callback is not running
 -- (title screen, loading). Never touches game objects.
 function Session:update_network_only()
@@ -549,9 +623,8 @@ function Session:update_network_only()
         if ev.type == "message" then
             -- Enemy messages are dropped here: they refer to objects that are being (un)loaded,
             -- and the host re-sends its full enemy state continuously anyway.
-            local m = P.decode(ev.data)
-            if m ~= nil and (m.type == P.T.CHAT or m.type == P.T.NOTIFY or m.type == P.T.HELLO
-                or m.type == P.T.PLAYER or m.type == P.T.SKELETON or m.type == P.T.ITEM_TAKEN) then
+            local t = type(ev.data) == "string" and ev.data:byte(1) or nil
+            if t ~= nil and OFFLINE_SAFE[t] then
                 self:handle_message(ev.data, now)
             end
         else

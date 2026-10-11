@@ -1,66 +1,34 @@
--- Draws the partner as a "ghost": skeleton lines through their real joint positions, a name
--- tag with distance and an HP bar. Needs nothing from the game but world_to_screen, so it
--- works in every chapter regardless of which character models are loaded.
--- Must run inside re.on_frame (REFramework's draw API is only valid there).
+-- 2D overlay: the partner's name tag with distance and HP bar above their character, and
+-- the status HUD. The partner themselves is the 3D model (puppet.lua); while that model is
+-- not visible (still loading, or unavailable) a small marker at their feet shows where they
+-- are. Must run inside re.on_frame (REFramework's draw API is only valid there).
 
 local P = require("re4coop.protocol")
 
-local Ghost = {}
+local Overlay = {}
 
 local COLOR_TEXT = 0xFFFFFFFF
 local COLOR_HP_BG = 0xC0000000
 local COLOR_HP = 0xFF40D040   -- ABGR green
 local COLOR_HP_LOW = 0xFF4040E0 -- ABGR red
 local COLOR_DOWN = 0xFF2020FF
+local COLOR_MARKER = 0xFFFFC040
 
-local function head_position(state)
-    if state.joints and #state.joints > 0 then
-        local top = state.joints[1]
-        for _, j in ipairs(state.joints) do
-            if j.y > top.y then top = j end
-        end
-        return { x = top.x, y = top.y + 0.25, z = top.z }
-    end
-    return { x = state.pos.x, y = state.pos.y + 1.9, z = state.pos.z }
-end
+local TAG_HEIGHT = 2.05 -- metres above the partner's feet
 
 -- game: adapter with world_to_screen/draw_*; state: interpolated PLAYER state;
--- parents: SKELETON parent table (may be nil); opts: { name, color, show_nametag, distance }
-function Ghost.draw(game, state, parents, opts)
-    local color = opts.color or 0xFFFFC040
+-- opts: { name, distance, show_nametag, marker = bool }
+function Overlay.draw_partner(game, state, opts)
     local dead = ((state.flags or 0) & P.PLAYER_FLAGS.DEAD) ~= 0
-    if dead then color = COLOR_DOWN end
 
-    -- Skeleton
-    local joints = state.joints
-    if joints and #joints > 0 then
-        local screen = {}
-        for i, j in ipairs(joints) do
-            local x, y = game:world_to_screen(j)
-            if x ~= nil then screen[i] = { x, y } end
-        end
-        if parents and #parents == #joints then
-            for i = 1, #joints do
-                local p = parents[i]
-                local a, b = screen[i], p and p > 0 and screen[p] or nil
-                if a and b then
-                    game:draw_line(a[1], a[2], b[1], b[2], color)
-                end
-            end
-        end
-        for i = 1, #joints do
-            local a = screen[i]
-            if a then game:draw_circle(a[1], a[2], 2.5, color) end
-        end
-    else
-        -- No joints yet: a simple marker at the feet.
+    if opts.marker then
         local x, y = game:world_to_screen(state.pos)
-        if x then game:draw_circle(x, y, 8, color) end
+        if x then game:draw_circle(x, y, 8, dead and COLOR_DOWN or COLOR_MARKER) end
     end
 
     if not opts.show_nametag then return end
 
-    local hx, hy = game:world_to_screen(head_position(state))
+    local hx, hy = game:world_to_screen({ x = state.pos.x, y = state.pos.y + TAG_HEIGHT, z = state.pos.z })
     if hx == nil then return end
 
     local label = opts.name or "Partner"
@@ -70,7 +38,7 @@ function Ghost.draw(game, state, parents, opts)
     if dead then
         label = label .. "  [DOWN]"
     end
-    game:draw_text(label, hx - #label * 3.5, hy - 30, COLOR_TEXT)
+    game:draw_text(label, hx - #label * 3.5, hy - 30, dead and COLOR_DOWN or COLOR_TEXT)
 
     local max_hp = state.max_hp or 0
     if max_hp > 0 then
@@ -82,7 +50,8 @@ function Ghost.draw(game, state, parents, opts)
 end
 
 -- Compact status text in the top-left corner, plus the newest chat/notice lines.
-function Ghost.draw_hud(game, status, messages, now)
+-- model: puppet status (puppet.lua) or nil.
+function Overlay.draw_hud(game, status, messages, now, model)
     local x, y = 12, 12
     local line = "RE4 Co-op: "
     if status.state == "connected" then
@@ -92,6 +61,10 @@ function Ghost.draw_hud(game, status, messages, now)
         end
         if not status.compatible then
             line = line .. "  |  VERSION MISMATCH"
+        elseif model ~= nil and model.state == "loading" then
+            line = line .. "  |  loading partner model..."
+        elseif model ~= nil and model.state == "failed" then
+            line = line .. "  |  partner model unavailable (see Diagnostics)"
         end
     elseif status.state == "listening" then
         line = line .. ("hosting on port %d, waiting for partner"):format(status.stats.local_port or 0)
@@ -127,4 +100,4 @@ function Ghost.draw_hud(game, status, messages, now)
     end
 end
 
-return Ghost
+return Overlay

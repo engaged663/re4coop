@@ -13,7 +13,22 @@ T.run("defaults_without_file", function()
     T.eq(cfg.port, Config.DEFAULTS.port, "port")
     T.eq(cfg.player_name, "Player", "name")
     T.eq(cfg.sync_enemies, true, "sync on by default")
-    T.eq(cfg.puppet_enabled, false, "experimental puppet off by default")
+    T.eq(cfg.show_partner, true, "partner's 3D character on by default")
+    T.eq(cfg.partner_audio, true, "partner sounds on by default")
+    T.eq(cfg.partner_effects, true, "partner effects on by default")
+    T.eq(cfg.share_character, true, "our character is shared by default")
+    T.eq(cfg.pose_hz, 30, "pose rate")
+end)
+
+T.run("settings_from_0_1_are_upgraded", function()
+    local files = { [Config.FILE] = { player_name = "Leon", show_ghost = true, ghost_color = 123,
+        puppet_enabled = true, puppet_prefab = "_chainsaw/x.pfb", pose_hz = 500 } }
+    local cfg = Config.load(fake_json(files))
+    T.eq(cfg.player_name, "Leon", "kept")
+    T.eq(cfg.show_ghost, nil, "skeleton ghost setting gone")
+    T.eq(cfg.puppet_prefab, nil, "manual prefab path gone")
+    T.eq(cfg.puppet_enabled, nil, "experimental toggle gone")
+    T.eq(cfg.pose_hz, 60, "pose rate clamped")
 end)
 
 T.run("loads_and_sanitizes_saved_values", function()

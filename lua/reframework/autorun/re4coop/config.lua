@@ -12,6 +12,7 @@ Config.DEFAULTS = {
 
     -- network rates
     player_hz = 20,
+    pose_hz = 30,         -- partner model pose updates per second
     enemy_tick_hz = 20,
     snapshot_hz = 10,
     interp_delay = 0.10,
@@ -31,13 +32,15 @@ Config.DEFAULTS = {
     teleport_key = 0x75,          -- F6 (Windows virtual-key code): accept the teleport prompt
     snooze_key = 0x76,            -- F7: hide the prompt for 2 minutes
 
-    -- partner rendering
-    show_ghost = true,
+    -- partner character
+    show_partner = true,               -- the partner's animated 3D character, built from their body prefab
+    partner_audio = true,              -- replay their sounds (gunshots, footsteps, reloads, voice) on the model
+    partner_effects = true,            -- replay their muzzle flashes and other effects
+    hide_partner_in_cutscenes = true,
+    partner_meshes_only = false,       -- build the partner from meshes instead of their body prefab
+    share_character = true,            -- send our character (prefab, costume, pose) to the partner
     show_nametag = true,
     show_hud = true,
-    ghost_color = 0xFFFFC040, -- ImGui ABGR: light blue
-    puppet_enabled = false,   -- experimental: spawn a real character model for the partner
-    puppet_prefab = "",
 }
 
 local function copy(t)
@@ -70,6 +73,7 @@ function Config.sanitize(cfg)
     cfg.player_name = tostring(cfg.player_name):sub(1, 32)
     if cfg.player_name == "" then cfg.player_name = Config.DEFAULTS.player_name end
     cfg.player_hz = math.max(5, math.min(60, cfg.player_hz))
+    cfg.pose_hz = math.max(10, math.min(60, cfg.pose_hz))
     cfg.enemy_tick_hz = math.max(5, math.min(60, cfg.enemy_tick_hz))
     cfg.snapshot_hz = math.max(2, math.min(30, cfg.snapshot_hz))
     cfg.interp_delay = math.max(0.0, math.min(0.5, cfg.interp_delay))

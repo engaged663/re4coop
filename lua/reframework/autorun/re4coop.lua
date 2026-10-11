@@ -28,11 +28,13 @@ end
 local Config = require("re4coop.config")
 local Game = require("re4coop.game")
 local Session = require("re4coop.session")
-local Ghost = require("re4coop.ghost")
+local Puppet = require("re4coop.puppet")
+local Overlay = require("re4coop.overlay")
 local UI = require("re4coop.ui")
+local P = require("re4coop.protocol")
 
 local settings = Config.load(json)
-local game = Game.new(log_info)
+local game = Game.new(log_info, re4coop_net.time)
 local session = Session.new({
     net = re4coop_net,
     game = game,
@@ -40,6 +42,7 @@ local session = Session.new({
     settings = settings,
     log = log_info,
 })
+local puppet = Puppet.new(game, log_info)
 
 local last_game_tick = -math.huge
 local reported_error = {}
@@ -53,20 +56,45 @@ local function report_once(where, err)
     end
 end
 
--- Game thread: networking, reading the player, enemy sync, puppet. Runs after behaviours
--- have updated this frame so positions/HP are settled.
+-- The partner's character: built from their body prefab, posed from their POSE stream,
+-- replaying their sounds, effects and shots.
+local function update_partner(now)
+    if not settings.show_partner then
+        if puppet.state ~= "idle" then puppet:destroy() end
+        session:take_partner_events(now) -- drop them, the model is off
+        return
+    end
+    local st = session:partner_avatar(now)
+    local hidden = session:partner_elsewhere()
+    if settings.hide_partner_in_cutscenes and not hidden then
+        local cut = P.POSE_FLAGS.CUTSCENE
+        hidden = (st ~= nil and st.pose ~= nil and (st.pose.flags & cut) ~= 0) or game:is_cutscene()
+    end
+    puppet:update(now, st, { hidden = hidden, meshes_only = settings.partner_meshes_only })
+    puppet:replay(session:take_partner_events(now), {
+        audio = settings.partner_audio, effects = settings.partner_effects,
+    })
+end
+
+-- Game thread: networking, reading the player, enemy sync, the partner's model. Runs after
+-- behaviours have updated this frame so positions/HP are settled.
 re.on_application_entry("LateUpdateBehavior", function()
-    last_game_tick = re4coop_net.time()
+    local now = re4coop_net.time()
+    last_game_tick = now
     local ok, err = pcall(session.update, session)
     if not ok then report_once("update", err) end
 
-    if settings.puppet_enabled then
-        local state = session:partner_render_state()
-        local ok2, err2 = pcall(game.update_puppet, game, true, settings.puppet_prefab, state)
-        if not ok2 then report_once("puppet", err2) end
-    elseif game.puppet ~= nil then
-        pcall(game.destroy_puppet, game)
-    end
+    local ok2, err2 = pcall(update_partner, now)
+    if not ok2 then report_once("partner model", err2) end
+end)
+
+-- End of the game frame, after animation, IK and physics: read our final pose for the
+-- partner, and make sure the partner's model shows the pose we gave it.
+re.on_application_entry("PrepareRendering", function()
+    local ok, err = pcall(game.capture_pose_late, game, re4coop_net.time())
+    if not ok then report_once("pose capture", err) end
+    local ok2, err2 = pcall(puppet.late_update, puppet)
+    if not ok2 then report_once("partner pose", err2) end
 end)
 
 -- Render thread: only drawing, plus network service while the game loop is not ticking.
@@ -77,28 +105,27 @@ re.on_frame(function()
         if not ok then report_once("network", err) end
     end
 
-    if settings.show_ghost then
-        local state, parents = session:partner_render_state()
-        if state ~= nil then
-            local status = session:status()
-            local ok, err = pcall(Ghost.draw, game, state, parents, {
-                name = status.partner_name,
-                color = settings.ghost_color,
-                show_nametag = settings.show_nametag,
-                distance = status.partner_distance,
-            })
-            if not ok then report_once("ghost", err) end
-        end
+    local state = session:partner_render_state()
+    if state ~= nil and (settings.show_nametag or not puppet:is_visible()) then
+        local status = session:status()
+        local ok, err = pcall(Overlay.draw_partner, game, state, {
+            name = status.partner_name,
+            distance = status.partner_distance,
+            show_nametag = settings.show_nametag,
+            marker = not puppet:is_visible(),
+        })
+        if not ok then report_once("overlay", err) end
     end
 
     if settings.show_hud then
-        local ok, err = pcall(Ghost.draw_hud, game, session:status(), session.messages, now)
+        local ok, err = pcall(Overlay.draw_hud, game, session:status(), session.messages, now,
+            settings.show_partner and puppet:status() or nil)
         if not ok then report_once("hud", err) end
     end
 end)
 
 re.on_draw_ui(function()
-    local ok, err = pcall(UI.draw, session, game, settings, json)
+    local ok, err = pcall(UI.draw, session, game, settings, json, puppet)
     if not ok then report_once("ui", err) end
 end)
 
@@ -109,8 +136,8 @@ end)
 re.on_script_reset(function()
     -- Keep the network session alive across script reloads (the plugin owns it); just
     -- remove anything we spawned into the world.
-    pcall(game.destroy_puppet, game)
+    pcall(puppet.shutdown, puppet)
     Config.save(json, settings)
 end)
 
-log_info("loaded (mod " .. require("re4coop.protocol").MOD_VERSION .. ")")
+log_info("loaded (mod " .. P.MOD_VERSION .. ")")

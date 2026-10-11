@@ -112,6 +112,9 @@ local function draw_status(session, status)
             imgui.text_colored(("Stage: you %s, partner %s"):format(tostring(status.local_stage or "?"),
                 tostring(status.partner_stage or "?")), COLOR_DIM)
         end
+        if status.partner_character then
+            imgui.text_colored("Partner character: " .. status.partner_character, COLOR_DIM)
+        end
         if status.enemies then
             local e = status.enemies
             imgui.text(("Enemies: %d local, %d paired%s"):format(e.local_count, e.paired,
@@ -152,12 +155,15 @@ end
 
 local function draw_options(settings)
     if imgui.tree_node("Options") then
-        imgui.text_colored("Partner display", COLOR_DIM)
-        checkbox(settings, "show_ghost", "Show partner ghost (skeleton)")
+        imgui.text_colored("Partner", COLOR_DIM)
+        checkbox(settings, "show_partner", "Show partner's character (animated 3D model)")
+        checkbox(settings, "partner_audio", "Partner sounds (gunshots, footsteps, reloads, voice)")
+        checkbox(settings, "partner_effects", "Partner effects (muzzle flash)")
+        checkbox(settings, "hide_partner_in_cutscenes", "Hide partner during cutscenes")
+        checkbox(settings, "partner_meshes_only", "Build partner from meshes only (if the body prefab misbehaves)")
+        checkbox(settings, "share_character", "Send my character to the partner")
         checkbox(settings, "show_nametag", "Show name tag + HP bar")
         checkbox(settings, "show_hud", "Show status HUD (top-left)")
-        local changed, color = imgui.color_edit("Ghost color", settings.ghost_color) -- ABGR, same as draw.*
-        if changed then settings.ghost_color = color end
 
         imgui.separator()
         imgui.text_colored("Enemy sync (host is authoritative)", COLOR_DIM)
@@ -177,24 +183,56 @@ local function draw_options(settings)
         imgui.separator()
         imgui.text_colored("Network", COLOR_DIM)
         slider_int(settings, "player_hz", "Player updates per second", 5, 60)
+        slider_int(settings, "pose_hz", "Character pose updates per second", 10, 60)
         slider_int(settings, "snapshot_hz", "Enemy snapshots per second (host)", 2, 30)
         slider_float(settings, "interp_delay", "Interpolation delay (s)", 0.0, 0.5)
-
-        imgui.separator()
-        imgui.text_colored("Experimental", COLOR_DIM)
-        checkbox(settings, "puppet_enabled", "Spawn a character model for the partner (may crash!)")
-        local pchanged, path = text_input("Prefab path (.pfb)", settings.puppet_prefab)
-        if pchanged then settings.puppet_prefab = path end
         imgui.tree_pop()
     end
 end
 
-local function draw_diagnostics(game, session_status)
+local function counters_text(c)
+    local keys = {}
+    for k in pairs(c or {}) do keys[#keys + 1] = k end
+    table.sort(keys)
+    local parts = {}
+    for _, k in ipairs(keys) do parts[#parts + 1] = ("%s %s"):format(k, tostring(c[k])) end
+    return table.concat(parts, ", ")
+end
+
+local function draw_models(status, game, puppet)
+    local desc = game.avatar
+    if desc ~= nil then
+        imgui.text(("Your character: %s, %d parts, %d animated joints"):format(desc.char_id, #desc.parts, #desc.joints))
+    else
+        imgui.text_colored("Your character: not in game", COLOR_DIM)
+    end
+    imgui.text_colored("Sent: " .. counters_text(status.avatar_tx), COLOR_DIM)
+    imgui.text_colored("Received: " .. counters_text(status.avatar_rx), COLOR_DIM)
+    if puppet ~= nil then
+        local p = puppet:status()
+        local color = p.state == "ready" and COLOR_OK or (p.state == "failed" and COLOR_ERR or COLOR_WARN)
+        imgui.text_colored(("Partner model: %s%s%s"):format(p.state, p.mode and (" (" .. p.mode .. ")") or "",
+            p.char_id and (" - " .. p.char_id) or ""), color)
+        if p.detail then imgui.text_colored("  " .. p.detail, COLOR_DIM) end
+        if p.state == "ready" then
+            imgui.text(("  %d parts, %d/%d joints animated%s"):format(p.parts, p.joints_mapped, p.joints_total,
+                p.late_writes and ", pose written after animation" or ""))
+            if #p.weapons > 0 then imgui.text("  weapons: " .. table.concat(p.weapons, ", ")) end
+        end
+        imgui.text_colored("  " .. counters_text(p.counters), COLOR_DIM)
+    end
+end
+
+local function draw_diagnostics(game, session_status, puppet)
     if imgui.tree_node("Diagnostics") then
         local version, proto = re4coop_net.version()
         imgui.text(("re4coop %s  |  plugin %s (net protocol %d)  |  game protocol %d"):format(
             P.MOD_VERSION, version, proto, P.VERSION))
-        for name, cap in pairs(game:capabilities()) do
+        local names = {}
+        for name in pairs(game:capabilities()) do names[#names + 1] = name end
+        table.sort(names)
+        for _, name in ipairs(names) do
+            local cap = game:capabilities()[name]
             imgui.text_colored(("%s %s: %s"):format(cap.ok and "[ok]" or "[--]", name, cap.detail), cap.ok and COLOR_OK or COLOR_WARN)
         end
         if session_status and session_status.enemies then
@@ -214,10 +252,14 @@ local function draw_diagnostics(game, session_status)
             imgui.text(("pickup detection: game callback %s | confirmed %d, heuristic %d, unconfirmed ignored %d"):format(
                 session_status.items.hook or "?", c.confirmed, c.heuristic, c.unconfirmed_ignored))
         end
+        imgui.separator()
+        draw_models(session_status, game, puppet)
         if imgui.button("Write research dump (adds a run to reframework/data/)") then
             local extra = session_status and {
                 role = session_status.role, enemies = session_status.enemies, items = session_status.items,
                 local_stage = session_status.local_stage, partner_stage = session_status.partner_stage,
+                character_sent = session_status.avatar_tx, character_received = session_status.avatar_rx,
+                partner_model = puppet and puppet:status() or nil,
             } or nil
             local ok, runs = game:dump_types(extra)
             dump_result = ok and ("run %d saved - send re4coop_typedump.json and re4coop_research_log.json"):format(runs)
@@ -231,7 +273,7 @@ local function draw_diagnostics(game, session_status)
     end
 end
 
-function UI.draw(session, game, settings, json)
+function UI.draw(session, game, settings, json, puppet)
     if not imgui.tree_node("RE4 Co-op (LAN)") then return end
     local status = session:status()
     draw_status(session, status)
@@ -240,7 +282,7 @@ function UI.draw(session, game, settings, json)
     imgui.separator()
     draw_chat(session, status)
     draw_options(settings)
-    draw_diagnostics(game, status)
+    draw_diagnostics(game, status, puppet)
     if imgui.button("Save settings") then
         Config.sanitize(settings)
         Config.save(json, settings)

@@ -26,9 +26,9 @@ framework for RE Engine games. It loads as `dinput8.dll` next to `re4.exe` and p
 | **Lua scripting** (`reframework/autorun/*.lua`), Lua 5.4.3 via sol2 | All game logic, UI and rendering of the partner |
 | **Type database (TDB) reflection**: `sdk.find_type_definition`, `get_method`, `:call()`, `get_field`/`set_field` | Reading the player, enemies and HP without hard-coded offsets |
 | **Managed singletons**: `sdk.get_managed_singleton("chainsaw.CharacterManager")` | Entry points into game state |
-| **Method hooks**: `sdk.hook(method, pre, post)` | Not needed in v0.1. Enemy damage is detected by polling (see §4) |
-| **Application-entry callbacks**: `re.on_application_entry("LateUpdateBehavior", fn)` | Game-thread tick for networking and sync |
-| **Drawing**: `re.on_frame` + `draw.world_to_screen/line/text/...` | Partner "ghost", name tag, HUD |
+| **Method hooks**: `sdk.hook(method, pre, post)` | Capturing the local player's sounds, effects and shots so the partner's copy can replay them (§4.1). Enemy damage is still detected by polling (§4) |
+| **Application-entry callbacks**: `re.on_application_entry("LateUpdateBehavior", fn)`, `"PrepareRendering"` | Game-thread tick for networking and sync; end-of-frame pose capture and pose check (§4.1) |
+| **Drawing**: `re.on_frame` + `draw.world_to_screen/line/text/...` | Partner name tag, HP bar, HUD |
 | **ImGui**: `re.on_draw_ui` + `imgui.*` | Host/Join panel inside the REFramework menu |
 | **JSON**: `json.load_file/dump_file` (sandboxed to `reframework/data`) | Settings, diagnostic type dumps |
 | **C/C++ plugin API**: DLLs in `reframework/plugins` with `reframework_plugin_initialize` | The network transport (`re4coop_net.dll`) |
@@ -80,7 +80,8 @@ These shaped the design:
   `getPlayerContextRef()`. Making a second, network-driven *player* inside one game instance
   would mean reverse-engineering input, camera and character-spawn systems that are not exposed
   through the TDB in any documented way. This is the main reason for the two-instance design
-  in §4.
+  in §4, and why the partner is shown as a *visual copy* (their body prefab with game logic
+  switched off, posed from the network) rather than a second player character.
 
 ## 2. Communication systems
 
@@ -124,7 +125,7 @@ RE4R's game code lives in the `chainsaw` namespace (`sdk.game_namespace("X")` �
 | `chainsaw.PlayerBaseContext` (`get_Position`, `get_IsHolding`, `get_AimTargetEnemy`, `get_CameraController`) | Confirmed | Health Bars `player_handler.lua` | Player position, aim flag |
 | `chainsaw.EnemyBaseContext` (`get_Position`, `get_HitPoint`, `get_BodyGameObject`, `get_IsLively`, `release`) | Confirmed | Health Bars `enemy_handler.lua` | Enemy state |
 | Concrete context types, e.g. `chainsaw.Ch1c0z0Context`, `Ch1d6z0Context`, `Ch1f6z0Context` | Confirmed | Health Bars, RE4 Mod Menu notes | Enemy *kind* = runtime type name |
-| `Context.get_BodyGameObject()` / `get_HeadGameObject()` | Confirmed | REFramework `RE4.lua` | Transform, joints, warping |
+| `Context.get_BodyGameObject()` / `get_HeadGameObject()` | Confirmed | REFramework `RE4.lua`; AWF reads `chainsaw.PlayerEquipment` from the head object | Body = skeleton + visible parts (`ch0a0z0_body` for Leon); head = game logic |
 | `chainsaw.HitPoint` (`get_CurrentHitPoint`, `get_DefaultHitPoint`, `get_IsLive`, `get_HitPointRatio`, `get_CurrentDamagePoint`) | Confirmed | SRT overlay, Health Bars | HP read |
 | `HitPoint.dead()`, `HitPoint.set_Invincible(bool)` | Reported by mods (method names published on Nexus, mods 6165 and 7363) | Search summaries of *True Invincible* and *RE4 Mod Menu* | Killing an enemy (probed; falls back to HP 0) |
 | `HitPoint` HP setter (`set_CurrentHitPoint`, `setHitPoint`, …) or backing field | **Verified at runtime** | No public source names it. v0.1's fixed-name probe did not find a working one in game (partial damage didn't sync) | Applying synced HP. Since v0.2 candidates come from `HitPoint`'s own methods/fields and one is trusted only after reading HP back proves it wrote the value (§3.2) |
@@ -133,16 +134,30 @@ RE4R's game code lives in the `chainsaw` namespace (`sdk.game_namespace("X")` �
 | `chainsaw.GameStatsManager.getKillCount()`, `InventoryManager.get_CurrPTAS()`, `InGameShopManager.get_CurrSpinelCount()`, `GameRankSystem.get_GameRank()` | Confirmed | SRT overlay | Not used yet (possible shared-stats features) |
 | Chapter/area getter (`chainsaw.CampaignManager.get_CurrentChapter`, …) | **Probed** | The autosplitter reads chapter IDs by raw offset only | "You are in different chapters" warning |
 | `via.GameObject.get_Transform`, `getComponent(System.Type)`, `destroy` | Confirmed (engine) | REFramework, every RE Engine mod | Transforms, components, puppet cleanup |
-| `via.Transform.get_Position/set_Position/get_Rotation/set_Rotation/get_Joints/getJointByName` | Confirmed (engine) | REFramework bindings, Health Bars | Positions, ghost skeleton |
-| `via.Joint.get_Name/get_Position/get_Parent` | Confirmed (engine) | Health Bars, REFramework | Ghost skeleton |
+| `via.Transform.get_Position/set_Position/get_Rotation/set_Rotation/get_Joints/getJointByName` | Confirmed (engine) | REFramework bindings, Health Bars | Positions, skeletons |
+| `via.Joint.get_Name/get_Position/get_Parent` | Confirmed (engine) | Health Bars, REFramework | Joint names, muzzle position |
 | `via.physics.CharacterController.warp()` | Engine convention (RE2/RE3/RE8 teleport mods) | Probed at call time | Teleport without physics snapping back |
-| `via.Prefab` (`set_Path`, `set_Standby`, `get_Ready`, `instantiate(via.vec3)`) | Confirmed | REFramework discussion #1112 (RE4 enemy spawn). Paths are relative, e.g. `_chainsaw/appsystem/character/ch8g2z0/ch8g2z0_body.pfb` | Experimental partner puppet |
-| Animation banks `_chainsaw/Animation/ch/cha0/motbank/cha0.motbank` (Leon), `cha1` (Ashley), … | Confirmed | EMV Engine RE4 resource list | Future: animated puppet |
+| `via.Prefab` (`set_Path`, `get_Exist`, `set_Standby`, `get_Ready`, `instantiate(via.vec3)`) | Confirmed | REFramework discussion #1112 (RE4 enemy spawn; paths are relative); EMV Engine (`get_Exist`) | Spawning the partner's body, weapons, muzzle flash |
+| Character prefabs `<content>/appsystem/character/<id>/<id>_body.pfb` and `<id>_head.pfb` | Confirmed | RE4 Steam file list (Ekey/REE.PAK.Tool `RE4_STM_Release.list`), §3.4 | The partner's body |
+| Weapon objects `wp4000`…`wp6400` with `chainsaw.Gun` / `chainsaw.Melee`; prefabs `_chainsaw/appsystem/prefab/weapon/wpNNNN.pfb`, `_mercenaries/.../wpNNNN_ao.pfb` (Separate Ways), `wpNNNN_mc.pfb` (Mercenaries) | Confirmed | AWF (`scene:findGameObject("wp4000")`, `chainsaw.Gun`), file list | The partner's weapons |
+| `chainsaw.Gun` shoot method (`shoot`, `fire`, …) or an ammo getter | **Probed** | No public source names it | Detecting shots (muzzle-flash fallback) |
+| `via.GameObject.create(System.String)`, `createComponent(System.Type)`, `get_Components`, `set_DrawSelf`, `get_Draw`, `set_Name`, `destroy` | Confirmed (engine) | EMV Engine `create_gameobj`, REFramework `utility/GameObject.lua` | Rebuilding parts from meshes, hiding/naming the copy |
+| `via.render.Mesh.getMesh` / `setMesh`, `get_Material` / `set_Material`; `sdk.create_resource(...):create_holder(...)` | Confirmed | EMV Engine, REFramework `Sdk.cpp` | Reading the player's meshes; rebuilding parts |
+| `via.Transform` hierarchy: `get_Child`, `get_Next`, `get_Parent`, `set_Parent`, `get/set_ParentJoint`, `get/set_SameJointsConstraint`, local position/rotation | Confirmed (engine) | EMV Engine | Parts follow the body's joints; weapons hang from the hand joint |
+| `via.Joint.get/set_LocalRotation`, `get/set_LocalPosition`, `get_Name` | Confirmed (engine) | EMV Engine poser (writes joints in `PrepareRendering`), REFramework scripts | Reading the local pose; posing the copy |
+| `via.SceneManager.get_CurrentScene()` + `findGameObject(System.String)` | Confirmed (engine) | EMV Engine, AWF | Weapons not parented to the player |
+| `via.wwise.WwiseContainer.trigger(...)` overloads; containers `snd_cont_cha0`, `snd_trgr_cha0`, `snd_bank_wp_4000`… | Confirmed (engine), banks from the file list | EMV Engine (`trigger(via.GameObject, System.UInt32, …)`) | Replaying the partner's sounds on the copy |
+| `via.effect.script.EPVStandard.requestEffect(...)`; `_chainsaw/vfx/provider/epv_system/epv_muzzleflash/epve_0015_muzzleflash_0000.pfb` | Confirmed (engine), path from the file list | EMV Engine | Replaying effects; fallback muzzle flash |
+| Animation banks `_chainsaw/Animation/ch/cha0/motbank/cha0.motbank` (Leon), `cha0_wp4000.motbank`…, `cha1` (Ashley), `cha8` (Ada) | Confirmed | EMV Engine RE4 resource list | Not needed: poses travel instead of animation ids (§4.1) |
 
-Character IDs are not needed by the current code. `cha0` is Leon's animation/model family and
-`cha1` is Ashley's. Per-character prefab paths should be read from the game files (or from
-REFramework's object explorer) rather than guessed. That is why the experimental puppet takes
-the path as user input.
+### 3.1 Prior art
+
+* **claybtv's "Multiplayer Mod"** ([Nexus 6539](https://www.nexusmods.com/residentevil42023/mods/6539),
+  open beta June 2026) runs two game instances with a host and a joining partner. It syncs
+  enemies, story events, doors and switches. Reported issues are lag and choppy enemies, and
+  the pause/inventory menu breaking the session. The author announced a **LAN version is in
+  progress**. That validates the two-instance approach this project uses. This project is an
+  independent, open implementation focused on direct IP/LAN play.
 
 ### 3.2 Second research round (v0.2)
 
@@ -275,14 +290,30 @@ everywhere). v0.3 keeps everything:
   target, motion layer 0 of the player and the first enemy, pickups (both item IDs, stage,
   lost flag), pickup-callback activity, and the session's sync counters.
 
-### 3.1 Prior art
+### 3.4 The player prefab
 
-* **claybtv's "Multiplayer Mod"** ([Nexus 6539](https://www.nexusmods.com/residentevil42023/mods/6539),
-  open beta June 2026) runs two game instances with a host and a joining partner. It syncs
-  enemies, story events, doors and switches. Reported issues are lag and choppy enemies, and
-  the pause/inventory menu breaking the session. The author announced a **LAN version is in
-  progress**. That validates the two-instance approach this project uses. This project is an
-  independent, open implementation focused on direct IP/LAN play.
+The RE4 Steam file list (167,617 paths, from [Ekey/REE.PAK.Tool](https://github.com/Ekey/REE.PAK.Tool))
+shows how characters are built:
+
+* Every character has `<content>/appsystem/character/<id>/<id>_body.pfb` and `<id>_head.pfb`.
+  The body object is what you see (the FRAMED EMV guide hides Leon by toggling `ch0a0z0_body`);
+  the "head" object carries game logic (AWF finds `chainsaw.PlayerEquipment` on it).
+* Leon is `ch0a0z0` (`_chainsaw/appsystem/character/ch0a0z0/ch0a0z0_body.pfb`). Ashley as a
+  playable character (chapters 9–10) is `ch0a1z0`. Ada (Separate Ways and Mercenaries) is
+  `ch3a8z0`, whose body prefab lives in the Mercenaries content:
+  `_mercenaries/appsystem/character/ch3a8z0/ch3a8z0_body.pfb`. Mercenaries characters are
+  `ch6i0z0`…`ch6i5z0`, `ch7k0z0`, `ch3a8z0_mc`.
+* Costumes are separate part prefabs (`.../ch0a0z0/costume/cha000_00.pfb`, `cha000_10`, `cha000_20`,
+  `cha001_00`…) over meshes such as `_chainsaw/character/ch/cha0/cha000/00/cha000_00.mesh` (body),
+  `.../10/` (face), `.../20/` (hair), with material variants (`cha000_00b.mdf2`… for dirt and blood).
+* Weapons: objects named by id (`wp4000` SG-09 R, `wp4100` W-870, `wp4400` SR M1903,
+  `wp5000` combat knife, `wp5400` hand grenade…), prefabs under `appsystem/prefab/weapon/`, meshes
+  under `_chainsaw/character/wp/wp40/wp4000/00/`, sound banks `snd_bank_wp_4000`, effects under
+  `vfx/provider/epv_weapon/epv_wp4000/`.
+
+So the mod does not need the user to type a path: the sender reports its body object's name, the
+receiver derives the character id and checks the candidate paths with `via.Prefab.get_Exist`.
+Costume differences are handled by mesh path (§4.1). Animation banks are not needed at all.
 
 ## 4. Sync architecture
 
@@ -292,18 +323,22 @@ everywhere). v0.3 keeps everything:
  ┌────────────────────────┐   UDP 33040 (direct IP)   ┌────────────────────────┐
  │ re4coop.lua            │ ◄───────────────────────► │ re4coop.lua            │
  │  session ─ enemy_sync  │   PLAYER (20 Hz, unrel.)  │  session ─ enemy_sync  │
- │  game.lua (sdk)        │   ENEMY_SNAPSHOT (10 Hz)  │  game.lua (sdk)        │
- │  ghost (draw)          │   ENEMY_DAMAGE/DEAD (rel.)│  ghost (draw)          │
+ │          ─ items_sync  │   ITEM_TAKEN (rel.)       │          ─ items_sync  │
+ │  avatar (character)    │   POSE (30 Hz, unrel.)    │  avatar (character)    │
+ │  game.lua (sdk)        │   AVATAR/GEAR/ACTIONS     │  game.lua (sdk)        │
+ │  puppet (partner model)│   ENEMY_SNAPSHOT (10 Hz)  │  puppet (partner model)│
+ │  overlay (name, HUD)   │   ENEMY_DAMAGE/DEAD (rel.)│  overlay (name, HUD)   │
  │ re4coop_net.dll        │   CHAT/NOTIFY/HELLO (rel.)│ re4coop_net.dll        │
  └────────────────────────┘                           └────────────────────────┘
 ```
 
 * **Two full game instances.** Each player runs their own RE4 with their own Leon, camera and
   inputs. Both load the **same chapter** from a save.
-* **Partner presence: the ghost.** Each side sends position, rotation, HP, flags and up to 40
-  joint positions (int16 cm offsets) at 20 Hz. The receiver interpolates 100 ms in the past and
-  draws a skeleton through the partner's real joints, plus a name tag, distance and HP bar. This
-  needs no model spawning, so it works in every chapter and with every costume.
+* **Partner presence: their real character.** Each side describes its character once (AVATAR:
+  character id, costume parts, skeleton joint list) and then streams its final pose ~30 times a
+  second (POSE). The receiver spawns the partner's body prefab, dresses it and poses it, 100 ms in
+  the past for smooth interpolation. Details in §4.1. Name tag, distance and HP bar are drawn on
+  top.
 * **Enemies: host-authoritative outcomes.** The level spawns the same enemies on both machines,
   and each machine runs its own AI.
   * The host numbers its enemies. Every 100 ms it broadcasts `{id, kind, ContextID, position,
@@ -326,13 +361,84 @@ everywhere). v0.3 keeps everything:
 * **Utilities**: teleport to partner (transform + `CharacterController.warp`), chat, notices
   ("partner is down", "teleported to you"), and a diagnostics panel with the research dump.
 
-### 4.1 Known limitations (v0.3)
+### 4.1 The partner's character
 
-* The partner is a ghost overlay, not a 3D character model. The experimental prefab puppet
-  only follows position and rotation and is not animated.
+**Why poses, not animation ids.** RE4R's player animation is a stack of layers, FSMs, IK, aim
+offsets, additive upper-body layers and physics (hair, cloth). Replaying motion bank + motion id
++ frame would need the same banks loaded on the copy (weapon banks are loaded on demand) and the
+same FSM/IK state, and would still miss IK and physics. Copying the *final* pose avoids all of
+that: whatever the partner's character does, every joint's local rotation is sent and applied.
+Every state is covered by construction, including ones nobody listed.
+
+**Capture (sender).** At `PrepareRendering` (end of frame, after animation, IK and physics, the
+same point where EMV Engine's poser writes joints) the mod reads the local rotation of every joint
+of the body skeleton plus the joints only a part has (face, hair), up to 512, and the local
+position of root/hip joints. Packed to 32 bits per joint (§PROTOCOL), ~1.2 KB per pose. Joint
+objects are never read after their transform changed (costume swap): the description is
+rescanned instead. The weapon is reported relative to the joint it hangs from (its
+`ParentJoint`), so the copy can hang it from the same joint.
+
+**Building the copy (receiver).**
+
+1. Find the body prefab from the character id (§3.4) and load it (`set_Standby`, wait for
+   `get_Ready`, `instantiate`).
+2. *Sanitize*: every component of the spawned tree whose type starts with `chainsaw.`, `app.`,
+   `via.behaviortree.`, `via.physics.`, `via.motion.Motion`, `via.motion.Ik`, `via.navigation.`,
+   `via.dynamics.`… is disabled. Rendering, sound containers, effect providers and cloth/hair
+   chains keep running. The copy has no logic, no collision, no AI, and cannot shoot.
+3. *Rename* every spawned object `re4coop_<name>`, so the game's own lookups by name (and
+   ours) keep finding the real player, and remember them so capture never mistakes them for ours.
+4. *Dress it*: the prefab's meshes are matched with the partner's parts by mesh path. Materials
+   are switched to the partner's (dirt/blood variants), meshes the partner does not wear are
+   hidden, and missing parts are rebuilt as mesh-only objects (`GameObject.create` +
+   `via.render.Mesh` + `setMesh`/`set_Material`) attached with the partner's parent joint and
+   `SameJointsConstraint`.
+5. If the prefab is missing, fails or takes over 15 s: *mirror mode*. The whole model is
+   rebuilt from meshes, with the main (body) mesh on the root so the other parts follow its
+   skeleton. *Options* has a switch to force this.
+
+**Posing.** Each frame (`LateUpdateBehavior`) the copy's root goes to the partner's position and
+every mapped joint gets its interpolated local rotation (unchanged joints are skipped). Parts that
+follow the body by name only get the joints the body lacks. At `PrepareRendering` one body joint
+is checked; if the engine overwrote the pose (an animation that could not be switched off), the
+pose is rewritten there from then on. Teleports (over 2.5 m between poses) jump instead of sliding.
+
+**Weapons.** Spawned from their prefab (`wp4000.pfb`), sanitized (so `chainsaw.Gun` cannot fire
+real bullets), hung from the same joint with the same offset; slide/trigger joints follow;
+hidden when the partner's weapon is hidden.
+
+**Sounds and effects.** All `via.wwise.WwiseContainer.trigger*` and
+`via.effect.script.EPVStandard.requestEffect*` overloads are hooked. A call on one of the local
+player's components (body, parts, head object, weapons) is recorded with the component's type
+and index and its arguments (numbers, booleans, GameObjects as part references, nulls). The
+copy has the same components (same prefabs), so the receiver calls the same overload on the
+matching component and the same sound plays from the copy's position, in sync with the delayed
+animation. Calls whose arguments cannot travel (a request object) are replayed through the
+simplest `trigger` overload with the same trigger id. The receiver's own replays are not
+recorded (they are not on the local player).
+
+**Shots.** `chainsaw.Gun` shoot methods are hooked when they exist (names probed), otherwise the
+magazine count is polled. A shot whose weapon effects did not come through the effect mirror
+gets the game's generic muzzle flash (`epve_0015_muzzleflash_0000.pfb`) at the copy's muzzle
+joint.
+
+**When it hides.** During the partner's or your own cutscenes (option), when both games report
+different chapters, and when no pose arrived for 3 s. If the game unloads the copy with an area,
+it is rebuilt.
+
+### 4.2 Known limitations (v0.4)
+
+* Nothing here has been verified in the running game yet. The riskiest assumption is that the
+  body prefab can be spawned outside the game's character spawner without side effects once its
+  logic is disabled; *Build partner from meshes only* is the escape hatch.
+* The copy is visual only: no collision, enemies don't see it, bullets pass through it.
+* Sounds the engine plays without going through the reflected `trigger` methods (for example
+  animation-driven ones, if they bypass it) are not replayed. *Diagnostics* counts what is.
+* Thrown grenades, projectiles, bullet impacts and blood happen only in the thrower's game.
 * Enemies only target the local player, so each machine's copy of an enemy fights its own
-  player. You don't see the partner's fight, and enemies don't choose between the two players.
-  Positions are not synced except by optional snapping. The next step is planned in §3.3.
+  player: you see the partner's character shoot, but enemies don't choose between the two
+  players, and your partner cannot draw aggro on your machine. Positions are not synced except
+  by optional snapping. The next step is planned in §3.3.
 * Random drops are rolled separately on each machine (plan in §3.3).
 * Story flags, doors and cutscenes are not synced. Key items are shared once, and the
   left-behind prompt brings the other player along.
@@ -345,17 +451,18 @@ everywhere). v0.3 keeps everything:
 
 ## 5. Roadmap
 
-1. **In-game validation of v0.3** with the checklist in [TESTING.md](TESTING.md), and collecting
-   `re4coop_typedump.json` + `re4coop_research_log.json` from several areas.
-2. With the log: partner as an enemy target on the host (partner-purpose character +
+1. **In-game validation of v0.4** with the checklist in [TESTING.md](TESTING.md), collecting
+   `re4coop_typedump.json` + `re4coop_research_log.json` from several areas (the dump also
+   lists the local character's objects, components, meshes and joints) and fixing any probed
+   names with them.
+2. With the log: partner as an enemy target on the host (a partner-purpose character
+   registered like Ashley/Luis, or the partner's model from §4.1, fed to
    `HateController.find/addHate`), then client enemies as host puppets (AI off, transform +
    motion layer from the host), then identical drops (`generateRandomDrop` →
    `requestGenerateLostItem`), then stage-aware teleports via `CharacterManager.requestWarp`.
 3. Event-driven damage via `chainsaw.EnemyManager.notifyHitDamage` hooks, to remove polling
    latency.
-4. An animated partner puppet: spawn the partner's character body prefab with AI components
-   disabled, and drive its motion layer (`via.motion.Motion`) from the partner's current motion
-   ID and frame.
+4. Replicate thrown objects (grenades, eggs, bolts) and hit effects on enemies.
 5. Shared progression: sync door/gimmick interactions and story flags; host-driven chapter
    transitions.
 6. Optional Steam networking transport for NAT traversal.
@@ -366,9 +473,11 @@ everywhere). v0.3 keeps everything:
 * [REFramework discussion #1112: creating a prefab instance in RE4](https://github.com/praydog/REFramework/discussions/1112)
 * [resyst/re4r `srt-overlay.lua`](https://github.com/resyst/re4r/blob/master/srt-overlay.lua) and [Joydurn/re4r-SRT](https://github.com/Joydurn/re4r-SRT/blob/master/srt-overlay.lua)
 * [GreenComfyTea/RE4-Health-Bars](https://github.com/GreenComfyTea/RE4-Health-Bars)
-* [alphazolam/EMV-Engine](https://github.com/alphazolam/EMV-Engine) (RE4 resource lists)
+* [alphazolam/EMV-Engine](https://github.com/alphazolam/EMV-Engine) (RE4 resource lists; `create_gameobj`, `create_resource`, `via.Prefab.get_Exist`, the poser writing joints at `PrepareRendering`, Wwise/EPV calls, `findComponents`, `get_Components`)
 * [alphazolam/RE_RSZ `rszre4.json`](https://github.com/alphazolam/RE_RSZ) (RE4 type names and serialized fields)
 * [resyst/re4r `re4r.asl`](https://github.com/resyst/re4r/blob/master/re4r.asl) (key item IDs)
-* [Ekey/REE.PAK.Tool `RE4_STM_Release.list`](https://github.com/Ekey/REE.PAK.Tool) (RE4 resource paths, used for prefab paths)
+* [Ekey/REE.PAK.Tool](https://github.com/Ekey/REE.PAK.Tool) `Projects/RE4_STM_Release.list` (the RE4 Steam file list: character, costume, weapon, sound and effect paths)
+* [SilverEzredes/Advanced-Weapon-Framework](https://github.com/SilverEzredes/Advanced-Weapon-Framework) (`RE4R_WeaponData.lua`: weapon ids; `chainsaw.Gun`, `chainsaw.PlayerEquipment`)
+* [FRAMED: EMV Engine guide](https://framedsc.com/GeneralGuides/emv_engine.htm) (`ch0a0z0_body` is Leon)
 * [RE4 Mod Menu (Nexus 7363)](https://www.nexusmods.com/residentevil42023/mods/7363), [True Invincible (Nexus 6165)](https://www.nexusmods.com/residentevil42023/mods/6165)
 * claybtv Multiplayer Mod coverage: [Nexus 6539](https://www.nexusmods.com/residentevil42023/mods/6539), [Screen Rant](https://screenrant.com/resident-evil-4-remake-co-op-mod/), [Rely on Horror](https://www.relyonhorror.com/latest-news/resident-evil-news/resident-evil-4-remake-gets-full-co-op-mode-thanks-to-new-mod/), [Retro Dodo](https://retrododo.com/resident-evil-4-remake-now-has-a-co-op-mode-mod/)
