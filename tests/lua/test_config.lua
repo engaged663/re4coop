@@ -33,14 +33,42 @@ end)
 
 T.run("loads_and_sanitizes_saved_values", function()
     local files = { [Config.FILE] = { port = 99999, player_name = "", player_hz = 500, last_address = "10.0.0.5",
-        sync_hp = "yes", unknown_key = 1 } }
+        enemy_erase = "yes", enemy_interp_delay = 5, unknown_key = 1 } }
     local cfg = Config.load(fake_json(files))
     T.eq(cfg.port, Config.DEFAULTS.port, "invalid port replaced")
     T.eq(cfg.player_name, "Player", "empty name replaced")
     T.eq(cfg.player_hz, 60, "rate clamped")
     T.eq(cfg.last_address, "10.0.0.5", "address kept")
-    T.eq(cfg.sync_hp, true, "wrong type ignored")
+    T.eq(cfg.enemy_erase, true, "wrong type ignored")
+    T.near(cfg.enemy_interp_delay, 0.4, 1e-9, "enemy smoothing clamped")
     T.eq(cfg.unknown_key, nil, "unknown keys dropped")
+end)
+
+T.run("enemy_sync_settings_of_0_7_are_reset_once", function()
+    -- 0.7's enemy sync was broken; players switched parts of it off. 0.8 rebuilt it around the
+    -- host: those switches come back on once, and the options that could only break it (and
+    -- 0.7's ownership switches: the host runs every enemy now) are gone.
+    local files = { [Config.FILE] = { config_version = 7, sync_enemies = false, enemy_mirror = false,
+        enemy_ownership = false, enemy_motion_sync = false, hit_ownership = false, sync_hp = false,
+        sync_deaths = false, enemy_puppet_ai = false, match_radius = 8.0, snap_distance = 3.0, sync_drops = false,
+        replay_partner_hits = true, interp_delay = 0.12 } }
+    local json = fake_json(files)
+    local cfg = Config.load(json)
+    for _, k in ipairs({ "sync_enemies", "enemy_mirror", "enemy_motion_sync" }) do
+        T.eq(cfg[k], true, k .. " back on")
+    end
+    for _, k in ipairs({ "sync_hp", "sync_deaths", "enemy_puppet_ai", "match_radius", "snap_distance",
+        "enemy_ownership", "hit_ownership" }) do
+        T.eq(cfg[k], nil, k .. " removed")
+    end
+    T.eq(cfg.sync_drops, false, "an unrelated choice is kept")
+    T.eq(cfg.replay_partner_hits, true, "0.7's own reset already happened: the player's choice stays")
+    T.near(cfg.interp_delay, 0.12, 1e-9, "same for the 0.7-era rates")
+    T.eq(cfg.enemy_erase, true, "dead enemies are erased by default")
+    T.near(cfg.enemy_interp_delay, 0.1, 1e-9, "enemy smoothing default")
+    cfg.enemy_mirror = false
+    Config.save(json, cfg)
+    T.eq(Config.load(json).enemy_mirror, false, "switched off again after the upgrade: kept")
 end)
 
 T.run("save_roundtrip", function()
@@ -82,7 +110,8 @@ T.run("experimental_features_are_off_by_default", function()
         "exp_force_routine" }) do
         T.eq(cfg[k], false, k)
     end
-    T.eq(cfg.hit_ownership, true, "fight-based enemy ownership on")
+    T.eq(cfg.hit_ownership, nil, "no enemy ownership: the host runs every enemy")
+    T.eq(cfg.sync_animals, true, "animals follow the host")
     T.eq(cfg.sync_drops, true, "per-player loot on")
     T.eq(cfg.profiler, true, "profiler on")
 end)

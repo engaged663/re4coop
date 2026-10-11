@@ -26,6 +26,7 @@ local Gate = require("re4coop.gate")
 local FlagSync = require("re4coop.flag_sync")
 local GimmickSync = require("re4coop.gimmick_sync")
 local ObjectSync = require("re4coop.object_sync")
+local AnimalSync = require("re4coop.animal_sync")
 local CutsceneSync = require("re4coop.cutscene_sync")
 local Travel = require("re4coop.travel")
 local Perf = require("re4coop.perf")
@@ -84,12 +85,13 @@ local OFFLINE_SAFE = {
 -- Reliable messages that must not be lost but touch game objects: kept until the game loop
 -- runs again. Everything else arriving then (enemy snapshots, hits) is resent continuously.
 local DEFER = {
-    [P.T.ENEMY_DAMAGE] = true, [P.T.ENEMY_DEAD] = true,
+    [P.T.ENEMY_DAMAGE] = true, [P.T.ENEMY_DEAD] = true, [P.T.ENEMY_GRAVE] = true,
     [P.T.FLAGS] = true, [P.T.FLAG_WORDS] = true, [P.T.GIMMICKS] = true, [P.T.OBJECTS] = true,
     [P.T.CUTSCENE] = true, [P.T.WORLD_REQUEST] = true, [P.T.WORLD_DONE] = true,
 }
 
-local SYNC_NAMES = { "enemy_sync", "drop_sync", "flag_sync", "gimmick_sync", "object_sync", "cutscene_sync" }
+local SYNC_NAMES = { "enemy_sync", "drop_sync", "flag_sync", "gimmick_sync", "object_sync", "animal_sync",
+    "cutscene_sync" }
 
 function Session.new(opts)
     local self = setmetatable({}, Session)
@@ -202,6 +204,7 @@ function Session:reset_peer()
     self.join_travel_pending = false
     self.sync_on_join = false
     self.world_sync_pending = nil
+    self.world_synced = false -- client: the host's world state arrived at least once
     self.chapter_ahead_since = nil
     self.deferred = {} -- queued messages belonged to the previous partner
     if self.travel then self.travel:cancel("partner left") end
@@ -230,6 +233,12 @@ function Session:make_syncs()
     self.flag_sync = FlagSync.new(base)
     self.gimmick_sync = GimmickSync.new(base)
     self.object_sync = ObjectSync.new(base)
+    local animal_opts = {}
+    for k, v in pairs(base) do animal_opts[k] = v end
+    -- Animal deaths go through the breakables' channel (OBJECTS) right away.
+    animal_opts.on_local_kill = function(guid, routine, now) self.object_sync:report_destroyed(guid, routine, now) end
+    animal_opts.on_remote_kill = function(guid, now) self.object_sync:note_applied(guid, now) end
+    self.animal_sync = AnimalSync.new(animal_opts)
     self.cutscene_sync = CutsceneSync.new(base)
     self.travel = Travel.new({
         settings = self.settings,
@@ -337,6 +346,7 @@ function Session:restore_game()
         self.pause:set_active(false, self.settings.no_pause_mode, false, self.clock())
     end
     if self.game.restore_enemy_ai then self.game:restore_enemy_ai() end
+    if self.world and self.world.restore_animals then self.world:restore_animals() end
     if self.world and self.world.disarm_chapter_switch then self.world:disarm_chapter_switch() end
 end
 
@@ -702,6 +712,7 @@ function Session:status()
         if self.flag_sync then st.flags = self.flag_sync:summary() end
         if self.gimmick_sync then st.gimmicks = self.gimmick_sync:summary() end
         if self.object_sync then st.objects = self.object_sync:summary() end
+        if self.animal_sync then st.animals = self.animal_sync:summary() end
         if self.cutscene_sync then st.cutscenes = self.cutscene_sync:summary() end
         if self.travel then st.travel = self.travel:status() end
     end
@@ -783,6 +794,9 @@ function Session:handle_event(ev, now)
             else
                 self.sync_on_join = true -- no travel, but still take over the host's world state
             end
+        elseif self.role == "client" and self.settings.sync_enemies ~= false then
+            -- No shared world here, but the enemies dead in the host's world still matter.
+            self:send(P.encode_world_request(0, P.WORLD.ENEMIES), true)
         end
     elseif ev.type == "disconnected" or ev.type == "rejected" then
         local who = self.partner_name or "Partner"
@@ -822,7 +836,12 @@ function Session:on_world_request(m)
             self.object_sync:send_history()
         end
     end
-    -- Enemies need nothing extra: deaths the client did not see are re-advertised anyway.
+    -- Enemies: the list of every enemy dead in our world follows in a moment (reading our
+    -- save's backups takes a few ticks).
+    if (m.what & P.WORLD.ENEMIES) ~= 0 and s.sync_enemies ~= false and self.enemy_sync then
+        self.enemy_sync:request_graveyard(self.clock())
+    end
+    if m.sync_id == 0 then return end -- an enemies-only request (no shared world on the client)
     self:send(P.encode_world_done(m.sync_id, m.what, n_groups, n_gimmicks), true)
     self:add_message(("Sent the world state to %s (%d flag groups, %d gimmicks)")
         :format(self.partner_name or "partner", n_groups, n_gimmicks), "info")
@@ -888,6 +907,7 @@ function Session:handle_message(data, now)
     elseif m.type == T.WORLD_DONE then
         if self.role == "client" and m.sync_id == self.world_sync_pending then
             self.world_sync_pending = nil
+            self.world_synced = true
             self:add_message(("World synchronised with the host (%d flag groups, %d gimmicks)")
                 :format(m.n_flag_groups, m.n_gimmicks), "good")
             if self.travel then self.travel:sync_done() end
@@ -898,6 +918,8 @@ function Session:handle_message(data, now)
         if self.gimmick_sync and self.world then self.gimmick_sync:on_message(m, now) end
     elseif m.type == T.OBJECTS then
         if self.object_sync and self.world then self.object_sync:on_message(m, now, self.world) end
+    elseif m.type == T.ANIMALS then
+        if self.animal_sync and self.world then self.animal_sync:on_message(m, now) end
     elseif m.type == T.CUTSCENE then
         if self.cutscene_sync and self.world then self.cutscene_sync:on_message(m, now) end
     elseif self.avatar_rx:on_message(m, now) then
@@ -974,11 +996,27 @@ function Session:on_reload(now)
     if self.game.on_reload then self.game:on_reload() end
     if self.world and self.world.on_reload then self.world:on_reload() end
     if self.enemy_sync then self.enemy_sync:on_local_reload() end
+    if self.animal_sync then self.animal_sync:on_local_reload() end
     if self.drop_sync then self.drop_sync:forget_enemies() end
     self.in_game_since = now
+    -- Client: a checkpoint brought back enemies the host has killed since, and put our story
+    -- flags and doors behind the host's. Take the host's world again (once it has been taken
+    -- over before; joining and travelling ask on their own).
+    if self.role == "client" and self.partner_connected and self.compatible and self.world_synced
+        and self.world_sync_pending == nil and not self.join_travel_pending
+        and (self.travel == nil or not self.travel:busy()) then
+        local partner = self.partner_state
+        local mine = self.world and self.world:location() or nil
+        if partner ~= nil and (partner.chapter == nil or mine == nil or mine.chapter == nil
+            or partner.chapter == mine.chapter) then
+            self:add_message("Your game reloaded - taking over the host's world again", "info")
+            self:request_world_sync()
+        end
+    end
 end
 
--- Both players' positions for enemy ownership (the partner only counts in the same region).
+-- Both players' positions: our position decides how enemies dead in the partner's world go,
+-- and the host sends the animals near both (the partner only counts in the same region).
 function Session:players_info(now)
     local local_pos = self:fresh_local_pos(now)
     local remote = self.interp:sample(now)
@@ -1014,7 +1052,10 @@ function Session:update_world(now)
     if world.update then world:update() end
     self.flag_sync:tick(now, world)
     self.gimmick_sync:tick(now, world)
-    self.object_sync:tick(now, world, self:fresh_local_pos(now))
+    -- Animal sync finds the animals in the breakables' scan.
+    local animals = s.sync_animals ~= false and world.animals_near ~= nil
+    self.object_sync:tick(now, world, self:fresh_local_pos(now), animals)
+    if world.animals_near ~= nil then self.animal_sync:tick(now, world, self:players_info(now)) end
     self.cutscene_sync:tick(now, world, self.local_loc, self.travel)
 
     local partner = self:partner_location()
@@ -1061,6 +1102,7 @@ function Session:apply_pending_restores()
     elseif self.ai_restore_pending then
         self.ai_restore_pending = false
         if self.game.restore_enemy_ai then self.game:restore_enemy_ai() end
+        if self.world and self.world.restore_animals then self.world:restore_animals() end
     end
 end
 

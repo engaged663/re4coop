@@ -308,6 +308,78 @@ T.run("host_reload_resets_old_deaths_on_the_client", function()
     T.check(reset, "client told to forget the host's earlier deaths")
 end)
 
+T.run("host_answers_an_enemies_request_with_its_graveyard", function()
+    local s, net, clock, game = make("host")
+    -- The host's save has two enemies eliminated (read over several ticks).
+    local scans = 0
+    function game:scan_eliminated()
+        scans = scans + 1
+        if scans < 3 then return false, nil end
+        return true, { 0x1111, 0x2222 }
+    end
+    net.push(P.encode_world_request(5, P.WORLD.FLAGS | P.WORLD.ENEMIES))
+    for i = 1, 10 do
+        clock.t = i * 0.06
+        s:update()
+    end
+    local grave
+    for _, m in ipairs(net.sent) do
+        local d = P.decode(m.data)
+        if d and d.type == P.T.ENEMY_GRAVE then
+            grave = d
+            T.eq(m.reliable, true, "sent reliably")
+        end
+    end
+    T.check(grave ~= nil, "the graveyard went out")
+    T.eq(grave and #grave.uids, 2, "with the save's dead enemies")
+    T.eq(net.sent_types()[P.T.WORLD_DONE], 1, "the world transfer still ends with its marker")
+end)
+
+T.run("a_client_without_a_world_adapter_still_asks_for_the_dead", function()
+    local s, net = make("client", { world = false })
+    s.world = nil
+    net.inbox[#net.inbox + 1] = { type = "connected", name = "Host" }
+    s:update_network_only()
+    local req
+    for _, m in ipairs(net.sent) do
+        local d = P.decode(m.data)
+        if d and d.type == P.T.WORLD_REQUEST then req = d end
+    end
+    T.check(req ~= nil, "asked")
+    T.eq(req and req.what, P.WORLD.ENEMIES, "for the enemies only")
+end)
+
+T.run("a_client_reload_takes_the_hosts_world_again", function()
+    local s, net, clock, game = make("client")
+    net.push(player_msg(0.1, 21100, 40200, { x = 1, y = 0, z = 1 }))
+    s:update()
+    -- Before the first world transfer a reload asks for nothing (joining asks on its own).
+    game.ctx_id = 2
+    clock.t = 0.2
+    s:update()
+    T.eq(net.sent_types()[P.T.WORLD_REQUEST], nil, "nothing asked yet")
+    s.world_synced = true -- the host's world arrived once
+    game.ctx_id = 3       -- the client died and reloaded a checkpoint
+    clock.t = 0.4
+    s:update()
+    local req
+    for _, m in ipairs(net.sent) do
+        local d = P.decode(m.data)
+        if d and d.type == P.T.WORLD_REQUEST then req = d end
+    end
+    T.check(req ~= nil, "asked for the host's world again")
+    T.check(req and (req.what & P.WORLD.ENEMIES) ~= 0, "including the enemies dead in it")
+    T.check(told(s, "reloaded"), "the player is told")
+    -- In another chapter (the host moved on): following the host handles it, not a re-sync.
+    s.world_sync_pending = nil
+    net.sent = {}
+    game.chapter = 21200
+    game.ctx_id = 4
+    clock.t = 0.6
+    s:update()
+    T.eq(net.sent_types()[P.T.WORLD_REQUEST], nil, "not across chapters")
+end)
+
 T.run("no_pause_follows_the_session", function()
     local pause = fake_pause()
     local s, net, _, game = make("host", { pause = pause })

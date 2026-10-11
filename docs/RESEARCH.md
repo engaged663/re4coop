@@ -236,6 +236,11 @@ stage as group (`3:0:40200:0…2`, `3:0:40210:12…13`). v0.3:
 * reads `DropItem.getItemID()` when `_ItemData.ItemID` is 0, which it was for every
   level-placed item in the dump.
 
+> **Corrected in v0.8 (§3.8):** for enemies, group 12 is *not* a runtime counter. The game's
+> code shows that a level enemy's `_ID` (and its `SpawnerID`) is the serialized `_ContextID` of
+> the spawn param that created it, while runtime characters get group 1. Treating group 12 as
+> "runtime" made v0.3–v0.7 throw away the one exact identity every enemy has.
+
 **Pickups.** `static DropItem.onAcceptPickup(user_id: ContextID, item_id: ContextID)` and
 `onAcceptOccupied(user_id, item_id, arg)` are the game's pickup callbacks. v0.3 hooks both.
 For a static method REFramework passes the parameters from `args[2]` on (`args[1]` is the VM
@@ -416,7 +421,7 @@ What v0.6 builds on that:
 | No pauses | While hosting or connected, the parameters of menu pauses (inventory, map, files, pause menu, item pickup, typewriter, tutorials) freeze nothing; re-applied when the game rebuilds its table | Cutscene, movie and loading pauses are kept. Restored on leave and on "Reset Scripts". Mode *all* and a request-refusing mode are options |
 | Join the host's game | Client: arm the chapter switch to the host's chapter (also from the title screen) and start the reload; once there, WORLD_REQUEST → full flags, gimmicks and destroyed objects → stage preload + `requestWarp` next to the host | Each step has a timeout and reports what failed; without a stage, a plain teleport |
 | Follow the host | The client follows the host into a *later* chapter after 15 s (or at once with F6 when the host waits for it at the gate) | Never pulled back to an earlier chapter; the transition gate keeps the host waiting meanwhile |
-| Enemies fight both players | Ownership: the host gives an enemy to the client when the client's player is closer by 2 m for 0.6 s (and back); the owner's AI runs it, the other game mirrors position, facing and animation from a 150 ms buffer and switches that enemy's AI head off | Only enemies the client reported having (ENEMY_CLIENT) are handed over; AI is switched back on before any kill, on hand-back, on disconnect and on "Reset Scripts"; every part has an option |
+| Enemies fight both players | Ownership: the host gives an enemy to the client when the client's player is closer by 2 m for 0.6 s (and back); the owner's AI runs it, the other game mirrors position, facing and animation from a 150 ms buffer and switches that enemy's AI head off | Only enemies the client reported having (ENEMY_CLIENT) are handed over; AI is switched back on before any kill, on hand-back, on disconnect and on "Reset Scripts"; every part has an option. Replaced in v0.8: the host runs every enemy (§3.9) |
 | Late arrivals, both ways | Host deaths the client did not witness are re-advertised for 10 min and kill the client's copy when its level spawns it; client kills of enemies the host had not loaded are remembered by the host and applied when they spawn there | Deaths the client saw are never re-advertised, and living host enemies pair first, so a wave enemy spawning where another died is not killed. A host checkpoint reload clears all death records on both sides |
 
 ### 3.7 v0.7: crashes, stutter, lag and loot
@@ -514,6 +519,97 @@ enemy, including the partner's kills, so v0.7 drops the host roll entirely:
   is never rolled for the partner's kills either. Nothing is rolled until the hooks have seen
   one roll of the game's own (otherwise a missed hook would double the loot).
 
+### 3.8 v0.8: enemy sync on the game's own identities
+
+In-game reports of v0.7: enemies one player killed were still alive for the other, enemy
+positions were often wrong on one screen, and enemies spawned differently. v0.8 rebuilds
+enemy sync on how RE4 itself identifies, spawns, kills and persists enemies.
+
+**How this was established.** REFramework had written its type dump (`il2cpp_dump.json`, 1 GB:
+every type, field, method and the address of its compiled code) into the game folder. Its
+addresses still match the current `re4.exe` (checked on getters such as
+`CharacterContext.get_SpawnerID` = `mov rax,[rdx+40h]; ret`). The functions below were cut out
+of `re4.exe` with their `.pdata` bounds into small PE files, decompiled with Ghidra (through
+REA), and their calls named from the dump. Addresses are for the October 2026 build.
+
+| Function (address) | What it does | Consequence |
+|---|---|---|
+| `CharacterSpawnParam._ContextID` (RSZ field) | Serialized in the scene file | Level data: the same on both PCs |
+| `CharacterSpawnParam.createCharacter` (`0x1424C49E0`), `updateSpawn` (`0x142559670`) | `CharacterInstanceCoordinator.requestCreateBody/Head(this._ContextID, kind, Spawner)` and `CharacterLinkCoordinator.requestSpawn(_ContextID, _ContextID, …)` | A level enemy's own `_ID` **and** its `SpawnerID` are that ContextID |
+| `CharacterManager.generateDynamicContextID` (`0x143425CA0`) | `new ContextID(Character, 0, 1, counter)`, counter `& 0x7FF` | Runtime characters live in group 1 (machine-specific); group 12 is level data |
+| `CharacterSpawnParam.isNextSpawn` (`0x1424F0410`) | Reads the live context's `IsEliminated` (`+0x5A`), else `CharacterManager.getBackupData(_ContextID)._IsEliminated`; if set, `invalidateSpawn(true)` and never spawns | Eliminated = gone for good, also after the area reloads |
+| `CharacterContext.eliminate` (`0x140174160`) | `IsEliminated = true` | Marks an enemy as finished |
+| `CharacterSpawnParam.invalidateSpawn` (`0x1424EDB70`) | Status bit 8, then `updateSpawn`: `requestSuspend`, `releaseControl`, `requestDestroyBody/Head` | Despawns the enemy at once: no death, corpse or loot |
+| `CharacterManager.storeContext` (`0x1434C0E00`) / `restoreContext` / `getBackupData` (`0x143427050`) | Backups in `CharacterBackupDB` (ConcurrentDictionary: ContextID code → `CharacterBackup`, saved with the game), written when a character is unlinked (`CharacterLinkInfo.doneUnlink`, `storeContextAll`), restored when it is linked again | The save remembers every enemy (HP, position, `_IsEliminated`) |
+| `CharacterSpawnPointController.getNextSpawnParam` (`0x1419508C0`) | The first pool entry not yet in `SpawnedDataList` | Wave/spawn-point enemies come from a pool of spawn params, each used once: one ContextID = one life |
+| `HitPoint.dead` (`0x14028F870`), `get_IsLive` | `IsHPChanged = 1; CurrentHitPoint = 0`; alive = HP > 0 | A kill is data; the enemy's own logic plays the death |
+| `CharacterInstanceCoordinator` | `HeadPoolList`, `BodyPoolList`, `findUsableHead/Body` | Heads and bodies are pooled and reused by later enemies |
+| `CharacterContext.setTransform` | Sets the context transform, fires `OnChangeTransform`; used by `requestWarp` and spawn relocation | The game's own character teleport (not used yet) |
+| `GmCrow/GmChicken/GmFish/GmBat/GmMouse.RoutineType` | All have `Die`/`Dead` (fish also `Erase`); `GmAnimal._DeadSetFlag` | Animal deaths are detected by `object_sync`; animals themselves: §3.9 |
+
+Everything in `EnemyContextList` derives from `chainsaw.EnemyBaseContext` (Ganados, dogs,
+Novistadors, bosses: ch1/ch4/ch7/ch8 kinds); `ch2` kinds are partner NPCs and are not synced.
+
+**What was wrong, and what v0.8 does instead.**
+
+| Problem | Cause | v0.8 |
+|---|---|---|
+| Enemies paired with the wrong one | Pairing by kind + first-seen position within 3 m; spawn-point controllers place the same enemy at different points on each PC; the exact ID was discarded as "runtime" | Pairing by **uid** (the ContextID code of the enemy's own `_ID`): exact, whatever the positions. Kind + spawn point only for runtime (group 1) enemies |
+| Killed enemies alive for the partner | Deaths re-advertised by position, only those seen during the session | A **graveyard**: every enemy dead in the host's world by uid - deaths it sees, the client's kills of enemies it had not loaded, and, for a joining client, every enemy its save has eliminated (`CharacterBackupDB`, read 48 backups per tick). The client removes them wherever they appear: one dying in front of the player (known ≥ 1 s, within 40 m) is killed with `HitPoint.dead` (death animation, loot); one that just spawned or is far away is **erased** with the game's own `eliminate` + `invalidateSpawn` (never appears, never comes back). An erase the game ignores becomes a kill after 3 s |
+| Enemies frozen or standing still | Heads switched off for mirroring went back to the game's pool switched off when their enemy despawned | The adapter remembers the head it switched off and switches it back on when the enemy leaves the list, gets another head, or the game reloads |
+| Enemies jumping between players, positions that disagree | Each game ran some enemies: ownership moved an enemy between the games with distance and hits | **The host's game runs every enemy** (§3.9): an enemy never changes hands, and the client's copy follows the host's from the moment they pair |
+| A client reload brought enemies back | Nothing re-applied the host's state | A client whose game reloads (same chapter) requests the host's world again: flags, gimmicks, objects and the graveyard |
+
+The UI's enemy section keeps the tweaks that help (master switch, same positions, animation,
+erasing, smoothing, loot, animals) and drops the ones that could only break sync (separate
+HP/death switches, AI-off switch, pairing radius, legacy snapping, and the ownership switches:
+the host runs every enemy).
+
+### 3.9 v0.8: one authority - everything follows the host
+
+The first v0.8 builds still let enemies change hands: each enemy was run by the game of the
+closer player (or of the one fighting it alone), and the other game mirrored it. That is two
+authorities over one enemy, kept apart by hand-over rules. v0.8 drops it: **the host's game
+runs every enemy and every animal; the client's game shows them.**
+
+| What | Host | Client |
+|---|---|---|
+| Enemies the host has loaded | AI, movement, HP and death run normally | Copies paired by uid follow the host's: AI head off (`set_UpdateSelf(false)` on the head GameObject), position, facing and animation from a 100 ms buffer, HP lowered to the host's. Damage the client's player deals goes to the host (ENEMY_DAMAGE); a copy the client kills gets its AI back so its own death plays, and the host kills its enemy |
+| Enemies only the client has loaded | (not spawned yet) | Run by the client's own AI until the host's level spawns them; from then on they follow the host's |
+| Animals within 50 m of both players | Normal | Follow the host's (below) |
+| Deaths | The graveyard (§3.8) | Removed or killed as in §3.8 |
+| Flags, gimmicks, breakables, cutscenes | Shared both ways with the host as referee (§3.6): the client must still be able to open doors and progress | |
+
+Consequence: RE4's enemy AI picks its targets among the characters of its own game. The host's
+enemies only know the host's Leon (the partner's model is visual only, §4.1), so enemies chase
+and attack the host's character, and the client's character is not attacked by enemies the
+host's game has loaded. Making the partner a target in the host's game is on the roadmap (§5).
+
+**Animals.** Established like §3.8 (functions cut out of `re4.exe`, decompiled with Ghidra
+through REA; addresses for the October 2026 build):
+
+| Function (address) | What it does | Consequence |
+|---|---|---|
+| `GmCrow`, `GmChicken`, `GmFish`, `GmBat`, `GmMouse` | Derive from `chainsaw.GmAnimal` → `GmBase` → `via.Behavior`; `GmAnimal._Motion` is a `via.motion.Motion` | The animals; their animation is an ordinary motion layer |
+| `GmAnimal.lateUpdate` (`0x140749DD0`) | Only pauses and resumes the Motion during the game's pauses | Switching the animal component off would not stop its AI |
+| `GimmickCore.update` (`0x142219040`) | Registers the gimmick, then (state 2) calls `onGimmickMove` on every `IGimmickOnMove` in `_GimmickMove`. When `GimmickManager` has its updater behaviour (`_Bhv`), the core calls `registerMove(core)`, sets `_HasRegisteredMove` and switches itself off (`ComponentEnableMediator.request(core, false, …)`) | A gimmick's AI normally runs from `GimmickManager`'s move list |
+| `GmBase.onGimmickMove` (`0x14044F4A0`) | Tail call to the virtual `updateGimmick` | `updateGimmick` is the animal's AI (`GmCrow.updateGimmick` `0x14254F6F0` switches on `_Routine`) |
+| `GimmickManager.registerMove` (`0x141022470`), `unregisterMove` (`0x14105F8B0`) | Add / remove the core in `_Move` under `_LockMove`, then `_RenewMoveArray = true` | Taking a core off the list stops that animal's AI; putting it back resumes it |
+| `GimmickCore.finish` (`0x142183410`) | The only caller of `unregisterMove`; clears `_HasRegisteredMove` | A core whose flag went false was finished by the game and must never be registered again |
+| `GmCrow.onHitDamage` (`0x142502EB0`) | Called from the hit system; ends with `set_Routine(Die)` | A shot kills an animal even while its AI is off the list; the death plays once it is back |
+| `GmCrow.set_Routine` (`0x142530960`), `updateDie` (`0x14254DD10`) | `_Routine = value`, step counter 0; Die: die motion, fall, effects, then the gimmick flag | The death the mod applies is the game's own entry into it: `set_Routine(Die)` |
+| `RoutineType` values | Crow Die 7, Dead 8 (some deaths end in Loop 10); chicken 6/7; fish 4/5 (Erase 6); bat 2/3; mouse 6/7 | "Dead" = a routine named Die/Dead, read from the enum at runtime |
+
+So the client takes its copy of each host animal off `GimmickManager`'s move list (or switches
+its core off when it updates itself), writes the host animal's position and rotation every frame
+(every third frame beyond 20 m) and plays its animation (`changeMotion` on layer 0). It looks at
+the copy's routine ten times a second: a copy the client's player shot goes back on the list at
+once to play its death, and the kill goes to the host as OBJECTS. A host animal that dies is put
+back and given `set_Routine(Die)` where it followed the host's. Leaving, disconnecting, a reload
+and "Reset Scripts" put every animal back, unless its GameObject is gone or the game finished its
+gimmick. Animals are found in the breakables' scan (§3.6) and paired by GameObject GUID. Before
+this, the partner's kill only hid an animal (no animal has a kill method); now it dies.
+
 ## 4. Sync architecture
 
 ```
@@ -524,7 +620,7 @@ enemy, including the partner's kills, so v0.7 drops the host roll entirely:
  │  session ─ enemy_sync  │   PLAYER (20 Hz, unrel.)  │  session ─ enemy_sync  │
  │   items, drops, gate   │   POSE / AVATAR / ACTIONS │   items, drops, gate   │
  │   flag/gimmick/object/ │   ENEMY_SNAPSHOT (15 Hz)  │   flag/gimmick/object/ │
- │   cutscene sync        │   ENEMY_CLIENT (20 Hz)    │   cutscene sync        │
+ │   animal/cutscene sync │   ENEMY_CLIENT, ANIMALS   │   animal/cutscene sync │
  │   travel               │   ENEMY_DAMAGE/DEAD/HIT   │   travel               │
  │  game / game_world /   │   FLAGS, FLAG_WORDS,      │  game / game_world /   │
  │  game_pause (sdk)      │   GIMMICKS, OBJECTS,      │  game_pause (sdk)      │
@@ -544,22 +640,26 @@ enemy, including the partner's kills, so v0.7 drops the host roll entirely:
   the past for smooth interpolation. Details in §4.1. Name tag, distance and HP bar are drawn on
   top.
 * **Enemies: one shared set.**
-  * Identity: the host numbers its enemies. The client pairs each with its own copy by **kind +
-    spawn point** (deterministic level spawns), or by the enemy's **spawner ContextID** once
-    spawner IDs have proven reliable (§3.3). Living host enemies are paired first.
+  * Identity: every level enemy's own ContextID (its spawn param's, level data) is its **uid**
+    on both machines; the host numbers its enemies for the wire and the client pairs by uid.
+    Runtime enemies are paired by kind + spawn point (§3.8).
   * Health and death: the host is authoritative. Client damage is detected by HP polling and
-    sent as `ENEMY_DAMAGE`; the client only ever lowers HP and applies deaths. Deaths the client
-    did not witness are re-advertised, and kills the host could not match wait for the enemy to
-    spawn on the host (§3.6).
-  * Movement and AI: each enemy is **owned** by the machine whose player is closer (2 m
-    hysteresis, 0.6 s hold). The owner's AI runs it; the other machine **mirrors** it every
-    frame (position, facing, animation) with its AI head switched off. So an enemy near the
-    client attacks the client for real, and both see it in the same place doing the same thing.
-  * Hits each player lands are replayed (cosmetically) on the other side's copy, and the host's
-    random roll decides enemy drops for both (§3.5).
+    sent as `ENEMY_DAMAGE`; the client only ever lowers HP. Deaths go through the host's
+    **graveyard** (every enemy dead in its world, also from its save): the client kills or
+    erases those enemies wherever they appear, and the host erases enemies the client killed
+    where it had not loaded them (§3.8).
+  * Movement and AI: **the host's game runs every enemy**; nothing changes hands. The client's
+    copy of each enemy the host has loaded **follows** it every frame (position, facing,
+    animation) with its AI head switched off; enemies the host has not loaded yet run in the
+    client's game until the host's level spawns them (§3.9).
+  * Hits each player lands are sent to the other side (tracers, optional cosmetic replay), and
+    each player rolls their own loot from every enemy that dies in their game (§3.7).
+* **Animals: the host's** (§3.9). The client's copies of the host's animals near both players
+  follow them, AI off the game's update; deaths cross both ways.
 * **World: event + state replication** (§3.6): scenario flags by GUID through the game's own
-  setter, gimmick records by ContextID, breakables and animals by GameObject GUID, cutscenes by
-  timeline event ID.
+  setter, gimmick records by ContextID, breakables and animal deaths by GameObject GUID,
+  cutscenes by timeline event ID. Both sides can change the world (the client has to open doors
+  too); the host's state is what a joining or reloading client takes over.
 * **No pauses in co-op** (§3.6): menu pauses freeze nothing while hosting or connected.
 * **Key items exist once** (§3.2, §3.3): whoever picks one up keeps it, and the partner's copy
   is removed.
@@ -637,18 +737,28 @@ joint.
 different chapters, and when no pose arrived for 3 s. If the game unloads the copy with an area,
 it is rebuilt.
 
-### 4.2 Known limitations (v0.7)
+### 4.2 Known limitations (v0.8)
 
 * v0.6 crashed in game; v0.7 removes the causes we found (§3.7), but has not been run in game
   yet. After a crash, `re4coop_breadcrumb.json` names the last thing the mod did.
 * Most of this has not been verified in the running game yet. The riskiest assumptions are that the
   body prefab can be spawned outside the game's character spawner once its logic is disabled
   (*Build partner from meshes only* is the escape hatch), that switching an enemy's AI head off
-  leaves its body and HitController working (*...with their AI switched off* is the switch),
-  and that the probed flag/gimmick/cutscene methods are the ones named in §3.6 (*Diagnostics*).
-* The copy is visual only: no collision, enemies don't see it, bullets pass through it. An
-  enemy chasing the partner is run by the partner's game (ownership), so it does not target the
-  copy on yours.
+  leaves its body and HitController working (*Client: enemies stand and move where the host's are* switches
+  mirroring off), and that the probed flag/gimmick/cutscene methods are the ones named in §3.6
+  (*Diagnostics*). The enemy identity, kill and erase calls of §3.8 come from the game's code,
+  but have not run in the game yet either.
+* Enemies the client's *own* save has eliminated but the host's world has alive cannot be
+  brought back in the client's game: the host fights them alone (the client sees nothing
+  there). Joining with an older save than the host avoids it.
+* After a host checkpoint reload the host's enemies come back; enemies the client already
+  removed stay gone in the client's game.
+* The copy is visual only: no collision, enemies don't see it, bullets pass through it. The
+  host's game runs every enemy, and its enemies only target the host's character: the client's
+  character is not attacked by enemies the host has loaded (§3.9).
+* Animal puppets rely on `GimmickManager.unregisterMove`/`registerMove` (§3.9), not yet run in
+  the game; *Options → Animals near both players…* switches them off. Animals placed at runtime
+  (not from the scene file) may have GUIDs that differ between the games: those run on their own.
 * Sounds the engine plays without going through the reflected `trigger` methods are not
   replayed. Thrown grenades, projectiles, bullet impacts and blood happen only in the thrower's
   game.
@@ -667,17 +777,21 @@ it is rebuilt.
 
 ## 5. Roadmap
 
-1. **In-game validation of v0.7** with the checklist in [TESTING.md](TESTING.md): the
-   profiler's numbers, the breadcrumb file after any crash, `drop_calls` in the research log,
-   then switching the experimental features on one at a time.
-2. Shared checkpoints: when one player dies, both reload (RE5/RE6 style), or the other revives
+1. **In-game validation of v0.8** with the checklist in [TESTING.md](TESTING.md), enemies
+   first (steps 12-14: `enemy_uid`, `enemy_erase`, `enemy_backups`), then the profiler's
+   numbers, the breadcrumb file after any crash, `drop_calls` in the research log, and the
+   experimental features one at a time.
+2. Enemy positions through `CharacterContext.setTransform` (the game's own character teleport)
+   if the transform write proves jittery in game.
+3. Shared checkpoints: when one player dies, both reload (RE5/RE6 style), or the other revives
    them.
-3. Event-driven damage via `chainsaw.EnemyManager.notifyHitDamage` hooks, to remove polling
+4. Event-driven damage via `chainsaw.EnemyManager.notifyHitDamage` hooks, to remove polling
    latency.
-4. Replicate thrown objects (grenades, eggs, bolts) and hit effects on enemies.
-5. The partner's model as an enemy target (`HateController.find/addHate`), so enemies run by
-   your game can also turn on the partner standing next to you.
-6. Optional Steam networking transport for NAT traversal.
+5. Replicate thrown objects (grenades, eggs, bolts) and hit effects on enemies.
+6. Enemies that attack the client: the partner's model as a target in the host's game
+   (`HateController.find/addHate` on a stand-in character), with the hits it takes sent to the
+   client as damage.
+7. Optional Steam networking transport for NAT traversal.
 
 ## Sources
 

@@ -4,12 +4,15 @@ local T = require("testlib")
 local P = require("re4coop.protocol")
 local EnemySync = require("re4coop.enemy_sync")
 
-local function make_world(id_base)
-    local w = { enemies = {}, next_id = id_base, calls = { set_hp = 0, kill = 0, move = 0 } }
+local GANADO, DOG, CHIEF = "chainsaw.Ch1c0z0Context", "chainsaw.Ch1d1z1Context", "chainsaw.Ch1d0z0Context"
 
-    function w:spawn(kind, x, y, z, hp, ctx)
-        local e = { id = self.next_id, kind = kind, pos = { x = x, y = y, z = z }, yaw = 0, hp = hp or 100,
-            max_hp = hp or 100, alive = true, ctx = ctx }
+local function make_world(id_base)
+    local w = { enemies = {}, next_id = id_base, calls = { set_hp = 0, kill = 0, erase = 0 }, save_dead = nil }
+
+    -- uid: the enemy's level identity (the same on both machines), nil for runtime enemies.
+    function w:spawn(kind, x, y, z, hp, uid)
+        local e = { id = self.next_id, kind = kind, uid = uid, pos = { x = x, y = y, z = z }, yaw = 0,
+            hp = hp or 100, max_hp = hp or 100, alive = true }
         self.next_id = self.next_id + 1
         table.insert(self.enemies, e)
         return e
@@ -36,8 +39,8 @@ local function make_world(id_base)
     function w:list()
         local out = {}
         for _, e in ipairs(self.enemies) do
-            out[#out + 1] = { id = e.id, kind = e.kind, pos = { x = e.pos.x, y = e.pos.y, z = e.pos.z },
-                yaw = e.yaw, hp = e.hp, max_hp = e.max_hp, alive = e.alive, ctx = e.ctx, motion = e.motion }
+            out[#out + 1] = { id = e.id, kind = e.kind, uid = e.uid, pos = { x = e.pos.x, y = e.pos.y, z = e.pos.z },
+                yaw = e.yaw, hp = e.hp, max_hp = e.max_hp, alive = e.alive, motion = e.motion }
         end
         return out
     end
@@ -54,9 +57,22 @@ local function make_world(id_base)
     function w:enemy_kill(id)
         local e = self:get(id)
         if not e then return false end
+        if self.refuse_kill then return false end
         self.calls.kill = self.calls.kill + 1
         e.hp = 0
         e.alive = false
+        e.killed = true
+        return true
+    end
+
+    -- Erasing despawns the enemy (it leaves the list). no_erase: the enemy has no spawn
+    -- param; erase_ignored: the game accepted the call but the enemy stayed.
+    function w:enemy_erase(id)
+        local e = self:get(id)
+        if not e or self.no_erase then return false end
+        self.calls.erase = self.calls.erase + 1
+        e.erased = true
+        if not self.erase_ignored then self:remove(e) end
         return true
     end
 
@@ -77,12 +93,13 @@ local function make_world(id_base)
         return e and e.hp or nil
     end
 
-    function w:enemy_set_position(id, pos)
-        local e = self:get(id)
-        if not e then return false end
-        self.calls.move = self.calls.move + 1
-        e.pos = { x = pos.x, y = pos.y, z = pos.z }
-        return true
+    -- The save's eliminated enemies, read over several calls like the real backup table.
+    function w:scan_eliminated(budget)
+        if self.save_dead == nil then return true, {} end
+        self.scan_calls = (self.scan_calls or 0) + 1
+        if self.scan_calls < 3 then return false, nil end
+        self.scan_calls = 0
+        return true, self.save_dead
     end
 
     return w
@@ -90,59 +107,131 @@ end
 
 local function make_pair(settings)
     settings = settings or {}
-    for k, v in pairs({ sync_hp = true, sync_deaths = true, snapshot_hz = 10, match_radius = 3.0, snap_distance = 0,
-        replay_partner_hits = true }) do
+    for k, v in pairs({ snapshot_hz = 10, replay_partner_hits = true }) do
         if settings[k] == nil then settings[k] = v end
     end
     local pair = { now = 0, host_world = make_world(1000), client_world = make_world(5000), to_host = {}, to_client = {},
-        traffic = { host = 0, client = 0 } }
+        traffic = { host = 0, client = 0 }, host_kills = {}, client_kills = {},
+        host_player = { x = 0, y = 0, z = -5 }, client_player = { x = 0, y = 0, z = -5 } }
     pair.host = EnemySync.new({ role = "host", protocol = P, settings = settings,
-        send = function(bytes) table.insert(pair.to_client, bytes) pair.traffic.host = pair.traffic.host + 1 end })
+        send = function(bytes) table.insert(pair.to_client, bytes) pair.traffic.host = pair.traffic.host + 1 end,
+        on_kill = function(id) pair.host_kills[#pair.host_kills + 1] = id end })
     pair.client = EnemySync.new({ role = "client", protocol = P, settings = settings,
-        send = function(bytes) table.insert(pair.to_host, bytes) pair.traffic.client = pair.traffic.client + 1 end })
+        send = function(bytes) table.insert(pair.to_host, bytes) pair.traffic.client = pair.traffic.client + 1 end,
+        on_kill = function(id) pair.client_kills[#pair.client_kills + 1] = id end })
+
+    function pair:deliver_to_client()
+        for _, bytes in ipairs(self.to_client) do
+            self.client:on_message(assert(P.decode(bytes)), self.now, self.client_world)
+        end
+        self.to_client = {}
+    end
+
+    function pair:deliver_to_host()
+        for _, bytes in ipairs(self.to_host) do
+            self.host:on_message(assert(P.decode(bytes)), self.now, self.host_world)
+        end
+        self.to_host = {}
+    end
 
     function pair:step(n)
         for _ = 1, n or 1 do
             self.now = self.now + 0.05
-            self.host:tick(self.now, self.host_world:list(), self.host_world)
-            for _, bytes in ipairs(self.to_client) do
-                self.client:on_message(assert(P.decode(bytes)), self.now, self.client_world)
-            end
-            self.to_client = {}
-            self.client:tick(self.now, self.client_world:list(), self.client_world)
-            for _, bytes in ipairs(self.to_host) do
-                self.host:on_message(assert(P.decode(bytes)), self.now, self.host_world)
-            end
-            self.to_host = {}
+            local host_players = { local_pos = self.host_player, partner_pos = self.client_player }
+            self.host:tick(self.now, self.host_world:list(), self.host_world, host_players)
+            self.host:frame(self.now, self.host_world)
+            self:deliver_to_client()
+            self.client:tick(self.now, self.client_world:list(), self.client_world,
+                { local_pos = self.client_player, partner_pos = self.host_player })
+            self.client:frame(self.now, self.client_world)
+            self:deliver_to_host()
         end
     end
 
     return pair
 end
 
--- The same level spawned on two machines: same kinds/spawn points (tiny jitter), different
--- object ids and list order.
+-- The same level spawned on two machines: same uids, but each game placed its enemies on
+-- its own (different positions, ids and list order).
 local function standard_level(pair)
     local h, c = {}, {}
-    h.a = pair.host_world:spawn("chainsaw.Ch1c0z0Context", 0, 0, 0)
-    h.b = pair.host_world:spawn("chainsaw.Ch1c0z0Context", 10, 0, 0)
-    h.c = pair.host_world:spawn("chainsaw.Ch1d0z0Context", 0, 0, 10, 300)
-    c.c = pair.client_world:spawn("chainsaw.Ch1d0z0Context", 0.2, 0, 10.1, 300)
-    c.b = pair.client_world:spawn("chainsaw.Ch1c0z0Context", 10.3, 0, -0.2)
-    c.a = pair.client_world:spawn("chainsaw.Ch1c0z0Context", -0.4, 0.1, 0.3)
+    h.a = pair.host_world:spawn(GANADO, 0, 0, 0, 100, 0x1001)
+    h.b = pair.host_world:spawn(GANADO, 10, 0, 0, 100, 0x1002)
+    h.c = pair.host_world:spawn(CHIEF, 0, 0, 10, 300, 0x1003)
+    c.c = pair.client_world:spawn(CHIEF, 0.2, 0, 10.1, 300, 0x1003)
+    c.b = pair.client_world:spawn(GANADO, 10.3, 0, -0.2, 100, 0x1002)
+    c.a = pair.client_world:spawn(GANADO, -0.4, 0.1, 0.3, 100, 0x1001)
     return h, c
 end
 
-T.run("pairs_enemies_by_kind_and_spawn", function()
+-------------------------------------------------------------------------------
+-- Identity
+-------------------------------------------------------------------------------
+
+T.run("pairs_by_level_identity_wherever_each_game_put_them", function()
     local pair = make_pair()
-    local h, c = standard_level(pair)
+    -- A spawn point controller put the same three villagers at different points on each
+    -- machine, in a different order: spawn positions say nothing, the uid says everything.
+    local ha = pair.host_world:spawn(GANADO, 0, 0, 0, 100, 0x2001)
+    local hb = pair.host_world:spawn(GANADO, 1, 0, 0, 100, 0x2002)
+    local hc = pair.host_world:spawn(GANADO, 2, 0, 0, 100, 0x2003)
+    local cc = pair.client_world:spawn(GANADO, 40, 0, 7, 100, 0x2003)
+    local ca = pair.client_world:spawn(GANADO, 1, 0, 0, 100, 0x2001)
+    local cb = pair.client_world:spawn(GANADO, 0, 0, 0, 100, 0x2002) -- standing exactly where the host's A is
     pair:step(5)
-    local cl = pair.client
-    T.eq(cl.net_of[c.a.id], pair.host.net_of[h.a.id], "A paired with A")
-    T.eq(cl.net_of[c.b.id], pair.host.net_of[h.b.id], "B paired with B")
-    T.eq(cl.net_of[c.c.id], pair.host.net_of[h.c.id], "C paired with C")
-    T.eq(cl:summary().paired, 3, "3 pairs")
+    local cl, ho = pair.client, pair.host
+    T.eq(cl.net_of[ca.id], ho.net_of[ha.id], "A paired with A")
+    T.eq(cl.net_of[cb.id], ho.net_of[hb.id], "B paired with B, not with the A standing on its spot")
+    T.eq(cl.net_of[cc.id], ho.net_of[hc.id], "C paired with C 40 m away")
+    T.eq(cl.counters.uid_pairs, 3, "all three by uid")
+    T.eq(cl.counters.spatial_pairs, 0, "none by position")
 end)
+
+T.run("different_enemies_never_pair_even_on_the_same_spot", function()
+    local pair = make_pair()
+    pair.host_world:spawn(GANADO, 0, 0, 0, 100, 0x3001)
+    local other = pair.client_world:spawn(GANADO, 0, 0, 0, 100, 0x3002)
+    local runtime = pair.client_world:spawn(GANADO, 0.1, 0, 0, 100, nil)
+    pair:step(10)
+    T.eq(pair.client.net_of[other.id], nil, "another level enemy is never taken for it")
+    T.eq(pair.client.net_of[runtime.id], nil, "nor a runtime enemy")
+end)
+
+T.run("runtime_enemies_pair_by_kind_and_spawn_point", function()
+    local pair = make_pair()
+    local h1 = pair.host_world:spawn(GANADO, 0, 0, 0, 100, nil)
+    local h2 = pair.host_world:spawn(GANADO, 6, 0, 0, 100, nil)
+    local c2 = pair.client_world:spawn(GANADO, 6.3, 0, 0, 100, nil)
+    local c1 = pair.client_world:spawn(GANADO, 0.2, 0, 0, 100, nil)
+    local far = pair.client_world:spawn(GANADO, 30, 0, 0, 100, nil)
+    local dog = pair.client_world:spawn(DOG, 0, 0, 0.5, 100, nil)
+    pair:step(5)
+    T.eq(pair.client.net_of[c1.id], pair.host.net_of[h1.id], "first by position")
+    T.eq(pair.client.net_of[c2.id], pair.host.net_of[h2.id], "second by position")
+    T.eq(pair.client.net_of[far.id], nil, "too far is not the same enemy")
+    T.eq(pair.client.net_of[dog.id], nil, "another kind is not the same enemy")
+    T.eq(pair.client.counters.spatial_pairs, 2, "counted")
+end)
+
+T.run("a_reused_context_is_a_new_enemy", function()
+    local pair = make_pair()
+    local h = pair.host_world:spawn(GANADO, 0, 0, 0, 100, 0x4001)
+    local c = pair.client_world:spawn(GANADO, 0, 0, 0, 100, 0x4001)
+    pair:step(5)
+    T.check(pair.client.net_of[c.id] ~= nil, "paired")
+    -- The game gives the same context to another enemy (pooled): different uid.
+    c.uid = 0x4002
+    pair:step(3)
+    T.eq(pair.client.net_of[c.id], nil, "no longer paired with the old enemy")
+    local h2 = pair.host_world:spawn(GANADO, 5, 0, 0, 100, 0x4002)
+    pair:step(5)
+    T.eq(pair.client.net_of[c.id], pair.host.net_of[h2.id], "paired with its new identity")
+    T.check(h.alive, "nothing died")
+end)
+
+-------------------------------------------------------------------------------
+-- Health and deaths during a fight
+-------------------------------------------------------------------------------
 
 T.run("client_damage_applies_on_host_without_echo", function()
     local pair = make_pair()
@@ -160,13 +249,16 @@ end)
 T.run("host_damage_and_kill_mirror_on_client", function()
     local pair = make_pair()
     local h, c = standard_level(pair)
-    pair:step(5)
+    pair:step(25) -- the client has seen its enemies for a while (a fight in progress)
     pair.host_world:damage(h.b, 55)
     pair:step(3)
     T.eq(c.b.hp, 45, "client HP lowered to host value")
     pair.host_world:damage(h.c, 1000)
     pair:step(3)
-    T.eq(c.c.alive, false, "client copy killed")
+    T.eq(c.c.alive, false, "client copy died")
+    T.eq(c.c.killed, true, "with its own death (in front of the player)")
+    T.eq(c.c.erased, nil, "not erased")
+    T.eq(#pair.client_kills, 1, "the client rolls its own loot for it")
     T.eq(pair.client.counters.damage_sent, 0, "mirroring never reports back as damage")
     T.eq(h.a.hp, 100, "untouched enemy stays full")
 end)
@@ -179,176 +271,25 @@ T.run("client_kill_is_authoritative", function()
     pair:step(5)
     T.eq(h.c.alive, false, "host enemy dies from the client's lethal hit")
     T.eq(pair.host_world.calls.kill, 1, "one kill call on host")
+    T.eq(#pair.host_kills, 1, "the host rolls its own loot for it")
+    pair:step(10)
+    T.eq(pair.client_world.calls.kill, 0, "the client is not asked to kill it again")
 end)
 
-T.run("damage_before_pairing_is_matched_by_spawn", function()
+T.run("damage_before_pairing_is_matched_by_uid", function()
     local pair = make_pair()
     local h, c = standard_level(pair)
-    -- The client has seen A once (HP baseline) but no host snapshot has arrived yet, so the
-    -- first report goes out with net_id 0 and the host must find A by kind + spawn point.
-    -- (Damage dealt before an enemy is observed at all has no baseline and is not reported.)
+    -- The client has seen A once (HP baseline) but no host snapshot has arrived yet: the
+    -- report goes out without a net id and the host finds A by its uid.
     pair.client:tick(pair.now, pair.client_world:list(), pair.client_world)
     pair.client_world:damage(c.a, 10)
-    pair:step(1)
-    pair.client_world:damage(c.a, 15)
-    pair:step(5)
-    T.eq(h.a.hp, 75, "both hits landed on the right host enemy")
-end)
-
-T.run("late_arrival_sees_enemies_host_already_killed", function()
-    local pair = make_pair()
-    local h, c = standard_level(pair)
-    local hd = pair.host_world:spawn("chainsaw.Ch1c0z0Context", 50, 0, 50)
-    pair:step(5)
-    pair.host_world:damage(hd, 500) -- host clears the next room alone...
-    pair:step(5)
-    pair.host_world:remove(hd)      -- ...and the corpse despawns from the host's list
-    pair:step(10)
-    local cd = pair.client_world:spawn("chainsaw.Ch1c0z0Context", 50.5, 0, 49.8) -- client arrives
-    pair:step(12)
-    T.eq(cd.alive, false, "client's copy of the already-killed enemy is removed")
-    T.eq(c.a.alive, true, "others unaffected")
-end)
-
-T.run("unmatched_enemies_are_left_alone", function()
-    local pair = make_pair()
-    standard_level(pair)
-    local only_client = pair.client_world:spawn("chainsaw.Ch1c0z0Context", 100, 0, 100)
-    local wrong_kind = pair.client_world:spawn("chainsaw.Ch4b0z0Context", 0, 0, 0)
-    local only_host = pair.host_world:spawn("chainsaw.Ch1c0z0Context", -80, 0, 0)
-    pair:step(10)
-    T.eq(pair.client.net_of[only_client.id], nil, "client-only enemy unpaired")
-    T.eq(pair.client.net_of[wrong_kind.id], nil, "different kind at same spot unpaired")
-    pair.host_world:damage(only_host, 1000)
-    pair:step(5)
-    T.eq(only_client.alive and wrong_kind.alive, true, "nothing killed by mistake")
-end)
-
-T.run("position_snapping_when_enabled", function()
-    local pair = make_pair({ snap_distance = 2.0 })
-    local h, c = standard_level(pair)
-    pair:step(5)
-    h.b.pos = { x = 20, y = 0, z = 0 } -- host's copy chased the host 10 m away
-    pair:step(3)
-    T.near(c.b.pos.x, 20, 1e-4, "client copy moved to host position")
-    local moves = pair.client_world.calls.move
-    pair:step(10)
-    T.eq(pair.client_world.calls.move, moves, "no repeated snapping once close")
-end)
-
--- Three enemies that both machines see near their spawn points: spatial pairing succeeds
--- and, since their spawner IDs agree, builds trust in spawner pairing.
-local function build_spawner_trust(pair)
-    for i = 1, 3 do
-        local k = { category = 3, kind = 0, group = 900, index = i }
-        pair.host_world:spawn("chainsaw.Ch1c0z0Context", 100 + i * 10, 0, 0, 100, k)
-        pair.client_world:spawn("chainsaw.Ch1c0z0Context", 100 + i * 10 + 0.5, 0, 0, 100, k)
-    end
-    pair:step(5)
-end
-
-T.run("pairs_by_spawner_id_once_trusted", function()
-    local pair = make_pair()
-    build_spawner_trust(pair)
-    T.check(pair.client:spawner_trusted(), "trusted after 3 agreeing spatial pairs")
-    -- The client arrived later and saw these 8-12 m from where the host first saw them:
-    -- spatial pairing would fail (3 m radius), the spawner ID does not.
-    local ka, kb = { category = 3, kind = 0, group = 300, index = 1 }, { category = 3, kind = 0, group = 300, index = 2 }
-    local ha = pair.host_world:spawn("chainsaw.Ch1c0z0Context", 0, 0, 0, 100, ka)
-    local hb = pair.host_world:spawn("chainsaw.Ch1c0z0Context", 1, 0, 0, 100, kb)
-    local cb = pair.client_world:spawn("chainsaw.Ch1c0z0Context", 9, 0, 6, 100, kb)
-    local ca = pair.client_world:spawn("chainsaw.Ch1c0z0Context", 12, 0, 0, 100, ka)
-    pair:step(5)
-    T.eq(pair.client.net_of[ca.id], pair.host.net_of[ha.id], "A paired by spawner")
-    T.eq(pair.client.net_of[cb.id], pair.host.net_of[hb.id], "B paired by spawner (not swapped)")
-    T.check(pair.client.counters.id_matches >= 2, "spawner matches counted")
-    pair.client_world:damage(cb, 25)
-    pair:step(5)
-    T.eq(hb.hp, 75, "damage lands on the right enemy")
-    T.eq(ha.hp, 100, "not on the other one")
-end)
-
-T.run("spawner_ids_unused_until_trusted", function()
-    local pair = make_pair()
-    local k = { category = 3, kind = 0, group = 300, index = 1 }
-    pair.host_world:spawn("chainsaw.Ch1c0z0Context", 0, 0, 0, 100, k)
-    local c = pair.client_world:spawn("chainsaw.Ch1c0z0Context", 12, 0, 0, 100, k)
-    pair:step(5)
-    T.eq(pair.client.net_of[c.id], nil, "no pairing by an unproven ID")
-end)
-
-T.run("one_disagreement_disables_spawner_pairing", function()
-    local pair = make_pair()
-    build_spawner_trust(pair)
-    -- An enemy that both see at the same spot, but the spawner IDs differ: IDs are not a
-    -- reliable cross-machine identity after all.
-    pair.host_world:spawn("chainsaw.Ch1c0z0Context", 300, 0, 0, 100, { category = 3, kind = 0, group = 1, index = 1 })
-    pair.client_world:spawn("chainsaw.Ch1c0z0Context", 300.2, 0, 0, 100, { category = 3, kind = 0, group = 1, index = 2 })
-    pair:step(5)
-    T.check(not pair.client:spawner_trusted(), "trust revoked")
-    local k = { category = 3, kind = 0, group = 77, index = 7 }
-    pair.host_world:spawn("chainsaw.Ch1c0z0Context", 400, 0, 0, 100, k)
-    local c = pair.client_world:spawn("chainsaw.Ch1c0z0Context", 412, 0, 0, 100, k)
-    pair:step(5)
-    T.eq(pair.client.net_of[c.id], nil, "no spawner pairing after a disagreement")
-end)
-
-T.run("shared_spawner_id_pairs_by_position_only", function()
-    local pair = make_pair()
-    build_spawner_trust(pair)
-    -- A wave spawner created two enemies: same spawner ID, so the ID identifies neither.
-    local k = { category = 3, kind = 0, group = 55, index = 1 }
-    local h1 = pair.host_world:spawn("chainsaw.Ch1c0z0Context", 0, 0, 0, 100, k)
-    local h2 = pair.host_world:spawn("chainsaw.Ch1c0z0Context", 6, 0, 0, 100, k)
-    local c2 = pair.client_world:spawn("chainsaw.Ch1c0z0Context", 6.3, 0, 0, 100, k)
-    local c1 = pair.client_world:spawn("chainsaw.Ch1c0z0Context", 0.2, 0, 0, 100, k)
-    pair:step(5)
-    T.eq(pair.client.net_of[c1.id], pair.host.net_of[h1.id], "first paired by position")
-    T.eq(pair.client.net_of[c2.id], pair.host.net_of[h2.id], "second paired by position")
-end)
-
-T.run("context_id_guarded_by_kind_and_distance", function()
-    local pair = make_pair()
-    local k = { category = 2, kind = 1, group = 50, index = 9 }
-    pair.host_world:spawn("chainsaw.Ch1c0z0Context", 0, 0, 0, 100, k)
-    local wrong_kind = pair.client_world:spawn("chainsaw.Ch1d0z0Context", 0, 0, 0, 100, k)
-    local too_far = pair.client_world:spawn("chainsaw.Ch1c0z0Context", 60, 0, 0, 100, k)
-    pair:step(5)
-    T.eq(pair.client.net_of[wrong_kind.id], nil, "same ID but different kind is not paired")
-    T.eq(pair.client.net_of[too_far.id], nil, "same ID but 60 m away is not paired")
-end)
-
-T.run("unpaired_damage_found_by_context_id", function()
-    local pair = make_pair()
-    -- Untrusted: the report carries no spawner ID.
-    local k0 = { category = 3, kind = 0, group = 6, index = 6 }
-    pair.host_world:spawn("chainsaw.Ch1c0z0Context", 500, 0, 0, 100, k0)
-    local c0 = pair.client_world:spawn("chainsaw.Ch1c0z0Context", 510, 0, 0, 100, k0)
-    pair.client:tick(pair.now, pair.client_world:list(), pair.client_world)
-    pair.client_world:damage(c0, 5)
-    pair.client:tick(pair.now + 0.05, pair.client_world:list(), pair.client_world)
-    T.eq(assert(P.decode(pair.to_host[1])).ctx, nil, "no spawner ID before trust")
-    pair.to_host = {}
-    build_spawner_trust(pair)
-    pair.to_host = {}
-    local k = { category = 2, kind = 1, group = 7, index = 7 }
-    local h = pair.host_world:spawn("chainsaw.Ch1c0z0Context", 0, 0, 0, 100, k)
-    local c = pair.client_world:spawn("chainsaw.Ch1c0z0Context", 10, 0, 0, 100, k)
-    pair.client:tick(pair.now, pair.client_world:list(), pair.client_world) -- baseline, no snapshot yet
-    pair.client_world:damage(c, 40)
-    pair.client:tick(pair.now + 0.05, pair.client_world:list(), pair.client_world)
-    local reports = {}
-    for _, bytes in ipairs(pair.to_host) do
-        local msg = assert(P.decode(bytes))
-        if msg.type == P.T.ENEMY_DAMAGE then reports[#reports + 1] = msg end
-    end
-    T.eq(#reports, 1, "report sent before pairing")
-    local m = reports[1]
-    T.eq(m.net_id, 0, "no net id yet")
-    T.eq(P.ctx_key(m.ctx), "2:1:7:7", "carries ContextID")
     pair.host:tick(pair.now, pair.host_world:list(), pair.host_world)
-    pair.host:on_message(m, pair.now, pair.host_world)
-    T.eq(h.hp, 60, "host matched it by ContextID although spawns are 10 m apart")
+    pair.client:tick(pair.now + 0.01, pair.client_world:list(), pair.client_world)
+    local report = assert(P.decode(pair.to_host[#pair.to_host]))
+    T.eq(report.net_id, 0, "no net id yet")
+    T.eq(report.uid, 0x1001, "carries the uid")
+    pair:deliver_to_host()
+    T.eq(h.a.hp, 90, "landed on the right host enemy")
 end)
 
 T.run("failed_hp_writes_are_counted", function()
@@ -363,6 +304,302 @@ T.run("failed_hp_writes_are_counted", function()
     T.eq(pair.host.counters.damage_failed, 1, "host could not apply the client's damage")
     T.check(pair.client.counters.hp_failed >= 1, "client could not mirror host HP")
 end)
+
+T.run("host_damage_between_ticks_is_not_overwritten", function()
+    local pair = make_pair()
+    local h, c = standard_level(pair)
+    pair:step(3)
+    -- The client's 20 damage report arrives right after the host shot the same enemy for 30,
+    -- before the host's next enemy scan.
+    pair.client_world:damage(c.a, 20)
+    pair.client:tick(pair.now, pair.client_world:list(), pair.client_world)
+    pair.host_world:damage(h.a, 30)
+    pair:deliver_to_host()
+    T.eq(h.a.hp, 50, "both hits count (100 - 30 - 20)")
+end)
+
+-------------------------------------------------------------------------------
+-- Enemies dead in the partner's world
+-------------------------------------------------------------------------------
+
+T.run("enemies_the_host_killed_never_appear_for_a_late_client", function()
+    local pair = make_pair()
+    standard_level(pair)
+    local hd = pair.host_world:spawn(GANADO, 50, 0, 50, 100, 0x5001)
+    pair:step(5)
+    pair.host_world:damage(hd, 500) -- the host clears the next room alone...
+    pair:step(5)
+    pair.host_world:remove(hd)      -- ...and the corpse despawns from the host's list
+    pair:step(20)
+    -- The client arrives: its level spawns that enemy (wherever its own spawner put it).
+    local cd = pair.client_world:spawn(GANADO, 42, 0, 60, 100, 0x5001)
+    pair:step(2)
+    T.eq(cd.erased, true, "erased the moment it appears")
+    T.eq(cd.killed, nil, "not killed: no death animation, no corpse")
+    T.eq(pair.client_world:get(cd.id), nil, "gone from the client's world")
+    T.eq(#pair.client_kills, 0, "no loot for an enemy the client never fought")
+    T.eq(pair.client.counters.erased, 1, "counted")
+end)
+
+T.run("an_old_dead_enemy_far_away_is_erased", function()
+    local pair = make_pair()
+    local h, c = standard_level(pair)
+    local hf = pair.host_world:spawn(DOG, 100, 0, 0, 80, 0x5101)
+    local cf = pair.client_world:spawn(DOG, 101, 0, 0, 80, 0x5101)
+    pair:step(30) -- both had it loaded for a while, far from the client
+    pair.host_world:damage(hf, 500)
+    pair:step(3)
+    T.eq(cf.erased, true, "nobody on the client could see it die: erased")
+    T.eq(c.a.alive, true, "others untouched")
+end)
+
+T.run("an_enemy_without_spawn_param_is_killed_instead", function()
+    local pair = make_pair()
+    standard_level(pair)
+    pair.client_world.no_erase = true
+    local hd = pair.host_world:spawn(GANADO, 50, 0, 50, 100, 0x5201)
+    pair:step(5)
+    pair.host_world:damage(hd, 500)
+    pair:step(5)
+    local cd = pair.client_world:spawn(GANADO, 50, 0, 50, 100, 0x5201)
+    pair:step(2)
+    T.eq(cd.killed, true, "killed when it cannot be erased")
+    T.eq(cd.alive, false, "dead")
+end)
+
+T.run("an_erase_that_did_not_take_is_followed_by_a_kill", function()
+    local pair = make_pair()
+    standard_level(pair)
+    pair.client_world.erase_ignored = true
+    local hd = pair.host_world:spawn(GANADO, 50, 0, 50, 100, 0x5301)
+    pair:step(5)
+    pair.host_world:damage(hd, 500)
+    pair:step(5)
+    local cd = pair.client_world:spawn(GANADO, 50, 0, 50, 100, 0x5301)
+    pair:step(2)
+    T.eq(cd.erased, true, "erase tried")
+    T.eq(cd.alive, true, "but the game left it standing")
+    pair:step(70)
+    T.eq(cd.killed, true, "a few seconds later it is killed")
+    T.eq(pair.client_world.calls.erase, 1, "erase not retried")
+end)
+
+T.run("a_kill_the_game_refuses_is_retried", function()
+    local pair = make_pair()
+    local h, c = standard_level(pair)
+    pair:step(25)
+    pair.client_world.refuse_kill = true -- e.g. an invincible phase
+    pair.host_world:damage(h.a, 500)
+    pair:step(5)
+    T.eq(c.a.alive, true, "still standing")
+    pair.client_world.refuse_kill = false
+    pair:step(25)
+    T.eq(c.a.alive, false, "dies once the game accepts it")
+end)
+
+T.run("erasing_can_be_switched_off", function()
+    local pair = make_pair({ enemy_erase = false })
+    standard_level(pair)
+    local hd = pair.host_world:spawn(GANADO, 50, 0, 50, 100, 0x5401)
+    pair:step(5)
+    pair.host_world:damage(hd, 500)
+    pair:step(5)
+    local cd = pair.client_world:spawn(GANADO, 50, 0, 50, 100, 0x5401)
+    pair:step(2)
+    T.eq(cd.killed, true, "killed instead")
+    T.eq(pair.client_world.calls.erase, 0, "never erased")
+end)
+
+T.run("a_joining_client_gets_every_enemy_dead_in_the_hosts_save", function()
+    local pair = make_pair()
+    local h, c = standard_level(pair)
+    -- Killed in earlier sessions: the host's save has them eliminated (never loaded now).
+    pair.host_world.save_dead = { 0x6001, 0x6002 }
+    -- Killed this session before the client asked.
+    local hd = pair.host_world:spawn(GANADO, 30, 0, 0, 100, 0x6003)
+    pair:step(3)
+    pair.host_world:damage(hd, 500)
+    pair:step(3)
+    pair.host:request_graveyard(pair.now)
+    pair:step(1)
+    T.eq(pair.host:summary().listing_dead, true, "reading the save takes a few ticks")
+    pair:step(5)
+    T.eq(pair.client:summary().dead_known, 3, "client knows all three")
+    T.eq(pair.client.counters.graves_received, 1, "one list")
+    -- The client's level spawns all three: none of them shows up.
+    local c1 = pair.client_world:spawn(GANADO, 70, 0, 0, 100, 0x6001)
+    local c2 = pair.client_world:spawn(DOG, 75, 0, 0, 80, 0x6002)
+    local c3 = pair.client_world:spawn(GANADO, 31, 0, 0, 100, 0x6003)
+    pair:step(2)
+    T.eq(c1.erased and c2.erased and c3.erased, true, "all erased")
+    T.eq(c.a.alive and c.b.alive and c.c.alive, true, "the living ones stay")
+end)
+
+T.run("a_new_graveyard_list_replaces_the_old_one", function()
+    local pair = make_pair()
+    pair.host_world.save_dead = { 0x6101, 0x6102 }
+    pair.host:request_graveyard(pair.now)
+    pair:step(5)
+    T.eq(pair.client:summary().dead_known, 2, "two")
+    pair.host_world.save_dead = { 0x6102 }
+    pair.host:request_graveyard(pair.now)
+    pair:step(5)
+    T.eq(pair.client:summary().dead_known, 1, "replaced, not added")
+    T.eq(pair.host.counters.graves_sent, 2, "two lists sent")
+end)
+
+T.run("a_corpse_the_host_finds_is_announced", function()
+    local pair = make_pair()
+    -- Killed by the host before the session; its corpse is still in the host's list, while
+    -- the client's copy (from the client's own save) is alive.
+    local hd = pair.host_world:spawn(GANADO, 20, 0, 0, 100, 0x7001)
+    hd.hp, hd.alive = 0, false
+    local cd = pair.client_world:spawn(GANADO, 20, 0, 0, 100, 0x7001)
+    pair:step(5)
+    T.eq(cd.erased, true, "the client's copy is gone too")
+    T.eq(pair.client_world:get(cd.id), nil, "despawned")
+end)
+
+T.run("the_old_scenes_dead_right_after_a_host_reload_are_not_news", function()
+    local pair = make_pair()
+    local cd = pair.client_world:spawn(GANADO, 20, 0, 0, 100, 0x7101)
+    pair:step(5)
+    pair.host:on_local_reload()
+    -- For a moment the host's list still holds a dead enemy of the scene it just left.
+    local old = pair.host_world:spawn(GANADO, 20, 0, 0, 100, 0x7101)
+    old.hp, old.alive = 0, false
+    pair:step(3)
+    pair.host_world:remove(old)
+    pair:step(5)
+    T.eq(cd.erased, nil, "the client's copy is left alone")
+    T.eq(cd.alive, true, "alive")
+end)
+
+T.run("a_stale_snapshot_never_revives_a_dead_enemy", function()
+    local pair = make_pair()
+    local h, c = standard_level(pair)
+    pair:step(25)
+    -- A snapshot taken before the death arrives after the death notice.
+    local old = P.encode_enemy_snapshots(pair.now, {
+        { net_id = pair.host.net_of[h.a.id], uid = h.a.uid, kind_hash = P.hash(GANADO), pos = h.a.pos, yaw = 0, hp = 100,
+          max_hp = 100, flags = P.ENEMY_FLAGS.ALIVE } })[1]
+    pair.host_world:damage(h.a, 500)
+    pair.host:tick(pair.now + 0.05, pair.host_world:list(), pair.host_world)
+    pair.to_client[#pair.to_client + 1] = old
+    pair:deliver_to_client()
+    pair:step(3)
+    T.eq(c.a.alive, false, "still dead")
+    T.eq(pair.client:summary().dead_known, 1, "still buried")
+end)
+
+T.run("an_enemy_alive_again_in_the_hosts_world_is_unburied", function()
+    local pair = make_pair()
+    local h, c = standard_level(pair)
+    pair:step(5)
+    pair.client:on_message(assert(P.decode(P.encode_enemy_dead(77, 0x1002))), pair.now, pair.client_world)
+    T.eq(pair.client:summary().dead_known, 1, "buried")
+    pair:step(1)
+    T.eq(c.b.erased, true, "the client's copy goes")
+    pair:step(60) -- the host keeps reporting B alive (respawned, or its world reloaded)
+    T.eq(pair.client:summary().dead_known, 0, "unburied")
+    -- The client's level spawns it again later: now it pairs instead of disappearing.
+    local c2 = pair.client_world:spawn(GANADO, 10, 0, 0, 100, 0x1002)
+    pair:step(5)
+    T.eq(pair.client.net_of[c2.id], pair.host.net_of[h.b.id], "paired with the host's living B")
+    T.eq(c2.erased, nil, "not erased")
+end)
+
+T.run("client_kill_where_the_host_had_no_enemy_applies_later", function()
+    local pair = make_pair()
+    standard_level(pair)
+    pair:step(5)
+    -- The client clears a room the host has not loaded.
+    local far = pair.client_world:spawn(GANADO, 200, 0, 0, 100, 0x8001)
+    pair:step(5)
+    pair.client_world:damage(far, 500)
+    pair:step(5)
+    T.eq(pair.host:summary().dead_known, 1, "the host remembers the kill")
+    -- The host arrives: its level spawns that enemy, which never shows up.
+    local hf = pair.host_world:spawn(GANADO, 190, 0, 3, 100, 0x8001)
+    local other = pair.host_world:spawn(GANADO, 200, 0, 0, 100, 0x8002)
+    pair:step(3)
+    T.eq(hf.erased, true, "host's copy erased on arrival")
+    T.eq(other.alive, true, "another enemy at the same spot is not touched")
+    T.eq(pair.host.counters.late_kills, 1, "counted")
+end)
+
+T.run("host_reload_forgets_old_deaths", function()
+    local pair = make_pair()
+    local hd = pair.host_world:spawn(GANADO, 50, 0, 50, 100, 0x9001)
+    pair:step(5)
+    pair.host_world:damage(hd, 500) -- host kills it alone
+    pair:step(5)
+    T.eq(pair.client:summary().dead_known, 1, "buried on the client")
+    pair.host:on_local_reload()      -- the host died and reloaded the checkpoint...
+    hd.hp, hd.alive = 100, true      -- ...which has that enemy alive
+    pair:step(10)
+    T.eq(pair.client:summary().dead_known, 0, "forgotten")
+    local cd = pair.client_world:spawn(GANADO, 50.5, 0, 49.8, 100, 0x9001)
+    pair:step(12)
+    T.eq(cd.alive, true, "the reloaded host's world has it alive again: not removed")
+end)
+
+T.run("a_client_reload_keeps_the_hosts_dead_and_forgets_its_old_scene", function()
+    local pair = make_pair()
+    standard_level(pair)
+    local hd = pair.host_world:spawn(GANADO, 50, 0, 50, 100, 0x9101)
+    pair:step(5)
+    pair.host_world:damage(hd, 500)
+    pair:step(5)
+    local cd = pair.client_world:spawn(GANADO, 50, 0, 50, 100, 0x9101)
+    pair:step(2)
+    T.eq(cd.erased, true, "erased once")
+    -- The client dies and reloads: its level spawns that enemy again (the game may even reuse
+    -- the same context).
+    pair.client:on_local_reload()
+    cd.erased = nil
+    pair.client_world.enemies[#pair.client_world.enemies + 1] = cd
+    pair:step(2)
+    T.eq(cd.erased, true, "erased again, not taken for a failed erase of the old scene")
+    T.eq(pair.client_world.calls.erase, 2, "two erases")
+    T.eq(pair.client:summary().dead_known, 1, "the host's dead are still known")
+end)
+
+T.run("two_waves_at_the_same_door_are_never_confused", function()
+    local pair = make_pair()
+    -- Wave 1 dies at the door with the client watching.
+    local h1 = pair.host_world:spawn(GANADO, 0, 0, 0, 100, 0xA001)
+    local c1 = pair.client_world:spawn(GANADO, 0, 0, 0, 100, 0xA001)
+    pair:step(25)
+    pair.host_world:damage(h1, 500)
+    pair:step(5)
+    T.eq(c1.alive, false, "client copy died with it")
+    pair.host_world:remove(h1)
+    pair.client_world:remove(c1)
+    -- Wave 2 spawns at the same door: first on the client, a moment later on the host.
+    local c2 = pair.client_world:spawn(GANADO, 0.1, 0, 0, 100, 0xA002)
+    pair:step(30)
+    T.eq(c2.alive, true, "the new enemy is not mistaken for the dead one")
+    local h2 = pair.host_world:spawn(GANADO, -0.1, 0, 0, 100, 0xA002)
+    pair:step(5)
+    T.eq(pair.client.net_of[c2.id], pair.host.net_of[h2.id], "and pairs with the host's new enemy")
+end)
+
+T.run("unmatched_enemies_are_left_alone", function()
+    local pair = make_pair()
+    standard_level(pair)
+    local only_client = pair.client_world:spawn(GANADO, 100, 0, 100, 100, 0xB001)
+    local only_host = pair.host_world:spawn(GANADO, -80, 0, 0, 100, 0xB002)
+    pair:step(10)
+    T.eq(pair.client.net_of[only_client.id], nil, "client-only enemy unpaired")
+    pair.host_world:damage(only_host, 1000)
+    pair:step(5)
+    T.eq(only_client.alive, true, "nothing killed by mistake")
+end)
+
+-------------------------------------------------------------------------------
+-- Hits
+-------------------------------------------------------------------------------
 
 local function hit_event(e, damage, wince)
     return { id = e.id, damage = damage, wince = wince, break_ = 0, stopping = 0, dir = { x = 0, y = 0, z = -1 },
@@ -395,14 +632,14 @@ T.run("client_hits_replay_on_host", function()
     T.eq(pair.host_world.replays[1].id, h.b.id, "on the host's copy")
 end)
 
-T.run("unpaired_client_hit_matched_by_spawn", function()
+T.run("unpaired_client_hit_matched_by_uid", function()
     local pair = make_pair()
     local h, c = standard_level(pair)
     pair.client:tick(0.05, pair.client_world:list(), pair.client_world) -- client has seen its enemies, no pairs yet
     pair.host:tick(0.05, pair.host_world:list(), pair.host_world)
     pair.client:on_local_hits({ hit_event(c.c, 20, 8) }, 0.05)
-    for _, bytes in ipairs(pair.to_host) do pair.host:on_message(assert(P.decode(bytes)), 0.05, pair.host_world) end
-    T.eq(pair.host_world.replays[1] and pair.host_world.replays[1].id, h.c.id, "found by kind and spawn point")
+    pair:deliver_to_host()
+    T.eq(pair.host_world.replays[1] and pair.host_world.replays[1].id, h.c.id, "found by its uid")
 end)
 
 T.run("replay_setting_off_still_draws_tracers", function()
@@ -438,75 +675,29 @@ T.run("unrestorable_replay_hp_is_not_counted_twice", function()
     T.eq(c.b.hp, 80, "client agrees")
 end)
 
-T.run("host_damage_between_ticks_is_not_overwritten", function()
-    local pair = make_pair()
-    local h, c = standard_level(pair)
-    pair:step(3)
-    -- The client's 20 damage report arrives right after the host shot the same enemy for 30,
-    -- before the host's next enemy scan.
-    pair.client_world:damage(c.a, 20)
-    pair.client:tick(pair.now, pair.client_world:list(), pair.client_world)
-    pair.host_world:damage(h.a, 30)
-    for _, bytes in ipairs(pair.to_host) do pair.host:on_message(assert(P.decode(bytes)), pair.now, pair.host_world) end
-    pair.to_host = {}
-    T.eq(h.a.hp, 50, "both hits count (100 - 30 - 20)")
-end)
-
 T.run("hits_on_unknown_enemies_are_counted", function()
     local pair = make_pair()
     standard_level(pair)
     pair:step(3)
-    pair.client:on_message(assert(P.decode(P.encode_enemy_hit({ net_id = 999, pos = { x = 0, y = 0, z = 0 } }))),
+    pair.client:on_message(assert(P.decode(P.encode_enemy_hit({ net_id = 999, uid = 0xDEAD, pos = { x = 0, y = 0, z = 0 } }))),
         pair.now, pair.client_world)
     T.eq(pair.client.counters.hits_unmatched, 1, "unmatched")
-end)
-
-T.run("an_enemy_follows_the_fight", function()
-    local pair = make_pair({ enemy_mirror = true, enemy_ownership = true })
-    local function mirror_capable(w) w.enemy_set_transform = function() return true end end
-    mirror_capable(pair.host_world)
-    mirror_capable(pair.client_world)
-    local h, c = standard_level(pair)
-    pair:step(5)
-    local players = { local_pos = { x = 0, y = 0, z = -30 }, partner_pos = { x = 0, y = 0, z = -31 } } -- both far, host a bit closer
-    local function step_owned(n)
-        for _ = 1, n do
-            pair.now = pair.now + 0.05
-            pair.host:tick(pair.now, pair.host_world:list(), pair.host_world, players)
-            for _, b in ipairs(pair.to_client) do pair.client:on_message(assert(P.decode(b)), pair.now, pair.client_world) end
-            pair.to_client = {}
-            pair.client:tick(pair.now, pair.client_world:list(), pair.client_world)
-            for _, b in ipairs(pair.to_host) do pair.host:on_message(assert(P.decode(b)), pair.now, pair.host_world) end
-            pair.to_host = {}
-        end
-    end
-    step_owned(20)
-    local net_a = pair.host.net_of[h.a.id]
-    T.eq(pair.host.owner[net_a], nil, "the host runs it (closer)")
-    pair.client:on_local_hits({ hit_event(c.a, 20, 8) }, pair.now) -- the client shoots it
-    step_owned(8)
-    T.eq(pair.host.owner[net_a], "client", "moves to the client's game while the client fights it")
-    step_owned(70)
-    T.eq(pair.host.owner[net_a], "client", "after the fight, distance decides (with hysteresis: still the client)")
-    players.partner_pos = { x = 0, y = 0, z = -60 } -- the client walks away
-    step_owned(30)
-    T.eq(pair.host.owner[net_a], nil, "back to the closer player")
 end)
 
 T.run("snapshots_stay_compact", function()
     local pair = make_pair()
     for i = 1, 120 do
-        pair.host_world:spawn("chainsaw.Ch1c0z0Context", i * 5, 0, 0)
+        pair.host_world:spawn(GANADO, i * 5, 0, 0, 100, 0xC000 + i)
     end
     pair:step(20) -- 1 second
-    -- 10 Hz x ceil(120/17) chunks = ~80 messages per second.
-    T.check(pair.traffic.host <= 88, "host sends about 80 snapshot messages/s, got " .. pair.traffic.host)
+    -- 10 Hz x ceil(120/19) chunks = 70 messages per second.
+    T.check(pair.traffic.host <= 77, "host sends about 70 snapshot messages/s, got " .. pair.traffic.host)
     T.check(pair.traffic.client <= 22, "client sends about 20 reports/s, got " .. pair.traffic.client)
 end)
 
 -------------------------------------------------------------------------------
--- Ownership and mirroring: each enemy is run by the machine whose player is closer; the
--- other machine's copy follows it (position, facing, animation) with its own AI off.
+-- The host runs every enemy: the client's copies follow the host's (position, facing,
+-- animation) with their own AI off. An enemy never changes hands.
 -------------------------------------------------------------------------------
 
 -- The transform, animation and AI writers game.lua provides.
@@ -533,10 +724,14 @@ local function with_mirroring(w)
         self.ai_off[id] = (not on) or nil
         return true
     end
-    local kill = w.enemy_kill
+    local kill, erase = w.enemy_kill, w.enemy_erase
     function w:enemy_kill(id)
         self.killed_with_ai_off = self.killed_with_ai_off or (self.ai_off[id] == true)
         return kill(self, id)
+    end
+    function w:enemy_erase(id)
+        self.erased_with_ai_off = self.erased_with_ai_off or (self.ai_off[id] == true)
+        return erase(self, id)
     end
     return w
 end
@@ -547,24 +742,6 @@ local function make_mirror_pair(settings)
     with_mirroring(pair.client_world)
     pair.host_player = { x = 0, y = 0, z = -30 }
     pair.client_player = { x = 0, y = 0, z = -30 }
-    function pair:step(n)
-        for _ = 1, n or 1 do
-            self.now = self.now + 0.05
-            local players = { local_pos = self.host_player, partner_pos = self.client_player }
-            self.host:tick(self.now, self.host_world:list(), self.host_world, players)
-            self.host:frame(self.now, self.host_world)
-            for _, bytes in ipairs(self.to_client) do
-                self.client:on_message(assert(P.decode(bytes)), self.now, self.client_world)
-            end
-            self.to_client = {}
-            self.client:tick(self.now, self.client_world:list(), self.client_world)
-            self.client:frame(self.now, self.client_world)
-            for _, bytes in ipairs(self.to_host) do
-                self.host:on_message(assert(P.decode(bytes)), self.now, self.host_world)
-            end
-            self.to_host = {}
-        end
-    end
     return pair
 end
 
@@ -586,6 +763,100 @@ T.run("client_mirrors_host_enemy_movement", function()
     T.eq(pair.host_world.ai_off[h.b.id], nil, "the host's runs")
 end)
 
+T.run("a_copy_spawned_elsewhere_jumps_to_the_hosts_enemy", function()
+    local pair = make_mirror_pair()
+    local h = pair.host_world:spawn(GANADO, 0, 0, 0, 100, 0xD001)
+    pair:step(5)
+    -- The client's spawn point controller chose another spawn point for the same villager.
+    local c = pair.client_world:spawn(GANADO, 35, 0, 12, 100, 0xD001)
+    pair:step(6)
+    T.near(c.pos.x, 0, 0.01, "moved to where the host's copy is")
+    T.near(c.pos.z, 0, 0.01, "in every axis")
+    T.eq(pair.client_world.ai_off[c.id], true, "following it with its AI off")
+    T.check(h.alive, "untouched on the host")
+end)
+
+T.run("an_enemy_only_the_client_has_runs_in_the_clients_game_until_the_host_loads_it", function()
+    local pair = make_mirror_pair()
+    pair.host_player = { x = 0, y = 0, z = 0 }
+    pair.client_player = { x = 100, y = 0, z = 0 }
+    -- The client ran ahead: its villager chases it where the host's level has not spawned it.
+    local c = pair.client_world:spawn(GANADO, 101, 0, 1, 100, 0xD101)
+    pair:step(10)
+    T.eq(pair.client.net_of[c.id], nil, "nothing to follow yet")
+    T.eq(pair.client_world.ai_off[c.id], nil, "its own AI runs it (it fights the client)")
+    T.eq(pair.client_world.calls.transform, 0, "not moved by the sync")
+    -- The host's level spawns it now: from here on the host's game runs it.
+    local h = pair.host_world:spawn(GANADO, 40, 0, 0, 100, 0xD101)
+    pair:step(10)
+    T.eq(pair.client.net_of[c.id], pair.host.net_of[h.id], "paired")
+    T.eq(pair.client_world.ai_off[c.id], true, "the client's copy follows with its AI off")
+    T.near(c.pos.x, 40, 0.05, "to where the host's enemy is")
+    T.eq(pair.host_world.calls.ai, 0, "the host's enemy keeps its AI")
+end)
+
+T.run("the_host_runs_every_enemy_even_next_to_the_client", function()
+    local pair = make_mirror_pair()
+    local h, c = standard_level(pair)
+    pair.host_player = { x = 0, y = 0, z = -40 }  -- far away
+    pair.client_player = { x = 11, y = 0, z = 1 } -- right next to B, shooting it
+    for _ = 1, 20 do
+        pair.client:on_local_hits({ hit_event(c.b, 1, 1) }, pair.now)
+        pair:step(2)
+    end
+    T.eq(pair.client_world.ai_off[c.b.id], true, "B follows the host on the client")
+    T.eq(pair.client_world.ai_off[c.a.id], true, "and so do the others")
+    T.eq(pair.host_world.calls.ai, 0, "the host never switches an AI off")
+    T.eq(pair.host_world.calls.transform, 0, "nor moves its enemies")
+    h.b.pos = { x = 12, y = 0, z = 3 }
+    pair:step(10)
+    T.near(c.b.pos.z, 3, 0.05, "the client's B moves with the host's")
+end)
+
+T.run("the_host_reads_animations_only_for_enemies_the_client_has", function()
+    local pair = make_mirror_pair()
+    local h = standard_level(pair)
+    local only_host = pair.host_world:spawn(GANADO, -80, 0, 0, 100, 0xE001)
+    pair:step(10)
+    T.eq(pair.host:wants_motion(h.a.id), true, "the client has A: its animation is read and sent")
+    T.eq(pair.host:wants_motion(only_host.id), false, "the client lacks this one")
+    T.eq(pair.host:summary().paired, 3, "three enemies with a copy at the client")
+    T.eq(pair.client:wants_motion(1), false, "the client never sends animations")
+end)
+
+T.run("an_enemy_the_client_kills_dies_with_its_own_ai_and_on_the_host", function()
+    local pair = make_mirror_pair()
+    local h, c = standard_level(pair)
+    pair.client_player = { x = 0, y = 0, z = 9 }
+    pair:step(25)
+    T.eq(pair.client_world.ai_off[c.c.id], true, "C follows the host")
+    pair.client_world:damage(c.c, 1000) -- the client's shotgun
+    pair:step(1)
+    T.eq(pair.client_world.ai_off[c.c.id], nil, "its AI is back on for the death")
+    pair:step(5)
+    T.eq(h.c.alive, false, "the host's C died from the client's damage report")
+    T.eq(pair.host_world.calls.kill, 1, "killed once")
+    T.eq(pair.client_world.calls.kill, 0, "the client's copy died on its own (not killed again)")
+end)
+
+T.run("a_copy_without_news_from_the_host_runs_on_its_own", function()
+    local pair = make_mirror_pair()
+    local h, c = standard_level(pair)
+    pair:step(10)
+    T.eq(pair.client_world.ai_off[c.a.id], true, "following")
+    -- The host's game stops sending (loading, a hitch...): only the client runs.
+    for _ = 1, 30 do
+        pair.now = pair.now + 0.05
+        pair.client:tick(pair.now, pair.client_world:list(), pair.client_world, { local_pos = pair.client_player })
+        pair.client:frame(pair.now, pair.client_world)
+        pair.to_host = {}
+    end
+    T.eq(pair.client_world.ai_off[c.a.id], nil, "its own AI takes over after a second")
+    pair:step(10)
+    T.eq(pair.client_world.ai_off[c.a.id], true, "it follows again once the host is back")
+    T.check(h.a.alive, "the host's enemy is untouched")
+end)
+
 T.run("facing_blends_the_short_way_round", function()
     local pair = make_mirror_pair()
     local h, c = standard_level(pair)
@@ -600,67 +871,6 @@ T.run("facing_blends_the_short_way_round", function()
     end
     T.check(not seen_far, "never turns the long way through 0")
     T.near(math.abs(c.a.yaw), 3.0, 0.05, "ends facing the same way")
-end)
-
-T.run("ownership_moves_to_the_closer_player", function()
-    local pair = make_mirror_pair()
-    local h, c = standard_level(pair)
-    pair.host_player = { x = 0, y = 0, z = 5 }    -- between A and C
-    pair.client_player = { x = 11, y = 0, z = 1 } -- right next to B
-    pair:step(30)
-    local net_b = pair.host.net_of[h.b.id]
-    T.eq(pair.host.owner[net_b], "client", "B is run by the client")
-    T.eq(pair.host:summary().client_owned, 1, "only B")
-    T.eq(pair.client:summary().client_owned, 1, "the client knows")
-    T.eq(pair.client_world.ai_off[c.b.id], nil, "B's AI runs on the client (it attacks the client)")
-    -- The client's AI moves B; the host mirrors it.
-    for i = 1, 10 do
-        c.b.pos = { x = 10, y = 0, z = 1 + i * 0.5 }
-        pair:step(1)
-    end
-    pair:step(8)
-    T.near(h.b.pos.z, 6, 0.05, "host copy follows the client's AI")
-    T.near(c.b.pos.z, 6, 1e-6, "client copy is not mirrored back")
-    T.eq(pair.host_world.ai_off[h.b.id], true, "the host copy's AI is off")
-    T.eq(pair.host_world.ai_off[h.a.id], nil, "A still runs on the host")
-    -- Host walks up to B, client leaves: B goes back to the host.
-    pair.host_player = { x = 10, y = 0, z = 6 }
-    pair.client_player = { x = 60, y = 0, z = 60 }
-    pair:step(30)
-    T.check(pair.host.owner[net_b] == nil, "back to the host")
-    T.eq(pair.host_world.ai_off[h.b.id], nil, "its AI runs on the host again")
-    T.eq(pair.client_world.ai_off[c.b.id], true, "and is off on the client")
-    T.check(pair.host.counters.ownership_changes >= 2, "two hand-overs")
-end)
-
-T.run("ownership_needs_the_client_to_have_the_enemy", function()
-    local pair = make_mirror_pair()
-    local only_host = pair.host_world:spawn("chainsaw.Ch1c0z0Context", 5, 0, 5)
-    pair.host_player = { x = 0, y = 0, z = -40 }
-    pair.client_player = { x = 5, y = 0, z = 6 }
-    pair:step(30)
-    T.check(pair.host.owner[pair.host.net_of[only_host.id]] == nil, "host keeps enemies the client lacks")
-end)
-
-T.run("ownership_off_without_the_partner_nearby", function()
-    local pair = make_mirror_pair()
-    local h = standard_level(pair)
-    pair.client_player = { x = 11, y = 0, z = 1 }
-    pair.host_player = { x = 0, y = 0, z = 5 }
-    pair:step(30)
-    T.eq(pair.host:summary().client_owned, 1, "B handed over")
-    -- The client is in another region now (no partner position for ownership).
-    function pair:step_alone(n)
-        for _ = 1, n do
-            self.now = self.now + 0.05
-            self.host:tick(self.now, self.host_world:list(), self.host_world, { local_pos = self.host_player })
-            self.host:frame(self.now, self.host_world)
-            self.to_client, self.to_host = {}, {}
-        end
-    end
-    pair:step_alone(5)
-    T.eq(pair.host:summary().client_owned, 0, "everything back to the host")
-    T.eq(pair.host_world.ai_off[h.b.id], nil, "with its AI on")
 end)
 
 T.run("animation_is_mirrored", function()
@@ -678,40 +888,39 @@ T.run("animation_is_mirrored", function()
 end)
 
 T.run("mirroring_off_keeps_every_copy_local", function()
-    local pair = make_mirror_pair({ enemy_mirror = false, snap_distance = 2.0 })
+    local pair = make_mirror_pair({ enemy_mirror = false })
     local h, c = standard_level(pair)
     pair.client_player = { x = 11, y = 0, z = 1 }
     pair:step(10)
     h.b.pos = { x = 20, y = 0, z = 0 }
     pair:step(5)
     T.eq(pair.client_world.calls.transform, 0, "no mirroring")
-    T.near(c.b.pos.x, 20, 1e-4, "snapping still works")
-    T.eq(pair.host:summary().client_owned, 0, "no hand-over")
     T.eq(pair.client_world.calls.ai, 0, "AI never touched")
+    pair.host_world:damage(h.b, 30)
+    pair:step(3)
+    T.eq(c.b.hp, 70, "HP still follows the host")
 end)
 
-T.run("switching_options_off_gives_the_ai_back", function()
+T.run("switching_mirroring_off_gives_the_ai_back", function()
     local pair = make_mirror_pair()
     local h, c = standard_level(pair)
     pair:step(10)
     T.eq(pair.client_world.ai_off[c.a.id], true, "A mirrored with its AI off")
-    pair.client.settings.enemy_puppet_ai = false
-    pair:step(2)
-    T.eq(pair.client_world.ai_off[c.a.id], nil, "AI back on, still mirrored")
-    T.check(pair.client_world.calls.transform > 0, "position still follows")
-    pair.client.settings.enemy_puppet_ai = true
-    pair:step(2)
-    T.eq(pair.client_world.ai_off[c.a.id], true, "off again")
     pair.client.settings.enemy_mirror = false
     pair:step(2)
     T.eq(next(pair.client_world.ai_off), nil, "mirroring off: every AI back on")
     pair.client.settings.enemy_mirror = true
+    pair:step(2)
+    T.eq(pair.client_world.ai_off[c.a.id], true, "off again")
 end)
 
 T.run("mirrored_enemy_dies_with_its_ai_on", function()
     local pair = make_mirror_pair()
     local h, c = standard_level(pair)
-    pair:step(10)
+    -- Both players near C: it dies in front of the client.
+    pair.host_player = { x = 0, y = 0, z = 4 }
+    pair.client_player = { x = 0, y = 0, z = 3 }
+    pair:step(25)
     T.eq(pair.client_world.ai_off[c.c.id], true, "C mirrored on the client")
     pair.host_world:damage(h.c, 1000)
     pair:step(5)
@@ -720,56 +929,17 @@ T.run("mirrored_enemy_dies_with_its_ai_on", function()
     T.eq(pair.client_world.killed_with_ai_off, false, "never killed while its AI was off")
 end)
 
-T.run("wave_enemy_at_a_witnessed_death_spot_is_not_killed", function()
+T.run("a_mirrored_enemy_is_erased_with_its_ai_on", function()
     local pair = make_mirror_pair()
     local h, c = standard_level(pair)
-    pair:step(10)
-    pair.host_world:damage(h.a, 1000) -- killed with the client watching (its copy dies too)
-    pair:step(10)
-    T.eq(c.a.alive, false, "client copy died with it")
-    pair.host_world:remove(h.a)
-    pair.client_world:remove(c.a)
-    pair:step(10)
-    -- The next wave spawns at the same door: first on the client, a moment later on the host.
-    local c2 = pair.client_world:spawn("chainsaw.Ch1c0z0Context", -0.2, 0, 0.1)
-    pair:step(30)
-    T.eq(c2.alive, true, "the new enemy is not mistaken for the dead one")
-    local h2 = pair.host_world:spawn("chainsaw.Ch1c0z0Context", 0.1, 0, -0.1)
-    pair:step(10)
-    T.eq(pair.client.net_of[c2.id], pair.host.net_of[h2.id], "and pairs with the host's new enemy")
-end)
-
-T.run("client_kill_where_the_host_had_no_enemy_applies_later", function()
-    local pair = make_mirror_pair()
-    standard_level(pair)
-    pair:step(5)
-    -- The client clears a room the host has not loaded.
-    local far = pair.client_world:spawn("chainsaw.Ch1c0z0Context", 200, 0, 0)
-    pair:step(5)
-    pair.client_world:damage(far, 500)
-    pair:step(5)
-    T.eq(pair.host.counters.pending_kills, 1, "the host remembers the kill")
-    -- The host arrives: its level spawns that enemy, which dies at once.
-    local hf = pair.host_world:spawn("chainsaw.Ch1c0z0Context", 200.4, 0, 0.3)
-    pair:step(5)
-    T.eq(hf.alive, false, "host's copy killed on arrival")
-    T.eq(pair.host.counters.late_kills, 1, "counted")
-    local other = pair.host_world:spawn("chainsaw.Ch1c0z0Context", 200.2, 0, 0)
-    pair:step(5)
-    T.eq(other.alive, true, "each remembered kill is used once")
-end)
-
-T.run("host_reload_forgets_old_deaths", function()
-    local pair = make_mirror_pair()
-    local hd = pair.host_world:spawn("chainsaw.Ch1c0z0Context", 50, 0, 50)
-    pair:step(5)
-    pair.host_world:damage(hd, 500) -- host kills it alone
-    pair:step(5)
-    pair.host:on_local_reload()      -- the host died and reloaded the checkpoint
-    pair:step(10)
-    local cd = pair.client_world:spawn("chainsaw.Ch1c0z0Context", 50.5, 0, 49.8)
-    pair:step(12)
-    T.eq(cd.alive, true, "the reloaded host's world has it alive again: not killed")
+    local hf = pair.host_world:spawn(DOG, 90, 0, 0, 80, 0xF001)
+    local cf = pair.client_world:spawn(DOG, 91, 0, 0, 80, 0xF001)
+    pair:step(25)
+    T.eq(pair.client_world.ai_off[cf.id], true, "mirrored")
+    pair.host_world:damage(hf, 500)
+    pair:step(3)
+    T.eq(cf.erased, true, "erased (far from the client's player)")
+    T.eq(pair.client_world.erased_with_ai_off, false, "its head goes back to the game's pool switched on")
 end)
 
 T.finish()

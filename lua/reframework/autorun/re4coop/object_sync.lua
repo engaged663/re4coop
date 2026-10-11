@@ -142,12 +142,14 @@ function ObjectSync:apply(guid, ev, world, now)
     return false
 end
 
-function ObjectSync:tick(now, world, local_pos)
-    if not self:enabled() then return end
+-- scan_anyway: scan even with object sync off (animal sync finds the animals in the scan).
+function ObjectSync:tick(now, world, local_pos, scan_anyway)
+    local enabled = self:enabled()
+    if not enabled and not scan_anyway then return end
     if now - self.last_scan < SCAN_INTERVAL then return end
     self.last_scan = now
     local snap = world:objects_scan()
-    if snap == nil then
+    if snap == nil or not enabled then
         self.prev = nil
         return
     end
@@ -191,6 +193,27 @@ function ObjectSync:on_objects(m, now, world)
             self.remote_applied[ev.guid] = now
         end
     end
+end
+
+-- An object died here because the partner's game killed it (animal sync applied it): the
+-- next scan must not report it back.
+function ObjectSync:note_applied(guid, now)
+    self.remote_applied[guid] = now
+    self:remember(guid, self.P.OBJECT_EVENT.DESTROYED, -1, now)
+end
+
+-- An object was destroyed here and must be reported now rather than on the next scans (an
+-- animal our player killed while it followed the host's).
+function ObjectSync:report_destroyed(guid, value, now)
+    if not self:enabled() then return end
+    local E = self.P.OBJECT_EVENT
+    for _, msg in ipairs(self.P.encode_objects({ { guid = guid, event = E.DESTROYED, value = value or -1 } })) do
+        self.send(msg, true)
+    end
+    self.counters.sent = self.counters.sent + 1
+    self:remember(guid, E.DESTROYED, value or -1, now)
+    -- Detection skips it like an event of the partner's we applied.
+    self.remote_applied[guid] = now
 end
 
 -- Host: everything destroyed so far, for a joining client.

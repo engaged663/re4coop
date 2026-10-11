@@ -188,7 +188,8 @@ T.run("objects_scan_detect_and_apply", function()
     -- Applying the partner's events.
     T.eq(w:object_apply("aaaaaaaa-0000-0000-0000-000000000099", P.OBJECT_EVENT.DESTROYED, -1), "missing", "unknown guid")
     T.eq(w:object_apply("aaaaaaaa-0000-0000-0000-000000000002", P.OBJECT_EVENT.DESTROYED, -1), "done", "crow")
-    T.eq(crow.__fields._Routine, 2, "crow killed through requestDead")
+    T.eq(crow.__fields._Routine, 7, "the crow dies the way a shot kills it: set_Routine(Die)")
+    T.eq(crow.owner.draw_self, true, "not hidden")
     T.eq(w:object_apply("aaaaaaaa-0000-0000-0000-000000000003", P.OBJECT_EVENT.DESTROYED, -1), "done", "bottle")
     T.eq(bottle.owner.draw_self, false, "bottle hidden as a last resort")
     box.__fields._Routine = 0
@@ -204,6 +205,67 @@ T.run("objects_scan_detect_and_apply", function()
     mock.destroy(crow.owner)
     T.eq(w:object_apply("aaaaaaaa-0000-0000-0000-000000000002", P.OBJECT_EVENT.DESTROYED, -1), "missing",
         "destroyed since the scan: left alone")
+end)
+
+T.run("animals_the_host_reads_and_the_client_follows", function()
+    local w, _, world = fresh()
+    local A, B = "bbbbbbbb-0000-0000-0000-000000000001", "bbbbbbbb-0000-0000-0000-000000000002"
+    local crow = mock.make_object("chainsaw.GmCrow", A, { x = 3, y = 1, z = 0 }, 0)
+    mock.make_object("chainsaw.GmCrow", B, { x = 300, y = 0, z = 0 }, 0)
+    local box = mock.make_object("chainsaw.GmWoodBox", "bbbbbbbb-0000-0000-0000-000000000003", { x = 2, y = 0, z = 0 }, 0)
+    w:objects_scan()
+    T.check(w.object_index[A].animal and not w.object_index[box.owner.guid].animal, "animals told apart from breakables")
+    -- Host: the animals near both players, read now.
+    crow.owner.transform.wpos.x = 4
+    local list = w:animals_near({ { x = 0, y = 0, z = 0 }, { x = 6, y = 0, z = 0 } }, 50, 24)
+    T.eq(#list, 1, "only the crow near both players")
+    T.eq(list[1].guid, A, "by its GameObject GUID")
+    T.near(list[1].pos.x, 4, 1e-6, "its current position")
+    T.eq(list[1].routine, 0, "routine")
+    T.eq(list[1].dead, false, "alive")
+    T.check(list[1].motion and list[1].motion.bank == 7 and list[1].motion.id == 1, "its animation")
+    T.eq(#w:animals_near({ { x = 0, y = 0, z = 0 }, { x = 200, y = 0, z = 0 } }, 50, 24), 0,
+        "nothing when one player is far away")
+
+    -- Client: the crow follows the host's, its own AI off the game's update.
+    local core = crow.core
+    T.eq(world.moving[core], true, "the game updates it")
+    T.check(w:animal_puppet(A, true), "puppet")
+    T.eq(world.moving[core], nil, "off the update list: its AI stops")
+    local frames = crow.ai_frames or 0
+    mock.update_gimmicks()
+    T.eq(crow.ai_frames or 0, frames, "its state machine does not run")
+    T.check(w:animal_set_transform(A, { x = 5, y = 2, z = 1 }, { x = 0, y = 0.6, z = 0, w = 0.8 }), "moved")
+    T.near(crow.owner.transform.wpos.y, 2, 1e-6, "to the host's position")
+    T.near(crow.owner.transform.wrot.y, 0.6, 1e-6, "and rotation")
+    T.check(w:animal_set_motion(A, { bank = 7, id = 5, frame = 2 }), "animated")
+    T.eq(crow.__fields._Motion.layers[1].motion, 5, "the host's animation")
+    T.eq(w:animal_local(A).dead, false, "alive here")
+    T.check(w:animal_puppet(A, false), "released")
+    T.eq(world.moving[core], true, "back on the update")
+    -- A gimmick the game finished meanwhile (GimmickCore.finish) is never put back.
+    w:animal_puppet(A, true)
+    core.__fields._HasRegisteredMove = false
+    w:animal_puppet(A, false)
+    T.eq(world.moving[core], nil, "finished: stays off the update")
+    core.__fields._HasRegisteredMove = true
+    world.moving[core] = true
+    -- Killed for the partner: it dies with its own AI running.
+    w:animal_puppet(A, true)
+    T.check(w:animal_kill(A), "killed")
+    T.eq(crow.__fields._Routine, 7, "Die")
+    T.eq(world.moving[core], true, "its AI runs the death")
+    T.eq(w:animal_local(A).dead, true, "dead here")
+    -- Leaving the session gives every puppet back; destroyed ones are left alone.
+    local B2 = mock.make_object("chainsaw.GmCrow", "bbbbbbbb-0000-0000-0000-000000000004", { x = 3, y = 0, z = 3 }, 0)
+    local C2 = mock.make_object("chainsaw.GmCrow", "bbbbbbbb-0000-0000-0000-000000000005", { x = 3, y = 0, z = 4 }, 0)
+    w:objects_scan()
+    T.check(w:animal_puppet(B2.owner.guid, true) and w:animal_puppet(C2.owner.guid, true), "two puppets")
+    mock.destroy(C2.owner)
+    w:restore_animals()
+    T.eq(world.moving[B2.core], true, "back on the update")
+    T.eq(world.moving[C2.core], nil, "a destroyed one is not")
+    T.eq(w:animal_puppet(C2.owner.guid, true), false, "and cannot become a puppet")
 end)
 
 T.run("cutscene_hooks_play_and_current_id", function()

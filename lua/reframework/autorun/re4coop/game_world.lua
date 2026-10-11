@@ -51,6 +51,13 @@ World.OBJECT_TYPES = {
     "chainsaw.GmBatGroup", "chainsaw.GmMouse", "chainsaw.GmCockroach", "chainsaw.GmSmokeBag",
 }
 
+-- Animals (chainsaw.GmAnimal and the animals derived from it): the host's game moves them and
+-- the client's copies follow (animal_sync.lua, docs/RESEARCH.md 3.9).
+World.ANIMAL_TYPES = {
+    ["chainsaw.GmAnimal"] = true, ["chainsaw.GmCrow"] = true, ["chainsaw.GmChicken"] = true,
+    ["chainsaw.GmFish"] = true, ["chainsaw.GmBat"] = true, ["chainsaw.GmMouse"] = true,
+}
+
 -- Scenario flag setters worth hooking (lower case name -> "value": takes the new value as
 -- its Boolean parameter, true/false: sets / clears the flag given only the GUID).
 World.FLAG_SETTERS = {
@@ -115,8 +122,9 @@ function World.new(game, log)
     self.dirty_seen = 0      -- game.gimmick_calls already reported by gimmicks_dirty()
     self.active = false      -- a partner is connected (set by the session)
     self.word_queue = {}     -- pending flag word changes (group -> word -> {set, clear})
-    self.object_index = {}   -- guid -> {comp, go, info={field, enum}} from the latest scan
+    self.object_index = {}   -- guid -> {comp, go, info={field, enum}, kind, animal, pos} from the latest scan
     self.comp_guid = {}      -- component address -> guid
+    self.animal_frozen = {}  -- guid -> {core, go, how}: animals whose state machine we took off the update
     self.chapter_target = nil
     self:probe()
     return self
@@ -145,6 +153,7 @@ end
 
 -- The game reloaded: scanned components and half-read tables belong to the old scene.
 function World:on_reload()
+    self:restore_animals()
     self.object_index = {}
     self.comp_guid = {}
     self.comp_guid_n = 0
@@ -215,6 +224,13 @@ function World:probe()
         if r:type(name) ~= nil then self.object_types[#self.object_types + 1] = name end
     end
     self:cap("objects", #self.object_types > 0, ("%d object types"):format(#self.object_types))
+    -- Animals: a gimmick's state machine (GmBase.updateGimmick) runs from its GimmickCore, and
+    -- GimmickManager updates the cores registered with registerMove. A client's copy of a host
+    -- animal leaves that list while it follows the host.
+    self.move_reg_m = r:find_method(GIM, function(i) return i.name == "registerMove" and #i.params == 1 end)
+    self.move_unreg_m = r:find_method(GIM, function(i) return i.name == "unregisterMove" and #i.params == 1 end)
+    self:cap("animal_puppets", self.move_reg_m ~= nil and self.move_unreg_m ~= nil,
+        self.move_unreg_m and "GimmickManager.unregisterMove / registerMove" or "no move registry")
 
     -- Cutscenes.
     local function has_event_param(i)
@@ -774,11 +790,14 @@ function World:objects_scan()
                 if okaddr and guid then self.comp_guid[addr] = { guid = guid, go_addr = go_addr } end
             end
             if guid ~= nil and objects[guid] == nil then
-                local info = self:routine_info(R.type_name(comp) or tname)
+                local rtype = R.type_name(comp) or tname
+                local info = self:routine_info(rtype)
                 local routine = info.field and R.number(R.get(comp, "_Routine")) or nil
                 local rname = routine and info.enum and info.enum.values[routine] or nil
-                objects[guid] = { kind = tname, pos = position_of(go), routine = routine, terminal = is_terminal(rname) }
-                index[guid] = { comp = comp, go = go, info = info }
+                local pos = position_of(go)
+                objects[guid] = { kind = tname, pos = pos, routine = routine, terminal = is_terminal(rname) }
+                index[guid] = { comp = comp, go = go, info = info, kind = rtype, pos = pos,
+                    animal = World.ANIMAL_TYPES[rtype] == true or World.ANIMAL_TYPES[tname] == true }
             end
         end)
         scan.by_type[tname] = { objects = objects, index = index }
@@ -812,8 +831,13 @@ function World:object_apply(guid, event, value)
     if event == E.ROUTINE then
         if force_routine and o.info.field and R.set(o.comp, "_Routine", value) then result = "done" end
     elseif event == E.DESTROYED then
+        -- 0) An animal dies the way a shot kills it: its state machine enters Die.
+        if o.animal and self:animal_kill_entry(guid, o) then
+            result = "done"
+        end
         -- 1) The same terminal state the partner's copy reached (plays its own break/death).
-        if force_routine and value ~= nil and value >= 0 and o.info.field and R.set(o.comp, "_Routine", value) then
+        if result ~= "done" and force_routine and value ~= nil and value >= 0 and o.info.field
+            and R.set(o.comp, "_Routine", value) then
             result = "done"
         end
         -- 2) A break / kill method of the object.
@@ -836,6 +860,213 @@ function World:object_apply(guid, event, value)
     end
     self.applying = false
     return result
+end
+
+-------------------------------------------------------------------------------
+-- Animals (crows, chickens, fish, bats, rats): the host's game moves them; the client's
+-- copies of the ones near both players follow (animal_sync.lua). Facts from re4.exe
+-- (docs/RESEARCH.md 3.9): an animal's AI is GmBase.updateGimmick, called by its GimmickCore's
+-- move update, which GimmickManager runs for every core registered with registerMove (the
+-- core switches itself off once registered). GimmickCore.finish - the gimmick ending - is
+-- the only caller of unregisterMove and clears the core's _HasRegisteredMove. A shot calls
+-- the animal's onHitDamage, which sets its routine to Die there and then (set_Routine), so
+-- hits still land on an animal whose AI is off the update.
+-------------------------------------------------------------------------------
+
+local ANIMAL_PREFILTER = 40.0 -- metres: positions from the scan can be a few seconds old
+
+local function dist3(a, b)
+    local dx, dy, dz = a.x - b.x, a.y - b.y, a.z - b.z
+    return math.sqrt(dx * dx + dy * dy + dz * dz)
+end
+
+-- A scanned animal that still exists, or nil.
+function World:animal(guid)
+    local o = self.object_index[guid]
+    if o == nil or not o.animal then return nil end
+    if o.tf == nil then o.tf = R.call(o.go, "get_Transform") or false end
+    if not o.tf then return nil end
+    if self.game ~= nil and self.game.alive ~= nil and not self.game:alive(o.tf) then return nil end
+    return o
+end
+
+local function animal_routine(o)
+    local routine = o.info.field and R.number(R.get(o.comp, "_Routine")) or nil
+    local rname = routine and o.info.enum and o.info.enum.values[routine] or nil
+    return routine, is_terminal(rname)
+end
+
+-- Layer 0 of the animal's via.motion.Motion (GmAnimal._Motion).
+function World:animal_layer(o)
+    if o.layer == nil then
+        local motion = R.get(o.comp, "_Motion") or R.call(o.comp, "get_Motion")
+        o.layer = (motion and R.call(motion, "getLayer", 0)) or false
+    end
+    return o.layer or nil
+end
+
+-- Position, rotation, routine and animation of a scanned animal, read now.
+function World:animal_read(guid, o)
+    local p = R.call(o.tf, "get_Position")
+    if p == nil then return nil end
+    o.pos = { x = p.x, y = p.y, z = p.z }
+    local q = R.call(o.tf, "get_Rotation")
+    local routine, dead = animal_routine(o)
+    local a = { guid = guid, pos = o.pos, rot = q and { x = q.x, y = q.y, z = q.z, w = q.w } or nil,
+        routine = routine, dead = dead }
+    local layer = self:animal_layer(o)
+    if layer ~= nil then
+        local bank, mid = R.number(R.call(layer, "get_MotionBankID")), R.number(R.call(layer, "get_MotionID"))
+        if bank ~= nil and mid ~= nil then
+            a.motion = { bank = bank, id = mid, frame = R.number(R.call(layer, "get_Frame")) or 0 }
+        end
+    end
+    return a
+end
+
+-- Host: the animals within `radius` of every point in `points` (both players), nearest to
+-- the first point first, at most `max`, read now.
+function World:animals_near(points, radius, max)
+    if #points == 0 then return {} end
+    local cands = {}
+    for guid, o in pairs(self.object_index) do
+        if o.animal and o.pos ~= nil then
+            local far = false
+            for _, p in ipairs(points) do
+                if dist3(o.pos, p) > radius + ANIMAL_PREFILTER then far = true break end
+            end
+            if not far then cands[#cands + 1] = { guid = guid, d = dist3(o.pos, points[1]) } end
+        end
+    end
+    table.sort(cands, function(a, b) return a.d < b.d end)
+    local out = {}
+    for _, c in ipairs(cands) do
+        if #out >= max then break end
+        local o = self:animal(c.guid)
+        local a = o and self:animal_read(c.guid, o) or nil
+        if a ~= nil then
+            local near = true
+            for _, p in ipairs(points) do
+                if dist3(a.pos, p) > radius then near = false break end
+            end
+            if near then out[#out + 1] = a end
+        end
+    end
+    return out
+end
+
+-- Client: our copy of an animal - { pos, routine, dead } - or nil when it is not loaded.
+function World:animal_local(guid)
+    local o = self:animal(guid)
+    if o == nil then return nil end
+    local routine, dead = animal_routine(o)
+    return { pos = o.pos, routine = routine, dead = dead }
+end
+
+local function gimmick_core(o)
+    if o.core == nil then o.core = R.call(o.comp, "get_Core") or false end
+    return o.core or nil
+end
+
+-- Client: our copy of an animal stops running its own AI (on = true: it becomes a puppet of
+-- the host's) or runs it again (on = false). Returns true when it is (no longer) a puppet.
+function World:animal_puppet(guid, on)
+    if not on then
+        local f = self.animal_frozen[guid]
+        if f ~= nil then
+            self.animal_frozen[guid] = nil
+            self:animal_thaw(f)
+        end
+        return true
+    end
+    if self.animal_frozen[guid] ~= nil then return true end
+    local o = self:animal(guid)
+    local core = o and gimmick_core(o)
+    if core == nil then return false end
+    local how
+    if R.get(core, "_HasRegisteredMove") == true then
+        local mgr = self.r:singleton(GIM)
+        local m = self.move_unreg_m
+        if mgr == nil or m == nil or not pcall(m.method.call, m.method, mgr, core) then
+            self:cap("animal_puppets", false, "unregisterMove failed")
+            return false
+        end
+        how = "move"
+    elseif R.call(core, "get_Enabled") == true then
+        if not pcall(core.call, core, "set_Enabled", false) then return false end
+        how = "core" -- a core that updates itself (no central update)
+    else
+        how = "none" -- nothing runs its state machine right now
+    end
+    self:crumb("world.animal", "puppet")
+    self.animal_frozen[guid] = { core = core, go = o.go, tf = o.tf, how = how }
+    return true
+end
+
+-- Gives an animal's state machine back to the game, unless the animal is gone or the game
+-- finished its gimmick meanwhile (it must never come back onto the update list then).
+function World:animal_thaw(f)
+    if self.game ~= nil and self.game.alive ~= nil and not self.game:alive(f.tf) then return end
+    self:crumb("world.animal", "release")
+    if f.how == "move" then
+        if R.get(f.core, "_HasRegisteredMove") == true then
+            local mgr = self.r:singleton(GIM)
+            local m = self.move_reg_m
+            if mgr ~= nil and m ~= nil then pcall(m.method.call, m.method, mgr, f.core) end
+        end
+    elseif f.how == "core" then
+        pcall(f.core.call, f.core, "set_Enabled", true)
+    end
+end
+
+-- Every animal we took off the update runs on its own again (session ended, reload).
+function World:restore_animals()
+    for _, f in pairs(self.animal_frozen or {}) do self:animal_thaw(f) end
+    self.animal_frozen = {}
+end
+
+-- Client: a puppet animal takes the host animal's position and rotation.
+function World:animal_set_transform(guid, pos, rot)
+    local o = self:animal(guid)
+    if o == nil then return false end
+    local ok = pcall(o.tf.call, o.tf, "set_Position", Vector3f.new(pos.x, pos.y, pos.z))
+    if ok and rot ~= nil then
+        ok = pcall(o.tf.call, o.tf, "set_Rotation", Quaternion.new(rot.w, rot.x, rot.y, rot.z))
+    end
+    if ok then o.pos = { x = pos.x, y = pos.y, z = pos.z } end
+    return ok
+end
+
+-- Client: a puppet animal plays the host animal's animation (TreeLayer.changeMotion, as for
+-- enemies).
+function World:animal_set_motion(guid, motion)
+    local o = self:animal(guid)
+    local layer = o and self:animal_layer(o)
+    if layer == nil then return false end
+    return (pcall(function()
+        layer:call("changeMotion(System.UInt32, System.UInt32, System.Single, System.Single, via.motion.InterpolationMode, via.motion.InterpolationCurve)",
+            motion.bank, motion.id, motion.frame or 0.0, 8.0, 2, 0)
+    end))
+end
+
+-- The animal dies with its own logic: the routine a shot gives it (set_Routine(Die)), after
+-- its AI is back on the update. True if it is dead (or dying) now.
+function World:animal_kill_entry(guid, o)
+    local routine, dead = animal_routine(o)
+    if dead then return true end
+    local die = o.info.enum and o.info.enum.names.Die
+    if die == nil then return false end
+    self:animal_puppet(guid, false)
+    local tname = R.type_name(o.comp) or o.kind
+    local m = tname and self.r:find_method(tname, function(i) return i.name == "set_Routine" and #i.params == 1 end, nil, 1)
+    self:crumb("world.animal", "kill")
+    if m ~= nil and pcall(m.method.call, m.method, o.comp, die) then return true end
+    return routine ~= nil and R.set(o.comp, "_Routine", die) and R.number(R.get(o.comp, "_Routine")) == die
+end
+
+function World:animal_kill(guid)
+    local o = self:animal(guid)
+    return o ~= nil and self:animal_kill_entry(guid, o)
 end
 
 -------------------------------------------------------------------------------

@@ -297,31 +297,30 @@ T.run("enemy_snapshot_chunking", function()
             spawn = { x = i + 0.5, y = 0, z = -i }, yaw = 0.5, hp = i * 10, max_hp = 1000, flags = P.ENEMY_FLAGS.ALIVE,
             motion = { bank = 100 + i, id = 2000 + i, frame = i / 4 } }
     end
-    entries[10].ctx = { category = 2, kind = 1, group = -5, index = 123456 }
+    entries[10].uid = 0xFEDCBA98
+    entries[13].uid = 0 -- "no identity" is not sent as an identity
     entries[11].motion = nil
-    entries[12].flags = P.ENEMY_FLAGS.ALIVE | P.ENEMY_FLAGS.CLIENT_OWNED
+    entries[12].flags = 0 -- (dead)
     local msgs = P.encode_enemy_snapshots(9.5, entries)
     local per = P.ENEMIES_PER_SNAPSHOT
-    T.eq(per, 17, "17 enemies per snapshot")
-    T.eq(#msgs, 5, "75 enemies -> 5 chunks")
+    T.eq(per, 19, "19 enemies per snapshot")
+    T.eq(#msgs, 4, "75 enemies -> 4 chunks")
     local seen = 0
     for c, data in ipairs(msgs) do
         T.check(#data <= MAX, ("chunk %d fits in one datagram (%d bytes)"):format(c, #data))
         local m = assert(P.decode(data))
         T.eq(m.chunk, c, "chunk index")
-        T.eq(m.chunks, 5, "chunk count")
+        T.eq(m.chunks, 4, "chunk count")
         for _, e in ipairs(m.enemies) do
             seen = seen + 1
             T.eq(e.net_id, seen, "order preserved")
             T.near(e.spawn.x, seen + 0.5, 1e-5, "spawn")
             T.eq(e.hp, seen * 10, "hp")
-            T.eq(e.flags & P.ENEMY_FLAGS.ALIVE, P.ENEMY_FLAGS.ALIVE, "alive flag kept")
+            T.eq((e.flags & P.ENEMY_FLAGS.ALIVE) ~= 0, seen ~= 12, "alive flag kept")
             if seen == 10 then
-                T.check(e.ctx and e.ctx.group == -5 and e.ctx.index == 123456 and e.ctx.kind == 1 and e.ctx.category == 2,
-                    "ContextID round-trips (negative group too)")
-                T.eq(P.ctx_key(e.ctx), "2:1:-5:123456", "ctx key")
+                T.eq(e.uid, 0xFEDCBA98, "uid round-trips (all 32 bits)")
             else
-                T.eq(e.ctx, nil, "no ContextID when none was sent")
+                T.eq(e.uid, nil, "no uid when none was sent")
             end
             if seen == 11 then
                 T.eq(e.motion, nil, "no animation when none was sent")
@@ -329,14 +328,57 @@ T.run("enemy_snapshot_chunking", function()
                 T.check(e.motion and e.motion.bank == 100 + seen and e.motion.id == 2000 + seen, "animation round-trips")
                 T.near(e.motion and e.motion.frame or -1, seen / 4, 1e-5, "animation frame")
             end
-            T.eq((e.flags & P.ENEMY_FLAGS.CLIENT_OWNED) ~= 0, seen == 12, "client-owned flag")
         end
     end
     T.eq(seen, 75, "all entries")
     local full = {}
     for i = 1, per do full[i] = entries[i] end
-    T.check(#P.encode_enemy_snapshots(1, full)[1] <= MAX, "a full chunk with ContextIDs and animation fits")
+    for i = 1, per do full[i].uid = 0xFFFFFFFF end
+    T.check(#P.encode_enemy_snapshots(1, full)[1] <= MAX, "a full chunk with uids and animation fits")
     T.eq(#P.encode_enemy_snapshots(1, {}), 1, "empty list still yields one heartbeat snapshot")
+end)
+
+T.run("character_identity", function()
+    T.check(P.character_id_stable({ category = 0, kind = 0, group = 12, index = 312 }), "level enemy (group 12)")
+    T.check(P.character_id_stable({ category = 0, kind = 0, group = 40200, index = 3 }), "level enemy (stage group)")
+    T.check(not P.character_id_stable({ category = 0, kind = 0, group = 1, index = 5 }),
+        "runtime character (CharacterManager.generateDynamicContextID: group 1)")
+    T.check(not P.character_id_stable({ category = 2, kind = 0, group = 12, index = 3 }), "not a character")
+    T.check(not P.character_id_stable({ category = 0, kind = 0, group = 0, index = 0 }), "empty ID")
+    T.check(not P.character_id_stable(nil), "no ID")
+end)
+
+T.run("enemy_deaths_and_graveyard", function()
+    local d = assert(P.decode(P.encode_enemy_dead(65535, 0x89ABCDEF)))
+    T.eq(d.type, P.T.ENEMY_DEAD, "type")
+    T.eq(d.net_id, 65535, "net id")
+    T.eq(d.uid, 0x89ABCDEF, "uid")
+    T.eq(d.reset, false, "not a reset")
+    local bare = assert(P.decode(P.encode_enemy_dead(9)))
+    T.eq(bare.uid, nil, "runtime enemy: no uid")
+    local reset = assert(P.decode(P.encode_enemy_dead_reset()))
+    T.eq(reset.reset, true, "reset")
+    T.eq(reset.net_id, P.ENEMY_DEAD_RESET, "reset net id")
+
+    local uids = {}
+    for i = 1, 700 do uids[i] = 0x10000000 + i end
+    uids[701] = 0 -- never sent
+    local msgs = P.encode_enemy_grave(uids)
+    T.eq(#msgs, 3, "700 uids -> 3 messages")
+    local got = {}
+    for c, data in ipairs(msgs) do
+        T.check(#data <= MAX, ("graveyard chunk %d fits (%d bytes)"):format(c, #data))
+        local m = assert(P.decode(data))
+        T.eq(m.type, P.T.ENEMY_GRAVE, "type")
+        T.eq(m.chunk, c, "chunk")
+        T.eq(m.chunks, 3, "chunks")
+        for _, u in ipairs(m.uids) do got[#got + 1] = u end
+    end
+    T.eq(#got, 700, "every uid, no zero")
+    T.eq(got[700], 0x10000000 + 700, "order kept")
+    local empty = P.encode_enemy_grave({})
+    T.eq(#empty, 1, "an empty graveyard is still sent (it replaces the old one)")
+    T.eq(#assert(P.decode(empty[1])).uids, 0, "empty")
 end)
 
 T.run("small_messages_roundtrip", function()
@@ -346,10 +388,10 @@ T.run("small_messages_roundtrip", function()
     T.eq(d.kind_hash, 99, "kind")
     T.near(d.amount, 12.5, 1e-6, "amount")
     T.eq(d.flags, P.DAMAGE_FLAGS.LETHAL, "lethal")
-    T.eq(d.ctx, nil, "no ctx")
+    T.eq(d.uid, nil, "no uid")
     local d2 = assert(P.decode(P.encode_enemy_damage({ net_id = 0, kind_hash = 1, pos = { x = 0, y = 0, z = 0 },
-        amount = 3, flags = 0, ctx = { category = 2, kind = 0, group = 77, index = 3 } })))
-    T.eq(P.ctx_key(d2.ctx), "2:0:77:3", "damage carries ContextID")
+        amount = 3, flags = 0, uid = 4242 })))
+    T.eq(d2.uid, 4242, "damage carries the uid")
     T.eq(d2.flags & P.DAMAGE_FLAGS.LETHAL, 0, "not lethal")
     local it = assert(P.decode(P.encode_item_taken({ item_id = 119235200, pos = { x = 4, y = 5, z = 6 },
         ctx = { category = 5, kind = 0, group = 9, index = 2 } })))
@@ -365,7 +407,6 @@ T.run("small_messages_roundtrip", function()
         stage = 43400, only_instance = true })))
     T.eq(it2.stage, 43400, "item stage")
     T.eq(it2.only_instance, true, "only instance")
-    T.eq(assert(P.decode(P.encode_enemy_dead(65535))).net_id, 65535, "dead id")
     T.eq(assert(P.decode(P.encode_chat("hola amigo"))).text, "hola amigo", "chat")
     T.eq(#assert(P.decode(P.encode_chat(string.rep("x", 2000)))).text, 512, "chat truncated")
     local n = assert(P.decode(P.encode_notify(3, "teleported")))
@@ -398,9 +439,11 @@ T.run("enemy_hit_roundtrip", function()
     T.near(h.dir.z, -1, 1e-6, "direction")
     T.eq(h.weapon, 4000, "weapon")
     T.eq(h.critical, true, "critical")
-    local h2 = assert(P.decode(P.encode_enemy_hit({ pos = { x = 0, y = 0, z = 0 } })))
+    T.eq(h.uid, nil, "no uid")
+    local h2 = assert(P.decode(P.encode_enemy_hit({ pos = { x = 0, y = 0, z = 0 }, uid = 77 })))
     T.eq(h2.damage, 0, "defaults")
     T.eq(h2.critical, false, "not critical")
+    T.eq(h2.uid, 77, "uid")
 end)
 
 T.run("item_dropped_roundtrip", function()
@@ -432,22 +475,54 @@ T.run("guid_and_ctx_helpers", function()
 end)
 
 T.run("enemy_client_roundtrip_and_caps", function()
-    local states, paired = {}, {}
-    for i = 1, 40 do
-        states[i] = { net_id = i, pos = { x = i, y = 1, z = 2 }, yaw = 1.5,
-            motion = i % 2 == 0 and { bank = 1, id = i, frame = 3 } or nil }
-    end
-    for i = 1, 250 do paired[i] = 1000 + i end
-    local data = P.encode_enemy_client(3.5, states, paired)
+    local paired = {}
+    for i = 1, 700 do paired[i] = 1000 + i end
+    local data = P.encode_enemy_client(3.5, paired)
     T.check(#data <= MAX, "fits in one datagram (" .. #data .. " bytes)")
     local m = assert(P.decode(data))
     T.eq(m.type, P.T.ENEMY_CLIENT, "type")
-    T.eq(#m.states, P.MAX_CLIENT_ENEMY_STATES, "states capped")
+    T.near(m.time, 3.5, 1e-9, "time")
     T.eq(#m.paired, P.MAX_CLIENT_PAIRED, "paired capped")
-    T.near(m.states[3].yaw, 1.5, 1e-6, "yaw")
-    T.eq(m.states[2].motion and m.states[2].motion.id, 2, "animation kept")
-    T.eq(m.states[1].motion, nil, "no animation")
     T.eq(m.paired[1], 1001, "paired ids")
+    T.eq(m.paired[P.MAX_CLIENT_PAIRED], 1000 + P.MAX_CLIENT_PAIRED, "in order")
+    T.eq(#assert(P.decode(P.encode_enemy_client(1, {}))).paired, 0, "none")
+end)
+
+T.run("animals_roundtrip_and_chunking", function()
+    local animals = {}
+    for i = 1, 50 do
+        animals[i] = { guid = ("%08x-0000-0000-0000-%012x"):format(i, i), pos = { x = i, y = 2, z = -i },
+            rot = { x = 0, y = math.sin(i / 10), z = 0, w = math.cos(i / 10) }, routine = i % 9,
+            motion = { bank = 300 + i, id = 40 + i, frame = i / 2 }, dead = i == 7 }
+    end
+    animals[8].routine = nil
+    animals[9].motion = nil
+    animals[51] = { guid = "bogus", pos = { x = 0, y = 0, z = 0 } }
+    local msgs = P.encode_animals(4.25, animals)
+    T.eq(#msgs, 3, "50 animals -> 3 messages (" .. P.ANIMALS_PER_MESSAGE .. " each)")
+    local got = {}
+    for c, data in ipairs(msgs) do
+        T.check(#data <= MAX, ("chunk %d fits in one datagram (%d bytes)"):format(c, #data))
+        local m = assert(P.decode(data))
+        T.eq(m.type, P.T.ANIMALS, "type")
+        T.eq(m.chunk, c, "chunk")
+        T.eq(m.chunks, 3, "chunks")
+        T.near(m.time, 4.25, 1e-9, "time")
+        for _, a in ipairs(m.animals) do got[#got + 1] = a end
+    end
+    T.eq(#got, 50, "the bad GUID is skipped")
+    local a = got[5]
+    T.eq(a.guid, animals[5].guid, "guid")
+    T.near(a.pos.x, 5, 1e-5, "position")
+    T.near(a.rot.y, math.sin(0.5), 2e-3, "rotation")
+    T.near(a.rot.w, math.cos(0.5), 2e-3, "rotation w")
+    T.eq(a.routine, 5, "routine")
+    T.check(a.motion and a.motion.bank == 305 and a.motion.id == 45, "animation")
+    T.near(a.motion.frame, 2.5, 1e-5, "frame")
+    T.eq(a.dead, false, "alive")
+    T.eq(got[7].dead, true, "dead flag")
+    T.eq(got[8].routine, nil, "no routine")
+    T.eq(got[9].motion, nil, "no animation")
 end)
 
 T.run("flags_roundtrip_and_batching", function()
@@ -594,13 +669,16 @@ T.run("malformed_input_never_raises", function()
         P.fragment(string.rep("z", 3000), 1)[1],
         P.encode_item_taken({ item_id = 119235200, pos = { x = 1, y = 2, z = 3 },
             ctx = { category = 5, kind = 0, group = 9, index = 2 } }),
-        P.encode_enemy_damage({ net_id = 3, kind_hash = 7, pos = { x = 0, y = 0, z = 0 }, amount = 5,
-            ctx = { category = 2, kind = 1, group = 4, index = 5 } }),
-        P.encode_enemy_hit({ pos = { x = 0, y = 0, z = 0 } }),
+        P.encode_enemy_damage({ net_id = 3, kind_hash = 7, pos = { x = 0, y = 0, z = 0 }, amount = 5, uid = 99 }),
+        P.encode_enemy_hit({ pos = { x = 0, y = 0, z = 0 }, uid = 5 }),
+        P.encode_enemy_dead(4, 77),
+        P.encode_enemy_grave({ 1, 2, 3 })[1],
+        P.encode_enemy_snapshots(1, { { net_id = 1, uid = 8, kind_hash = 2, pos = { x = 0, y = 0, z = 0 }, flags = 1 } })[1],
         P.encode_item_dropped({ item_id = 1, count = 1, pos = { x = 0, y = 0, z = 0 } }),
         P.encode_player({ time = 1, pos = { x = 0, y = 0, z = 0 }, rot = { x = 0, y = 0, z = 0, w = 1 },
             stage = 43300, chapter = 21100 }),
-        P.encode_enemy_client(1, { { net_id = 1, pos = { x = 0, y = 0, z = 0 }, yaw = 0, motion = { bank = 1, id = 2, frame = 3 } } }, { 5 }),
+        P.encode_enemy_client(1, { 5, 6 }),
+        P.encode_animals(1, { { guid = G1, pos = { x = 0, y = 0, z = 0 }, routine = 2, motion = { bank = 1, id = 2, frame = 3 } } })[1],
         P.encode_flags({ { guid = G1, value = true } })[1],
         P.encode_flag_words(1, P.FLAG_WORDS_MODE.FULL, { { name = "Main", words = { 1, 2 } } })[1],
         P.encode_flag_words(1, P.FLAG_WORDS_MODE.DELTA, { { name = "Main", changes = { { word = 1, set = 1, clear = 0 } } } })[1],
@@ -623,7 +701,7 @@ T.run("malformed_input_never_raises", function()
     end
     -- An empty FLAGS or OBJECTS batch (count 0) is a complete, valid message.
     local empty_ok = { [3] = true, [P.T.FLAGS] = true, [P.T.OBJECTS] = true }
-    for t = 1, 24 do
+    for t = 1, 26 do
         if not empty_ok[t] then
             local m = P.decode(string.char(t) .. "\0")
             T.check(m == nil, "short message type " .. t)

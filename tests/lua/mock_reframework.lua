@@ -257,10 +257,27 @@ end
 -- Fixed-size System.Array stand-in (get_size / get_element / get_elements).
 M.array = array
 
+-- The 32-bit code of a ContextID {category, kind, group, index} (the game packs the four
+-- fields into bits; any deterministic, non-zero code serves the mock).
+function M.context_code(ctx)
+    local s = ("%d:%d:%d:%d"):format(ctx.category or 0, ctx.kind or 0, ctx.group or 0, ctx.index or 0)
+    local h = 2166136261
+    for i = 1, #s do h = ((h ~ s:byte(i)) * 16777619) & 0xFFFFFFFF end
+    return (h & 0x7FFFFFFF) + 1
+end
+
 -- Stand-in for a REFramework ValueType (struct field value, e.g. chainsaw.ContextID).
 local ValueType = {}
 ValueType.__index = ValueType
 function ValueType:get_field(name) return self.f[name] end
+-- chainsaw.ContextID.get_Code() for ContextID-shaped values.
+function ValueType:call(name)
+    if name == "get_Code" and self.f._Group ~= nil then
+        return M.context_code({ category = self.f._Category, kind = self.f._Kind, group = self.f._Group,
+            index = self.f._Index })
+    end
+    error("mock: value has no method " .. tostring(name))
+end
 local function value_type(fields) return setmetatable({ f = fields }, ValueType) end
 M.value_type = value_type
 
@@ -372,6 +389,7 @@ function M.install(opts)
     local world = {
         singletons = {}, enemies = {}, drops = {}, components = {}, gui_event = false, created = {}, gos = {},
         sounds = {}, effects = {}, shots = {}, resources = {}, spawned = {}, item_flags = {}, time_scale = 1.0,
+        moving = {}, -- GimmickCore -> true: registered for GimmickManager's update (registerMove)
     }
     M.world = world
 
@@ -664,14 +682,45 @@ function M.install(opts)
         get_HitPoint = { 0, function(self) return self.hitpoint end },
         get_BodyGameObject = { 0, function(self) return self.body end },
         get_HeadGameObject = { 0, function(self) return self.head end },
-        -- Level spawner that created the character (nil for characters without one).
+        -- The spawn param that created the character: its ContextID, which is also the
+        -- character's own _ID (nil for characters without one).
         get_SpawnerID = { 0, function(self) return self.spawner end },
+        get_CharacterSpawnParam = { 0, function(self) return self.spawn_param end },
+        get_IsEliminated = { 0, function(self) return self.eliminated == true end },
+        eliminate = { 0, function(self) self.eliminated = true end },
         get_CurrentStageID = { 0, function(self) return self.stage or world.stage or 40100 end },
         get_KindID = { 0, function(self) return self.kind_id or 0 end },
         get_TargetFindState = { 0, function() return 1 end },
         get_TargetFindSource = { 0, function() return 0 end },
     }
     class("chainsaw.CharacterContext", "System.Object", ctx_methods, { _ID = "chainsaw.ContextID" })
+    -- A level spawn param (a component on its own GameObject). invalidateSpawn(true) despawns
+    -- its character the way the game's updateSpawn does: the context leaves the enemy list
+    -- and its body and head are destroyed.
+    class("chainsaw.CharacterSpawnParam", "via.Component", {
+        invalidateSpawn = { 1, function(self, b)
+            self.invalid = b
+            if b and self.ctx ~= nil then M.despawn(self.ctx) end
+        end, { "System.Boolean" } },
+    })
+    -- CharacterManager.CharacterBackupDB: ContextID code -> CharacterBackup (world.backups).
+    class("chainsaw.CharacterBackup", "System.Object", {
+        get_IsEliminated = { 0, function(self) return self.eliminated == true end },
+        get_ContextID = { 0, function(self) return self.id end },
+    })
+    class("System.Collections.ObjectModel.ReadOnlyCollection`1<chainsaw.CharacterBackup>", "System.Object", {
+        get_Count = { 0, function(self) return #self.items end },
+        get_Item = { 1, function(self, i) return self.items[i + 1] end },
+    })
+    class("System.Collections.Concurrent.ConcurrentDictionary`2<System.UInt32,chainsaw.CharacterBackup>", "System.Object", {
+        get_Values = { 0, function()
+            local items = {}
+            for _, b in ipairs(world.backups) do items[#items + 1] = b end
+            return new("System.Collections.ObjectModel.ReadOnlyCollection`1<chainsaw.CharacterBackup>", { items = items })
+        end },
+    })
+    world.backups = world.backups or {}
+    local backup_db = new("System.Collections.Concurrent.ConcurrentDictionary`2<System.UInt32,chainsaw.CharacterBackup>")
     class("chainsaw.PlayerBaseContext", "chainsaw.CharacterContext", {
         get_IsHolding = { 0, function(self) return self.aiming or false end },
     })
@@ -692,6 +741,7 @@ function M.install(opts)
         getPlayerContextRef = { 0, function() return world.player end },
         getPartnerContextRef = { 0, function() return world.partner end },
         get_EnemyContextList = { 0, function() return enemy_list end },
+        get_CharacterBackupDB = { 0, function() return backup_db end },
     })
     class("chainsaw.GuiManager", "System.Object", {
         get_IsPlayingEvent = { 0, function() return world.gui_event end },
@@ -1080,9 +1130,26 @@ function M.update_motion()
     end
 end
 
+-- GimmickManager's update: every registered animal's state machine runs (it moves by
+-- `wander` per frame when it has one).
+function M.update_gimmicks()
+    for _, list in pairs(M.world.components) do
+        for _, c in ipairs(list) do
+            if c.core ~= nil and M.world.moving[c.core] and not c.owner.destroyed then
+                c.ai_frames = (c.ai_frames or 0) + 1
+                if c.wander then
+                    local p = c.owner.transform.wpos
+                    p.x, p.y, p.z = p.x + c.wander.x, p.y + c.wander.y, p.z + c.wander.z
+                end
+            end
+        end
+    end
+end
+
 -- One game frame in REFramework's order: behaviour updates, animation, end of frame,
 -- presentation, menu.
 function M.run_frame()
+    M.update_gimmicks()
     for _, cb in ipairs(M.callbacks.entry) do
         if cb.name == "LateUpdateBehavior" then cb.fn() end
     end
@@ -1108,11 +1175,13 @@ local function add_hitpoint(ctx)
     end
 end
 
--- Characters get a runtime `_ID` (group 12, like in the game) and a motion layer.
+-- A character created by a level spawn param carries that spawn param's ContextID as its
+-- own `_ID` (level data: category 0 = Character, e.g. group 12); one created at runtime gets
+-- CharacterManager.generateDynamicContextID's ContextID(Character, 0, group 1, counter).
 local next_runtime_index = 300
 local function runtime_id(ctx)
     next_runtime_index = next_runtime_index + 1
-    ctx.__fields._ID = context_id({ category = 2, kind = 0, group = 12, index = next_runtime_index })
+    ctx.__fields._ID = context_id({ category = 0, kind = 0, group = 1, index = next_runtime_index })
 end
 
 local function motion_layers()
@@ -1120,11 +1189,19 @@ local function motion_layers()
 end
 
 -- Creates a character context with HP, a body GameObject, a Transform and a joint tree
--- (enemies, simple players). spawner: optional {group, index, kind, category} returned by
--- get_SpawnerID() (level data, the same on every machine).
+-- (enemies, simple players). spawner: optional {group, index, kind, category}: the ContextID
+-- of the level spawn param that created it (the same on every machine), which becomes the
+-- character's `_ID` too; without one the character gets a runtime ID.
 function M.make_character(type_name, pos, hp, spawner)
     local ctx = new(type_name, { pos = vec(pos.x, pos.y, pos.z), hp = hp, max_hp = hp, yaw = 0 })
-    runtime_id(ctx)
+    if spawner ~= nil then
+        ctx.__fields._ID = context_id(spawner)
+        if (spawner.category or 0) == 0 and spawner.group ~= 1 then
+            ctx.spawn_param = new("chainsaw.CharacterSpawnParam", { ctx = ctx, owner = M.make_go("spawner") })
+        end
+    else
+        runtime_id(ctx)
+    end
     ctx.spawner = context_id(spawner)
     add_hitpoint(ctx)
     local body = M.make_go(type_name:match("Ch%w+") and (type_name:match("(Ch%w+)Context") .. "_body") or "body",
@@ -1136,6 +1213,25 @@ function M.make_character(type_name, pos, hp, spawner)
     ctx.body = body
     ctx.head = M.make_go(type_name:match("(Ch%w+)Context") and (type_name:match("(Ch%w+)Context") .. "_head") or "head")
     return ctx
+end
+
+-- The game despawns a character: its context leaves the enemy list and its body is destroyed.
+-- Its head GameObject survives: the game pools heads and gives them to the next characters.
+function M.despawn(ctx)
+    local list = M.world.enemies
+    for i = #list, 1, -1 do
+        if list[i] == ctx then table.remove(list, i) end
+    end
+    ctx.despawned = true
+    if ctx.body ~= nil then M.destroy(ctx.body) end
+end
+
+-- A character backup in CharacterManager.CharacterBackupDB (what the save remembers about a
+-- character that is not loaded). eliminated: it died and must never spawn again.
+function M.add_backup(ctx, eliminated)
+    local b = new("chainsaw.CharacterBackup", { id = context_id(ctx), eliminated = eliminated })
+    M.world.backups[#M.world.backups + 1] = b
+    return b
 end
 
 -- The local player as RE4 builds Leon: body object with the skeleton and sound container,
@@ -1434,6 +1530,8 @@ function M.install_world(world, opts)
         Datas = "System.Collections.Generic.List`1<chainsaw.GimmickManager.SaveItem>" })
     class("chainsaw.GimmickManager", "System.Object", {
         pushDirtyList = { 1, function() end },
+        registerMove = { 1, function(_, core) world.moving[core] = true end, { "chainsaw.GimmickCore" } },
+        unregisterMove = { 1, function(_, core) world.moving[core] = nil end, { "chainsaw.GimmickCore" } },
         saveGameSaveData = { 0, function()
             local keys = {}
             for k in pairs(world.gimmick_table) do keys[#keys + 1] = k end
@@ -1574,10 +1672,12 @@ function M.install_world(world, opts)
         end, { "chainsaw.LocID", "chainsaw.StageID", "chainsaw.AreaID" } },
     }, { _StageID = "chainsaw.StageID", _AreaNo = "System.Int32" })
     local WARP = "requestWarp(chainsaw.ContextID, System.Nullable`1<via.vec3>, System.Nullable`1<via.Quaternion>, chainsaw.StageIdentifier)"
+    local backup_db = new("System.Collections.Concurrent.ConcurrentDictionary`2<System.UInt32,chainsaw.CharacterBackup>")
     class("chainsaw.CharacterManager", "System.Object", {
         getPlayerContextRef = { 0, function() return world.player end },
         getPartnerContextRef = { 0, function() return world.partner end },
         get_EnemyContextList = { 0, function() return world.enemy_list end },
+        get_CharacterBackupDB = { 0, function() return backup_db end },
         isActive = { 1, function(_, stage) return world.active_stages ~= nil and world.active_stages[stage] == true end },
         [WARP] = { 4, function(_, id, npos, nrot, sid)
             local function value(n, t)
@@ -1600,14 +1700,23 @@ function M.install_world(world, opts)
             "chainsaw.StageIdentifier" } },
     })
 
-    -- Breakables and animals: scene components with a _Routine state machine.
+    -- Breakables and animals: scene components with a _Routine state machine. A gimmick's
+    -- state machine runs from its GimmickCore, which GimmickManager updates while it is
+    -- registered (registerMove / unregisterMove; see M.update_gimmicks).
     enum("chainsaw.GmWoodBoxBase.RoutineType", { Wait = 0, Damage = 1, Break = 2, BrokenWait = 3 })
-    enum("chainsaw.GmCrow.RoutineType", { Idle = 0, TakeOff = 1, Dead = 2 })
-    class("chainsaw.GmBase", "via.Component", {})
+    enum("chainsaw.GmCrow.RoutineType", { Idle = 0, Reaction = 1, Croak = 2, Peck = 3, Drink = 4, Run = 5,
+        Landing = 6, Die = 7, Dead = 8, Sleep = 9, Loop = 10 })
+    class("chainsaw.GimmickCore", "via.Component", {}, { _HasRegisteredMove = "System.Boolean" })
+    class("chainsaw.GmBase", "via.Component", {
+        get_Core = { 0, function(self) return self.core end },
+    })
     class("chainsaw.GmWoodBoxBase", "chainsaw.GmBase", {}, { _Routine = "chainsaw.GmWoodBoxBase.RoutineType" })
     class("chainsaw.GmWoodBox", "chainsaw.GmWoodBoxBase", {})
-    class("chainsaw.GmCrow", "chainsaw.GmBase", {
-        requestDead = { 0, function(self) self.__fields._Routine = 2 end },
+    class("chainsaw.GmAnimal", "chainsaw.GmBase", {
+        get_Motion = { 0, function(self) return self.__fields._Motion end },
+    }, { _Motion = "via.motion.Motion" })
+    class("chainsaw.GmCrow", "chainsaw.GmAnimal", {
+        set_Routine = { 1, function(self, v) self.__fields._Routine = v end, { "chainsaw.GmCrow.RoutineType" } },
     }, { _Routine = "chainsaw.GmCrow.RoutineType" })
     class("chainsaw.GmBottle", "chainsaw.GmBase", {})
 end
@@ -1656,11 +1765,19 @@ function M.load_save(chapter)
     M.world.singletons["chainsaw.CampaignManager"]:call("loadGameSaveData", data)
 end
 
--- A breakable or animal in the scene, with the GameObject GUID from the scene file.
+-- A breakable or animal in the scene, with the GameObject GUID from the scene file. Animals
+-- get a GimmickCore registered for the game's update and a Motion with one layer.
 function M.make_object(type_name, guid, pos, routine)
     local go = M.make_go(type_name:match("([^.]+)$"), { wpos = vec(pos.x, pos.y, pos.z) })
     go.guid = guid
     local comp = M.add_component(go, type_name, { __fields = { _Routine = routine or 0 } })
+    if classes[type_name]:is_a("chainsaw.GmAnimal") then
+        local core = M.add_component(go, "chainsaw.GimmickCore", { __fields = { _HasRegisteredMove = true } })
+        comp.core = core
+        M.world.moving[core] = true
+        comp.__fields._Motion = M.add_component(go, "via.motion.Motion",
+            { layers = { new("via.motion.TreeLayer", { bank = 7, motion = 1, frame = 0 }) } })
+    end
     local list = M.world.components[type_name] or {}
     list[#list + 1] = comp
     M.world.components[type_name] = list

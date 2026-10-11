@@ -56,15 +56,21 @@ Session rules:
 | `stats()` | Table: `rtt_ms, peer, peer_name, bytes_sent, bytes_recv, resends, reliable_in_flight, out_of_order, unordered_duplicates, …` |
 | `local_addresses()` | Array of this PC's LAN IPv4 addresses |
 | `time()` | Monotonic seconds (`os.clock` is CPU time, so don't use it for networking) |
-| `max_payload()`, `version()` | `1188`; `"0.7.0", 2` |
+| `max_payload()`, `version()` | `1188`; `"0.8.0", 2` |
 | `new_session()` | An independent session object with the same methods (tests/tools) |
 
-## Game messages (game protocol version 7)
+## Game messages (game protocol version 8)
 
-Version 7 (mod 0.7.0): ENEMY_SNAPSHOT carries 17 entries per chunk, ENEMY_CLIENT up to 24
-states, OBJECTS up to 50 events (everything fits the 1188-byte payload), deaths the client did
-not witness are re-advertised 30 at a time on every 10th snapshot, ACTIONS travel on the
-unordered lane, and ITEM_DROPPED is retired (each player rolls their own loot).
+Version 8 (mod 0.8.0) rebuilt enemy sync on the game's own enemy identity, with the host
+running every enemy: ENEMY_SNAPSHOT, ENEMY_DAMAGE, ENEMY_DEAD and ENEMY_HIT carry the enemy's
+**uid** (see "ContextIDs on the wire" below) instead of a spawner ContextID, ENEMY_SNAPSHOT
+carries 19 entries per chunk and no dead entries any more, ENEMY_GRAVE (25) carries the list of
+every enemy dead in the host's world, ENEMY_CLIENT only lists the host enemies the client has a
+copy of (enemies no longer change hands), and ANIMALS (26) carries the host's animals near both
+players.
+Version 7 (mod 0.7.0): ENEMY_CLIENT up to 24 states, OBJECTS up to 50 events (everything fits
+the 1188-byte payload), ACTIONS travel on the unordered lane, and ITEM_DROPPED is retired
+(each player rolls their own loot).
 
 The first byte is the message type. Formats use Lua `string.pack` notation.
 
@@ -73,9 +79,9 @@ The first byte is the message type. Formats use Lua `string.pack` notation.
 | 1 | HELLO | reliable | both, on connect | `<B I2 s1 s1 s1 B`: type, game protocol version, mod version, player name, chapter/area, flags (1 = reply requested) |
 | 2 | PLAYER | unreliable, 20 Hz | both | `<B d fff ffff ff B I4 i4 i4`: time, position, rotation quaternion (x,y,z,w), HP, max HP, flags (1 dead, 2 cutscene, 4 aiming, 8 has stage, 16 has chapter, 32 waiting at a transition), area hash, `chainsaw.StageID` (valid with flag 8), `chainsaw.ChapterID` (valid with flag 16) |
 | 3 | *(retired)* | | | SKELETON in protocols 1–3 (the stick-figure ghost) |
-| 4 | ENEMY_SNAPSHOT | unreliable, 20 Hz | host → client | `<B d B B B` + n × `<I2 I4 fff fff f f f B i4 i4 B B I4 I4 f>` (65 B): time, chunk, chunks, count; then net id, kind hash (FNV-1a of context type name), position, spawn position, yaw, HP, max HP, flags (1 alive, 2 has ContextID, 4 run by the client, 8 has animation), the enemy's **spawner** `chainsaw.ContextID` (`CharacterContext.get_SpawnerID()`) as group, index, kind, category, then motion bank, motion ID and frame of its motion layer 0 (read only for enemies the client mirrors). 17 entries per chunk. Every 10th snapshot also lists up to 30 deaths the client did not witness, in turn (flags without 1) |
-| 5 | ENEMY_DAMAGE | reliable | client → host | `<B I2 I4 fff f B i4 i4 B B`: net id (0 = unpaired), kind hash, spawn position, amount, flags (1 lethal, 2 has ContextID), spawner ContextID (sent only once spawner IDs are trusted, see below) |
-| 6 | ENEMY_DEAD | reliable | host → client | `<B I2`: net id. Net id 0: the host reloaded a checkpoint, forget every death it reported |
+| 4 | ENEMY_SNAPSHOT | unreliable, 20 Hz | host → client | `<B d B B B` + n × `<I2 I4 fff fff f f f B I4 I4 I4 f>` (59 B): time, chunk, chunks, count; then the host's living enemies: net id, kind hash (FNV-1a of context type name), position, spawn position (where the host first saw it), yaw, HP, max HP, flags (1 alive, 2 has uid, 8 has animation; 4 and 16 meant "run by the client" and "hand-over decided" in development builds and are retired), uid, then motion bank, motion ID and frame of its motion layer 0 (read only for enemies the client has a copy of). 19 entries per chunk. The client's copies follow these: position, facing and animation, with their own AI off |
+| 5 | ENEMY_DAMAGE | reliable | client → host | `<B I2 I4 fff f B I4`: net id (0 = unpaired), kind hash, spawn position, amount, flags (1 lethal, 2 has uid), uid. A lethal report for an enemy the host has not loaded puts it in the host's graveyard |
+| 6 | ENEMY_DEAD | reliable | host → client | `<B I2 B I4`: net id, flags (1 has uid, 2 reset), uid. One enemy died in the host's world (also a corpse the host found that died earlier). Flag 2 (net id 0): the host reloaded a checkpoint, forget every death it reported |
 | 7 | CHAT | reliable | both | `<B s2`: text (≤ 512 bytes) |
 | 8 | NOTIFY | reliable | both | `<B B s1`: code (1 died, 2 revived, 3 teleported, 4 info), text |
 | 9 | ITEM_TAKEN | reliable | both | `<B I4 fff B i4 i4 B B i4`: item ID, position, flags (1 has ContextID, 2 it was the only copy in the sender's scene, 4 has stage), ContextID of the `chainsaw.DropItem` (level IDs only), its `chainsaw.StageID`. The receiver removes its copy of that key item |
@@ -84,24 +90,27 @@ The first byte is the message type. Formats use Lua `string.pack` notation.
 | 12 | GEAR | reliable | both | see below: the weapons the character carries |
 | 13 | POSE | unreliable, 30 Hz | both | see below: root placement, every joint's local rotation, weapon placement |
 | 14 | ACTIONS | reliable, unordered lane | both | see below: sound/effect calls and shots to replay |
-| 15 | ENEMY_HIT | unreliable | both | `<B I2 I4 fff i4 fff fff i4 B`: net id (host numbering; 0 = unpaired), kind hash, enemy spawn position, damage, wince, break, stopping, damage direction, weapon ID, flags (1 critical). A hit the sender's player landed (`HitController.callbackDamageHit`). The host hands an enemy the client is fighting to the client's game (and back); with the experimental replay switch the receiver also replays it on its copy (cosmetic: 1 damage, HP restored) |
+| 15 | ENEMY_HIT | unreliable | both | `<B I2 I4 fff i4 fff fff i4 B I4`: net id (host numbering; 0 = unpaired), kind hash, enemy spawn position, damage, wince, break, stopping, damage direction, weapon ID, flags (1 critical, 2 has uid), uid. A hit the sender's player landed (`HitController.callbackDamageHit`): the receiver draws a shot tracer, and with the experimental replay switch also replays it on its copy (cosmetic: 1 damage, HP restored) |
 | 16 | *(retired)* | | | ITEM_DROPPED in protocols 4–6 (the host's roll spawned on the client); still decoded, ignored |
-| 17 | ENEMY_CLIENT | unreliable, 20 Hz | client → host | `<B d B B` + n × `<I2 fff f I4 I4 f B>` + m × `<I2>`: time, state count (≤ 24), copy count (≤ 200); the enemies the client runs (net id, position, yaw, motion bank/ID/frame, flags: 1 has animation), then the net ids of every other host enemy the client has a copy of. The host mirrors the first list and hands over only enemies the client has |
+| 17 | ENEMY_CLIENT | unreliable, 20 Hz | client → host | `<B d I2` + n × `<I2>`: time, count (≤ 500), the net ids of the host enemies the client has a living copy of. The host reads (and sends) the animation of those enemies only |
 | 18 | FLAGS | reliable | both | `<B B` + n × (`guid` + `<B`): scenario flags that changed (≤ 64 per message), with their new value |
 | 19 | FLAG_WORDS | reliable | both | `<B I2 B B B B` (sync id, mode, chunk, chunks, item count) + per item `<s1 I2 I2` (group name, first word, count) + words. Mode 1 = full copy: `<I4` words. Mode 2 = changes: `<I2 I4 I4` (word index, bits set, bits cleared) |
 | 20 | GIMMICKS | reliable | both | `<B I2 B B B B` (sync id, mode, chunk, chunks, count) + per gimmick: `ctx` (`<i4 i4 B B>`: group, index, kind, category), `<s1` attribute bytes, `<B` + n × `<I4 I4` (trigger save ID, done), `<B` detected, `<B` + n × (`<B` kind, `<f` or `<I4` value) accessory values. Mode 1 = the whole table, 2 = records that changed, 3 = records that appeared (applied only where the receiver has no record of that gimmick) |
 | 21 | OBJECTS | reliable | both | `<B B` + n × (`guid` + `<B i4`): scene object (GameObject GUID), event (1 destroyed, 2 state changed), value (the `_Routine` it ended in, or -1) |
 | 22 | CUTSCENE | reliable | both | `<B i4 s1 i4 i4 fff B`: timeline event ID (`chainsaw.TimelineEventDefine.ID`), request method name, chapter, stage, position where it started, flags (1 = triggered by the sender's game) |
 | 23 | WORLD_REQUEST | reliable | client → host | `<B I2 B`: sync id, what (1 flags, 2 gimmicks, 4 enemies, 8 objects) |
-| 24 | WORLD_DONE | reliable | host → client | `<B I2 B I4 I4`: sync id, what, flag groups sent, gimmicks sent. Follows the FLAG_WORDS / GIMMICKS / OBJECTS of a full transfer (the ordered lane keeps them in order) |
+| 24 | WORLD_DONE | reliable | host → client | `<B I2 B I4 I4`: sync id, what, flag groups sent, gimmicks sent. Follows the FLAG_WORDS / GIMMICKS / OBJECTS of a full transfer (the ordered lane keeps them in order). A request with sync id 0 (enemies only, from a client without a world adapter) gets no WORLD_DONE |
+| 25 | ENEMY_GRAVE | reliable | host → client | `<B B B I2` + n × `<I4>`: chunk, chunks, count (≤ 290), uids. Every enemy dead in the host's world: the deaths it saw, the client's kills of enemies it had not loaded, and the enemies its save has eliminated (`CharacterManager.CharacterBackupDB`). Sent after a WORLD_REQUEST with bit 4 (joining, the client's game reloading), once the host has read its save (a few ticks). The first message replaces what the client knew |
+| 26 | ANIMALS | unreliable, 10 Hz | host → client | `<B d B B B` + n × (`guid` + `<fff I4 i4 I4 I4 f B>`) (49 B): time, chunk, chunks, count (≤ 23); then the host's animals (`chainsaw.GmAnimal`: crows, chickens, fish, bats, rats) within 50 m of both players, nearest to the client first, at most 24: GameObject GUID, position, packed rotation, `_Routine`, motion bank, motion ID, motion frame, flags (1 has animation, 2 dead: its routine reached Die/Dead, 4 has routine). The client's copies follow them with their own AI off the game's update; a dead one dies in the client's game with its own death. Animal kills travel as OBJECTS |
 
 `guid` is 16 raw bytes: the 32 hex digits of the canonical GUID string, in order. Scenario
 flags are addressed by GUID in the game itself; scene objects by their GameObject GUID, which
 comes from the scene file and is the same on both machines.
 
 Joining: once the client is in the host's chapter it sends WORLD_REQUEST; the host answers
-with full FLAG_WORDS and GIMMICKS, the OBJECTS destroyed so far and WORLD_DONE; the client
-applies them and then warps next to the host.
+with full FLAG_WORDS and GIMMICKS, the OBJECTS destroyed so far and WORLD_DONE, and then
+ENEMY_GRAVE; the client applies them and then warps next to the host. A client whose game
+reloads a checkpoint later sends WORLD_REQUEST again (in the host's chapter only).
 
 Compatibility: only the `version` field of HELLO is guaranteed across game protocol versions.
 A peer with a different version gets an "update both" message, and its game messages are
@@ -109,23 +118,24 @@ ignored.
 
 ### ContextIDs on the wire
 
-`chainsaw.ContextID` is `{category, kind, group, index}`. The research dump showed two kinds:
+`chainsaw.ContextID` is `{category, kind, group, index}` with a 32-bit code (`get_Code()`).
 
-* **Level IDs**, the same on both machines: level-placed items (`3:0:40210:13`, group =
-  stage) and, presumably, level spawners.
-* **Runtime IDs** in group 12, handed out in load order: every enemy's own `_ID`
-  (`0:0:12:987`) and every spawned drop item (`2:0:12:486`). Two machines can give the same
-  number to different objects, or agree for a while and then drift apart.
-
-Runtime IDs are never used across the network: enemies are identified by their spawner's ID
-(ignored if it is a runtime ID), and ITEM_TAKEN carries a ContextID only if it is a level
-ID. A spawner may create several enemies, so the client pairs by spawner ID only when that ID
-is unique among the enemies of that kind on both sides, within 25 m, and only after three
-position-based pairings agreed with the spawner IDs and none disagreed.
+* **Enemy identity (uid)**: every enemy the level places is created by a
+  `chainsaw.CharacterSpawnParam` whose `_ContextID` is serialized in the scene file, and the
+  game uses that ID as the character's own `_ID` (and as its `SpawnerID`): `0:0:12:312` is level
+  data, the same on both PCs. An enemy's uid on the wire is that ID's code. Characters created
+  at runtime get `ContextID(Character, 0, 1, counter & 0x7FF)`
+  (`CharacterManager.generateDynamicContextID`): group 1, never sent; those enemies are paired
+  by kind and spawn point. The evidence is in [RESEARCH.md](RESEARCH.md) section 3.8.
+* **Animals and breakables** are addressed by their GameObject GUID (`guid`), which comes from
+  the scene file ([RESEARCH.md](RESEARCH.md) section 3.9).
+* **Items**: level-placed items carry level IDs (`3:0:40210:13`, group = stage); spawned drop
+  items get IDs in group 12 handed out at runtime (`2:0:12:486`). ITEM_TAKEN carries a
+  ContextID only if it is a level ID.
 
 ### Quaternions
 
-Rotations in AVATAR/POSE travel as 32 bits, "smallest three": bits 31–30 hold the index (x, y,
+Rotations in AVATAR/POSE/ANIMALS travel as 32 bits, "smallest three": bits 31–30 hold the index (x, y,
 z, w) of the largest component, which is dropped (its sign is made positive, since q and −q are
 the same rotation); the other three are 10 bits each (bits 29–20, 19–10, 9–0), mapped from
 [−1/√2, 1/√2] to 0…1022 with 511 = 0. The receiver rebuilds the dropped component from unit

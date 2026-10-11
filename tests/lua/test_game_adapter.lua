@@ -11,8 +11,10 @@ local function fresh_game(opts)
     local world = mock.install(opts)
     world.player = mock.make_player({ x = 1, y = 2, z = 3 })
     world.enemies = {
+        -- Placed by a level spawn param: its ContextID is the enemy's own.
         mock.make_character("chainsaw.Ch1c0z0Context", { x = 5, y = 0, z = 0 }, 100,
-            { category = 2, kind = 1, group = 4100, index = 7 }),
+            { category = 0, kind = 0, group = 4100, index = 7 }),
+        -- Created at runtime (group 1): no identity that holds across machines.
         mock.make_character("chainsaw.Ch1d0z0Context", { x = 0, y = 0, z = 8 }, 300),
     }
     return require("re4coop.game").new(function() end, clock), world
@@ -220,20 +222,104 @@ T.run("lists_and_modifies_enemies_via_setter", function()
     T.eq(#list, 2, "two enemies")
     T.eq(list[1].kind, "chainsaw.Ch1c0z0Context", "kind is the runtime context type")
     T.eq(list[2].max_hp, 300, "max hp")
-    T.check(list[1].ctx ~= nil and list[1].ctx.group == 4100 and list[1].ctx.index == 7
-        and list[1].ctx.kind == 1 and list[1].ctx.category == 2, "spawner ContextID read via get_SpawnerID")
-    T.eq(list[2].ctx, nil, "enemy without a spawner")
+    T.eq(list[1].uid, mock.context_code({ category = 0, kind = 0, group = 4100, index = 7 }),
+        "level enemy: uid = the code of its own ContextID")
+    T.eq(list[2].uid, nil, "runtime enemy: no uid")
+    T.check(game:capabilities().enemy_uid.ok, "reported: " .. game:capabilities().enemy_uid.detail)
     T.check(game:enemy_set_hp(list[1].id, 41.6), "set hp")
     T.eq(world.enemies[1].hp, 42, "rounded for the Int32 setter")
     T.check(game:capabilities().enemy_set_hp.ok, "writer verified after a successful write")
     T.check(game:capabilities().enemy_set_hp.detail:find("set_CurrentHitPoint", 1, true), "names the verified writer")
     T.check(game:enemy_kill(list[2].id), "kill")
     T.eq(world.enemies[2].hp, 0, "dead() called")
-    T.check(game:enemy_set_position(list[1].id, { x = 9, y = 1, z = 9 }), "move")
-    T.near(world.enemies[1].pos.x, 9, 1e-6, "moved")
-    T.eq(world.enemies[1].warped, 1, "CharacterController.warp called")
     T.check(game:enemy_set_hp(123456, 5) == false, "unknown id is a no-op")
     T.eq(mock.decoy_calls, 0, "set_DefaultHitPoint (max HP) never touched")
+end)
+
+T.run("enemy_identity_is_its_level_context_id", function()
+    local _, world = fresh_game()
+    world.enemies[3] = mock.make_character("chainsaw.Ch1c0z0Context", { x = 1, y = 0, z = 1 }, 100,
+        { category = 0, kind = 0, group = 12, index = 312 }) -- the IDs the research dump saw
+    world.enemies[4] = mock.make_character("chainsaw.Ch1c0z0Context", { x = 2, y = 0, z = 1 }, 100,
+        { category = 2, kind = 0, group = 12, index = 9 })  -- not a character ID
+    local game = require("re4coop.game").new(function() end)
+    local list = game:list_enemies()
+    T.eq(list[3].uid, mock.context_code({ category = 0, kind = 0, group = 12, index = 312 }),
+        "group 12 is level data, not a runtime counter")
+    T.eq(list[4].uid, nil, "a non-character ID is not an identity")
+    T.eq(list[2].uid, nil, "group 1 (generateDynamicContextID) is not either")
+    -- A second machine running the same level reads the same uid for the same enemy.
+    local _, world2 = fresh_game()
+    local game2 = require("re4coop.game").new(function() end)
+    T.eq(game2:list_enemies()[1].uid, list[1].uid, "same enemy, same uid on another machine")
+    T.check(world2 ~= world, "really another world")
+end)
+
+T.run("erasing_an_enemy_the_partner_already_killed", function()
+    local game, world = fresh_game()
+    local list = game:list_enemies()
+    local ctx = world.enemies[1]
+    T.check(game:enemy_set_ai(list[1].id, false), "mirrored: AI off")
+    T.check(game:enemy_erase(list[1].id), "erased")
+    T.eq(ctx.eliminated, true, "CharacterContext.eliminate(): the stored backup keeps it dead")
+    T.eq(ctx.spawn_param.invalid, true, "CharacterSpawnParam.invalidateSpawn(true)")
+    T.eq(ctx.despawned, true, "the game despawned it")
+    T.eq(ctx.head.update_self, true, "its pooled head was switched back on first")
+    T.eq(ctx.hp, 100, "never killed: no death, no corpse, no loot")
+    T.check(game:capabilities().enemy_erase.ok, "reported")
+    T.eq(#game:list_enemies(), 1, "gone from the list")
+    -- A runtime enemy has no spawn param: the caller kills it instead.
+    T.check(not game:enemy_erase(list[2].id), "no spawn param: not erased")
+    T.eq(world.enemies[1].hp, 300, "and not touched")
+end)
+
+T.run("a_head_switched_off_goes_back_to_the_pool_switched_on", function()
+    local game, world = fresh_game()
+    local list = game:list_enemies()
+    local ctx = world.enemies[1]
+    T.check(game:enemy_set_ai(list[1].id, false), "AI off")
+    T.eq(ctx.head.update_self, false, "head off")
+    -- The area unloads: the game despawns the enemy, its head goes back to the pool.
+    mock.despawn(ctx)
+    game:list_enemies()
+    T.eq(ctx.head.update_self, true, "the next enemy that gets this head will think")
+    T.eq(next(game.enemy_ai_off), nil, "forgotten")
+    -- The same through a reload.
+    local list2 = game:list_enemies()
+    T.check(game:enemy_set_ai(list2[1].id, false), "another one off")
+    local head2 = world.enemies[1].head
+    game:on_reload()
+    T.eq(head2.update_self, true, "restored on reload")
+    -- And when the context gets another head while ours is off.
+    local list3 = game:list_enemies()
+    local ctx3 = world.enemies[1]
+    T.check(game:enemy_set_ai(list3[1].id, false), "off")
+    local old_head = ctx3.head
+    ctx3.head = mock.make_go("Ch1d0z0_head")
+    T.check(game:enemy_set_ai(list3[1].id, false), "the new head off")
+    T.eq(old_head.update_self, true, "the old head runs again")
+    T.eq(ctx3.head.update_self, false, "the new one is off")
+end)
+
+T.run("reading_the_enemies_dead_in_our_save", function()
+    local game = fresh_game()
+    for i = 1, 100 do
+        mock.add_backup({ category = 0, kind = 0, group = 12, index = i }, i % 3 == 0)
+    end
+    mock.add_backup({ category = 0, kind = 0, group = 1, index = 5 }, true) -- runtime: never sent
+    local done, uids, calls = false, nil, 0
+    while not done do
+        done, uids = game:scan_eliminated(40)
+        calls = calls + 1
+        T.check(calls < 10, "finishes")
+    end
+    T.eq(calls, 3, "read in slices (40 per call)")
+    T.eq(#uids, 33, "every eliminated level enemy")
+    T.eq(uids[1], mock.context_code({ category = 0, kind = 0, group = 12, index = 3 }), "by uid")
+    T.check(game:capabilities().enemy_backups.ok, "reported: " .. game:capabilities().enemy_backups.detail)
+    local again_done, again = game:scan_eliminated(1000)
+    T.eq(again_done, true, "a new scan starts from the beginning")
+    T.eq(#again, 33, "same result")
 end)
 
 T.run("hp_writer_discovered_under_another_name", function()
@@ -385,7 +471,7 @@ T.run("pickup_callbacks_hooked", function()
     local ev = game:take_pickup_events()
     T.eq(#ev, 1, "one event")
     T.eq(ev[1].key, "2:0:12:77", "item ContextID read from args[3]")
-    T.eq(ev[1].user, "2:0:12:" .. game:read_context_id(mock.world.player).index, "user ContextID from args[2]")
+    T.eq(ev[1].user, P.ctx_key(game:read_context_id(mock.world.player)), "user ContextID from args[2]")
     T.eq(ev[1].via, "onAcceptPickup", "callback name")
     T.eq(#game:take_pickup_events(), 0, "drained")
     mock.fire_hooks("onAcceptPickup", nil, nil) -- unreadable arguments are ignored
@@ -404,15 +490,6 @@ T.run("pickup_callbacks_hooked", function()
     local nohook = fresh_game({ no_hook = true })
     T.eq(nohook:take_pickup_events(), nil, "no hook: nil")
     T.check(not nohook:capabilities().pickup_hook.ok, "capability reports it")
-end)
-
-T.run("runtime_spawner_ids_are_ignored", function()
-    local _, world = fresh_game()
-    world.enemies[2].spawner = mock.value_type({ _Category = 0, _Kind = 0, _Group = 12, _Index = 55 })
-    local game = require("re4coop.game").new(function() end)
-    local list = game:list_enemies()
-    T.check(list[1].ctx ~= nil, "level spawner kept")
-    T.eq(list[2].ctx, nil, "runtime spawner dropped")
 end)
 
 T.run("hit_hook_captures_player_hits", function()
@@ -626,7 +703,7 @@ T.run("research_dump", function()
     T.check(type(dump.types["chainsaw.GmContextBox"]) == "table", "changed gimmick types described")
     T.eq(dump.types["chainsaw.HateControllerUserData"], "not found", "types missing in this build are listed as such")
     T.check(dump.live.singletons["chainsaw.CharacterManager"] == true, "singleton presence")
-    T.check(dump.live.enemies[1].spawner_id.group == 4100, "enemy spawner IDs")
+    T.eq(dump.live.enemies[1].uid, mock.context_code({ category = 0, kind = 0, group = 4100, index = 7 }), "enemy uids")
     T.check(dump.live.pickups[1].key_item == true, "pickup samples")
     T.check(dump.live.pickup_components and dump.live.pickup_components[2] == "chainsaw.DropItem", "pickup components")
     T.check(dump.live.enemy_components and dump.live.enemy_components[1] == "via.Transform", "enemy components")
@@ -651,9 +728,11 @@ T.run("research_dump", function()
     T.eq(r.partner.type, "chainsaw.Ch3a8z0Context", "partner from getPartnerContextRef")
     T.eq(r.partner.spawner, "1:0:40200:1", "partner spawner")
     T.check(r.partner.components ~= nil, "partner components")
-    T.eq(r.enemies[1].spawner, "2:1:4100:7", "enemy spawner key")
+    T.eq(r.enemies[1].spawner, "0:0:4100:7", "enemy spawner key")
     T.eq(r.enemies[1].stage, 40200, "enemy stage")
-    T.check(r.enemies[1].id:find("^2:0:12:") ~= nil, "runtime enemy ID")
+    T.eq(r.enemies[1].id, "0:0:4100:7", "a level enemy's own ID is its spawn param's")
+    T.eq(r.enemies[1].id_stable, true, "and holds across machines")
+    T.eq(r.enemies[1].uid, mock.context_code({ category = 0, kind = 0, group = 4100, index = 7 }), "uid")
     T.eq(r.enemies[1].motion.bank, 100, "first enemy motion")
     T.eq(r.enemies[1].find_state, 1, "enemy find state")
     T.eq(r.hate[1].game_object, "GameObject ch1c0z0_hate", "HateController's GameObject")

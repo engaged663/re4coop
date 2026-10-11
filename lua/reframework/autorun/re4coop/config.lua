@@ -6,7 +6,7 @@ Config.FILE = "re4coop.json"
 
 -- Bumped when defaults change for safety: settings saved by an older version take the new
 -- default for the keys listed in Config.RESET_ON_UPGRADE.
-Config.VERSION = 7
+Config.VERSION = 8
 
 Config.DEFAULTS = {
     config_version = Config.VERSION,
@@ -20,21 +20,18 @@ Config.DEFAULTS = {
     pose_hz = 30,         -- partner model pose updates per second
     enemy_tick_hz = 20,
     snapshot_hz = 20,
-    client_enemy_hz = 20, -- client: reports of the enemies it runs per second
+    client_enemy_hz = 20, -- client: reports of the host's enemies it has a copy of, per second
     interp_delay = 0.066, -- seconds the partner is shown in the past (smooths network jitter)
 
-    -- enemy sync
+    -- enemy sync: the host's game runs every enemy (AI, HP, deaths); pairing is by the level's
+    -- own enemy IDs
     sync_enemies = true,
-    sync_hp = true,
-    sync_deaths = true,
-    enemy_mirror = true,      -- both screens show each enemy in the same place (the other PC's copy follows)
-    enemy_ownership = true,   -- each enemy is run by the PC whose player is closer (it attacks that player)
-    enemy_motion_sync = true, -- mirrored enemies also play the owner's animation
-    enemy_puppet_ai = true,   -- a mirrored enemy's own AI is switched off (it only follows the owner's copy)
-    match_radius = 3.0,   -- metres between spawn points to treat two enemies as the same one
-    snap_distance = 0.0,  -- client, without mirroring: teleport enemies further than this from the host's copy (0 = off)
-    hit_ownership = true, -- an enemy the partner is shooting is run by their game (it reacts to their hits)
-    sync_drops = true,    -- every enemy that dies gives each player their own loot roll, also the partner's kills
+    enemy_mirror = true,      -- the client's enemies stand and move where the host's are (their own AI off)
+    enemy_motion_sync = true, -- those enemies (and animals) also play the host's animation
+    enemy_erase = true,       -- enemies dead in the partner's world that only now spawn here never appear (no corpse)
+    enemy_interp_delay = 0.1, -- seconds the host's enemies are shown in the past on the client (smoothness vs. delay)
+    sync_drops = true,        -- every enemy that dies gives each player their own loot roll, also the partner's kills
+    sync_animals = true,      -- crows, chickens, fish, bats and rats near both players move as in the host's game
 
     -- shared world
     sync_flags = true,        -- story/scenario flags: objectives, map, doors, items taken, events seen
@@ -87,9 +84,15 @@ Config.DEFAULTS = {
     exp_force_routine = false,   -- break objects by forcing their state machine into a "broken" state
 }
 
--- Keys whose default changed in Config.VERSION for stability (crashes or stutter in 0.6).
-Config.RESET_ON_UPGRADE = { "interp_delay", "snapshot_hz", "replay_partner_hits", "sync_cutscenes", "travel_reload",
-    "stage_travel" }
+-- Keys that take their (new) default once when a config saved before that config version is
+-- loaded: version 7 (0.7) made 0.6's risky defaults experimental (crashes, stutter); version 8
+-- (0.8) rebuilt enemy sync around the host, so switches turned off to work around 0.7's
+-- problems come back on. (0.7's enemy_ownership and hit_ownership no longer exist: the host
+-- runs every enemy.)
+Config.RESET_ON_UPGRADE = {
+    [7] = { "interp_delay", "snapshot_hz", "replay_partner_hits", "sync_cutscenes", "travel_reload", "stage_travel" },
+    [8] = { "sync_enemies", "enemy_mirror", "enemy_motion_sync" },
+}
 
 local function copy(t)
     local out = {}
@@ -104,8 +107,11 @@ function Config.load(json)
         local ok, saved = pcall(json.load_file, Config.FILE)
         if ok and type(saved) == "table" then
             local reset = {}
-            if (tonumber(saved.config_version) or 0) < Config.VERSION then
-                for _, k in ipairs(Config.RESET_ON_UPGRADE) do reset[k] = true end
+            local saved_version = tonumber(saved.config_version) or 0
+            for version, keys in pairs(Config.RESET_ON_UPGRADE) do
+                if saved_version < version then
+                    for _, k in ipairs(keys) do reset[k] = true end
+                end
             end
             for k, default in pairs(Config.DEFAULTS) do
                 local v = saved[k]
@@ -134,8 +140,7 @@ function Config.sanitize(cfg)
     end
     cfg.snapshot_hz = math.max(2, math.min(30, cfg.snapshot_hz))
     cfg.interp_delay = math.max(0.0, math.min(0.5, cfg.interp_delay))
-    cfg.match_radius = math.max(0.5, math.min(20.0, cfg.match_radius))
-    cfg.snap_distance = math.max(0.0, math.min(50.0, cfg.snap_distance))
+    cfg.enemy_interp_delay = math.max(0.03, math.min(0.4, cfg.enemy_interp_delay))
     cfg.left_behind_distance = math.max(10.0, math.min(500.0, cfg.left_behind_distance))
     cfg.left_behind_seconds = math.max(1.0, math.min(120.0, cfg.left_behind_seconds))
     cfg.teleport_key = math.floor(cfg.teleport_key)
