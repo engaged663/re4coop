@@ -8,10 +8,13 @@
 --     or order each game spawned it in. Enemies created at runtime (no uid) are paired by
 --     kind and position.
 --   * Movement and AI: the host's AI runs every enemy, all the time - an enemy never changes
---     hands. The client's copy of each enemy the host has is a puppet: its own AI is switched
---     off, and its position, facing and animation follow the host's enemy through an
---     interpolation buffer. Enemies the host has not loaded (yet) run in the client's game
---     with their own AI until the host's level spawns them.
+--     hands, and the client's game never runs an enemy's AI. The client's copy of each enemy
+--     the host has is a puppet: its own AI is switched off, and its position, facing and
+--     animation follow the host's enemy through an interpolation buffer. An enemy the client's
+--     level spawned that the host's game does not run (not loaded there, or not paired yet) is
+--     held: AI off and not drawn, until the host's enemy shows up. A puppet without news from
+--     the host stays where it is. The client's player still hits, damages and kills the
+--     copies: the damage goes to the host, and a copy the client kills plays its own death.
 --   * Health: the host's HP is applied to the client's copies. Damage the client's player
 --     deals is sent to the host and applied there.
 --   * Deaths: the host keeps the list of enemies dead in its world ("the graveyard"): every
@@ -40,6 +43,7 @@
 --   game:enemy_set_transform(id, pos, yaw) -> bool (optional, client: puppets follow the host)
 --   game:enemy_set_motion(id, motion) -> bool      (optional, client: puppets play the host's animation)
 --   game:enemy_set_ai(id, on) -> bool              (optional, client: a puppet's own AI is off)
+--   game:enemy_set_visible(id, on) -> bool         (optional, client: an enemy the host does not run is not drawn)
 --   game:scan_eliminated(budget) -> done, uids     (optional, host: enemies dead in its save)
 
 local Interp = require("re4coop.interp")
@@ -141,13 +145,14 @@ function EnemySync:reset()
     self.removing = {}      -- local id -> {time, how = "erase"|"kill"}: our last try to remove it (dead in the partner's world)
     self.mirror_motion = {} -- local id -> "bank:id" last applied
     self.ai_off = {}        -- local id -> true while its AI is switched off (a puppet of the host's enemy)
+    self.hidden = {}        -- local id -> true while it is not drawn (client: the host does not run it)
     self.hit_credit = {}    -- local id -> {amount, time}
     self.recent_hits = {}   -- partner hits: {pos, time}
 
     self.counters = { damage_sent = 0, damage_applied = 0, damage_failed = 0, kills_applied = 0, erased = 0,
         hp_applied = 0, hp_failed = 0, snaps = 0, uid_pairs = 0, spatial_pairs = 0, hits_sent = 0,
         hits_received = 0, hits_replayed = 0, hits_unmatched = 0, mirrored = 0, motions = 0, ai_switched = 0,
-        late_kills = 0, buried = 0, graves_sent = 0, graves_received = 0 }
+        late_kills = 0, buried = 0, graves_sent = 0, graves_received = 0, held = 0 }
 end
 
 function EnemySync:kind_hash(kind)
@@ -171,6 +176,7 @@ function EnemySync:forget(id)
     self.alive_of[id] = nil
     self.mirror_motion[id] = nil
     self.ai_off[id] = nil
+    self.hidden[id] = nil
     self.removing[id] = nil
     self.hit_credit[id] = nil
     local net_id = self.net_of[id]
@@ -296,6 +302,19 @@ function EnemySync:mirroring(game)
     return self.settings.enemy_mirror ~= false and game ~= nil and game.enemy_set_transform ~= nil
 end
 
+-- Whether the host is the only authority: the client's game runs no enemy at all (enemies the
+-- host does not run are held). With enemy_host_only off, they run on their own as in 0.8.
+function EnemySync:host_only(game)
+    return self:mirroring(game) and self.settings.enemy_host_only ~= false
+end
+
+-- Whether local enemy `id` is the copy of a living enemy the host runs.
+function EnemySync:paired_alive(id)
+    local net_id = self.net_of[id]
+    local r = net_id and self.remote[net_id]
+    return r ~= nil and r.alive and self.local_of[net_id] == id
+end
+
 function EnemySync:new_buffer()
     local delay = tonumber(self.settings.enemy_interp_delay) or MIRROR_DELAY
     return Interp.new({ delay = delay, max_delay = math.max(0.25, delay), adaptive = true, max_extrapolate = 0.2,
@@ -329,9 +348,31 @@ function EnemySync:set_ai(game, id, on)
     end
 end
 
--- Every local enemy runs its own AI again (mirroring or enemy sync switched off).
+-- Shows or hides a local enemy (client: one the host does not run is not drawn).
+function EnemySync:set_visible(game, id, on)
+    if game == nil or game.enemy_set_visible == nil then return end
+    if on then
+        if self.hidden[id] then
+            game:enemy_set_visible(id, true)
+            self.hidden[id] = nil
+        end
+    elseif not self.hidden[id] then
+        if game:enemy_set_visible(id, false) then self.hidden[id] = true end
+    end
+end
+
+-- The host does not run this enemy: it stays still and unseen in our game until it does.
+function EnemySync:hold(game, id)
+    if not self.ai_off[id] or not self.hidden[id] then self.counters.held = self.counters.held + 1 end
+    self:set_ai(game, id, false)
+    self:set_visible(game, id, false)
+    self.mirror_motion[id] = nil
+end
+
+-- Every local enemy runs its own AI again and is drawn (mirroring or enemy sync switched off).
 function EnemySync:release_all(game)
     for id in pairs(self.ai_off) do self:release_mirror(game, id) end
+    for id in pairs(self.hidden) do self:release_mirror(game, id) end
 end
 
 -- Writes the host enemy's transform (and animation) onto our puppet.
@@ -353,9 +394,11 @@ function EnemySync:apply_mirror(game, id, e, st)
     end
 end
 
--- The enemy is ours to run again: its AI back on, no animation to keep in step with.
+-- The enemy runs its own logic again (its death, or the session's end): AI back on, drawn,
+-- no animation to keep in step with.
 function EnemySync:release_mirror(game, id)
     self:set_ai(game, id, true)
+    self:set_visible(game, id, true)
     self.mirror_motion[id] = nil
 end
 
@@ -623,7 +666,7 @@ end
 function EnemySync:on_local_reload()
     for id in pairs(self.last_seen) do self:forget(id) end
     self.by_id, self.id_of_uid = {}, {}
-    self.ai_off, self.mirror_motion, self.removing = {}, {}, {}
+    self.ai_off, self.hidden, self.mirror_motion, self.removing = {}, {}, {}, {}
     self.local_of, self.net_of = {}, {}
     if self.role == "host" then
         self.client_paired = {}
@@ -729,7 +772,8 @@ function EnemySync:client_tick(now, enemies, game, players)
         if by_id[id] == nil or r == nil then
             self.local_of[net_id] = nil
             if self.net_of[id] == net_id then self.net_of[id] = nil end
-            if by_id[id] ~= nil then self:release_mirror(game, id) end -- the host no longer has it: ours to run
+            -- The host no longer has it: held below (host only), or ours to run.
+            if by_id[id] ~= nil and not self:host_only(game) then self:release_mirror(game, id) end
         end
     end
 
@@ -814,8 +858,26 @@ function EnemySync:client_tick(now, enemies, game, players)
                     self.counters.hp_failed = self.counters.hp_failed + 1
                 end
             end
-            if not mirror then self:release_mirror(game, id) end
+            if not mirror then self:release_mirror(game, id) else self:set_visible(game, id, true) end
         end
+    end
+
+    -- 4b) Host only: every other enemy of ours stays still and unseen - the host's game does
+    -- not run it (not loaded there, or not paired yet). One that dies here (our player shot
+    -- it, or the host's world has it dead) plays its own death.
+    if self:host_only(game) then
+        for _, e in ipairs(enemies) do
+            local id = e.id
+            if not self:paired_alive(id) then
+                if e.alive and not self.self_killed[id] and self.removing[id] == nil then
+                    self:hold(game, id)
+                elseif not e.alive and (self.ai_off[id] or self.hidden[id]) then
+                    self:release_mirror(game, id)
+                end
+            end
+        end
+    elseif next(self.hidden) ~= nil then
+        for id in pairs(self.hidden) do self:set_visible(game, id, true) end
     end
 
     -- 5) Tell the host which of its enemies we have (it sends their animation).
@@ -842,9 +904,9 @@ function EnemySync:client_frame(now, game)
             if age ~= nil and age < MIRROR_STALE then
                 local st = r.interp:sample(now)
                 if st ~= nil then self:apply_mirror(game, id, e, st) end
-            else
+            elseif not self:host_only(game) then
                 self:release_mirror(game, id) -- no news from the host: let our copy act
-            end
+            end -- host only: without news from the host our copy waits where it is
         end
     end
 end
@@ -867,7 +929,7 @@ end
 function EnemySync:frame(now, game)
     if self.role ~= "client" then return end
     if not self:mirroring(game) then
-        if next(self.ai_off) ~= nil then self:release_all(game) end
+        if next(self.ai_off) ~= nil or next(self.hidden) ~= nil then self:release_all(game) end
         return
     end
     self:client_frame(now, game)
@@ -910,6 +972,8 @@ function EnemySync:summary()
         if e.uid ~= nil then n_uid = n_uid + 1 end
     end
     for _ in pairs(self.ai_off) do n_ai_off = n_ai_off + 1 end
+    local n_hidden = 0
+    for _ in pairs(self.hidden) do n_hidden = n_hidden + 1 end
     if self.role == "host" then
         -- Our enemies the client has a copy of.
         local now = self.last_tick or 0
@@ -921,7 +985,7 @@ function EnemySync:summary()
         for _ in pairs(self.remote) do n_remote = n_remote + 1 end
     end
     return { role = self.role, local_count = n_local, with_uid = n_uid, paired = n_paired, remote_count = n_remote,
-        puppets = n_ai_off,
+        puppets = n_ai_off, held = n_hidden,
         dead_known = self.role == "host" and self.dead_count or self.grave_count,
         listing_dead = self.grave_scan ~= nil, counters = self.counters }
 end

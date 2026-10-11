@@ -159,8 +159,33 @@ T.run("the_host_animation_plays_once_per_change", function()
     T.eq(c.motion.id, 13, "the next one follows")
 end)
 
-T.run("only_animals_near_both_players_follow_the_host", function()
+T.run("the_host_runs_every_animal_near_the_client", function()
     local pair = make_pair()
+    pair.host_player = { x = 60, y = 0, z = 0 } -- the crow is out of the host's reach, not the client's
+    local _, near = pair:both(1, 5, 0, 5)
+    local _, far = pair:both(2, 120, 0, 0)
+    local only_client = pair.client_world:add(3, 6, 0, 6)
+    pair:step(60)
+    T.eq(near.puppet, true, "near the client: follows the host")
+    T.near(near.pos.x, 5, 1e-6, "where the host's is")
+    T.eq(far.puppet, nil, "far from the client: nothing to do")
+    T.eq(only_client.puppet, true, "not in the host's game: held, its own AI off")
+    T.near(only_client.pos.x, 6, 1e-6, "where it was")
+    T.eq(pair.client:summary().counters.held, 1, "counted")
+    -- The client runs far ahead: the host's crow is no longer reported, ours waits where it is.
+    pair.client_player = { x = 200, y = 0, z = 0 }
+    pair:step(400)
+    T.eq(near.puppet, true, "still not running on its own")
+    -- A held animal our player shoots dies with its own death, and the host is told.
+    pair.client_player = { x = 2, y = 0, z = 0 }
+    pair.client_world:die(only_client)
+    pair:step(60)
+    T.eq(only_client.puppet, nil, "released for its death")
+    T.eq(#pair.local_kills, 1, "reported to the host")
+end)
+
+T.run("without_host_only_only_animals_near_both_players_follow_the_host", function()
+    local pair = make_pair({ enemy_host_only = false })
     local _, near = pair:both(1, 5, 0, 5)
     local _, far = pair:both(2, 120, 0, 0)
     local only_client = pair.client_world:add(3, 6, 0, 6)

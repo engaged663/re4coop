@@ -600,6 +600,10 @@ function M.install(opts)
         info_methods["set_" .. f] = { 1, function(self, v) self.data[f] = v end }
     end
     class("chainsaw.HitController.DamageInfo", "System.Object", info_methods)
+    -- A head's updater: linked to its character (Context) while in use, unlinked in the pool.
+    class("chainsaw.HeadUpdater", "via.Component", {
+        get_Context = { 0, function(self) return self.context end },
+    })
     class("chainsaw.HitController", "via.Component", {
         get_DamageOwner = { 0, function(self) return self.damage_owner end },
         get_ParentHitController = { 0, function(self) return self.parent_hc end },
@@ -682,6 +686,7 @@ function M.install(opts)
         get_HitPoint = { 0, function(self) return self.hitpoint end },
         get_BodyGameObject = { 0, function(self) return self.body end },
         get_HeadGameObject = { 0, function(self) return self.head end },
+        get_HeadUpdater = { 0, function(self) return self.head_updater end },
         -- The spawn param that created the character: its ContextID, which is also the
         -- character's own _ID (nil for characters without one).
         get_SpawnerID = { 0, function(self) return self.spawner end },
@@ -1212,7 +1217,13 @@ function M.make_character(type_name, pos, hp, spawner)
     M.add_component(body, "chainsaw.HitController", { ctx = ctx })
     ctx.body = body
     ctx.head = M.make_go(type_name:match("(Ch%w+)Context") and (type_name:match("(Ch%w+)Context") .. "_head") or "head")
+    ctx.head_updater = M.add_component(ctx.head, "chainsaw.HeadUpdater", { context = ctx })
     return ctx
+end
+
+-- The game gives a pooled head to another character (or to `ctx`): its updater is linked again.
+function M.relink_head(head_updater, ctx)
+    head_updater.context = ctx
 end
 
 -- The game despawns a character: its context leaves the enemy list and its body is destroyed.
@@ -1224,6 +1235,8 @@ function M.despawn(ctx)
     end
     ctx.despawned = true
     if ctx.body ~= nil then M.destroy(ctx.body) end
+    -- Its head goes back to the pool unlinked: HeadUpdater.Context is null there.
+    if ctx.head_updater ~= nil then ctx.head_updater.context = nil end
 end
 
 -- A character backup in CharacterManager.CharacterBackupDB (what the save remembers about a

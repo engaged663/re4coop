@@ -724,6 +724,11 @@ local function with_mirroring(w)
         self.ai_off[id] = (not on) or nil
         return true
     end
+    w.hidden = {}
+    function w:enemy_set_visible(id, on)
+        self.hidden[id] = (not on) or nil
+        return true
+    end
     local kill, erase = w.enemy_kill, w.enemy_erase
     function w:enemy_kill(id)
         self.killed_with_ai_off = self.killed_with_ai_off or (self.ai_off[id] == true)
@@ -776,8 +781,54 @@ T.run("a_copy_spawned_elsewhere_jumps_to_the_hosts_enemy", function()
     T.check(h.alive, "untouched on the host")
 end)
 
-T.run("an_enemy_only_the_client_has_runs_in_the_clients_game_until_the_host_loads_it", function()
+T.run("an_enemy_the_host_does_not_run_is_held_on_the_client_until_the_host_loads_it", function()
     local pair = make_mirror_pair()
+    pair.host_player = { x = 0, y = 0, z = 0 }
+    pair.client_player = { x = 100, y = 0, z = 0 }
+    -- The client ran ahead: its level spawned a villager the host's level has not spawned.
+    local c = pair.client_world:spawn(GANADO, 101, 0, 1, 100, 0xD101)
+    pair:step(10)
+    T.eq(pair.client.net_of[c.id], nil, "nothing to follow yet")
+    T.eq(pair.client_world.ai_off[c.id], true, "the client's game does not run it: AI off")
+    T.eq(pair.client_world.hidden[c.id], true, "and it is not drawn")
+    T.eq(pair.client_world.calls.transform, 0, "not moved by the sync")
+    T.eq(pair.client:summary().held, 1, "reported as held")
+    -- The host's level spawns it now: the client sees the host's enemy.
+    local h = pair.host_world:spawn(GANADO, 40, 0, 0, 100, 0xD101)
+    pair:step(10)
+    T.eq(pair.client.net_of[c.id], pair.host.net_of[h.id], "paired")
+    T.eq(pair.client_world.ai_off[c.id], true, "follows with its AI off")
+    T.eq(pair.client_world.hidden[c.id], nil, "drawn again")
+    T.near(c.pos.x, 40, 0.05, "where the host's enemy is")
+    T.eq(pair.host_world.calls.ai, 0, "the host's enemy keeps its AI")
+    -- The host's level unloads it again: the client holds its copy where it is.
+    pair.host_world:remove(h)
+    pair:step(60)
+    T.eq(pair.client.net_of[c.id], nil, "no longer paired")
+    T.eq(pair.client_world.ai_off[c.id], true, "still no AI of its own")
+    T.eq(pair.client_world.hidden[c.id], true, "hidden again")
+end)
+
+T.run("the_client_can_kill_an_enemy_it_holds", function()
+    local pair = make_mirror_pair()
+    pair.host_player = { x = 0, y = 0, z = 0 }
+    pair.client_player = { x = 100, y = 0, z = 0 }
+    local c = pair.client_world:spawn(GANADO, 101, 0, 1, 100, 0xD102)
+    pair:step(5)
+    T.eq(pair.client_world.ai_off[c.id], true, "held")
+    pair.client_world:damage(c, 100) -- our player's shot
+    pair:step(5)
+    T.eq(pair.client_world.ai_off[c.id], nil, "its death runs with its own logic")
+    T.eq(pair.client_world.hidden[c.id], nil, "and is seen")
+    -- The host's level spawns it later: it dies there too.
+    local h = pair.host_world:spawn(GANADO, 101, 0, 1, 100, 0xD102)
+    pair:step(10)
+    T.check(h.erased or not h.alive, "dead in the host's world")
+    T.eq(pair.host.counters.late_kills, 1, "the client's kill applied when the host's level spawned it")
+end)
+
+T.run("without_host_only_an_enemy_only_the_client_has_runs_in_the_clients_game", function()
+    local pair = make_mirror_pair({ enemy_host_only = false })
     pair.host_player = { x = 0, y = 0, z = 0 }
     pair.client_player = { x = 100, y = 0, z = 0 }
     -- The client ran ahead: its villager chases it where the host's level has not spawned it.
@@ -839,8 +890,28 @@ T.run("an_enemy_the_client_kills_dies_with_its_own_ai_and_on_the_host", function
     T.eq(pair.client_world.calls.kill, 0, "the client's copy died on its own (not killed again)")
 end)
 
-T.run("a_copy_without_news_from_the_host_runs_on_its_own", function()
+T.run("a_copy_without_news_from_the_host_waits_where_it_is", function()
     local pair = make_mirror_pair()
+    local h, c = standard_level(pair)
+    pair:step(10)
+    T.eq(pair.client_world.ai_off[c.a.id], true, "following")
+    local x = c.a.pos.x
+    -- The host's game stops sending (loading, a hitch...): nothing runs the client's copy.
+    for _ = 1, 30 do
+        pair.now = pair.now + 0.05
+        pair.client:tick(pair.now, pair.client_world:list(), pair.client_world, { local_pos = pair.client_player })
+        pair.client:frame(pair.now, pair.client_world)
+        pair.to_host = {}
+    end
+    T.eq(pair.client_world.ai_off[c.a.id], true, "its own AI stays off")
+    T.near(c.a.pos.x, x, 0.01, "it waits where it was")
+    h.a.pos = { x = h.a.pos.x + 2, y = 0, z = h.a.pos.z }
+    pair:step(10)
+    T.near(c.a.pos.x, x + 2, 0.05, "it follows again once the host is back")
+end)
+
+T.run("without_host_only_a_copy_without_news_from_the_host_runs_on_its_own", function()
+    local pair = make_mirror_pair({ enemy_host_only = false })
     local h, c = standard_level(pair)
     pair:step(10)
     T.eq(pair.client_world.ai_off[c.a.id], true, "following")

@@ -2,12 +2,13 @@
 -- rats); the client's copies of the ones near both players follow them.
 --
 -- Animals are identified by their GameObject GUID (level data, the same on both PCs). About
--- ten times a second the host sends the animals within RADIUS of both players (ANIMALS:
--- position, rotation, routine, animation). The client takes each of those copies off its
--- game's update - its own AI stops - and moves it along the host's through an interpolation
--- buffer, playing the host's animation. Animals the host does not report (far from one of
--- the players, or not loaded in its game) run on their own, and a puppet without news for
--- STALE seconds runs on its own again.
+-- ten times a second the host sends the animals within RADIUS of the client's player
+-- (ANIMALS: position, rotation, routine, animation). The client takes each of those copies
+-- off its game's update - its own AI stops - and moves it along the host's through an
+-- interpolation buffer, playing the host's animation. The host is the only authority: an
+-- animal near the client that the host does not report (not loaded in its game) is held -
+-- taken off the update where it is - and a puppet without news from the host stays where it
+-- is. (With enemy_host_only off, those run on their own as in 0.8.)
 --
 -- Deaths: a host animal that dies (its routine reaches Die/Dead) dies in the client's game
 -- with its own death, where the host's copy was. An animal the client's player shoots dies
@@ -30,7 +31,7 @@ local AnimalSync = {}
 AnimalSync.__index = AnimalSync
 
 local SEND_HZ = 10
-AnimalSync.RADIUS = 50.0     -- metres: animals this close to both players follow the host
+AnimalSync.RADIUS = 50.0     -- metres: animals this close to the client's player follow the host
 AnimalSync.MAX_ANIMALS = 24  -- host: animals sent per round (the nearest to the client first)
 local STALE = 1.0            -- client: a puppet without news for this long runs on its own
 local FORGET = 5.0           -- client: a host animal not reported for this long is forgotten
@@ -39,6 +40,7 @@ local NEAR_FRAME = 20.0      -- client: puppets nearer than this move every fram
 local FAR_STRIDE = 3         -- ...the others every third frame
 local LOCAL_CHECK = 0.1      -- client: seconds between looks at a puppet's own routine (was it shot?)
 local RETRY = 0.25           -- client: seconds before an animal that could not become a puppet is tried again
+local HOLD_SCAN = 0.5        -- client: seconds between looks for animals the host does not report
 
 local function dist(a, b)
     local dx, dy, dz = a.x - b.x, a.y - b.y, a.z - b.z
@@ -67,12 +69,18 @@ function AnimalSync:reset()
     self.remote = {}   -- client: guid -> { interp, updated, dead }: the host's animals
     self.puppets = {}  -- client: guid -> { motion, last_check, dist }: our copies that follow them
     self.dead = {}     -- client: guid -> true: died in one of the games; runs its own death
+    self.last_hold_scan = -math.huge
     self.counters = { sent = 0, received = 0, puppeted = 0, released = 0, moves = 0, motions = 0,
-        kills_applied = 0, kills_reported = 0 }
+        kills_applied = 0, kills_reported = 0, held = 0 }
 end
 
 function AnimalSync:enabled()
     return self.settings.sync_animals ~= false
+end
+
+-- The host is the only authority: no animal near the client runs on its own.
+function AnimalSync:host_only()
+    return self.settings.enemy_host_only ~= false
 end
 
 -------------------------------------------------------------------------------
@@ -83,8 +91,8 @@ function AnimalSync:host_tick(now, world, local_pos, partner_pos)
     local interval = 1.0 / SEND_HZ
     if now - self.last_send < interval then return end
     self.last_send = (now - self.last_send >= 2 * interval) and now or (self.last_send + interval)
-    if local_pos == nil or partner_pos == nil or world.animals_near == nil then return end
-    local animals = world:animals_near({ partner_pos, local_pos }, AnimalSync.RADIUS, AnimalSync.MAX_ANIMALS)
+    if partner_pos == nil or world.animals_near == nil then return end
+    local animals = world:animals_near({ partner_pos }, AnimalSync.RADIUS, AnimalSync.MAX_ANIMALS)
     if #animals == 0 then return end
     for _, msg in ipairs(self.P.encode_animals(now, animals)) do
         self.send(msg, false)
@@ -175,11 +183,37 @@ function AnimalSync:drive(now, world, guid, r, local_pos)
     end
 end
 
+-- Host only: the animals near our player the host does not report are taken off our game's
+-- update where they are (held). One our player shot plays its own death, and the host is told.
+function AnimalSync:hold_unreported(now, world, local_pos)
+    if now - self.last_hold_scan < HOLD_SCAN then return end
+    self.last_hold_scan = now
+    if local_pos == nil or world.animals_near == nil then return end
+    for _, a in ipairs(world:animals_near({ local_pos }, AnimalSync.RADIUS, AnimalSync.MAX_ANIMALS)) do
+        local guid = a.guid
+        if guid ~= nil and self.remote[guid] == nil and not self.dead[guid] then
+            local p = self.puppets[guid]
+            if a.dead then
+                self.dead[guid] = true
+                if p ~= nil then
+                    self:release(world, guid)
+                    self.counters.kills_reported = self.counters.kills_reported + 1
+                    self.on_local_kill(guid, a.routine, now)
+                end
+            elseif p == nil and world:animal_puppet(guid, true) then
+                self.puppets[guid] = { last_check = now, dist = dist(a.pos, local_pos) }
+                self.counters.held = self.counters.held + 1
+            end
+        end
+    end
+end
+
 function AnimalSync:client_tick(now, world, local_pos)
     self.frame_n = self.frame_n + 1
+    local host_only = self:host_only()
     for guid, r in pairs(self.remote) do
         if now - r.updated > FORGET then
-            self:release(world, guid)
+            if not host_only then self:release(world, guid) end -- host only: held where it is
             self.remote[guid] = nil
         elseif self.dead[guid] then
             self:release(world, guid) -- (already released when it died)
@@ -192,16 +226,18 @@ function AnimalSync:client_tick(now, world, local_pos)
                 self.on_remote_kill(guid, now)
             end
         elseif now - r.updated > STALE then
-            self:release(world, guid) -- no news from the host: ours acts on its own
+            -- No news from the host: ours acts on its own, or (host only) waits where it is.
+            if not host_only then self:release(world, guid) end
         else
             self:drive(now, world, guid, r, local_pos)
         end
     end
+    if host_only then self:hold_unreported(now, world, local_pos) end
 end
 
 -------------------------------------------------------------------------------
 
--- Every game frame. players = { local_pos, partner_pos }: the host sends the animals near both.
+-- Every game frame. players = { local_pos, partner_pos }: the host sends the animals near the client.
 function AnimalSync:tick(now, world, players)
     if world == nil then return end
     if not self:enabled() then

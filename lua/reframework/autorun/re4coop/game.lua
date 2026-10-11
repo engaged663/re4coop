@@ -203,7 +203,10 @@ function Game.new(log, clock)
     self.hp_guard = {}      -- enemy id -> {hp, ticks}: undo HP changes a cosmetic hit replay made
     self.player_objects = {} -- addresses of the local player's body/head GameObjects
     self.enemy_info = {}    -- enemy id -> cached per-context data (see list_enemies)
-    self.enemy_ai_off = {}  -- enemy id -> its head GameObject while we have it switched off (mirrored)
+    self.enemy_ai_off = {}  -- enemy id -> { go = head, upd = HeadUpdater } while we have it switched off
+    self.parked_heads = {}  -- head address -> { go, upd }: switched off and in the game's pool (service_heads)
+    self.enemy_hidden = {}  -- enemy id -> { body_addr, gos = {GameObjects we stopped drawing} }
+    self.parked_bodies = {} -- body address -> gos: hidden by us when its enemy left the list
     self.read_motion = false -- list_enemies() also reads each enemy's animation (enemy mirroring)
     self.extra_dump_types = {} -- types other adapters want in the research dump
     self.active = false     -- a partner is connected: the hooks do work only then
@@ -241,13 +244,13 @@ function Game:on_reload()
     self.perf:crumb("game.reload", nil, true)
     -- Pooled heads can outlive a checkpoint reload: never leave one switched off.
     for id in pairs(self.enemy_ai_off) do self:restore_head(id) end
+    for id in pairs(self.enemy_hidden) do self:park_body(id) end
     self.enemy_ctx = {}
     self.enemy_info = {}
     self.enemy_by_body = {}
     self.enemy_ai_off = {}
     self.elim_scan = nil
     self.hp_guard = {}
-    if self.hit_template ~= nil then pcall(self.hit_template.release, self.hit_template) end
     self.hit_template = nil
     self.hit_events = {}
     self.drop_events = {}
@@ -912,8 +915,13 @@ function Game:instantiate(pf, pos)
     return go
 end
 
-function Game:release(obj)
-    if obj ~= nil then pcall(obj.release, obj) end
+-- Lets go of an object we created. REFramework counts the references Lua holds and releases
+-- each object once when its Lua value is garbage collected (the REManagedObject __gc calls
+-- release); calling release() ourselves as well made that later release find nothing to drop
+-- ("REManagedObject:release attempted to release an object that was not managed by our Lua
+-- state"), and could free an object a newer Lua value still used. Dropping our references is
+-- all it takes: the caller forgets `obj`, and the collector releases it.
+function Game:release(_)
 end
 
 -- The partner's body prefab from their character id (the body GameObject's name minus
@@ -953,6 +961,7 @@ end
 function Game:begin_frame()
     self.frame_ctx = nil
     self.frame_cutscene = nil
+    self:service_heads()
 end
 
 function Game:player_context()
@@ -1815,6 +1824,8 @@ function Game:list_enemies(local_pos, want_motion)
                     info = self:new_enemy_info(ctx, body, body_addr)
                     self.hp_guard[id] = nil
                     self:restore_head(id) -- a new character in this context: its own AI runs
+                    self:park_body(id)    -- and the body we hid (if any) is no longer this enemy's
+                    self:unpark_body(body_addr)
                 end
             end
             info.tick = info.tick + 1
@@ -1856,6 +1867,9 @@ function Game:list_enemies(local_pos, want_motion)
     -- must run again or that enemy would stand still.
     for id in pairs(self.enemy_ai_off) do
         if ctx_by_id[id] == nil then self:restore_head(id) end
+    end
+    for id in pairs(self.enemy_hidden) do
+        if ctx_by_id[id] == nil then self:park_body(id) end
     end
     for id in pairs(self.hp_guard) do
         if ctx_by_id[id] == nil then self.hp_guard[id] = nil end
@@ -2088,8 +2102,11 @@ end
 -- (CharacterContext.get_HeadGameObject: think, targeting, HateController) and the body that
 -- carries out its commands; a mirrored enemy's head stops updating, so it no longer chases
 -- or attacks the local player while its body follows the partner's copy. The head we
--- switched off is remembered (enemy_ai_off[id] = head): heads are pooled
--- (CharacterInstanceCoordinator.HeadPoolList) and must never go back to the pool switched off.
+-- switched off is remembered (enemy_ai_off[id] = { go, upd }): heads are pooled
+-- (CharacterInstanceCoordinator.HeadPoolList) and must never be handed to a new enemy
+-- switched off - but a head must also never be switched on while it sits in the pool: its
+-- HeadUpdater has no Context there, and CharacterHeadUpdater.update reads Context+0x148
+-- without a null check (re4.exe 0x1412733c0, the crash of 2026-10-11). See restore_head.
 function Game:enemy_set_ai(id, on)
     local ctx = self:live_enemy(id) and self.enemy_ctx[id]
     if ctx == nil then -- gone with its area: put back the head we switched off, if it still exists
@@ -2101,6 +2118,13 @@ function Game:enemy_set_ai(id, on)
         self:cap("enemy_ai_switch", false, "no head GameObject")
         return false
     end
+    local upd = self:call(ctx, "get_HeadUpdater")
+    if on and not self:head_linked(upd) then
+        -- Being unlinked right now: the pool decides; we switch it on once it is linked again.
+        self:park_head({ go = head, upd = upd })
+        self.enemy_ai_off[id] = nil
+        return true
+    end
     self.perf:crumb("enemy.ai", on and "on" or "off")
     local ok = pcall(head.call, head, "set_UpdateSelf", on and true or false)
     self:cap("enemy_ai_switch", ok, ok and "head GameObject set_UpdateSelf" or "set_UpdateSelf failed")
@@ -2109,34 +2133,128 @@ function Game:enemy_set_ai(id, on)
         if on then
             self.enemy_ai_off[id] = nil
         else
-            self.enemy_ai_off[id] = head
+            self.enemy_ai_off[id] = { go = head, upd = upd }
         end
         -- The context got another head since we switched the old one off: that one runs again too.
-        if prev ~= nil and prev ~= true and address_of(prev) ~= address_of(head) and self:go_alive(prev) then
-            pcall(prev.call, prev, "set_UpdateSelf", true)
-        end
+        if prev ~= nil and address_of(prev.go) ~= address_of(head) then self:wake_head(prev) end
     end
     return ok
 end
 
--- Switches the head we switched off for enemy `id` back on, whether or not the enemy is still
--- listed (a despawned enemy's head goes back to the game's pool), and forgets it.
-function Game:restore_head(id)
-    local head = self.enemy_ai_off[id]
-    if head == nil then return end
-    self.enemy_ai_off[id] = nil
-    if head ~= true and self:go_alive(head) then
-        self.perf:crumb("enemy.ai", "restore")
-        pcall(head.call, head, "set_UpdateSelf", true)
+-- Whether a head's updater is linked to a character (HeadUpdater.Context set). A head in the
+-- game's pool has none, and must not update.
+function Game:head_linked(upd)
+    return upd ~= nil and self:alive(upd) and self:call(upd, "get_Context") ~= nil
+end
+
+-- Switches a head we switched off back on if it is linked to a character now; a pooled head
+-- is parked until the game links it to its next enemy (service_heads). Returns true when done.
+function Game:wake_head(entry)
+    if entry == nil or not self:go_alive(entry.go) then return true end
+    if not self:head_linked(entry.upd) then
+        self:park_head(entry)
+        return false
+    end
+    self.perf:crumb("enemy.ai", "restore")
+    pcall(entry.go.call, entry.go, "set_UpdateSelf", true)
+    return true
+end
+
+function Game:park_head(entry)
+    local addr = address_of(entry.go)
+    if addr ~= nil then self.parked_heads[addr] = entry end
+end
+
+-- Every frame (cheap: only while we parked heads): a parked head the game linked to a new
+-- enemy runs again; one that was destroyed is forgotten.
+function Game:service_heads()
+    if next(self.parked_heads) == nil then return end
+    local now = self.clock()
+    if now - (self.heads_checked or -math.huge) < 0.1 then return end
+    self.heads_checked = now
+    for addr, entry in pairs(self.parked_heads) do
+        if not self:go_alive(entry.go) then
+            self.parked_heads[addr] = nil
+        elseif self:head_linked(entry.upd) then
+            self.parked_heads[addr] = nil
+            self.perf:crumb("enemy.ai", "relinked")
+            pcall(entry.go.call, entry.go, "set_UpdateSelf", true)
+        end
     end
 end
 
--- Switches every enemy's AI back on (session ended, script reset).
+-- Puts back the head we switched off for enemy `id`, whether or not the enemy is still listed
+-- (a despawned enemy's head goes back to the game's pool), and forgets it.
+function Game:restore_head(id)
+    local entry = self.enemy_ai_off[id]
+    if entry == nil then return end
+    self.enemy_ai_off[id] = nil
+    self:wake_head(entry)
+end
+
+-- Switches every enemy's AI back on and shows every enemy we hid (session ended, script reset).
 function Game:restore_enemy_ai()
     for id in pairs(self.enemy_ai_off) do
         if not self:enemy_set_ai(id, true) then self:restore_head(id) end
     end
     self.enemy_ai_off = {}
+    for id in pairs(self.enemy_hidden) do
+        if not self:enemy_set_visible(id, true) then self:park_body(id) end
+    end
+    self.enemy_hidden = {}
+    for addr, gos in pairs(self.parked_bodies) do
+        self:draw_again(gos)
+        self.parked_bodies[addr] = nil
+    end
+end
+
+-- Client: an enemy the host's game does not run is not shown (on = false), or is shown again.
+-- Its body and everything attached to it (weapons, accessories) stop drawing; only the
+-- objects that were drawn are hidden, and exactly those are drawn again. Returns true when
+-- the enemy is now as asked.
+function Game:enemy_set_visible(id, on)
+    local hidden = self.enemy_hidden[id]
+    if on then
+        if hidden == nil then return true end
+        self.enemy_hidden[id] = nil
+        self:draw_again(hidden.gos)
+        return true
+    end
+    if hidden ~= nil then return true end
+    local info = self:live_enemy(id)
+    if info == nil or not info.body then return false end
+    local gos = {}
+    for _, node in ipairs(self:collect_tree(info.body, 4)) do
+        if self:call(node.go, "get_DrawSelf") ~= false and pcall(node.go.call, node.go, "set_DrawSelf", false) then
+            gos[#gos + 1] = node.go
+        end
+    end
+    self.perf:crumb("enemy.hide", info.kind)
+    self.enemy_hidden[id] = { body_addr = info.body_addr, gos = gos }
+    self:cap("enemy_hide", #gos > 0, ("%d objects hidden"):format(#gos))
+    return true
+end
+
+function Game:draw_again(gos)
+    for _, go in ipairs(gos or {}) do
+        if self:go_alive(go) then pcall(go.call, go, "set_DrawSelf", true) end
+    end
+end
+
+-- The enemy left the list while hidden: its body is destroyed, or kept by the game to be
+-- reused. A reused body is drawn again when an enemy shows up with it (unpark_body).
+function Game:park_body(id)
+    local hidden = self.enemy_hidden[id]
+    self.enemy_hidden[id] = nil
+    if hidden == nil or hidden.body_addr == nil then return end
+    self.parked_bodies[hidden.body_addr] = hidden.gos
+end
+
+function Game:unpark_body(body_addr)
+    local gos = body_addr and self.parked_bodies[body_addr]
+    if gos == nil then return end
+    self.parked_bodies[body_addr] = nil
+    self:draw_again(gos)
 end
 
 -------------------------------------------------------------------------------
@@ -2326,15 +2444,15 @@ local function hook_available()
     return type(sdk) == "table" and type(sdk.hook) == "function" and type(sdk.to_managed_object) == "function"
 end
 
--- Keeps an object we created alive while we hold it (released with drop_ref).
+-- Keeps an object we created alive while we hold it. add_ref() turns a new (still local)
+-- object into one Lua holds a reference to; the reference goes when the collector frees our
+-- Lua value, so letting go of it (drop_ref) is just forgetting it - see Game:release.
 local function keep_ref(obj)
     if obj ~= nil then pcall(obj.add_ref, obj) end
     return obj
 end
 
-local function drop_ref(obj)
-    if obj ~= nil then pcall(obj.release, obj) end
-end
+local function drop_ref(_) end
 
 function Game:remember_player_objects(body, head)
     local objs = {}

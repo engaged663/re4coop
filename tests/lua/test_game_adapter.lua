@@ -279,11 +279,21 @@ T.run("a_head_switched_off_goes_back_to_the_pool_switched_on", function()
     local ctx = world.enemies[1]
     T.check(game:enemy_set_ai(list[1].id, false), "AI off")
     T.eq(ctx.head.update_self, false, "head off")
-    -- The area unloads: the game despawns the enemy, its head goes back to the pool.
+    -- The area unloads: the game despawns the enemy, its head goes back to the pool unlinked.
     mock.despawn(ctx)
     game:list_enemies()
-    T.eq(ctx.head.update_self, true, "the next enemy that gets this head will think")
+    -- Switching an unlinked head on makes CharacterHeadUpdater.update read a null Context
+    -- (the crash at re4.exe+0x1273425): it stays off while it sits in the pool.
+    T.eq(ctx.head.update_self, false, "not switched on while in the pool")
     T.eq(next(game.enemy_ai_off), nil, "forgotten")
+    game:begin_frame()
+    T.eq(ctx.head.update_self, false, "still unlinked: still off")
+    -- The game gives the head to its next enemy: it thinks again.
+    mock.relink_head(ctx.head_updater, world.enemies[1])
+    game.heads_checked = nil
+    game:begin_frame()
+    T.eq(ctx.head.update_self, true, "the next enemy that gets this head will think")
+    T.eq(next(game.parked_heads), nil, "no longer parked")
     -- The same through a reload.
     local list2 = game:list_enemies()
     T.check(game:enemy_set_ai(list2[1].id, false), "another one off")
@@ -299,6 +309,41 @@ T.run("a_head_switched_off_goes_back_to_the_pool_switched_on", function()
     T.check(game:enemy_set_ai(list3[1].id, false), "the new head off")
     T.eq(old_head.update_self, true, "the old head runs again")
     T.eq(ctx3.head.update_self, false, "the new one is off")
+    -- Session ends while a switched-off head is already unlinked: it is parked, not woken.
+    local list4 = game:list_enemies()
+    local ctx4 = world.enemies[1]
+    T.check(game:enemy_set_ai(list4[1].id, false), "off again")
+    ctx4.head_updater.context = nil
+    game:restore_enemy_ai()
+    T.eq(ctx4.head.update_self, false, "an unlinked head is never woken")
+    T.check(next(game.parked_heads) ~= nil, "parked until the game links it")
+end)
+
+T.run("an_enemy_the_host_does_not_run_is_hidden_and_shown_again", function()
+    local game, world = fresh_game()
+    local list = game:list_enemies()
+    local ctx = world.enemies[1]
+    T.check(game:enemy_set_visible(list[1].id, false), "hidden")
+    T.eq(ctx.body.draw_self, false, "its body is not drawn")
+    T.check(game:enemy_set_visible(list[1].id, true), "shown")
+    T.eq(ctx.body.draw_self, true, "drawn again")
+    -- Hidden when the session ends: drawn again.
+    T.check(game:enemy_set_visible(list[1].id, false), "hidden again")
+    game:restore_enemy_ai()
+    T.eq(ctx.body.draw_self, true, "restored with the session's end")
+    -- Hidden when the enemy leaves the list: the body is drawn again only when an enemy
+    -- shows up with it.
+    T.check(game:enemy_set_visible(list[1].id, false), "hidden")
+    local body = ctx.body
+    for i = #world.enemies, 1, -1 do
+        if world.enemies[i] == ctx then table.remove(world.enemies, i) end
+    end
+    game:list_enemies()
+    T.eq(body.draw_self, false, "left alone while it is not an enemy's")
+    T.eq(next(game.enemy_hidden), nil, "forgotten")
+    table.insert(world.enemies, ctx)
+    game:list_enemies()
+    T.eq(body.draw_self, true, "drawn again once an enemy has it")
 end)
 
 T.run("reading_the_enemies_dead_in_our_save", function()

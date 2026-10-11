@@ -4,7 +4,7 @@
 local P = {}
 
 P.VERSION = 8            -- bump on any incompatible change to the layouts below
-P.MOD_VERSION = "0.8.0"
+P.MOD_VERSION = "0.8.1"
 P.MAX_PAYLOAD = 1188     -- re4coop_net.max_payload(): biggest message one datagram carries
 
 P.T = {

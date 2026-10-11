@@ -27,11 +27,12 @@ Config.DEFAULTS = {
     -- own enemy IDs
     sync_enemies = true,
     enemy_mirror = true,      -- the client's enemies stand and move where the host's are (their own AI off)
+    enemy_host_only = true,   -- client: enemies the host's game does not run stay still and unseen (no client AI at all)
     enemy_motion_sync = true, -- those enemies (and animals) also play the host's animation
     enemy_erase = true,       -- enemies dead in the partner's world that only now spawn here never appear (no corpse)
     enemy_interp_delay = 0.1, -- seconds the host's enemies are shown in the past on the client (smoothness vs. delay)
     sync_drops = true,        -- every enemy that dies gives each player their own loot roll, also the partner's kills
-    sync_animals = true,      -- crows, chickens, fish, bats and rats near both players move as in the host's game
+    sync_animals = true,      -- crows, chickens, fish, bats and rats near the client move as in the host's game
 
     -- shared world
     sync_flags = true,        -- story/scenario flags: objectives, map, doors, items taken, events seen

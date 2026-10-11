@@ -575,8 +575,8 @@ runs every enemy and every animal; the client's game shows them.**
 | What | Host | Client |
 |---|---|---|
 | Enemies the host has loaded | AI, movement, HP and death run normally | Copies paired by uid follow the host's: AI head off (`set_UpdateSelf(false)` on the head GameObject), position, facing and animation from a 100 ms buffer, HP lowered to the host's. Damage the client's player deals goes to the host (ENEMY_DAMAGE); a copy the client kills gets its AI back so its own death plays, and the host kills its enemy |
-| Enemies only the client has loaded | (not spawned yet) | Run by the client's own AI until the host's level spawns them; from then on they follow the host's |
-| Animals within 50 m of both players | Normal | Follow the host's (below) |
+| Enemies only the client has loaded | (not spawned yet) | Held (since 0.8.1, `enemy_host_only`): AI head off and not drawn (`set_DrawSelf(false)` on the body and everything under it) until the host's level spawns them; from then on they follow the host's. A copy without news from the host waits where it is. The client's player can still shoot and kill a held enemy: it dies with its own logic and the kill waits in the host's graveyard |
+| Animals within 50 m of the client's player | Normal | Follow the host's (below); the ones the host does not report are taken off the move list where they are (0.8.1) |
 | Deaths | The graveyard (§3.8) | Removed or killed as in §3.8 |
 | Flags, gimmicks, breakables, cutscenes | Shared both ways with the host as referee (§3.6): the client must still be able to open doors and progress | |
 
@@ -609,6 +609,27 @@ back and given `set_Routine(Die)` where it followed the host's. Leaving, disconn
 and "Reset Scripts" put every animal back, unless its GameObject is gone or the game finished its
 gimmick. Animals are found in the breakables' scan (§3.6) and paired by GameObject GUID. Before
 this, the partner's kill only hid an animal (no animal has a kill method); now it dies.
+
+**Head pool crash (0.8.1).** The 0.8.0 client crashed with an access violation at
+`re4.exe+0x1273425`, called from `EnemyHeadUpdater.update`. Disassembly of
+`CharacterHeadUpdater.update` (`0x1412733C0`): it loads `HeadUpdater.<Context>` (offset 0x50),
+checks its type, and then reads `Context+0x148` without a null check. A head whose updater has
+no Context is a head in `CharacterInstanceCoordinator`'s pool. 0.8.0 switched every head it had
+switched off back on (`set_UpdateSelf(true)`) when its enemy left the list, which is exactly when
+the game had just put that head back in the pool, so the next frame updated an unlinked head. Since
+0.8.1 a head is only switched on while `HeadUpdater.get_Context()` is set. A pooled head we
+switched off is parked and switched on as soon as the game links it to its next enemy (checked
+every 0.1 s). Bodies hidden for held enemies are handled the same way: drawn again when an enemy
+shows up with that body.
+
+**REFramework references (0.8.1).** The `REManagedObject:release attempted to release an object
+that was not managed by our Lua state` warnings came from the mod itself. REFramework adds a
+reference when it hands a managed object to Lua and releases it when the Lua value is garbage
+collected (`__gc` calls `release`; `src/mods/bindings/Sdk.cpp`). The mod also called
+`release()` itself, so the collector's later release found nothing to drop. That was
+harmless, but it logged a warning every time and could release an object early if the game handed
+the same pointer to Lua again in the meantime. The mod now only calls `add_ref()` on objects it
+creates and lets the collector release them.
 
 ## 4. Sync architecture
 
