@@ -18,10 +18,12 @@ local function fresh(opts)
         mock.add_flag(G1, 1, 5)
         mock.add_flag(G2, 2, 31)
     end
+    world.now = 0
     local Game = require("re4coop.game")
-    local game = Game.new(function() end, function() return 0 end)
+    local game = Game.new(function() end, function() return world.now end)
     local World = require("re4coop.game_world")
     local w = World.new(game, function() end)
+    w:set_active(true) -- a partner is connected
     return w, game, world
 end
 
@@ -63,6 +65,24 @@ T.run("flag_hooks_report_game_changes_but_not_ours", function()
     mock.game_set_flag(G1, false)
     T.eq(seen[2][2], false, "clears are reported too")
     T.eq(world.watch_calls, nil, "the flag watcher decoy was never called")
+end)
+
+T.run("flag_hooks_are_idle_without_a_partner_and_never_flood", function()
+    local w, game, world = fresh()
+    local seen = 0
+    w:install_hooks({ on_flag = function() seen = seen + 1 end })
+    w:set_active(false)
+    mock.game_set_flag(G1, true)
+    T.eq(seen, 0, "no partner: the hook does nothing")
+    w:set_active(true)
+    for i = 1, 500 do mock.game_set_flag(G1, i % 2 == 0) end -- a game re-setting a flag every frame
+    T.eq(seen, 400, "at most 400 setter calls a second are read")
+    T.eq(w:flag_hooks_active(), false, "word diffs take over meanwhile")
+    T.check(game:capabilities().flag_hooks.detail:find("busy") ~= nil, "shown in Diagnostics")
+    world.now = 6
+    T.eq(w:flag_hooks_active(), true, "hooks back after the pause")
+    mock.game_set_flag(G2, true)
+    T.eq(seen, 401, "and report again")
 end)
 
 T.run("flag_words_snapshot_and_full_apply", function()

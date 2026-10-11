@@ -1001,6 +1001,7 @@ function Session:update()
     if self.pause and self.pause.update then self.pause:update(now) end
     local active = self.partner_connected and self.compatible
     if self.game.set_capture then self.game:set_capture(active and self.settings.share_character ~= false) end
+    if self.world and self.world.set_active then self.world:set_active(active) end
     if not active then
         -- Game events from before the partner joined are stale by the time we sync.
         if self.game.take_pickup_events then self.game:take_pickup_events() end

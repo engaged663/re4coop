@@ -112,6 +112,7 @@ function World.new(game, log)
     self.callbacks = {}      -- on_flag(guid, value), on_cutscene(id, method)
     self.applying = false
     self.dirty_seen = 0      -- game.gimmick_calls already reported by gimmicks_dirty()
+    self.active = false      -- a partner is connected (set by the session)
     self.word_queue = {}     -- pending flag word changes (group -> word -> {set, clear})
     self.object_index = {}   -- guid -> {comp, go, info={field, enum}} from the latest scan
     self.comp_guid = {}      -- component address -> guid
@@ -248,9 +249,10 @@ function World:install_hooks(callbacks)
         local implied = kind ~= false
         local nparams = #info.params
         local ok = r:hook(info, function(args)
-            if self.applying then return end
+            -- Cheap checks first: this runs for every flag the game sets.
+            if self.applying or not self.active then return end
             local cb = self.callbacks.on_flag
-            if cb == nil then return end
+            if cb == nil or not self:flag_hook_budget() then return end
             local guid = R.arg_guid(args[base])
             if guid == nil then return end
             local value = implied
@@ -336,8 +338,41 @@ function World:flag_check(guid)
     return nil
 end
 
+-- Sync is running (a partner is connected): the hooks only do work while it is.
+function World:set_active(on)
+    self.active = on and true or false
+end
+
+function World:now()
+    local clock = self.game and self.game.clock
+    return clock and clock() or os.clock()
+end
+
+-- Some games re-set flags every frame. If the setter hooks fire more than FLAG_HOOK_BUDGET
+-- times in a second, they stop reading arguments for a while and the word diffs (which
+-- see only real changes) take over, so the frame rate never pays for it.
+local FLAG_HOOK_BUDGET = 400
+local FLAG_HOOK_PAUSE = 5.0
+
+function World:flag_hook_budget()
+    local t = self:now()
+    if t < (self.flag_overflow_until or -math.huge) then return false end
+    if t - (self.flag_window or -math.huge) >= 1.0 then
+        self.flag_window, self.flag_calls = t, 0
+    end
+    self.flag_calls = self.flag_calls + 1
+    if self.flag_calls > FLAG_HOOK_BUDGET then
+        self.flag_overflow_until = t + FLAG_HOOK_PAUSE
+        self.flag_overflows = (self.flag_overflows or 0) + 1
+        self:cap("flag_hooks", true, ("setters busy (%d/s): word diffs for %ds"):format(FLAG_HOOK_BUDGET, FLAG_HOOK_PAUSE))
+        return false
+    end
+    return true
+end
+
+-- Whether every flag change arrives through the hooks (else flag_sync diffs the words).
 function World:flag_hooks_active()
-    return self.flag_hooks == true
+    return self.flag_hooks == true and self:now() >= (self.flag_overflow_until or -math.huge)
 end
 
 function World:flag_save_data()

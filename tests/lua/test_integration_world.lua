@@ -5,7 +5,7 @@
 local T = require("testlib")
 local mock = require("mock_reframework")
 
-local PORT = 47000 + (os.time() % 3000)
+local PORT = 41000 + (os.time() % 2000) -- below the Windows dynamic port range, apart from the other UDP test
 local G_DOOR = "0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9"   -- a door the host opens
 local G_OBJ = "11111111-2222-3333-4444-555555555555"    -- an objective the client completes
 local CROW = "c0c0c0c0-0000-0000-0000-000000000001"
