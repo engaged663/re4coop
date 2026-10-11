@@ -12,6 +12,7 @@ local COLOR_ERR = 0xFF6060FF
 local COLOR_DIM = 0xFFA0A0A0
 
 local chat_draft = ""
+local dump_result = nil
 
 local function text_input(label, value)
     local changed, v = imgui.input_text(label, value, 0)
@@ -94,6 +95,10 @@ local function draw_status(session, status)
                 hp = ("  |  HP %d/%d"):format(math.floor(status.partner_hp or 0), math.floor(status.partner_max_hp))
             end
             imgui.text(("Partner %.1f m away%s"):format(status.partner_distance or 0, hp))
+            if status.left_behind ~= nil then
+                imgui.text_colored(("You may be left behind - press %s or the button below"):format(
+                    status.teleport_key_name or "F6"), COLOR_WARN)
+            end
             if imgui.button("Teleport to partner") then
                 session:teleport_to_partner()
             end
@@ -107,6 +112,10 @@ local function draw_status(session, status)
             local e = status.enemies
             imgui.text(("Enemies: %d local, %d paired%s"):format(e.local_count, e.paired,
                 e.role == "client" and (", %d from host"):format(e.remote_count) or ""))
+        end
+        if status.items and status.items.taken > 0 then
+            local c = status.items.counters
+            imgui.text(("Key items: %d taken by you, %d by partner"):format(c.taken_by_me, c.taken_by_partner))
         end
     elseif status.state == "listening" then
         imgui.text_colored(("Hosting on UDP port %d - waiting for partner..."):format(stats.local_port or 0), COLOR_WARN)
@@ -155,6 +164,13 @@ local function draw_options(settings)
         slider_float(settings, "snap_distance", "Client: snap enemies further than (m, 0 = off)", 0.0, 20.0)
 
         imgui.separator()
+        imgui.text_colored("Progression", COLOR_DIM)
+        checkbox(settings, "share_key_items", "Key items exist once (partner's copy disappears when you take one)")
+        checkbox(settings, "left_behind_prompt", "Offer a teleport when the partner is far away")
+        slider_float(settings, "left_behind_distance", "Far-away distance (m)", 10.0, 200.0, "%.0f")
+        slider_float(settings, "left_behind_seconds", "...for at least (s)", 1.0, 60.0, "%.0f")
+
+        imgui.separator()
         imgui.text_colored("Network", COLOR_DIM)
         slider_int(settings, "player_hz", "Player updates per second", 5, 60)
         slider_int(settings, "snapshot_hz", "Enemy snapshots per second (host)", 2, 30)
@@ -169,7 +185,7 @@ local function draw_options(settings)
     end
 end
 
-local function draw_diagnostics(game)
+local function draw_diagnostics(game, session_status)
     if imgui.tree_node("Diagnostics") then
         local version, proto = re4coop_net.version()
         imgui.text(("re4coop %s  |  plugin %s (net protocol %d)  |  game protocol %d"):format(
@@ -177,8 +193,22 @@ local function draw_diagnostics(game)
         for name, cap in pairs(game:capabilities()) do
             imgui.text_colored(("%s %s: %s"):format(cap.ok and "[ok]" or "[--]", name, cap.detail), cap.ok and COLOR_OK or COLOR_WARN)
         end
-        if imgui.button("Write type dump (reframework/data/re4coop_typedump.json)") then
-            game:dump_types()
+        if session_status and session_status.enemies then
+            local c = session_status.enemies.counters
+            imgui.text(("enemy sync: damage sent %d, applied %d, failed %d | hp mirrored %d, failed %d | kills %d | id pairs %d"):format(
+                c.damage_sent, c.damage_applied, c.damage_failed, c.hp_applied, c.hp_failed, c.kills_applied, c.id_matches))
+        end
+        if session_status and session_status.items then
+            local c = session_status.items.counters
+            imgui.text(("key items: tracked %d | taken by me %d, by partner %d | removed %d, remove failed %d"):format(
+                session_status.items.tracked, c.taken_by_me, c.taken_by_partner, c.removed, c.remove_failed))
+        end
+        if imgui.button("Write research dump (reframework/data/re4coop_typedump.json)") then
+            dump_result = game:dump_types() and "written - please send this file" or "failed (see REFramework log)"
+        end
+        if dump_result then
+            imgui.same_line()
+            imgui.text_colored(dump_result, COLOR_DIM)
         end
         imgui.tree_pop()
     end
@@ -193,7 +223,7 @@ function UI.draw(session, game, settings, json)
     imgui.separator()
     draw_chat(session, status)
     draw_options(settings)
-    draw_diagnostics(game)
+    draw_diagnostics(game, status)
     if imgui.button("Save settings") then
         Config.sanitize(settings)
         Config.save(json, settings)

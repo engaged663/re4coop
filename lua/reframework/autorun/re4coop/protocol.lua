@@ -3,8 +3,8 @@
 
 local P = {}
 
-P.VERSION = 1            -- bump on any incompatible change to the layouts below
-P.MOD_VERSION = "0.1.1"
+P.VERSION = 2            -- bump on any incompatible change to the layouts below
+P.MOD_VERSION = "0.2.0"
 
 P.T = {
     HELLO = 1,          -- reliable, both directions, right after connecting
@@ -15,6 +15,7 @@ P.T = {
     ENEMY_DEAD = 6,     -- reliable, host -> client
     CHAT = 7,           -- reliable
     NOTIFY = 8,         -- reliable, short status notices (died, cutscene, teleported...)
+    ITEM_TAKEN = 9,     -- reliable, both directions: a shared pickup (key item) was taken
 }
 
 P.PLAYER_FLAGS = {
@@ -25,16 +26,23 @@ P.PLAYER_FLAGS = {
 
 P.ENEMY_FLAGS = {
     ALIVE = 1,
+    HAS_CTX = 2, -- entry carries the enemy's chainsaw.ContextID
 }
 
 P.DAMAGE_FLAGS = {
     LETHAL = 1,
+    HAS_CTX = 2,
+}
+
+P.ITEM_FLAGS = {
+    HAS_CTX = 1,
 }
 
 P.MAX_JOINTS = 40
-P.ENEMIES_PER_SNAPSHOT = 30 -- 12 B header + 30 * 43 B entries stays under the 1388 B payload limit
+P.ENEMIES_PER_SNAPSHOT = 25 -- 12 B header + 25 * 53 B entries stays under the 1388 B payload limit
 
-local ENEMY_ENTRY = "<I2I4fffffffffB"
+-- net id, kind hash, position, spawn position, yaw, hp, max hp, flags, ContextID (group, index, kind, category)
+local ENEMY_ENTRY = "<I2I4fffffffffBi4i4BB"
 local JOINT_SCALE = 100.0 -- joints travel as int16 centimetres relative to the root
 
 local function clamp_i16(v)
@@ -42,6 +50,23 @@ local function clamp_i16(v)
     if v > 32767 then return 32767 end
     if v < -32768 then return -32768 end
     return v
+end
+
+-- chainsaw.ContextID {category, kind, group, index} identifies a character or item context.
+-- Level data assigns it, so placed enemies/items carry the same ID on both machines.
+local function ctx_fields(ctx)
+    if ctx == nil then return 0, 0, 0, 0 end
+    return ctx.group or 0, ctx.index or 0, (ctx.kind or 0) & 0xFF, (ctx.category or 0) & 0xFF
+end
+
+local function ctx_from(group, index, kind, category)
+    return { group = group, index = index, kind = kind, category = category }
+end
+
+-- Stable string key for a ContextID table, or nil.
+function P.ctx_key(ctx)
+    if ctx == nil then return nil end
+    return string.format("%d:%d:%d:%d", ctx.category or 0, ctx.kind or 0, ctx.group or 0, ctx.index or 0)
 end
 
 -- 32-bit FNV-1a, used to identify enemy kinds and areas compactly.
@@ -94,9 +119,9 @@ function P.encode_skeleton(parents)
 end
 
 -- Splits the enemy list into as many messages as needed. Returns an array of strings.
--- entry = { net_id, kind_hash, pos={x,y,z}, spawn={x,y,z}, yaw, hp, max_hp, flags }
--- `spawn` is where the host first saw the enemy. Level spawns are deterministic, so
--- (kind, spawn position) identifies the same enemy on both machines.
+-- entry = { net_id, kind_hash, pos={x,y,z}, spawn={x,y,z}, yaw, hp, max_hp, flags, ctx }
+-- `ctx` is the enemy's chainsaw.ContextID (nil if unreadable). `spawn` is where the host
+-- first saw the enemy; (kind, spawn position) is the fallback identity when IDs differ.
 function P.encode_enemy_snapshots(time, entries)
     local out = {}
     local per = P.ENEMIES_PER_SNAPSHOT
@@ -109,19 +134,33 @@ function P.encode_enemy_snapshots(time, entries)
         for i = first, last do
             local e = entries[i]
             local spawn = e.spawn or e.pos
+            local flags = (e.flags or 0) & ~P.ENEMY_FLAGS.HAS_CTX
+            if e.ctx ~= nil then flags = flags | P.ENEMY_FLAGS.HAS_CTX end
+            local g, idx, k, c = ctx_fields(e.ctx)
             parts[#parts + 1] = string.pack(ENEMY_ENTRY, e.net_id, e.kind_hash,
                 e.pos.x, e.pos.y, e.pos.z, spawn.x, spawn.y, spawn.z,
-                e.yaw or 0, e.hp or 0, e.max_hp or 0, e.flags or 0)
+                e.yaw or 0, e.hp or 0, e.max_hp or 0, flags, g, idx, k, c)
         end
         out[#out + 1] = table.concat(parts)
     end
     return out
 end
 
--- m = { net_id (0 if unknown), kind_hash, pos={x,y,z}, amount, flags }
+-- m = { net_id (0 if unknown), kind_hash, pos={x,y,z}, amount, flags, ctx }
 function P.encode_enemy_damage(m)
-    return string.pack("<BI2I4ffffB", P.T.ENEMY_DAMAGE, m.net_id or 0, m.kind_hash or 0,
-        m.pos.x, m.pos.y, m.pos.z, m.amount or 0, m.flags or 0)
+    local flags = (m.flags or 0) & ~P.DAMAGE_FLAGS.HAS_CTX
+    if m.ctx ~= nil then flags = flags | P.DAMAGE_FLAGS.HAS_CTX end
+    local g, idx, k, c = ctx_fields(m.ctx)
+    return string.pack("<BI2I4ffffBi4i4BB", P.T.ENEMY_DAMAGE, m.net_id or 0, m.kind_hash or 0,
+        m.pos.x, m.pos.y, m.pos.z, m.amount or 0, flags, g, idx, k, c)
+end
+
+-- m = { item_id, pos={x,y,z}, ctx }  (ctx = the pickup's chainsaw.ContextID, may be nil)
+function P.encode_item_taken(m)
+    local flags = m.ctx ~= nil and P.ITEM_FLAGS.HAS_CTX or 0
+    local g, idx, k, c = ctx_fields(m.ctx)
+    return string.pack("<BI4fffBi4i4BB", P.T.ITEM_TAKEN, m.item_id or 0,
+        m.pos.x, m.pos.y, m.pos.z, flags, g, idx, k, c)
 end
 
 function P.encode_enemy_dead(net_id)
@@ -181,20 +220,33 @@ decoders[P.T.ENEMY_SNAPSHOT] = function(data)
     local _, time, chunk, chunks, count, off = string.unpack("<BdBBB", data)
     local m = { time = time, chunk = chunk, chunks = chunks, enemies = {} }
     for i = 1, count do
-        local net_id, kind_hash, x, y, z, sx, sy, sz, yaw, hp, max_hp, flags
-        net_id, kind_hash, x, y, z, sx, sy, sz, yaw, hp, max_hp, flags, off = string.unpack(ENEMY_ENTRY, data, off)
+        local net_id, kind_hash, x, y, z, sx, sy, sz, yaw, hp, max_hp, flags, g, idx, k, c
+        net_id, kind_hash, x, y, z, sx, sy, sz, yaw, hp, max_hp, flags, g, idx, k, c, off =
+            string.unpack(ENEMY_ENTRY, data, off)
         m.enemies[i] = {
             net_id = net_id, kind_hash = kind_hash,
             pos = { x = x, y = y, z = z }, spawn = { x = sx, y = sy, z = sz },
             yaw = yaw, hp = hp, max_hp = max_hp, flags = flags,
+            ctx = (flags & P.ENEMY_FLAGS.HAS_CTX) ~= 0 and ctx_from(g, idx, k, c) or nil,
         }
     end
     return m
 end
 
 decoders[P.T.ENEMY_DAMAGE] = function(data)
-    local _, net_id, kind_hash, x, y, z, amount, flags = string.unpack("<BI2I4ffffB", data)
-    return { net_id = net_id, kind_hash = kind_hash, pos = { x = x, y = y, z = z }, amount = amount, flags = flags }
+    local _, net_id, kind_hash, x, y, z, amount, flags, g, idx, k, c = string.unpack("<BI2I4ffffBi4i4BB", data)
+    return {
+        net_id = net_id, kind_hash = kind_hash, pos = { x = x, y = y, z = z }, amount = amount, flags = flags,
+        ctx = (flags & P.DAMAGE_FLAGS.HAS_CTX) ~= 0 and ctx_from(g, idx, k, c) or nil,
+    }
+end
+
+decoders[P.T.ITEM_TAKEN] = function(data)
+    local _, item_id, x, y, z, flags, g, idx, k, c = string.unpack("<BI4fffBi4i4BB", data)
+    return {
+        item_id = item_id, pos = { x = x, y = y, z = z },
+        ctx = (flags & P.ITEM_FLAGS.HAS_CTX) ~= 0 and ctx_from(g, idx, k, c) or nil,
+    }
 end
 
 decoders[P.T.ENEMY_DEAD] = function(data)

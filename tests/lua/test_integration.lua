@@ -11,7 +11,7 @@ world.player = mock.make_character("chainsaw.PlayerBaseContext", { x = 0, y = 0,
 local host_e1 = mock.make_character("chainsaw.Ch1c0z0Context", { x = 5, y = 0, z = 0 }, 100)
 local host_e2 = mock.make_character("chainsaw.Ch1d0z0Context", { x = 0, y = 0, z = 8 }, 300)
 world.enemies = { host_e1, host_e2 }
-mock.files["re4coop.json"] = { player_name = "HostLeon", port = PORT }
+mock.files["re4coop.json"] = { player_name = "HostLeon", port = PORT, left_behind_distance = 30, left_behind_seconds = 1 }
 
 local function run_entry_script()
     for name in pairs(package.loaded) do
@@ -67,6 +67,24 @@ function client_game:enemy_kill(id) self.enemies[id].hp = 0 self.enemies[id].ali
 function client_game:enemy_set_position() return true end
 function client_game:area_name() return "1" end
 function client_game:teleport_player() return true end
+client_game.pickups, client_game.removed = {}, {}
+function client_game.is_key_item(id) return id >= 119000000 and id <= 119999999 end
+function client_game:list_pickups()
+    local out = {}
+    for i, p in ipairs(self.pickups) do out[i] = { id = p.id, item_id = p.item_id, pos = p.pos, ctx = p.ctx } end
+    return out
+end
+function client_game:remove_pickup(id)
+    for i, p in ipairs(self.pickups) do
+        if p.id == id then
+            table.remove(self.pickups, i)
+            self.removed[#self.removed + 1] = p.item_id
+            return true
+        end
+    end
+    return false
+end
+function client_game:is_key_down() return false end
 
 local client_settings = Config.load(nil)
 client_settings.player_name = "ClientAshley"
@@ -78,6 +96,11 @@ local client = Session.new({ net = wrap(client_net_obj), game = client_game, clo
 local function step()
     host_frame()
     client:update()
+end
+
+-- Keeps both sides running for real time (pickup scans run every 0.25 s).
+local function run_for(seconds)
+    T.wait_until(function() return false end, step, seconds)
 end
 
 local function host_messages_contain(pattern)
@@ -138,6 +161,32 @@ T.run("enemy_sync_end_to_end", function()
     T.eq(host_e1.hp, 60, "no damage echo after settling")
 end)
 
+T.run("key_items_exist_once", function()
+    local COG, FUEL = 119235200, 119273600
+    local cog_ctx = { category = 5, kind = 0, group = 31, index = 4 }
+    local fuel_ctx = { category = 5, kind = 0, group = 31, index = 5 }
+
+    -- Client picks up the Wooden Cog: the host's copy disappears.
+    local cog_h = mock.make_drop_item(COG, { x = 1, y = 0, z = 0 }, cog_ctx)
+    client_game.pickups = { { id = 1, item_id = COG, pos = { x = 1, y = 0, z = 0 }, ctx = cog_ctx } }
+    client_game.player.pos = { x = 1.5, y = 0, z = 0 }
+    run_for(0.6)
+    table.remove(client_game.pickups, 1)
+    local ok = T.wait_until(function() return cog_h.go.destroyed == true end, step, 5)
+    T.check(ok, "host's Wooden Cog removed through chainsaw.DropItem's GameObject")
+
+    -- Host picks up the Boat Fuel: the client's copy disappears.
+    local fuel_h = mock.make_drop_item(FUEL, { x = 0.5, y = 0, z = 0 }, fuel_ctx)
+    client_game.pickups = { { id = 2, item_id = FUEL, pos = { x = 0.5, y = 0, z = 0 }, ctx = fuel_ctx } }
+    run_for(0.6)
+    mock.remove_drop(fuel_h)
+    ok = T.wait_until(function() return client_game.removed[1] == FUEL end, step, 5)
+    T.check(ok, "client's Boat Fuel removed")
+    T.check(host_messages_contain("Partner picked up a key item"), "host was told about the Cog")
+    client_game.player.pos = { x = 10, y = 0, z = 4 }
+    run_for(0.5) -- let the host's view of the client catch up
+end)
+
 T.run("chat_and_teleport", function()
     T.check(client:send_chat("buenas, vamos"), "chat sent")
     local ok = T.wait_until(function() return host_messages_contain("ClientAshley: buenas, vamos") end, step, 5)
@@ -154,6 +203,23 @@ T.run("chat_and_teleport", function()
         return false
     end, step, 5)
     T.check(ok, "client notified about the teleport")
+end)
+
+T.run("left_behind_prompt_and_hotkey", function()
+    client_game.player.pos = { x = 80, y = 0, z = 4 } -- client went through a door the host cannot open
+    -- The prompt waits out the 4 s post-teleport watch from the previous test, then 1 s far away.
+    local ok = T.wait_until(function()
+        for _, s in ipairs(mock.draw_calls.texts) do
+            if s:find("press F6 to teleport") then return true end
+        end
+        return false
+    end, step, 8)
+    T.check(ok, "host HUD shows the teleport prompt")
+    mock.keys[0x75] = true
+    step()
+    mock.keys[0x75] = false
+    T.check(world.player.pos.x > 70, "F6 teleported the host to the client (x=" .. world.player.pos.x .. ")")
+    client_game.player.pos = { x = 10, y = 0, z = 4 }
 end)
 
 T.run("script_reset_keeps_connection", function()

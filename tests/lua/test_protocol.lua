@@ -74,8 +74,9 @@ T.run("enemy_snapshot_chunking", function()
         entries[i] = { net_id = i, kind_hash = P.hash("k" .. (i % 3)), pos = { x = i, y = 0, z = -i },
             spawn = { x = i + 0.5, y = 0, z = -i }, yaw = 0.5, hp = i * 10, max_hp = 1000, flags = P.ENEMY_FLAGS.ALIVE }
     end
+    entries[10].ctx = { category = 2, kind = 1, group = -5, index = 123456 }
     local msgs = P.encode_enemy_snapshots(9.5, entries)
-    T.eq(#msgs, 3, "75 enemies -> 3 chunks of 30")
+    T.eq(#msgs, 3, "75 enemies -> 3 chunks of 25")
     local seen = 0
     for c, data in ipairs(msgs) do
         T.check(#data <= re4coop_net.max_payload(), ("chunk %d fits in one datagram (%d bytes)"):format(c, #data))
@@ -87,6 +88,14 @@ T.run("enemy_snapshot_chunking", function()
             T.eq(e.net_id, seen, "order preserved")
             T.near(e.spawn.x, seen + 0.5, 1e-5, "spawn")
             T.eq(e.hp, seen * 10, "hp")
+            T.eq(e.flags & P.ENEMY_FLAGS.ALIVE, P.ENEMY_FLAGS.ALIVE, "alive flag kept")
+            if seen == 10 then
+                T.check(e.ctx and e.ctx.group == -5 and e.ctx.index == 123456 and e.ctx.kind == 1 and e.ctx.category == 2,
+                    "ContextID round-trips (negative group too)")
+                T.eq(P.ctx_key(e.ctx), "2:1:-5:123456", "ctx key")
+            else
+                T.eq(e.ctx, nil, "no ContextID when none was sent")
+            end
         end
     end
     T.eq(seen, 75, "all entries")
@@ -100,6 +109,18 @@ T.run("small_messages_roundtrip", function()
     T.eq(d.kind_hash, 99, "kind")
     T.near(d.amount, 12.5, 1e-6, "amount")
     T.eq(d.flags, P.DAMAGE_FLAGS.LETHAL, "lethal")
+    T.eq(d.ctx, nil, "no ctx")
+    local d2 = assert(P.decode(P.encode_enemy_damage({ net_id = 0, kind_hash = 1, pos = { x = 0, y = 0, z = 0 },
+        amount = 3, flags = 0, ctx = { category = 2, kind = 0, group = 77, index = 3 } })))
+    T.eq(P.ctx_key(d2.ctx), "2:0:77:3", "damage carries ContextID")
+    T.eq(d2.flags & P.DAMAGE_FLAGS.LETHAL, 0, "not lethal")
+    local it = assert(P.decode(P.encode_item_taken({ item_id = 119235200, pos = { x = 4, y = 5, z = 6 },
+        ctx = { category = 5, kind = 0, group = 9, index = 2 } })))
+    T.eq(it.type, P.T.ITEM_TAKEN, "item taken type")
+    T.eq(it.item_id, 119235200, "item id")
+    T.near(it.pos.z, 6, 1e-6, "position")
+    T.eq(P.ctx_key(it.ctx), "5:0:9:2", "item ContextID")
+    T.eq(assert(P.decode(P.encode_item_taken({ item_id = 1, pos = { x = 0, y = 0, z = 0 } }))).ctx, nil, "item without ctx")
     T.eq(assert(P.decode(P.encode_enemy_dead(65535))).net_id, 65535, "dead id")
     T.eq(assert(P.decode(P.encode_chat("hola amigo"))).text, "hola amigo", "chat")
     T.eq(#assert(P.decode(P.encode_chat(string.rep("x", 2000)))).text, 512, "chat truncated")
@@ -118,7 +139,7 @@ T.run("malformed_input_never_raises", function()
         local m, err = P.decode(good:sub(1, cut))
         T.check(m == nil and err ~= nil, "truncated player message at " .. cut)
     end
-    for t = 1, 8 do
+    for t = 1, 9 do
         if t ~= P.T.SKELETON then -- "\3\0" is a valid, empty skeleton
             T.check(P.decode(string.char(t) .. "\0") == nil, "short message type " .. t)
         end

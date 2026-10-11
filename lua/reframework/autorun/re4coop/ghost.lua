@@ -103,6 +103,14 @@ function Ghost.draw_hud(game, status, messages, now)
     game:draw_text(line, x, y, COLOR_TEXT)
     y = y + 18
 
+    if status.left_behind ~= nil then
+        local prompt = ("Partner is %.0f m away - press %s to teleport to them, %s to hide"):format(
+            status.left_behind.distance, status.teleport_key_name or "F6", status.snooze_key_name or "F7")
+        game:draw_rect(x - 4, y - 2, #prompt * 7 + 8, 18, 0xC0000000)
+        game:draw_text(prompt, x, y, 0xFF40E0FF)
+        y = y + 22
+    end
+
     local shown = 0
     for i = #messages, 1, -1 do
         local m = messages[i]

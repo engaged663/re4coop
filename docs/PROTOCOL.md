@@ -52,10 +52,10 @@ Session rules:
 | `stats()` | Table: `rtt_ms, peer, peer_name, bytes_sent, bytes_recv, resends, reliable_in_flight, …` |
 | `local_addresses()` | Array of this PC's LAN IPv4 addresses |
 | `time()` | Monotonic seconds (`os.clock` is CPU time, so don't use it for networking) |
-| `max_payload()`, `version()` | `1388`; `"0.1.1", 1` |
+| `max_payload()`, `version()` | `1388`; `"0.2.0", 1` |
 | `new_session()` | An independent session object with the same methods (tests/tools) |
 
-## Game messages (game protocol version 1)
+## Game messages (game protocol version 2)
 
 The first byte is the message type. Formats use Lua `string.pack` notation.
 
@@ -64,11 +64,12 @@ The first byte is the message type. Formats use Lua `string.pack` notation.
 | 1 | HELLO | reliable | both, on connect | `<B I2 s1 s1 s1 B`: type, game protocol version, mod version, player name, chapter/area, flags (1 = reply requested) |
 | 2 | PLAYER | unreliable, 20 Hz | both | `<B d fff ffff ff B I4 B` + `hhh` × n: time, position, rotation quaternion (x,y,z,w), HP, max HP, flags (1 dead, 2 cutscene, 4 aiming), area hash, joint count, joints as int16 cm offsets from position |
 | 3 | SKELETON | reliable, on change | both | `<B B` + `B` × n: parent index (1-based) of each joint in PLAYER, 0 = none |
-| 4 | ENEMY_SNAPSHOT | unreliable, 10 Hz | host → client | `<B d B B B` + n × `<I2 I4 fff fff f f f B`: time, chunk, chunks, count; then net id, kind hash (FNV-1a of context type name), position, spawn position, yaw, HP, max HP, flags (1 alive). 30 entries per chunk |
-| 5 | ENEMY_DAMAGE | reliable | client → host | `<B I2 I4 fff f B`: net id (0 = unpaired), kind hash, spawn position, amount, flags (1 lethal) |
+| 4 | ENEMY_SNAPSHOT | unreliable, 10 Hz | host → client | `<B d B B B` + n × `<I2 I4 fff fff f f f B i4 i4 B B`: time, chunk, chunks, count; then net id, kind hash (FNV-1a of context type name), position, spawn position, yaw, HP, max HP, flags (1 alive, 2 has ContextID), `chainsaw.ContextID` group, index, kind, category. 25 entries per chunk |
+| 5 | ENEMY_DAMAGE | reliable | client → host | `<B I2 I4 fff f B i4 i4 B B`: net id (0 = unpaired), kind hash, spawn position, amount, flags (1 lethal, 2 has ContextID), ContextID |
 | 6 | ENEMY_DEAD | reliable | host → client | `<B I2`: net id |
 | 7 | CHAT | reliable | both | `<B s2`: text (≤ 512 bytes) |
 | 8 | NOTIFY | reliable | both | `<B B s1`: code (1 died, 2 revived, 3 teleported, 4 info), text |
+| 9 | ITEM_TAKEN | reliable | both | `<B I4 fff B i4 i4 B B`: item ID, position, flags (1 has ContextID), ContextID of the `chainsaw.DropItem`. The receiver removes its copy of that key item |
 
 Compatibility: only the `version` field of HELLO is guaranteed across game protocol versions.
 A peer with a different version gets an "update both" message, and its game messages are

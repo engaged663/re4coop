@@ -127,7 +127,7 @@ RE4R's game code lives in the `chainsaw` namespace (`sdk.game_namespace("X")` �
 | `Context.get_BodyGameObject()` / `get_HeadGameObject()` | Confirmed | REFramework `RE4.lua` | Transform, joints, warping |
 | `chainsaw.HitPoint` (`get_CurrentHitPoint`, `get_DefaultHitPoint`, `get_IsLive`, `get_HitPointRatio`, `get_CurrentDamagePoint`) | Confirmed | SRT overlay, Health Bars | HP read |
 | `HitPoint.dead()`, `HitPoint.set_Invincible(bool)` | Reported by mods (method names published on Nexus, mods 6165 and 7363) | Search summaries of *True Invincible* and *RE4 Mod Menu* | Killing an enemy (probed; falls back to HP 0) |
-| `HitPoint` HP setter (`set_CurrentHitPoint`, `setHitPoint`, …) or backing field | **Probed** | No public source found | Applying synced HP. Integer setters are rounded |
+| `HitPoint` HP setter (`set_CurrentHitPoint`, `setHitPoint`, …) or backing field | **Verified at runtime** | No public source names it. v0.1's fixed-name probe did not find a working one in game (partial damage didn't sync) | Applying synced HP. Since v0.2 candidates come from `HitPoint`'s own methods/fields and one is trusted only after reading HP back proves it wrote the value (§3.2) |
 | `chainsaw.EnemyManager.notifyHitDamage(damageInfo, enemyCtx)` / `notifyDead(...)` | Confirmed | Health Bars hooks (`args[3]`, `args[4]`) | Not used in v0.1; candidate for event-driven damage sync |
 | `chainsaw.GuiManager.get_IsPlayingEvent()`, `get_IsHudOff()`, `get_GuiOpenCloseData()` | Confirmed | Health Bars `gui_handler.lua` | Cutscene flag |
 | `chainsaw.GameStatsManager.getKillCount()`, `InventoryManager.get_CurrPTAS()`, `InGameShopManager.get_CurrSpinelCount()`, `GameRankSystem.get_GameRank()` | Confirmed | SRT overlay | Not used yet (possible shared-stats features) |
@@ -143,6 +143,62 @@ Character IDs are not needed by the current code. `cha0` is Leon's animation/mod
 `cha1` is Ashley's. Per-character prefab paths should be read from the game files (or from
 REFramework's object explorer) rather than guessed. That is why the experimental puppet takes
 the path as user input.
+
+### 3.2 Second research round (v0.2)
+
+In-game testing of v0.1 showed kills syncing but partial damage, enemy positions, attacks, drops
+and key items not syncing. This round used two new primary sources:
+
+* **The RE4 RSZ schema** ([alphazolam/RE_RSZ `rszre4.json`](https://github.com/alphazolam/RE_RSZ),
+  built from praydog's REFramework dumps). It names all ~163,000 RE4 types and the serialized
+  fields of each, but no methods. Facts taken from it:
+  * `chainsaw.CharacterContext` / `EnemyBaseContext` have `_ID : chainsaw.ContextID`, and
+    `ContextID = { _Category, _Kind : Byte, _Group : Int32, _Index : Int32 }`. It is assigned by
+    level data, so placed enemies should carry the same ID on both machines. Enemy pairing now
+    uses it first. It's guarded by kind and a 25 m spawn distance and falls back to spatial
+    pairing, so a wrong assumption cannot make pairing worse than v0.1.
+  * World pickups and drops are `chainsaw.DropItem` components with `_ID : ContextID` and
+    `_ItemData : chainsaw.DropItemContext.SaveData { ItemID, Count, AmmoItemID, AmmoCount,
+    Durability, … }`.
+  * Systems that exist (types confirmed, methods unknown): `chainsaw.HateController` /
+    `HateTargetInfo` (enemy target selection), `chainsaw.DropItemManager`, `chainsaw.RandomDrop`,
+    `chainsaw.InteractGetPickupItem`, `chainsaw.ScenarioFlagManager`,
+    `chainsaw.ChapterSceneManager`, `chainsaw.LocationSceneManager`, `chainsaw.LocID`,
+    `chainsaw.ChapterID`, `chainsaw.CharacterSpawnController`.
+* **The resyst/re4r autosplitter**: all 16 key items it tracks (Wooden Cog `119235200`, Church
+  Insignia `119257600`, Boat Fuel `119273600`, …) fall in one ItemID block,
+  `119,203,200–119,273,600`. The mod treats `119,000,000–119,999,999` as key items.
+* **Engine calls verified in EMV Engine** (a widely used RE Engine script):
+  `via.SceneManager.get_CurrentScene` → `scene:call("findComponents(System.Type)", t)`,
+  `sdk.call_object_func(go, "get_Components")`, `obj:call("destroy", obj)`,
+  `via.motion.TreeLayer.get_MotionBankID/get_MotionID/get_Frame` and
+  `changeMotion(System.UInt32, System.UInt32, System.Single, System.Single,
+  via.motion.InterpolationMode, via.motion.InterpolationCurve)`. REFramework exposes
+  `reframework:is_key_down(vk)` for hotkeys.
+
+What v0.2 builds on that:
+
+| Feature | How | Verified by |
+|---|---|---|
+| HP sync during fights | Self-verifying HP writer. A candidate is used only after reading HP back proves the write. A no-op write never counts. Names containing default/max/rate/damage/… are excluded, so max HP is never touched | Tests with a working setter under another name, a broken setter, a field-only build and a max-HP decoy |
+| Exact enemy pairing | `chainsaw.ContextID` first, with spatial fallback | Tests with spawns 8–12 m apart, ID+kind mismatch, ID too far away |
+| Key items exist once | Scan `chainsaw.DropItem` 4×/s. An item that vanishes while you stood within 4 m of it, moments before, was picked up. Your partner's copy is destroyed (and destroyed again if the area reloads it). Area unloads far away are ignored, which prevents softlocks | `test_items_sync.lua`, integration test |
+| No softlock | Partner ≥ 35 m away for 6 s outside cutscenes → HUD prompt. **F6** teleports, **F7** hides it for 2 min. If you fall through not-yet-loaded ground, it re-teleports up to 3 times | `test_progression.lua`, integration test |
+
+Still needing **method signatures from the user's build**, collected by the in-game research dump
+(*Diagnostics → Write research dump*, written to `reframework/data/re4coop_typedump.json`):
+
+* **Enemies targeting both players, and seeing the partner's fights:** host enemies must be able
+  to pick the partner as a target (`chainsaw.HateController`/`HateTargetInfo`). Only then can
+  the client's enemies be turned into puppets of the host's (AI off, transform + motion layer
+  copied). Doing the puppet part first would leave the client with enemies that never attack
+  it. The dump lists the components on a live enemy, which shows what drives the AI.
+* **Identical drops:** need `chainsaw.DropItemManager` / `chainsaw.RandomDrop` methods, either
+  to make the client's random roll return the host's result or to spawn the host's drop
+  directly. Editing an existing drop's `_ItemData` is not used, because the visible model would
+  no longer match what you pick up.
+* **Chapter/area awareness:** `ChapterSceneManager`/`LocationSceneManager` getters, to replace
+  the distance heuristic in the left-behind prompt.
 
 ### 3.1 Prior art
 
@@ -175,10 +231,11 @@ the path as user input.
   needs no model spawning, so it works in every chapter and with every costume.
 * **Enemies: host-authoritative outcomes.** The level spawns the same enemies on both machines,
   and each machine runs its own AI.
-  * The host numbers its enemies. Every 100 ms it broadcasts `{id, kind, position, spawn
-    position, HP, alive}`, plus recently killed enemies every 0.5 s for up to 3 min.
-  * The client pairs each host enemy with its own copy by **kind + spawn point** (deterministic
-    level spawns), not current position, because the two copies chase different players.
+  * The host numbers its enemies. Every 100 ms it broadcasts `{id, kind, ContextID, position,
+    spawn position, HP, alive}`, plus recently killed enemies every 0.5 s for up to 3 min.
+  * The client pairs each host enemy with its own copy by **`chainsaw.ContextID`**, falling back
+    to **kind + spawn point** (deterministic level spawns), never current position, because the
+    two copies chase different players.
   * Damage the client deals is detected by HP polling (`expected HP − current HP`). It is sent
     as `ENEMY_DAMAGE`, which the host applies. The client never *raises* HP to the host's value
     (that would undo damage still in flight). It only lowers HP and applies deaths. Deaths are
@@ -186,16 +243,23 @@ the path as user input.
     cleared.
   * Optional position snapping (off by default) pulls the client's copies to the host's
     positions.
+* **Key items exist once** (§3.2): whoever picks one up keeps it, and the partner's copy is
+  removed.
+* **Left-behind prompt** (§3.2): offers a teleport (F6) when the partner has been far away for a
+  while, so the player without the key item is never stuck.
 * **Utilities**: teleport to partner (transform + `CharacterController.warp`), chat, notices
-  ("partner is down", "teleported to you"), and a diagnostics panel with a JSON type dump.
+  ("partner is down", "teleported to you"), and a diagnostics panel with the research dump.
 
-### 4.1 Known limitations (v0.1)
+### 4.1 Known limitations (v0.2)
 
 * The partner is a ghost overlay, not a 3D character model. The experimental prefab puppet
   only follows position and rotation and is not animated.
-* Enemies only target the local player. Your partner cannot draw aggro on your machine.
-* There is no story, door, item or cutscene sync. Each player triggers their own events. Use
-  *Teleport to partner* after a door or cutscene.
+* Enemies only target the local player, so each machine's copy of an enemy fights its own
+  player. You don't see the partner's fight, and enemies don't choose between the two players.
+  Positions are not synced except by optional snapping. This needs the research dump (§3.2).
+* Random drops are rolled separately on each machine (§3.2).
+* Story flags, doors and cutscenes are not synced. Key items are shared once, and the
+  left-behind prompt brings the other player along.
 * Pausing or opening the inventory pauses only your game. The connection survives because the
   network thread keeps running.
 * Damage dealt to an enemy before your game has observed it once (the first ~50 ms after it
@@ -205,16 +269,19 @@ the path as user input.
 
 ## 5. Roadmap
 
-1. **In-game validation pass** using the checklist in [TESTING.md](TESTING.md), and fixing any
-   probed names using `re4coop_typedump.json`.
-2. Event-driven damage via `chainsaw.EnemyManager.notifyHitDamage` hooks, to remove polling
+1. **In-game validation of v0.2** with the checklist in [TESTING.md](TESTING.md), and collecting
+   `re4coop_typedump.json` from the research dump.
+2. With the dump: partner as an enemy target on the host (`HateController`), then client enemies
+   as host puppets (AI off, transform + motion layer from the host), then identical drops
+   (`DropItemManager`/`RandomDrop`).
+3. Event-driven damage via `chainsaw.EnemyManager.notifyHitDamage` hooks, to remove polling
    latency.
-3. An animated partner puppet: spawn the partner's character body prefab with AI components
+4. An animated partner puppet: spawn the partner's character body prefab with AI components
    disabled, and drive its motion layer (`via.motion.Motion`) from the partner's current motion
    ID and frame.
-4. Shared progression: sync door/gimmick interactions and story flags; host-driven chapter
+5. Shared progression: sync door/gimmick interactions and story flags; host-driven chapter
    transitions.
-5. Optional Steam networking transport for NAT traversal.
+6. Optional Steam networking transport for NAT traversal.
 
 ## Sources
 
@@ -223,5 +290,8 @@ the path as user input.
 * [resyst/re4r `srt-overlay.lua`](https://github.com/resyst/re4r/blob/master/srt-overlay.lua) and [Joydurn/re4r-SRT](https://github.com/Joydurn/re4r-SRT/blob/master/srt-overlay.lua)
 * [GreenComfyTea/RE4-Health-Bars](https://github.com/GreenComfyTea/RE4-Health-Bars)
 * [alphazolam/EMV-Engine](https://github.com/alphazolam/EMV-Engine) (RE4 resource lists)
+* [alphazolam/RE_RSZ `rszre4.json`](https://github.com/alphazolam/RE_RSZ) (RE4 type names and serialized fields)
+* [resyst/re4r `re4r.asl`](https://github.com/resyst/re4r/blob/master/re4r.asl) (key item IDs)
+* [Ekey/REE.PAK.Tool `RE4_STM_Release.list`](https://github.com/Ekey/REE.PAK.Tool) (RE4 resource paths, used for prefab paths)
 * [RE4 Mod Menu (Nexus 7363)](https://www.nexusmods.com/residentevil42023/mods/7363), [True Invincible (Nexus 6165)](https://www.nexusmods.com/residentevil42023/mods/6165)
 * claybtv Multiplayer Mod coverage: [Nexus 6539](https://www.nexusmods.com/residentevil42023/mods/6539), [Screen Rant](https://screenrant.com/resident-evil-4-remake-co-op-mod/), [Rely on Horror](https://www.relyonhorror.com/latest-news/resident-evil-news/resident-evil-4-remake-gets-full-co-op-mode-thanks-to-new-mod/), [Retro Dodo](https://retrododo.com/resident-evil-4-remake-now-has-a-co-op-mode-mod/)

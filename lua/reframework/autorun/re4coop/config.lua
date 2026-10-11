@@ -23,6 +23,14 @@ Config.DEFAULTS = {
     match_radius = 3.0,   -- metres between spawn points to treat two enemies as the same one
     snap_distance = 0.0,  -- client: teleport enemies further than this from the host's copy (0 = off)
 
+    -- progression
+    share_key_items = true,       -- a key item exists once: the partner's copy disappears when you take it
+    left_behind_prompt = true,    -- offer a teleport when the partner is far away for a while
+    left_behind_distance = 35.0,  -- metres
+    left_behind_seconds = 6.0,
+    teleport_key = 0x75,          -- F6 (Windows virtual-key code): accept the teleport prompt
+    snooze_key = 0x76,            -- F7: hide the prompt for 2 minutes
+
     -- partner rendering
     show_ghost = true,
     show_nametag = true,
@@ -67,6 +75,12 @@ function Config.sanitize(cfg)
     cfg.interp_delay = math.max(0.0, math.min(0.5, cfg.interp_delay))
     cfg.match_radius = math.max(0.5, math.min(20.0, cfg.match_radius))
     cfg.snap_distance = math.max(0.0, math.min(50.0, cfg.snap_distance))
+    cfg.left_behind_distance = math.max(10.0, math.min(500.0, cfg.left_behind_distance))
+    cfg.left_behind_seconds = math.max(1.0, math.min(120.0, cfg.left_behind_seconds))
+    cfg.teleport_key = math.floor(cfg.teleport_key)
+    cfg.snooze_key = math.floor(cfg.snooze_key)
+    if cfg.teleport_key < 1 or cfg.teleport_key > 254 then cfg.teleport_key = Config.DEFAULTS.teleport_key end
+    if cfg.snooze_key < 1 or cfg.snooze_key > 254 then cfg.snooze_key = Config.DEFAULTS.snooze_key end
     return cfg
 end
 

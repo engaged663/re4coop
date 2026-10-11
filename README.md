@@ -4,7 +4,7 @@ An open-source [REFramework](https://github.com/praydog/REFramework) mod that co
 copies of **Resident Evil 4 (2023)** directly by IP address over UDP, so two players can go
 through the campaign together on a LAN, or over the internet with a forwarded port or a VPN.
 
-> **Status: v0.1, experimental.** The networking, sync logic and scripts are covered by
+> **Status: v0.2, experimental.** The networking, sync logic and scripts are covered by
 > automated tests, including end-to-end runs against a mock of REFramework. They have **not yet
 > been verified inside the running game.** Some RE4 method names are probed at runtime (see
 > [docs/RESEARCH.md](docs/RESEARCH.md)). Please run the
@@ -16,7 +16,9 @@ through the campaign together on a LAN, or over the internet with a forwarded po
 |---|---|
 | **Direct IP connection** | Host on a UDP port (default `33040`). The partner joins with `IP` or `IP:port`. Optional session password |
 | **See your partner** | Their real skeleton is drawn as a "ghost" (interpolated, 20 Hz), with name tag, distance and HP bar |
-| **Shared enemies** | The host is authoritative. Damage you deal is applied to the host's copy. Kills and HP sync back. Rooms the host already cleared stay cleared for a partner who arrives later |
+| **Shared enemies** | The host is authoritative. Damage you deal is applied to the host's copy, and HP and kills sync back during the fight. Enemies are paired by the game's own `ContextID`. Rooms the host already cleared stay cleared for a partner who arrives later |
+| **Key items exist once** | Whoever picks up a key item keeps it, and it disappears from the partner's world |
+| **Never stuck** | When your partner has been far away for a few seconds (e.g. they opened a door that needs their key item), press **F6** to teleport to them, or **F7** to hide the prompt |
 | **Teleport to partner** | One click, for after doors and cutscenes |
 | **Chat & notices** | In the REFramework menu. "Partner is down", "teleported to you"… |
 | **Survives hiccups** | Reliable channel with retransmits. Pauses and loading screens don't drop you. Rejoin after a disconnect or game restart. "Reset Scripts" keeps the session |
@@ -28,10 +30,12 @@ How it works and why: [docs/RESEARCH.md](docs/RESEARCH.md). Wire format: [docs/P
 
 * Your partner appears as a ghost skeleton, not a 3D character. An experimental model puppet
   is off by default.
-* Each game runs its own enemy AI: enemies attack the player on their own machine. Outcomes
-  (HP, deaths) are what's shared.
-* Story events, doors, items and cutscenes are not synced. Each player plays them, then
-  regroups with *Teleport to partner*.
+* Each game runs its own enemy AI: enemies attack the player on their own machine, and you
+  don't see your partner's fight. Outcomes (HP, deaths) are what's shared. Making enemies
+  target both players needs game internals that the in-game research dump will provide.
+* Random drops are rolled separately on each machine (same reason).
+* Story events, doors and cutscenes are not synced. Key items are shared once, and the F6
+  prompt regroups you.
 * Pausing or opening the inventory pauses only your own game.
 
 ## Install
@@ -89,8 +93,8 @@ cmake -S . -B build-win -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-w64.cmake && cmake --
 
 **Releasing:** bump the version in `lua/reframework/autorun/re4coop/protocol.lua`
 (`MOD_VERSION`), `plugin/src/lua_api.hpp` (`kVersion`) and `CMakeLists.txt`, then push a
-matching tag (`git tag v0.1.1 && git push origin v0.1.1`). CI builds the MSVC zip, checks the
-versions and attaches `re4coop-v0.1.1.zip` + `.sha256` to a draft GitHub Release for you to
+matching tag (`git tag v0.2.0 && git push origin v0.2.0`). CI builds the MSVC zip, checks the
+versions and attaches `re4coop-v0.2.0.zip` + `.sha256` to a draft GitHub Release for you to
 publish.
 
 ## Repository layout
@@ -115,7 +119,8 @@ docs/                  research, protocol, testing
 | "could not reach host" | Wrong IP or port, the host didn't click *Host game*, or a firewall is blocking it (see above). Both must be on the same network or VPN |
 | "Partner runs re4coop X…" | Install the same release on both PCs |
 | No ghost, but connected | The partner is on the title screen or loading, or in a different chapter (the HUD warns you). Check the *Options* toggles |
-| Enemies not syncing | Open *Diagnostics*. If `enemy_set_hp`/`enemy_list` show `[--]`, click *Write type dump* and open an issue with `reframework/data/re4coop_typedump.json` |
+| Enemies not syncing | Open *Diagnostics*. If `enemy_set_hp`/`enemy_list` show `[--]` after a few hits, click *Write research dump* and send `reframework/data/re4coop_typedump.json` |
+| Teleport prompt shows too often or too late | *Options → Progression*: distance and seconds sliders, or switch it off |
 
 ## Credits
 

@@ -111,6 +111,18 @@ M.new = new
 
 local function vec(x, y, z) return { x = x, y = y, z = z } end
 
+-- Stand-in for a REFramework ValueType (struct field value, e.g. chainsaw.ContextID).
+local ValueType = {}
+ValueType.__index = ValueType
+function ValueType:get_field(name) return self.f[name] end
+local function value_type(fields) return setmetatable({ f = fields }, ValueType) end
+M.value_type = value_type
+
+local function context_id(ctx)
+    if ctx == nil then return nil end
+    return value_type({ _Category = ctx.category or 0, _Kind = ctx.kind or 0, _Group = ctx.group, _Index = ctx.index })
+end
+
 -------------------------------------------------------------------------------
 -- Fake RE4 object model
 -------------------------------------------------------------------------------
@@ -124,7 +136,7 @@ function M.install(opts)
     opts = opts or {}
     classes = {}
     M.classes = classes
-    local world = { singletons = {}, enemies = {}, gui_event = false, created = {} }
+    local world = { singletons = {}, enemies = {}, drops = {}, gui_event = false, created = {} }
     M.world = world
 
     class("System.Object", nil, {})
@@ -153,16 +165,48 @@ function M.install(opts)
             if t.name == "via.physics.CharacterController" then return self.cc end
             return nil
         end },
-        destroy = { 1, function(self) self.destroyed = true end },
+        destroy = { 1, function(self)
+            self.destroyed = true
+            if self.on_destroy then self.on_destroy() end
+        end },
+        get_Components = { 0, function(self) return M.array(self.components or {}) end },
     })
+    class("chainsaw.DropItem", "System.Object", {
+        get_GameObject = { 0, function(self) return self.go end },
+    }, { _ID = "chainsaw.ContextID", _ItemData = "chainsaw.DropItemContext.SaveData" })
+    class("via.Scene", "System.Object", {
+        ["findComponents(System.Type)"] = { 1, function(_, t)
+            if t.name == "chainsaw.DropItem" then
+                local comps = {}
+                for _, d in ipairs(world.drops) do comps[#comps + 1] = d end
+                return M.array(comps)
+            end
+            return M.array({})
+        end },
+    })
+    class("via.SceneManager", "System.Object", {})
 
+    -- HitPoint variants (opts):
+    --   default            set_CurrentHitPoint(Int32) works
+    --   hp_setter_name     the working setter has another name (discovery must find it)
+    --   broken_setter      set_CurrentHitPoint exists but does nothing (must be rejected)
+    --   no_hp_setter       no setter at all; HP lives in field hp_field_name
+    --   decoy setter       set_DefaultHitPoint always exists (must never be used)
     local hp_methods = {
         get_CurrentHitPoint = { 0, function(self) return self.owner.hp end },
         get_DefaultHitPoint = { 0, function(self) return self.owner.max_hp end },
         get_IsLive = { 0, function(self) return self.owner.hp > 0 end },
+        set_DefaultHitPoint = { 1, function(self, v)
+            M.decoy_calls = (M.decoy_calls or 0) + 1
+            self.owner.max_hp = v
+        end, { "System.Int32" } },
     }
+    M.decoy_calls = 0
+    if opts.broken_setter then
+        hp_methods.set_CurrentHitPoint = { 1, function() end, { "System.Int32" } }
+    end
     if not opts.no_hp_setter then
-        hp_methods.set_CurrentHitPoint = { 1, function(self, v)
+        hp_methods[opts.hp_setter_name or "set_CurrentHitPoint"] = { 1, function(self, v)
             assert(math.type(v) == "integer", "HP setter expects an Int32")
             self.owner.hp = v
         end, { "System.Int32" } }
@@ -170,15 +214,16 @@ function M.install(opts)
     if not opts.no_kill_method then
         hp_methods.dead = { 0, function(self) self.owner.hp = 0 end }
     end
+    M.hp_field_name = opts.hp_field_name or "<CurrentHitPoint>k__BackingField"
     class("chainsaw.HitPoint", "System.Object", hp_methods,
-        opts.no_hp_setter and { ["<CurrentHitPoint>k__BackingField"] = "System.Int32" } or {})
+        opts.no_hp_setter and { [M.hp_field_name] = "System.Int32" } or {})
 
     local ctx_methods = {
         get_Position = { 0, function(self) return vec(self.pos.x, self.pos.y, self.pos.z) end },
         get_HitPoint = { 0, function(self) return self.hitpoint end },
         get_BodyGameObject = { 0, function(self) return self.body end },
     }
-    class("chainsaw.CharacterContext", "System.Object", ctx_methods)
+    class("chainsaw.CharacterContext", "System.Object", ctx_methods, { _ID = "chainsaw.ContextID" })
     class("chainsaw.PlayerBaseContext", "chainsaw.CharacterContext", {
         get_IsHolding = { 0, function(self) return self.aiming or false end },
     })
@@ -214,15 +259,31 @@ function M.install(opts)
         end },
     })
 
+    world.scene = new("via.Scene")
+    world.scene_manager = new("via.SceneManager")
     world.singletons["chainsaw.CharacterManager"] = new("chainsaw.CharacterManager")
     world.singletons["chainsaw.GuiManager"] = new("chainsaw.GuiManager")
     world.singletons["chainsaw.CampaignManager"] = new("chainsaw.CampaignManager")
 
     -- Globals REFramework provides.
-    _G.reframework = { get_game_name = function() return opts.game_name or "re4" end }
+    M.keys = {}
+    _G.reframework = {
+        get_game_name = function() return opts.game_name or "re4" end,
+        is_key_down = function(_, vk) return M.keys[vk] == true end,
+    }
     _G.sdk = {
         find_type_definition = function(name) return classes[name] end,
         get_managed_singleton = function(name) return world.singletons[name] end,
+        get_native_singleton = function(name)
+            if name == "via.SceneManager" then return world.scene_manager end
+            return nil
+        end,
+        call_native_func = function(obj, td, name)
+            assert(obj == world.scene_manager and td.name == "via.SceneManager" and name == "get_CurrentScene",
+                "mock: unexpected native call " .. tostring(name))
+            return world.scene
+        end,
+        call_object_func = function(obj, name, ...) return obj:call(name, ...) end,
         typeof = function(name) return { name = name } end,
         create_instance = function(name) return new(name) end,
     }
@@ -297,13 +358,23 @@ function M.install(opts)
 end
 
 -- Creates a character context with HP, a body GameObject, a Transform and a joint tree.
-function M.make_character(type_name, pos, hp)
+-- Fixed-size System.Array stand-in (get_size / get_element).
+function M.array(items)
+    return new("System.Array", {
+        get_size = function() return #items end,
+        get_element = function(_, i) return items[i + 1] end,
+    })
+end
+
+-- context_id: optional {group, index, kind, category} exposed through the `_ID` field.
+function M.make_character(type_name, pos, hp, context)
     local ctx = new(type_name, { pos = vec(pos.x, pos.y, pos.z), hp = hp, max_hp = hp, yaw = 0 })
+    ctx.__fields._ID = context_id(context)
     ctx.hitpoint = new("chainsaw.HitPoint", { owner = ctx })
-    if classes["chainsaw.HitPoint"]:get_field("<CurrentHitPoint>k__BackingField") then
+    if classes["chainsaw.HitPoint"]:get_field(M.hp_field_name) then
         -- Field-backed HP: keep ctx.hp in sync with writes through set_field.
         setmetatable(ctx.hitpoint.__fields, {
-            __newindex = function(_, k, v) if k == "<CurrentHitPoint>k__BackingField" then ctx.hp = v end end,
+            __newindex = function(_, k, v) if k == M.hp_field_name then ctx.hp = v end end,
         })
     end
     local body = new("via.GameObject", { owner = ctx })
@@ -322,8 +393,35 @@ function M.make_character(type_name, pos, hp)
     })
     body.transform = transform
     body.cc = new("via.physics.CharacterController", { owner = ctx })
+    body.components = { transform, body.cc }
     ctx.body = body
     return ctx
+end
+
+-- A pickup (chainsaw.DropItem) lying in the scene. Destroying its GameObject removes it.
+function M.make_drop_item(item_id, pos, context, count)
+    local owner = { pos = vec(pos.x, pos.y, pos.z) }
+    local comp = new("chainsaw.DropItem")
+    local go = new("via.GameObject", { owner = owner })
+    go.transform = new("via.Transform", { owner = owner })
+    go.components = { go.transform, comp }
+    go.on_destroy = function() M.remove_drop(comp) end
+    comp.go = go
+    comp.__fields._ID = context_id(context)
+    comp.__fields._ItemData = value_type({ ItemID = item_id, Count = count or 1 })
+    table.insert(M.world.drops, comp)
+    return comp
+end
+
+-- The player picks it up / the area unloads it: it leaves the scene.
+function M.remove_drop(comp)
+    for i, d in ipairs(M.world.drops) do
+        if d == comp then
+            table.remove(M.world.drops, i)
+            return true
+        end
+    end
+    return false
 end
 
 return M

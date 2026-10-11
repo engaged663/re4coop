@@ -13,10 +13,12 @@ cd build && ctest --output-on-failure
 | `native_transport` (`plugin/tests/test_net.cpp`) | Handshake, names, binary-safe payloads, size limits. 1,500 reliable messages each way under **30% simulated packet loss** arrive exactly once and in order. Password, session-full and version-mismatch rejections. Reconnect after a partner restart. Graceful leave and rejoin. Connect timeout, link timeout, LAN address listing |
 | `plugin_load` (Windows) | Loads `re4coop_net.dll` exactly like REFramework's PluginLoader: version and **game-name gate (`"RE4"`)**, initialization, then the Lua callback on a state owned by a *separate* Lua copy. Lua errors unwind across the DLL boundary, and UDP loopback works through the DLL |
 | `lua_test_bindings` | The `re4coop_net` C API: bad arguments raise catchable Lua errors, failures return `nil, message` (port in use, double host, unresolvable host), binary-safe payloads between two sessions |
+| `lua_test_items_sync` | Key items exist once: a pickup removes the partner's copy (again after an area reload). An area unloading far away, or a stale sighting after a loading screen, is never treated as a pickup. Ordinary items stay separate. Matching works without a ContextID. Simultaneous pickups don't remove anything retroactively |
+| `lua_test_progression` | Left-behind prompt timing, F6 teleport (edge-triggered), F7 snooze, no prompt during cutscenes, re-teleport after falling through unloaded ground, key-item notices during loading screens |
 | `lua_test_protocol` | Every game message round-trips. Snapshots chunk under the datagram limit. Truncated or garbage input never raises |
 | `lua_test_interp` | Interpolation, brief extrapolation, out-of-order packets, partner clock restarts |
-| `lua_test_enemy_sync` | Two simulated worlds: pairing by kind + spawn point, client damage → host, host damage/kills → client, no damage echo, late arrival after the host cleared a room, unmatched enemies left alone, position snapping, bandwidth |
-| `lua_test_game_adapter` | `game.lua` against a mock of REFramework's object model: player/skeleton reading, enemy list, the HP setter with Int32 rounding, the field-write fallback, the kill fallback, teleport + `CharacterController.warp`, exceptions swallowed, type dump |
+| `lua_test_enemy_sync` | Two simulated worlds: pairing by `chainsaw.ContextID` (spawns far apart, kind and distance guards) and by kind + spawn point, client damage → host, host damage/kills → client, no damage echo, late arrival after the host cleared a room, unmatched enemies left alone, position snapping, bandwidth |
+| `lua_test_game_adapter` | `game.lua` against a mock of REFramework's object model: player/skeleton reading, enemy list with ContextIDs, the **self-verifying HP writer** (setter found under another name, broken setter rejected, no-op writes prove nothing, max-HP decoy never touched, field fallback, Int32 rounding), the kill fallback, `chainsaw.DropItem` scan and removal, hotkeys, research dump with full signatures, teleport + `CharacterController.warp`, exceptions swallowed, type dump |
 | `lua_test_integration` | The **real entry script** hosts through its UI button against the mocked game. A second session joins over **real UDP on 127.0.0.1**. Covers handshake, ghosts drawn on both sides, enemy damage/kill sync, chat, teleport, surviving "Reset Scripts", leave/rejoin, settings saved |
 | `lua_test_entry_guards` | Script stays inert outside RE4. Clear message when the DLL is missing. Protocol-mismatch handling |
 
@@ -53,10 +55,20 @@ re4coop zip.
    the same enemies.
 8. **Teleport**: B clicks *Teleport to partner* and lands next to A.
 9. **Pause/menus**: A opens the inventory for 30 s. The session stays connected.
-10. **Reset Scripts**: on A, REFramework → ScriptRunner → *Reset scripts*. The co-op session
+10. **HP during fights (v0.2)**: B shoots an enemy without killing it. Within a second A's copy
+    loses the same HP, and the same the other way. *Diagnostics* should show
+    `[ok] enemy_set_hp: verified …` after the first hit. If it still shows `untested`/`rejected`,
+    send the research dump.
+11. **Key items (v0.2)**: A picks up a key item (e.g. the Wooden Cog). On B it disappears and
+    B's HUD says "Partner picked up a key item".
+12. **Left behind (v0.2)**: A opens a door B can't, and walks 35+ m away. After ~6 s B's HUD
+    offers a teleport. **F6** teleports B to A, and **F7** hides the prompt.
+13. **Reset Scripts**: on A, REFramework → ScriptRunner → *Reset scripts*. The co-op session
     continues and the ghost comes back.
-11. **Disconnect**: B quits the game. A's HUD shows the disconnect within about 10 s and A is
+14. **Disconnect**: B quits the game. A's HUD shows the disconnect within about 10 s and A is
     hosting again. B can rejoin.
 
-Please report failures with the step number, both `re4coop_typedump.json` files and
-`re2_framework_log.txt` (REFramework's log, which has this name in every game).
+Please report failures with the step number, both `re4coop_typedump.json` files (from
+*Diagnostics → Write research dump*, taken in game with enemies and items nearby) and
+`re2_framework_log.txt` (REFramework's log, which has this name in every game). The dump is also
+what the next features (enemy targeting/animation sync, identical drops) are built from.

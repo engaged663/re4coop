@@ -12,7 +12,7 @@
 --
 -- Adapter contract:
 --   enemies = { {id=<number>, kind=<string>, pos={x,y,z}, yaw=<number>, hp=<number>,
---               max_hp=<number>, alive=<bool>}, ... }        (passed to tick)
+--               max_hp=<number>, alive=<bool>, ctx=<ContextID table or nil>}, ... }  (passed to tick)
 --   game:enemy_set_hp(id, hp) -> bool
 --   game:enemy_kill(id) -> bool
 --   game:enemy_set_position(id, pos) -> bool
@@ -69,7 +69,8 @@ function EnemySync:reset()
     self.expected_hp = {}   -- local id -> HP we have already accounted for
     self.self_killed = {}   -- local ids we killed to mirror the host (don't report them back)
 
-    self.counters = { damage_sent = 0, damage_applied = 0, kills_applied = 0, hp_applied = 0, snaps = 0 }
+    self.counters = { damage_sent = 0, damage_applied = 0, damage_failed = 0, kills_applied = 0, hp_applied = 0,
+        hp_failed = 0, snaps = 0, id_matches = 0 }
 end
 
 function EnemySync:kind_hash(kind)
@@ -111,9 +112,26 @@ function EnemySync:observe(now, enemies)
     return by_id
 end
 
--- Closest local enemy of the given kind whose spawn (or, failing that, current position)
--- is within the match radius. `taken` excludes enemies already paired.
-function EnemySync:find_match(kind_hash, spawn_pos, cur_pos, taken, want_alive)
+-- Local enemy that is the same level enemy as a remote one. `taken` excludes enemies
+-- already paired.
+--  1. Same chainsaw.ContextID (assigned by level data) and same kind, with the spawn points
+--     no further apart than ID_MATCH_RADIUS - the guard keeps a wrong pairing impossible if
+--     IDs ever turn out not to be identical across machines.
+--  2. Otherwise the closest enemy of the same kind whose spawn (or current position) is
+--     within the match radius.
+local ID_MATCH_RADIUS = 25.0
+
+function EnemySync:find_match(kind_hash, spawn_pos, cur_pos, taken, want_alive, ctx)
+    local key = self.P.ctx_key(ctx)
+    if key ~= nil then
+        for id, e in pairs(self.by_id) do
+            if e.kind_hash == kind_hash and not taken[id] and (not want_alive or e.alive)
+                and self.P.ctx_key(e.ctx) == key and dist(self.spawn[id] or e.pos, spawn_pos) <= ID_MATCH_RADIUS then
+                self.counters.id_matches = self.counters.id_matches + 1
+                return id
+            end
+        end
+    end
     local radius = self.settings.match_radius or 3.0
     local best, best_d = nil, math.huge
     for id, e in pairs(self.by_id) do
@@ -165,7 +183,7 @@ function EnemySync:host_tick(now, enemies, game)
                 end
                 self.dead[net_id] = {
                     kind_hash = e.kind_hash, pos = copy3(e.pos), spawn = self.spawn[e.id],
-                    max_hp = e.max_hp, time = now,
+                    max_hp = e.max_hp, time = now, ctx = e.ctx,
                 }
             end
             self.alive_of[e.id] = e.alive
@@ -192,7 +210,7 @@ function EnemySync:host_tick(now, enemies, game)
         if net_id ~= nil and e.alive then
             entries[#entries + 1] = {
                 net_id = net_id, kind_hash = e.kind_hash, pos = e.pos, spawn = self.spawn[e.id],
-                yaw = e.yaw, hp = e.hp, max_hp = e.max_hp, flags = alive_flag,
+                yaw = e.yaw, hp = e.hp, max_hp = e.max_hp, flags = alive_flag, ctx = e.ctx,
             }
         end
     end
@@ -206,7 +224,7 @@ function EnemySync:host_tick(now, enemies, game)
             local x = dead_list[i]
             entries[#entries + 1] = {
                 net_id = x.net_id, kind_hash = x.d.kind_hash, pos = x.d.pos, spawn = x.d.spawn,
-                yaw = 0, hp = 0, max_hp = x.d.max_hp, flags = 0,
+                yaw = 0, hp = 0, max_hp = x.d.max_hp, flags = 0, ctx = x.d.ctx,
             }
         end
     end
@@ -221,7 +239,7 @@ function EnemySync:host_on_damage(m, game)
     local id = m.net_id ~= 0 and self.local_of[m.net_id] or nil
     local e = id and self.by_id[id] or nil
     if e == nil then
-        local match = self:find_match(m.kind_hash, m.pos, m.pos, {}, true)
+        local match = self:find_match(m.kind_hash, m.pos, m.pos, {}, true, m.ctx)
         e = match and self.by_id[match] or nil
     end
     if e == nil or not e.alive then
@@ -236,10 +254,13 @@ function EnemySync:host_on_damage(m, game)
             self.counters.kills_applied = self.counters.kills_applied + 1
             return true
         end
-    elseif self.settings.sync_hp ~= false and game:enemy_set_hp(e.id, new_hp) then
-        e.hp = new_hp
-        self.counters.damage_applied = self.counters.damage_applied + 1
-        return true
+    elseif self.settings.sync_hp ~= false then
+        if game:enemy_set_hp(e.id, new_hp) then
+            e.hp = new_hp
+            self.counters.damage_applied = self.counters.damage_applied + 1
+            return true
+        end
+        self.counters.damage_failed = self.counters.damage_failed + 1
     end
     return false
 end
@@ -306,6 +327,7 @@ function EnemySync:client_tick(now, enemies, game)
                     pos = self.spawn[e.id] or e.pos,
                     amount = expected - e.hp,
                     flags = lethal and P.DAMAGE_FLAGS.LETHAL or 0,
+                    ctx = e.ctx,
                 }), true)
                 self.counters.damage_sent = self.counters.damage_sent + 1
             end
@@ -327,7 +349,7 @@ function EnemySync:client_tick(now, enemies, game)
     for id in pairs(self.net_of) do taken[id] = true end
     for _, net_id in ipairs(unpaired) do
         local r = self.remote[net_id]
-        local id = self:find_match(r.kind_hash, r.spawn or r.pos, r.alive and r.pos or nil, taken, true)
+        local id = self:find_match(r.kind_hash, r.spawn or r.pos, r.alive and r.pos or nil, taken, true, r.ctx)
         if id ~= nil then
             self.local_of[net_id] = id
             self.net_of[id] = net_id
@@ -351,6 +373,8 @@ function EnemySync:client_tick(now, enemies, game)
                     if game:enemy_set_hp(id, r.hp) then
                         self.expected_hp[id] = r.hp
                         self.counters.hp_applied = self.counters.hp_applied + 1
+                    else
+                        self.counters.hp_failed = self.counters.hp_failed + 1
                     end
                 end
                 if snap_distance > 0 and dist(e.pos, r.pos) > snap_distance then

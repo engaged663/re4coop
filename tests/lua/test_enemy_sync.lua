@@ -7,9 +7,9 @@ local EnemySync = require("re4coop.enemy_sync")
 local function make_world(id_base)
     local w = { enemies = {}, next_id = id_base, calls = { set_hp = 0, kill = 0, move = 0 } }
 
-    function w:spawn(kind, x, y, z, hp)
+    function w:spawn(kind, x, y, z, hp, ctx)
         local e = { id = self.next_id, kind = kind, pos = { x = x, y = y, z = z }, yaw = 0, hp = hp or 100,
-            max_hp = hp or 100, alive = true }
+            max_hp = hp or 100, alive = true, ctx = ctx }
         self.next_id = self.next_id + 1
         table.insert(self.enemies, e)
         return e
@@ -37,7 +37,7 @@ local function make_world(id_base)
         local out = {}
         for _, e in ipairs(self.enemies) do
             out[#out + 1] = { id = e.id, kind = e.kind, pos = { x = e.pos.x, y = e.pos.y, z = e.pos.z },
-                yaw = e.yaw, hp = e.hp, max_hp = e.max_hp, alive = e.alive }
+                yaw = e.yaw, hp = e.hp, max_hp = e.max_hp, alive = e.alive, ctx = e.ctx }
         end
         return out
     end
@@ -218,14 +218,74 @@ T.run("position_snapping_when_enabled", function()
     T.eq(pair.client_world.calls.move, moves, "no repeated snapping once close")
 end)
 
+T.run("pairs_by_context_id_even_when_spawns_differ", function()
+    local pair = make_pair()
+    -- Same level enemies, but the client loaded later and saw them 8-12 m away from where the
+    -- host first saw them: spatial pairing would fail (3 m radius), the ContextID does not.
+    local ka, kb = { category = 2, kind = 1, group = 300, index = 1 }, { category = 2, kind = 1, group = 300, index = 2 }
+    local ha = pair.host_world:spawn("chainsaw.Ch1c0z0Context", 0, 0, 0, 100, ka)
+    local hb = pair.host_world:spawn("chainsaw.Ch1c0z0Context", 1, 0, 0, 100, kb)
+    local cb = pair.client_world:spawn("chainsaw.Ch1c0z0Context", 9, 0, 6, 100, kb)
+    local ca = pair.client_world:spawn("chainsaw.Ch1c0z0Context", 12, 0, 0, 100, ka)
+    pair:step(5)
+    T.eq(pair.client.net_of[ca.id], pair.host.net_of[ha.id], "A paired by ID")
+    T.eq(pair.client.net_of[cb.id], pair.host.net_of[hb.id], "B paired by ID (not swapped)")
+    T.check(pair.client.counters.id_matches >= 2, "ID matches counted")
+    pair.client_world:damage(cb, 25)
+    pair:step(5)
+    T.eq(hb.hp, 75, "damage lands on the right enemy")
+    T.eq(ha.hp, 100, "not on the other one")
+end)
+
+T.run("context_id_guarded_by_kind_and_distance", function()
+    local pair = make_pair()
+    local k = { category = 2, kind = 1, group = 50, index = 9 }
+    pair.host_world:spawn("chainsaw.Ch1c0z0Context", 0, 0, 0, 100, k)
+    local wrong_kind = pair.client_world:spawn("chainsaw.Ch1d0z0Context", 0, 0, 0, 100, k)
+    local too_far = pair.client_world:spawn("chainsaw.Ch1c0z0Context", 60, 0, 0, 100, k)
+    pair:step(5)
+    T.eq(pair.client.net_of[wrong_kind.id], nil, "same ID but different kind is not paired")
+    T.eq(pair.client.net_of[too_far.id], nil, "same ID but 60 m away is not paired")
+end)
+
+T.run("unpaired_damage_found_by_context_id", function()
+    local pair = make_pair()
+    local k = { category = 2, kind = 1, group = 7, index = 7 }
+    local h = pair.host_world:spawn("chainsaw.Ch1c0z0Context", 0, 0, 0, 100, k)
+    local c = pair.client_world:spawn("chainsaw.Ch1c0z0Context", 10, 0, 0, 100, k)
+    pair.client:tick(pair.now, pair.client_world:list(), pair.client_world) -- baseline, no snapshot yet
+    pair.client_world:damage(c, 40)
+    pair.client:tick(pair.now + 0.05, pair.client_world:list(), pair.client_world)
+    T.eq(#pair.to_host, 1, "report sent before pairing")
+    local m = assert(P.decode(pair.to_host[1]))
+    T.eq(m.net_id, 0, "no net id yet")
+    T.eq(P.ctx_key(m.ctx), "2:1:7:7", "carries ContextID")
+    pair.host:tick(pair.now, pair.host_world:list(), pair.host_world)
+    pair.host:on_message(m, pair.now, pair.host_world)
+    T.eq(h.hp, 60, "host matched it by ContextID although spawns are 10 m apart")
+end)
+
+T.run("failed_hp_writes_are_counted", function()
+    local pair = make_pair()
+    local h, c = standard_level(pair)
+    pair:step(5)
+    pair.host_world.enemy_set_hp = function() return false end -- game offers no working HP writer
+    pair.client_world.enemy_set_hp = function() return false end
+    pair.client_world:damage(c.a, 30)
+    pair.host_world:damage(h.b, 20)
+    pair:step(5)
+    T.eq(pair.host.counters.damage_failed, 1, "host could not apply the client's damage")
+    T.check(pair.client.counters.hp_failed >= 1, "client could not mirror host HP")
+end)
+
 T.run("snapshots_stay_compact", function()
     local pair = make_pair()
     for i = 1, 120 do
         pair.host_world:spawn("chainsaw.Ch1c0z0Context", i * 5, 0, 0)
     end
     pair:step(20) -- 1 second
-    -- 10 Hz x ceil(120/30) chunks = ~40 messages per second.
-    T.check(pair.traffic.host <= 48, "host sends about 40 snapshot messages/s, got " .. pair.traffic.host)
+    -- 10 Hz x ceil(120/25) chunks = ~50 messages per second.
+    T.check(pair.traffic.host <= 60, "host sends about 50 snapshot messages/s, got " .. pair.traffic.host)
 end)
 
 T.finish()
