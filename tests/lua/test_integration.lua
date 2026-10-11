@@ -275,7 +275,10 @@ T.run("sounds_and_shots_cross_over", function()
     for _, s in ipairs(world.sounds) do
         if s.id == 4000123 then T.eq(s.go, "re4coop_wp4000", "positioned at the model's weapon") end
     end
-    T.check((world.flashes or 0) > before_flashes, "muzzle flash at the model's gun")
+    -- Each event plays when the delayed timeline reaches its own time, so the shot (stamped a
+    -- moment after the sound) can come one frame later.
+    ok = T.wait_until(function() return (world.flashes or 0) > before_flashes end, step, 2)
+    T.check(ok, "muzzle flash at the model's gun")
 
     -- Host side: its Leon's footstep reaches the client.
     world.player.sound:call("trigger(System.UInt32)", 777)

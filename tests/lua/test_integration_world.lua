@@ -220,15 +220,23 @@ T.run("breakables_and_animals_cross", function()
 end)
 
 T.run("cutscene_plays_for_both", function()
+    -- The client stands 20 m away: close enough to watch from there, too far to count as
+    -- having arrived (gate radius 10 m) unless it is in the cutscene too.
+    client_game.player.pos = { x = 20, y = 0, z = 0 }
+    T.wait_until(function() return false end, step, 0.3) -- the host sees the client there
     mock.start_cutscene(20130) -- the host walks into a cutscene trigger
     local ok = T.wait_until(function() return #client_world.played > 0 end, step, 5)
     T.check(ok, "the client's game played it")
     T.eq(client_world.played[1] and client_world.played[1].id, 20130, "the same cutscene")
-    -- Both are in it, so the transition gate does not hold the host.
-    for _ = 1, 30 do step() end
+    -- Both are in it, so the transition gate does not hold the host once its grace period
+    -- (1.5 s) is over.
+    T.wait_until(function() return false end, step, 2.5)
     T.eq(world.time_scale, 1.0, "host not frozen while the client watches too")
+    T.eq(client.partner_state and (client.partner_state.flags & P.PLAYER_FLAGS.CUTSCENE) ~= 0, true,
+        "the client sees the host in the cutscene")
     mock.end_cutscene()
     client_world.playing = nil
+    client_game.player.pos = { x = 1, y = 0, z = 0 }
     for _ = 1, 10 do step() end
 end)
 
