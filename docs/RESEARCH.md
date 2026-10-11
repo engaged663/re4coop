@@ -315,6 +315,55 @@ So the mod does not need the user to type a path: the sender reports its body ob
 receiver derives the character id and checks the candidate paths with `via.Prefab.get_Exist`.
 Costume differences are handled by mesh path (§4.1). Animation banks are not needed at all.
 
+### 3.5 Fourth research round: 31 runs in chapter 1 (v0.5)
+
+The second dump (accumulated over 31 runs in `cp10_chp1_1` = ChapterID 21100, stages 40200 and
+43300–43410) added enum values and the types the next features need. The research log was not
+included, so the key-item callback activity and the live HateController search are still open.
+
+**Enums.** `CharacterUsePurposeFlag` = {None 0, Spawner 1, Dynamic 2}.
+`ContextID.EntityCategory` = {Character 0, Gimmick 1, Item 2, LostItem 3, Custom 4, GmDynamicID 5}.
+So the category-3 items with the stage as group are *LostItems* (spawned drops), and `2:0:12:…`
+are ordinary items. `CharacterKindID` has 72 values (e.g. `ch0_a0z0` 100000, `ch3_a8z0` 380000,
+Ganado `ch1_c0z0` 200000). `ChapterID` has 85 and `StageID` 833. `RandomDrop.DropType` =
+{Woodbox 1, WoodboxB 2, WoodboxC 4, enemy types 512…33554432, Crow, Egg}. Also
+`HateTargetInfo.FindSourceType`/`FindStateType` and `PauseLayer` = {Self 1, Inventory 2, Map 4, …}.
+
+**Enemies.** `enemy_spawner_id` read "0 of 9": these Ganados' spawner IDs are runtime IDs or
+missing, so pairing stays positional. Every character has a separate AI **head**
+(`CharacterContext.get_HeadGameObject()`, `get_HeadUpdater()`) and a **body**
+(`get_BodyUpdater()`). The context carries what the head tells the body: `Actions`,
+`MoveDirection`, `MoveIntensity`, `WatchDirection`. It also has `OperationStopState`
+(a `PauseLayer`) and, for Ganados, `ThinkOffEvent`. `HateController` is a `via.Behavior` but not
+on the body GameObject, so it most likely lives on the head. This is the route to enemy puppets:
+switch the head off on the machine that doesn't own the enemy, and feed the owner's commands to
+the body.
+
+**Hits.** `HitController.callbackDamageHit(info: DamageInfo)` runs on the victim's HitController
+for every hit. `DamageInfo` = {Damage, Wince, Break, Stopping, DamageDir, AttackOwnerObject,
+WeaponGameObject, WeaponID, IsCritical, IsKill, IsPartnerDamage} with `copy(src)`.
+
+**Drops and items.** `DropItemManager.generateRandomDrop(droptype, cc, pos, stage, order,
+option)`, `requestGenerateLostItem(item, pos, stage, option)`. `chainsaw.Item` has
+`setItemId`/`setItemCount`, and `GenerateItemOption` is a plain class (Falldown, Effect,
+NeedColCheck, …). `InventoryManager.getItemGetFlag(ItemID)` turns true when the save obtains an
+item.
+
+**Gimmicks and story.** `GimmickManager.findGimmick/findContext(ContextID)`,
+`pushDirtyList(context)` (a gimmick changed state), `CampaignManager.setChapter`,
+`CampaignJumper`, `GameSituationManager.requestInhibit(InhibitType, RequestLayer)`. REFramework's
+own timescale feature uses `via.Scene.set_TimeScale`, and 0 is allowed.
+
+What v0.5 builds on that:
+
+| Feature | How | Safety |
+|---|---|---|
+| See the partner's hits | Hook `callbackDamageHit`. A hit whose attack owner is your player is sent as ENEMY_HIT. The partner replays it on its copy: a new `DamageInfo` copied from their *own* last hit (so weapon/owner objects are valid in their game), with your wince/break/stopping/direction and 1 damage. HP is put back at once, and again if the game applies it a frame late. A yellow tracer runs from your ghost to the enemy | No replay before the receiving player has landed a hit. Never on nearly dead enemies. HP still syncs through the proven damage/HP path. Option: *Enemies react to your partner's hits* |
+| Identical enemy drops | Host: `generateRandomDrop` for an enemy + a new pickup near it → ITEM_DROPPED. Client: skips its own roll (`SKIP_ORIGINAL`) for paired enemies and spawns the host's item with `requestGenerateLostItem` where its copy is | Skipping starts only after the client's own hook fired for an enemy. If the first spawned item never shows up, sync switches off and both roll their own again. Boxes and unpaired enemies are untouched |
+| Key items exist once | The game's "obtained" flag turning true while the item leaves the scene is now the main signal. If the item was the only copy on both sides in the same stage, it matches even at another position. A removal that had no effect is reported | Proximity guessing only until an exact signal has worked. Event log in *Diagnostics* |
+| Transition gate (RE5/6 style) | A cutscene longer than 1.5 s, or a chapter/part change, holds the player who got there first (scene time scale 0) until the partner arrives. The partner is offered F6 right away. **F8** continues alone | Released on disconnect, on "Reset Scripts", when switched off, and automatically if holding ever stops the mod's game loop |
+| Damage race fix | The host applied client damage to the HP from its last enemy scan, overwriting HP the enemy lost since (its own shots). It now reads the current HP | Regression test |
+
 ## 4. Sync architecture
 
 ```
@@ -358,6 +407,10 @@ Costume differences are handled by mesh path (§4.1). Animation banks are not ne
   is removed. Pickups are confirmed by the game's own pickup callback.
 * **Left-behind prompt** (§3.2, §3.3): offers a teleport (F6) when the partner has been far
   away, or in another stage, for a while, so the player without the key item is never stuck.
+* **Transition gate** (§3.5): the player who reaches a cutscene or a new chapter part first is
+  held there (scene time scale 0) until the partner arrives; F8 continues alone.
+* **Partner hits and drops** (§3.5): hits each player lands are replayed (cosmetically) on the
+  other side's copy of the enemy, and the host's random roll decides enemy drops for both.
 * **Utilities**: teleport to partner (transform + `CharacterController.warp`), chat, notices
   ("partner is down", "teleported to you"), and a diagnostics panel with the research dump.
 
@@ -426,7 +479,7 @@ joint.
 different chapters, and when no pose arrived for 3 s. If the game unloads the copy with an area,
 it is rebuilt.
 
-### 4.2 Known limitations (v0.4)
+### 4.2 Known limitations (v0.5)
 
 * Nothing here has been verified in the running game yet. The riskiest assumption is that the
   body prefab can be spawned outside the game's character spawner without side effects once its
@@ -436,10 +489,11 @@ it is rebuilt.
   animation-driven ones, if they bypass it) are not replayed. *Diagnostics* counts what is.
 * Thrown grenades, projectiles, bullet impacts and blood happen only in the thrower's game.
 * Enemies only target the local player, so each machine's copy of an enemy fights its own
-  player: you see the partner's character shoot, but enemies don't choose between the two
-  players, and your partner cannot draw aggro on your machine. Positions are not synced except
-  by optional snapping. The next step is planned in §3.3.
-* Random drops are rolled separately on each machine (plan in §3.3).
+  player: you see the partner's character shoot and your copy of the enemy flinches from their
+  hits, but enemies don't choose between the two players, and your partner cannot draw aggro
+  on your machine. Positions are not synced except by optional snapping. The next step is the
+  AI head (§3.5).
+* Wooden boxes and other breakables are not synced. Only enemy drops are identical.
 * Story flags, doors and cutscenes are not synced. Key items are shared once, and the
   left-behind prompt brings the other player along.
 * Pausing or opening the inventory pauses only your game. The connection survives because the
@@ -451,15 +505,16 @@ it is rebuilt.
 
 ## 5. Roadmap
 
-1. **In-game validation of v0.4** with the checklist in [TESTING.md](TESTING.md), collecting
-   `re4coop_typedump.json` + `re4coop_research_log.json` from several areas (the dump also
+1. **In-game validation of v0.5** with the checklist in [TESTING.md](TESTING.md), collecting
+   `re4coop_typedump.json` + **`re4coop_research_log.json`** from several areas (the dump also
    lists the local character's objects, components, meshes and joints) and fixing any probed
    names with them.
-2. With the log: partner as an enemy target on the host (a partner-purpose character
-   registered like Ashley/Luis, or the partner's model from §4.1, fed to
-   `HateController.find/addHate`), then client enemies as host puppets (AI off, transform +
-   motion layer from the host), then identical drops (`generateRandomDrop` →
-   `requestGenerateLostItem`), then stage-aware teleports via `CharacterManager.requestWarp`.
+2. Enemies for both players: enemy ownership (each enemy's AI runs on the machine of the player
+   it targets; the other machine switches the enemy's AI head off and mirrors position,
+   rotation and motion, which also shows enemies attacking the partner), or the partner's model
+   from §4.1 registered as a target (`HateController.find/addHate`).
+3. Breakables and doors through the gimmick state-change log (`pushDirtyList`), then stage-aware
+   teleports via `CharacterManager.requestWarp`.
 3. Event-driven damage via `chainsaw.EnemyManager.notifyHitDamage` hooks, to remove polling
    latency.
 4. Replicate thrown objects (grenades, eggs, bolts) and hit effects on enemies.

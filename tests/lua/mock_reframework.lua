@@ -13,6 +13,7 @@ local M = {}
 
 local classes = {}
 local objects = {} -- address -> managed object
+M.SKIP_ORIGINAL = 1 -- sdk.PreHookResult.SKIP_ORIGINAL
 
 -------------------------------------------------------------------------------
 -- Type definitions and methods
@@ -33,8 +34,13 @@ local function invoke(m, obj, ...)
         if not m.static then args[2] = raw_arg(obj) end
         local base = #args
         for i = 1, select("#", ...) do args[base + i] = raw_arg((select(i, ...))) end
+        local skip = false
         for _, h in ipairs(m.hooks) do
-            if h.pre then h.pre(args) end
+            if h.pre and h.pre(args) == M.SKIP_ORIGINAL then skip = true end
+        end
+        if skip then
+            M.skipped = (M.skipped or 0) + 1
+            return nil
         end
     end
     local r = m.fn(obj, ...)
@@ -179,6 +185,7 @@ local next_address = 0x10000
 function Managed:get_type_definition() return classes[self.__type] end
 function Managed:get_address() return self.__addr end
 function Managed:add_ref() self.__refs = (self.__refs or 0) + 1 return self end
+function Managed:add_ref_permanent() self.__permanent = true return self end
 function Managed:release() self.__refs = (self.__refs or 0) - 1 end
 function Managed:call(name, ...)
     local m = classes[self.__type]:get_method(name)
@@ -296,7 +303,7 @@ function M.install(opts)
     objects = {}
     local world = {
         singletons = {}, enemies = {}, drops = {}, components = {}, gui_event = false, created = {}, gos = {},
-        sounds = {}, effects = {}, shots = {}, resources = {},
+        sounds = {}, effects = {}, shots = {}, resources = {}, spawned = {}, item_flags = {}, time_scale = 1.0,
     }
     M.world = world
 
@@ -484,6 +491,67 @@ function M.install(opts)
     class("chainsaw.HitPoint", "System.Object", hp_methods,
         opts.no_hp_setter and { [M.hp_field_name] = "System.Int32" } or {})
 
+    -- Hits: HitController.callbackDamageHit(DamageInfo) applies damage to its character.
+    local info_fields = { "Damage", "Wince", "Break", "Stopping", "DamageDir", "AttackOwnerObject", "WeaponID",
+        "IsCritical", "IsKill" }
+    local info_methods = {
+        copy = { 1, function(self, src)
+            for _, f in ipairs(info_fields) do self.data[f] = src.data[f] end
+        end },
+    }
+    for _, f in ipairs(info_fields) do
+        info_methods["get_" .. f] = { 0, function(self) return self.data[f] end }
+        info_methods["set_" .. f] = { 1, function(self, v) self.data[f] = v end }
+    end
+    class("chainsaw.HitController.DamageInfo", "System.Object", info_methods)
+    class("chainsaw.HitController", "via.Component", {
+        get_DamageOwner = { 0, function(self) return self.damage_owner end },
+        get_ParentHitController = { 0, function(self) return self.parent_hc end },
+        callbackDamageHit = { 1, function(self, info)
+            local ctx = self.ctx
+            self.received = self.received or {}
+            self.received[#self.received + 1] = { damage = info.data.Damage, wince = info.data.Wince,
+                attacker = info.data.AttackOwnerObject, critical = info.data.IsCritical }
+            if M.deferred_damage then
+                M.pending_damage = { owner = ctx, amount = info.data.Damage or 0 }
+            elseif ctx ~= nil then
+                ctx.hp = math.max(0, ctx.hp - (info.data.Damage or 0))
+            end
+        end, { "chainsaw.HitController.DamageInfo" } },
+    })
+    -- Random drops and spawning items.
+    class("chainsaw.Item", "System.Object", {
+        setItemId = { 1, function(self, v) self.item_id = v end },
+        setItemCount = { 1, function(self, v) self.count = v end },
+    })
+    class("chainsaw.DropItemManager.GenerateItemOption", "System.Object", {},
+        { Falldown = "System.Boolean", Effect = "System.Boolean", NeedColCheck = "System.Boolean" })
+    class("chainsaw.DropItemManager", "System.Object", {
+        -- The original rolls `next_item` and drops it next to the character (or at `drop_pos`).
+        generateRandomDrop = { 6, function(self, droptype, cc)
+            local base = cc and cc.pos or self.drop_pos or vec(0, 0, 0)
+            self.last_drop = M.make_drop_item(self.next_item or 112800000, { x = base.x + 0.5, y = base.y, z = base.z },
+                nil, 1)
+        end, { "chainsaw.RandomDrop.DropType", "chainsaw.CharacterContext", "via.vec3", "chainsaw.StageID",
+            "chainsaw.Context", "chainsaw.DropItemManager.GenerateItemOption" } },
+        ["requestGenerateLostItem(chainsaw.Item, via.vec3, chainsaw.StageID, chainsaw.DropItemManager.GenerateItemOption)"] = {
+            4, function(_, item, pos, stage, opt)
+                world.spawned[#world.spawned + 1] = { item_id = item.item_id, count = item.count, pos = pos, stage = stage,
+                    falldown = opt.__fields.Falldown }
+                if not M.spawn_does_nothing then
+                    M.make_drop_item(item.item_id, pos, { category = 3, kind = 0, group = stage or 0, index = #world.spawned },
+                        item.count)
+                end
+            end },
+    })
+    -- Inventory "item obtained" flags.
+    class("chainsaw.InventoryManager", "System.Object", {
+        getItemGetFlag = { 1, function(_, id) return world.item_flags[id] == true end },
+    })
+    -- Gimmicks.
+    class("chainsaw.GimmickManager", "System.Object", { pushDirtyList = { 1, function() end } })
+    class("chainsaw.GmContextBox", "System.Object", { get_ID = { 0, function(self) return self.id end } })
+
     local ctx_methods = {
         get_Position = { 0, function(self) return vec(self.pos.x, self.pos.y, self.pos.z) end },
         get_HitPoint = { 0, function(self) return self.hitpoint end },
@@ -572,6 +640,8 @@ function M.install(opts)
     enum("chainsaw.ContextID.EntityCategory", { Character = 0, Gimmick = 1, DropItem = 2, StaticItem = 3 })
     enum("chainsaw.StageID", { st40_200 = 40200, st40_210 = 40210 })
     class("via.Scene", "System.Object", {
+        get_TimeScale = { 0, function() return world.time_scale end },
+        ["set_TimeScale(System.Single)"] = { 1, function(_, v) world.time_scale = v end, { "System.Single" } },
         ["findGameObject(System.String)"] = { 1, function(_, name)
             for _, go in ipairs(world.gos) do
                 if go.name == name and not go.destroyed then return go end
@@ -596,6 +666,9 @@ function M.install(opts)
     world.singletons["chainsaw.CharacterManager"] = new("chainsaw.CharacterManager")
     world.singletons["chainsaw.GuiManager"] = new("chainsaw.GuiManager")
     world.singletons["chainsaw.CampaignManager"] = new("chainsaw.CampaignManager")
+    world.singletons["chainsaw.DropItemManager"] = new("chainsaw.DropItemManager")
+    world.singletons["chainsaw.InventoryManager"] = new("chainsaw.InventoryManager")
+    world.singletons["chainsaw.GimmickManager"] = new("chainsaw.GimmickManager")
 
     M.prefab_files = {
         [M.PREFAB.leon_body] = function(pos) return M.build_body_prefab(pos) end,
@@ -634,7 +707,12 @@ function M.install(opts)
         end,
         call_object_func = function(obj, name, ...) return obj:call(name, ...) end,
         typeof = function(name) return { name = name } end,
-        create_instance = function(name) return new(name) end,
+        create_instance = function(name)
+            local o = new(name)
+            if name == "chainsaw.HitController.DamageInfo" then o.data = {} end
+            return o
+        end,
+        PreHookResult = { CALL_ORIGINAL = 0, SKIP_ORIGINAL = M.SKIP_ORIGINAL },
         create_resource = function(type_name, path)
             if M.missing_resources[path] then return nil end
             world.resources[#world.resources + 1] = path
@@ -924,7 +1002,9 @@ function M.make_character(type_name, pos, hp, spawner)
     M.add_joints(body.transform, JOINT_NAMES, JOINT_PARENTS)
     M.add_component(body, "via.motion.Motion", { layers = motion_layers() })
     M.add_component(body, "via.physics.CharacterController", { ctx = ctx })
+    M.add_component(body, "chainsaw.HitController", { ctx = ctx })
     ctx.body = body
+    ctx.head = M.make_go(type_name:match("(Ch%w+)Context") and (type_name:match("(Ch%w+)Context") .. "_head") or "head")
     return ctx
 end
 
@@ -1030,6 +1110,32 @@ function M.fire_hooks(method_name, ...)
         assert(r == nil, "pre-hook must let the original run")
         assert(h.post("retval") == "retval", "post-hook must pass the return value through")
     end
+end
+
+-- `attacker` (default: the player's body) hits `enemy`: the game builds a DamageInfo and
+-- calls the victim's HitController.callbackDamageHit (hooks run around it).
+function M.hit(enemy, damage, wince, attacker)
+    local info = new("chainsaw.HitController.DamageInfo", { data = {
+        Damage = damage, Wince = wince or 10, Break = 0, Stopping = 0, DamageDir = vec(0, 0, -1),
+        AttackOwnerObject = attacker or (M.world.player and M.world.player.body), WeaponID = 4000, IsCritical = false,
+        IsKill = false } })
+    M.component(enemy.body, "chainsaw.HitController"):call("callbackDamageHit", info)
+    return info
+end
+
+-- The game rolls a random drop for `enemy` (or a wooden box when enemy is nil). Returns the
+-- dropped item, or nil if a hook skipped the roll.
+function M.enemy_drop(enemy, item_id, droptype)
+    local mgr = M.world.singletons["chainsaw.DropItemManager"]
+    mgr.next_item, mgr.last_drop = item_id, nil
+    mgr:call("generateRandomDrop", droptype or (enemy and 65536 or 1), enemy, vec(0, 0, 0), 40100, nil, nil)
+    return mgr.last_drop
+end
+
+-- A gimmick changes state (box broken, door opened...).
+function M.gimmick_dirty(type_name, ctx_id)
+    local ctx = new(type_name, { id = value_type({ _Category = 1, _Kind = 0, _Group = ctx_id.group, _Index = ctx_id.index }) })
+    M.world.singletons["chainsaw.GimmickManager"]:call("pushDirtyList", ctx)
 end
 
 -- The local player picks a drop item up: the game reports it, then removes the item.

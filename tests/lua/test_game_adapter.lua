@@ -412,6 +412,131 @@ T.run("runtime_spawner_ids_are_ignored", function()
     T.eq(list[2].ctx, nil, "runtime spawner dropped")
 end)
 
+T.run("hit_hook_captures_player_hits", function()
+    local game, world = fresh_game()
+    T.check(game:capabilities().hit_hook.ok, "hit hook installed")
+    game:read_player_state() -- learns the player's body/head objects
+    game:list_enemies()      -- learns the enemies' bodies
+    local e1 = world.enemies[1]
+    mock.hit(e1, 25, 12)
+    local ev = game:take_hit_events()
+    T.eq(#ev, 1, "one hit by the player")
+    T.eq(ev[1].id, e1:get_address(), "the enemy that was hit")
+    T.eq(ev[1].damage, 25, "damage")
+    T.eq(ev[1].wince, 12, "wince")
+    T.near(ev[1].dir.z, -1, 1e-6, "direction")
+    T.eq(ev[1].weapon, 4000, "weapon")
+    T.eq(e1.hp, 75, "the game still applies its own damage")
+    T.eq(#game:take_hit_events(), 0, "drained")
+
+    local other = mock.make_character("chainsaw.Ch1d0z0Context", { x = 9, y = 0, z = 9 }, 100)
+    mock.hit(e1, 5, 1, other.body)
+    T.eq(#game:take_hit_events(), 0, "hits by other characters are not sent")
+    T.eq(game.hit_stats.other_owner, 1, "counted")
+    mock.hit(other, 5, 1)
+    T.eq(#game:take_hit_events(), 0, "player hits on non-enemies are not sent")
+    T.eq(game.hit_stats.not_enemy, 1, "counted")
+end)
+
+T.run("hit_replay_is_cosmetic", function()
+    local game, world = fresh_game()
+    game:read_player_state()
+    game:list_enemies()
+    local e2 = world.enemies[2]
+    local id = e2:get_address()
+    local hit = { damage = 50, wince = 30, break_ = 1, stopping = 2, dir = { x = 1, y = 0, z = 0 }, critical = true }
+    local ok = game:enemy_replay_hit(id, hit)
+    T.eq(ok, false, "no replay before our player landed a hit (no template yet)")
+
+    mock.hit(world.enemies[1], 10, 5) -- our own hit provides the DamageInfo template
+    game:take_hit_events()
+    local kept
+    ok, kept = game:enemy_replay_hit(id, hit)
+    T.check(ok, "replayed")
+    T.eq(kept, 0, "HP put back")
+    local r = mock.component(e2.body, "chainsaw.HitController").received[1]
+    T.eq(r.wince, 30, "the partner's wince")
+    T.eq(r.damage, 1, "cosmetic damage only")
+    T.eq(r.critical, true, "critical flag")
+    T.eq(r.attacker, world.player.body, "template objects come from this game")
+    T.eq(e2.hp, 300, "HP unchanged")
+    T.eq(#game:take_hit_events(), 0, "our replay is not reported as our own hit")
+
+    -- The game applies the replayed damage a frame late: the next enemy read undoes it.
+    mock.deferred_damage = true
+    game:enemy_replay_hit(id, hit)
+    mock.deferred_damage = false
+    local pd = mock.pending_damage
+    pd.owner.hp = pd.owner.hp - pd.amount
+    T.eq(game:list_enemies()[2].hp, 300, "delayed replay damage undone")
+    T.eq(e2.hp, 300, "in the game too")
+
+    -- Authoritative changes and our own hits are never undone.
+    game:enemy_replay_hit(id, hit)
+    T.check(game:enemy_set_hp(id, 200), "authoritative HP write")
+    T.eq(game:list_enemies()[2].hp, 200, "kept")
+    game:enemy_replay_hit(id, hit)
+    mock.hit(e2, 40, 5)
+    game:take_hit_events()
+    T.eq(game:list_enemies()[2].hp, 160, "our own hit right after a replay counts")
+
+    e2.hp = 15
+    T.eq(game:enemy_replay_hit(id, hit), false, "nearly dead enemies are not replayed")
+    T.eq(e2.hp, 15, "untouched")
+end)
+
+T.run("drop_hook_reports_and_suppresses", function()
+    local game, world = fresh_game()
+    T.check(game:capabilities().drop_hook.ok, "drop hook installed")
+    game:list_enemies()
+    local e1 = world.enemies[1]
+    T.check(mock.enemy_drop(e1, 112800000) ~= nil, "not skipped by default")
+    local ev = game:take_drop_events()
+    T.eq(#ev, 1, "reported")
+    T.eq(ev[1].enemy_id, e1:get_address(), "which enemy")
+    T.eq(ev[1].droptype, 65536, "drop type")
+    game:set_drop_suppress({ [e1:get_address()] = true })
+    T.eq(mock.enemy_drop(e1, 112800000), nil, "suppressed roll skipped")
+    T.eq(game.drop_stats.suppressed, 1, "counted")
+    T.eq(mock.enemy_drop(world.enemies[2], 112800000) ~= nil, true, "other enemies roll normally")
+    T.check(mock.enemy_drop(nil, 112800000) ~= nil, "wooden box drops are never skipped")
+    T.eq(#game:take_drop_events(), 2, "box drops not reported")
+
+    local ok = game:spawn_drop(124000000, 300, { x = 1, y = 2, z = 3 }, 43400)
+    T.check(ok, "spawn requested")
+    local sp = world.spawned[1]
+    T.eq(sp.item_id, 124000000, "item")
+    T.eq(sp.count, 300, "count")
+    T.eq(sp.stage, 43400, "stage")
+    T.eq(sp.falldown, true, "falls to the ground like a drop")
+    local found = false
+    for _, p in ipairs(game:list_pickups()) do
+        if p.item_id == 124000000 then found = true end
+    end
+    T.check(found, "spawned item lies in the scene")
+end)
+
+T.run("item_flags_and_time_scale", function()
+    local game, world = fresh_game()
+    world.item_flags[119288000] = true
+    local f = game:item_get_flags({ 119288000, 119286400 })
+    T.eq(f[119288000], true, "obtained")
+    T.eq(f[119286400], false, "not obtained")
+    T.eq(game:get_time_scale(), 1.0, "time scale")
+    T.check(game:set_time_scale(0), "set")
+    T.eq(world.time_scale, 0, "frozen")
+    T.eq(game:get_time_scale(), 0, "read back")
+    world.singletons["chainsaw.InventoryManager"] = nil
+    T.eq(game:item_get_flags({ 1 }), nil, "no inventory: nil")
+end)
+
+T.run("hooks_absent_without_sdk_hook", function()
+    local game = fresh_game({ no_hook = true })
+    T.eq(game:take_hit_events(), nil, "no hit events")
+    T.eq(game:take_drop_events(), nil, "no drop events")
+    T.check(not game:capabilities().hit_hook.ok, "hit hook reported missing")
+end)
+
 -- Only what REFramework's json.dump_file can write: finite numbers, strings, booleans,
 -- arrays and string-keyed tables.
 local function check_json_safe(v, path)
@@ -440,6 +565,7 @@ T.run("research_dump", function()
     mock.make_hate_controller("ch1c0z0_hate", { x = 5, y = 0, z = 0 }, world.player.body)
     local cog = mock.make_drop_item(119235200, { x = 3, y = 0, z = 1 }, { category = 3, kind = 0, group = 40200, index = 2 })
     game:avatar_descriptor(0)
+    mock.gimmick_dirty("chainsaw.GmContextBox", { group = 43400, index = 7 })
     local ok, runs = game:dump_types({ role = "host", items = { hook = "confirmed" }, partner_model = { state = "idle" } })
     T.check(ok, "dump written")
     T.eq(runs, 1, "first run")
@@ -453,6 +579,7 @@ T.run("research_dump", function()
     T.check(sig_found, "full method signatures (return type, parameter types)")
     T.check(dump.types["chainsaw.Ch1c0z0Context"] ~= nil, "live enemy type included")
     T.check(dump.types["chainsaw.Ch3a8z0Context"] ~= nil, "live partner type included")
+    T.check(type(dump.types["chainsaw.GmContextBox"]) == "table", "changed gimmick types described")
     T.eq(dump.types["chainsaw.HateControllerUserData"], "not found", "types missing in this build are listed as such")
     T.check(dump.live.singletons["chainsaw.CharacterManager"] == true, "singleton presence")
     T.check(dump.live.enemies[1].spawner_id.group == 4100, "enemy spawner IDs")
@@ -492,6 +619,10 @@ T.run("research_dump", function()
     T.eq(r.pickup_hook.hooks, 2, "hooks installed")
     T.eq(r.session.items.hook, "confirmed", "session state included")
     T.eq(r.session.partner_model.state, "idle", "partner model status included")
+    T.eq(r.gimmicks.recent[1].type, "chainsaw.GmContextBox", "gimmick state changes logged")
+    T.eq(r.gimmicks.recent[1].id, "1:0:43400:7", "gimmick ID")
+    T.eq(r.enemies[1].head, "GameObject Ch1c0z0_head", "enemy AI head object")
+    T.check(r.hits ~= nil and r.drops ~= nil, "hit and drop statistics")
     check_json_safe(log, "research_log")
 
     -- Second run in another area: a different enemy type; the first run's types and log

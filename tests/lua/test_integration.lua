@@ -130,6 +130,27 @@ function client_game:remove_pickup(id)
     return false
 end
 function client_game:is_key_down() return false end
+-- Hits and drops (game.lua hooks on a real client).
+client_game.replays, client_game.hit_queue, client_game.drop_queue, client_game.spawned = {}, {}, {}, {}
+function client_game:enemy_replay_hit(id, hit)
+    self.replays[#self.replays + 1] = { id = id, wince = hit.wince }
+    return true, 0
+end
+function client_game:take_hit_events()
+    local q = self.hit_queue
+    self.hit_queue = {}
+    return q
+end
+function client_game:take_drop_events()
+    local q = self.drop_queue
+    self.drop_queue = {}
+    return q
+end
+function client_game:set_drop_suppress(set) self.suppress = set end
+function client_game:spawn_drop(item_id, count, pos, stage)
+    self.spawned[#self.spawned + 1] = { item_id = item_id, count = count, pos = pos }
+    return true
+end
 
 local client_settings = Config.load(nil)
 client_settings.player_name = "ClientLeon"
@@ -285,6 +306,37 @@ T.run("enemy_sync_end_to_end", function()
     T.eq(client_game.kills, 1, "exactly one kill applied")
     for _ = 1, 50 do step() end
     T.eq(host_e1.hp, 60, "no damage echo after settling")
+end)
+
+T.run("hits_and_drops_end_to_end", function()
+    -- Host shoots enemy 1: the hooked HitController.callbackDamageHit reports it, the client replays it.
+    mock.hit(host_e1, 10, 15)
+    local ok = T.wait_until(function() return #client_game.replays > 0 end, step, 5)
+    T.check(ok, "client replayed the host's hit")
+    T.eq(client_game.replays[1] and client_game.replays[1].id, 1, "on its copy of enemy 1")
+    T.eq(client_game.replays[1] and client_game.replays[1].wince, 15, "with the host's wince")
+    local hp_after_host_hit = host_e1.hp
+
+    -- Client shoots enemy 1: the host replays it through the real game adapter.
+    client_game.hit_queue = { { id = 1, damage = 30, wince = 7, break_ = 0, stopping = 0,
+        dir = { x = 0, y = 0, z = 1 }, weapon = 4000, critical = false } }
+    ok = T.wait_until(function()
+        local r = mock.component(host_e1.body, "chainsaw.HitController").received
+        return r ~= nil and r[#r].wince == 7
+    end, step, 5)
+    T.check(ok, "host's enemy reacted to the client's hit")
+    local r = mock.component(host_e1.body, "chainsaw.HitController").received
+    T.eq(r[#r].damage, 1, "cosmetic replay")
+    T.eq(host_e1.hp, hp_after_host_hit, "replay did not change the host's HP")
+
+    -- Enemy 2 (killed by the host earlier) drops ammo: the client gets the same item.
+    client_game.drop_queue = { { enemy_id = 2, droptype = 65536 } } -- the client's own drop hook works
+    run_for(0.6)
+    T.eq(client_game.suppress and client_game.suppress[1], true, "client skips its own rolls for paired enemies")
+    mock.enemy_drop(host_e2, 112806400)
+    ok = T.wait_until(function() return #client_game.spawned > 0 end, step, 5)
+    T.check(ok, "client spawned the host's drop")
+    T.eq(client_game.spawned[1] and client_game.spawned[1].item_id, 112806400, "same item")
 end)
 
 T.run("key_items_exist_once", function()

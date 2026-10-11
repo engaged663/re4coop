@@ -106,15 +106,21 @@ re.on_frame(function()
     end
 
     local state = session:partner_render_state()
-    if state ~= nil and (settings.show_nametag or not puppet:is_visible()) then
+    if state ~= nil then
         local status = session:status()
-        local ok, err = pcall(Overlay.draw_partner, game, state, {
-            name = status.partner_name,
-            distance = status.partner_distance,
-            show_nametag = settings.show_nametag,
-            marker = not puppet:is_visible(),
-        })
-        if not ok then report_once("overlay", err) end
+        if status.partner_hits ~= nil and #status.partner_hits > 0 then
+            local okT, errT = pcall(Overlay.draw_tracers, game, state, status.partner_hits)
+            if not okT then report_once("tracers", errT) end
+        end
+        if settings.show_nametag or not puppet:is_visible() then
+            local ok, err = pcall(Overlay.draw_partner, game, state, {
+                name = status.partner_name,
+                distance = status.partner_distance,
+                show_nametag = settings.show_nametag,
+                marker = not puppet:is_visible(),
+            })
+            if not ok then report_once("overlay", err) end
+        end
     end
 
     if settings.show_hud then
@@ -137,6 +143,7 @@ re.on_script_reset(function()
     -- Keep the network session alive across script reloads (the plugin owns it); just
     -- remove anything we spawned into the world.
     pcall(puppet.shutdown, puppet)
+    pcall(session.shutdown, session) -- never leave the game frozen by the transition gate
     Config.save(json, settings)
 end)
 

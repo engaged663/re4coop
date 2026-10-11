@@ -13,8 +13,23 @@ local COLOR_HP = 0xFF40D040   -- ABGR green
 local COLOR_HP_LOW = 0xFF4040E0 -- ABGR red
 local COLOR_DOWN = 0xFF2020FF
 local COLOR_MARKER = 0xFFFFC040
+local COLOR_TRACER = 0xFF60F0FF -- ABGR warm yellow
 
 local TAG_HEIGHT = 2.05 -- metres above the partner's feet
+
+-- Shot tracers: a line from the partner's chest to each enemy they just hit.
+function Overlay.draw_tracers(game, state, hits)
+    if hits == nil or #hits == 0 then return end
+    local x0, y0 = game:world_to_screen({ x = state.pos.x, y = state.pos.y + 1.4, z = state.pos.z })
+    if x0 == nil then return end
+    for _, h in ipairs(hits) do
+        local x1, y1 = game:world_to_screen({ x = h.pos.x, y = h.pos.y + 1.2, z = h.pos.z })
+        if x1 ~= nil then
+            game:draw_line(x0, y0, x1, y1, COLOR_TRACER)
+            game:draw_circle(x1, y1, 4, COLOR_TRACER)
+        end
+    end
+end
 
 -- game: adapter with world_to_screen/draw_*; state: interpolated PLAYER state;
 -- opts: { name, distance, show_nametag, marker = bool }
@@ -76,10 +91,30 @@ function Overlay.draw_hud(game, status, messages, now, model)
     game:draw_text(line, x, y, COLOR_TEXT)
     y = y + 18
 
-    if status.left_behind ~= nil then
-        local where = status.left_behind.other_stage and "in another area (%.0f m)" or "%.0f m away"
-        local prompt = ("Partner is " .. where .. " - press %s to teleport to them, %s to hide"):format(
-            status.left_behind.distance, status.teleport_key_name or "F6", status.snooze_key_name or "F7")
+    local prompt = nil
+    local gate = status.gate
+    if gate ~= nil and gate.holding ~= nil then
+        if gate.holding == "chapter" then
+            prompt = ("Waiting for %s to reach this chapter (%.0f s) - press %s to continue alone"):format(
+                status.partner_name or "partner", gate.waited or 0, status.continue_key_name or "F8")
+        else
+            prompt = ("Waiting for %s at this transition (%.0f s) - press %s to continue alone"):format(
+                status.partner_name or "partner", gate.waited or 0, status.continue_key_name or "F8")
+        end
+    elseif status.left_behind ~= nil then
+        local lb = status.left_behind
+        if lb.partner_waiting == "chapter" then
+            prompt = "Partner is waiting for you in the next chapter - finish this one to join them"
+        elseif lb.partner_waiting == "here" then
+            prompt = ("Partner is waiting for you at a transition (%.0f m) - press %s to teleport to them"):format(
+                lb.distance, status.teleport_key_name or "F6")
+        else
+            local where = lb.other_stage and "in another area (%.0f m)" or "%.0f m away"
+            prompt = ("Partner is " .. where .. " - press %s to teleport to them, %s to hide"):format(
+                lb.distance, status.teleport_key_name or "F6", status.snooze_key_name or "F7")
+        end
+    end
+    if prompt ~= nil then
         game:draw_rect(x - 4, y - 2, #prompt * 7 + 8, 18, 0xC0000000)
         game:draw_text(prompt, x, y, 0xFF40E0FF)
         y = y + 22

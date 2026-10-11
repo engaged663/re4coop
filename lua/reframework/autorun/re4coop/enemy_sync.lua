@@ -16,6 +16,13 @@
 --   game:enemy_set_hp(id, hp) -> bool
 --   game:enemy_kill(id) -> bool
 --   game:enemy_set_position(id, pos) -> bool
+--   game:enemy_get_hp(id) -> number|nil   (optional: current HP, fresher than the last list)
+--   game:enemy_replay_hit(id, hit) -> ok, kept   (optional: replays the partner's hit so the
+--       enemy visibly reacts; `kept` = HP the replay took that could not be put back)
+--
+-- Hits: each side sends the hits its own player lands (ENEMY_HIT, from the game's damage
+-- callback) and the other side replays them on its copy, so you see the partner's shots
+-- land. Replays are cosmetic: HP still flows through the damage/HP sync below.
 
 local EnemySync = {}
 EnemySync.__index = EnemySync
@@ -25,6 +32,8 @@ local FORGET_AFTER = 5.0          -- seconds an enemy may be missing from the li
 local DEAD_REPORT_WINDOW = 180.0  -- host keeps advertising recent deaths for late joiners/areas
 local DEAD_EVERY_N_SNAPSHOTS = 5  -- ...but only on every Nth snapshot to save bandwidth
 local MAX_DEAD_ENTRIES = 90
+local CREDIT_SECONDS = 2.0        -- HP a replay could not put back is not reported as our damage
+local MAX_RECENT_HITS = 16        -- partner hits kept for drawing shot tracers
 
 local function dist(a, b)
     local dx, dy, dz = a.x - b.x, a.y - b.y, a.z - b.z
@@ -69,8 +78,12 @@ function EnemySync:reset()
     self.expected_hp = {}   -- local id -> HP we have already accounted for
     self.self_killed = {}   -- local ids we killed to mirror the host (don't report them back)
 
+    self.hit_credit = {}    -- local id -> {amount, time}
+    self.recent_hits = {}   -- partner hits: {pos, time}
+
     self.counters = { damage_sent = 0, damage_applied = 0, damage_failed = 0, kills_applied = 0, hp_applied = 0,
-        hp_failed = 0, snaps = 0, id_matches = 0 }
+        hp_failed = 0, snaps = 0, id_matches = 0, hits_sent = 0, hits_received = 0, hits_replayed = 0,
+        hits_unmatched = 0 }
     self.trust = { agree = 0, disagree = 0 } -- spawner-ID pairing evidence this session
 end
 
@@ -177,6 +190,83 @@ function EnemySync:find_match(kind_hash, spawn_pos, cur_pos, taken, want_alive, 
 end
 
 -------------------------------------------------------------------------------
+-- Hits
+-------------------------------------------------------------------------------
+
+function EnemySync:add_credit(id, amount, now)
+    local c = self.hit_credit[id]
+    if c == nil or now - c.time > CREDIT_SECONDS then c = { amount = 0 } end
+    c.amount, c.time = c.amount + amount, now
+    self.hit_credit[id] = c
+end
+
+-- Returns how much of `amount` is covered by credit (and uses it up).
+function EnemySync:take_credit(id, amount, now)
+    local c = self.hit_credit[id]
+    if c == nil then return 0 end
+    if now - c.time > CREDIT_SECONDS then
+        self.hit_credit[id] = nil
+        return 0
+    end
+    local used = math.min(c.amount, amount)
+    c.amount = c.amount - used
+    if c.amount <= HP_EPS then self.hit_credit[id] = nil end
+    return used
+end
+
+-- events: game:take_hit_events() - hits our player landed. Sent unreliably: a lost hit is
+-- only a missed flinch on the partner's screen.
+function EnemySync:on_local_hits(events, now)
+    for _, ev in ipairs(events or {}) do
+        local e = self.by_id[ev.id]
+        local net_id = self.net_of[ev.id]
+        if e ~= nil and (net_id ~= nil or self.role == "client") then
+            self.send(self.P.encode_enemy_hit({
+                net_id = net_id or 0, kind_hash = e.kind_hash, pos = self.spawn[ev.id] or e.pos,
+                damage = ev.damage, wince = ev.wince, break_ = ev.break_, stopping = ev.stopping,
+                dir = ev.dir, weapon = ev.weapon, critical = ev.critical,
+            }), false)
+            self.counters.hits_sent = self.counters.hits_sent + 1
+        end
+    end
+end
+
+function EnemySync:on_partner_hit(m, now, game)
+    local id
+    if self.role == "host" then
+        id = m.net_id ~= 0 and self.local_of[m.net_id] or nil
+        if id == nil then id = self:find_match(m.kind_hash, m.pos, m.pos, {}, true, nil) end
+    else
+        id = self.local_of[m.net_id]
+    end
+    local e = id and self.by_id[id] or nil
+    if e == nil then
+        self.counters.hits_unmatched = self.counters.hits_unmatched + 1
+        return
+    end
+    self.counters.hits_received = self.counters.hits_received + 1
+    local hits = self.recent_hits
+    hits[#hits + 1] = { pos = copy3(e.pos), time = now }
+    if #hits > MAX_RECENT_HITS then table.remove(hits, 1) end
+    if self.settings.replay_partner_hits ~= false and e.alive and game ~= nil and game.enemy_replay_hit ~= nil then
+        local ok, kept = game:enemy_replay_hit(id, m)
+        if ok then
+            self.counters.hits_replayed = self.counters.hits_replayed + 1
+            if kept ~= nil and kept > HP_EPS then self:add_credit(id, kept, now) end
+        end
+    end
+end
+
+-- Positions of enemies the partner hit in the last `window` seconds (for shot tracers).
+function EnemySync:recent_partner_hits(now, window)
+    local out = {}
+    for _, h in ipairs(self.recent_hits) do
+        if now - h.time <= window then out[#out + 1] = h end
+    end
+    return out
+end
+
+-------------------------------------------------------------------------------
 -- Host
 -------------------------------------------------------------------------------
 
@@ -263,7 +353,7 @@ function EnemySync:host_tick(now, enemies, game)
     self.counters.snaps = self.counters.snaps + 1
 end
 
-function EnemySync:host_on_damage(m, game)
+function EnemySync:host_on_damage(m, game, now)
     local id = m.net_id ~= 0 and self.local_of[m.net_id] or nil
     local e = id and self.by_id[id] or nil
     if e == nil then
@@ -275,7 +365,15 @@ function EnemySync:host_on_damage(m, game)
     end
 
     local lethal = (m.flags & self.P.DAMAGE_FLAGS.LETHAL) ~= 0
-    local new_hp = e.hp - m.amount
+    -- HP a replayed hit already took (and could not be put back) is not taken twice.
+    local amount = m.amount - self:take_credit(e.id, m.amount, now or 0)
+    if amount <= HP_EPS and not lethal then
+        return true
+    end
+    -- Current HP, not the value from our last enemy list: the enemy may have lost HP since
+    -- then (the host's own shots), which must not be overwritten.
+    local cur = game.enemy_get_hp ~= nil and game:enemy_get_hp(e.id) or nil
+    local new_hp = (cur or e.hp) - amount
     if lethal or new_hp <= HP_EPS then
         if self.settings.sync_deaths ~= false and game:enemy_kill(e.id) then
             e.hp = 0
@@ -347,13 +445,15 @@ function EnemySync:client_tick(now, enemies, game)
         if expected == nil then
             self.expected_hp[e.id] = e.hp
         elseif e.hp < expected - HP_EPS then
-            if not self.self_killed[e.id] then
-                local lethal = (not e.alive) or e.hp <= HP_EPS
+            -- HP a replayed partner hit took (and could not be put back) is not our damage.
+            local amount = (expected - e.hp) - self:take_credit(e.id, expected - e.hp, now)
+            local lethal = (not e.alive) or e.hp <= HP_EPS
+            if not self.self_killed[e.id] and (amount > HP_EPS or lethal) then
                 self.send(P.encode_enemy_damage({
                     net_id = self.net_of[e.id] or 0,
                     kind_hash = e.kind_hash,
                     pos = self.spawn[e.id] or e.pos,
-                    amount = expected - e.hp,
+                    amount = math.max(0, amount),
                     flags = lethal and P.DAMAGE_FLAGS.LETHAL or 0,
                     -- The host has no evidence of its own about spawner IDs: only send one
                     -- once this session has proven they match across machines.
@@ -437,9 +537,13 @@ end
 -- Returns true if the message was an enemy message (consumed).
 function EnemySync:on_message(m, now, game)
     local T = self.P.T
+    if m.type == T.ENEMY_HIT then
+        self:on_partner_hit(m, now, game)
+        return true
+    end
     if self.role == "host" then
         if m.type == T.ENEMY_DAMAGE then
-            self:host_on_damage(m, game)
+            self:host_on_damage(m, game, now)
             return true
         end
     else

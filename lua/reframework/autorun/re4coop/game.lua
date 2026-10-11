@@ -179,8 +179,15 @@ function Game.new(log, clock)
     self.call_budget = { t = 0, n = 0 }
     self.counters = { calls = 0, calls_fallback = 0, calls_skipped = 0, shots = 0, events_dropped = 0 }
     self.pickup_events = {} -- filled by the DropItem callback hooks, drained by take_pickup_events()
+    self.enemy_body = {}    -- enemy id -> body GameObject
+    self.enemy_by_body = {} -- body GameObject address -> enemy id
+    self.hp_guard = {}      -- enemy id -> {hp, ticks}: undo HP changes a cosmetic hit replay made
+    self.player_objects = {} -- addresses of the local player's body/head GameObjects
     self:probe()
     self:install_pickup_hooks()
+    self:install_hit_hook()
+    self:install_drop_hook()
+    self:install_gimmick_hook()
     return self
 end
 
@@ -252,6 +259,7 @@ local function method_param_type(m, i)
 end
 
 local function address_of(obj)
+    if obj == nil then return nil end
     local ok, a = pcall(obj.get_address, obj)
     return ok and a or nil
 end
@@ -870,6 +878,7 @@ function Game:read_player_state()
 
     local st = { pos = pos }
     local body = self:call(ctx, "get_BodyGameObject")
+    self:remember_player_objects(body, self:call(ctx, "get_HeadGameObject"))
     local transform = body and self:call(body, "get_Transform")
     if transform ~= nil then
         st.rot = q4(self:call(transform, "get_Rotation"))
@@ -883,6 +892,7 @@ function Game:read_player_state()
     end
     st.cutscene = self:is_cutscene()
     st.stage = tonumber(self:call(ctx, "get_CurrentStageID"))
+    st.chapter = tonumber(self:area_name()) -- CampaignManager.get_CurrentChapter (chainsaw.ChapterID)
     st.aiming = self:call(ctx, "get_IsHolding") == true
     return st
 end
@@ -1618,8 +1628,9 @@ function Game:list_enemies()
     local count = tonumber(self:call(list, "get_Count")) or 0
     self:cap("enemy_list", true, ("%d enemy contexts"):format(count))
 
-    local out, ctx_by_id, ids = {}, {}, {}
+    local out, ctx_by_id, ids, bodies, by_body = {}, {}, {}, {}, {}
     local old_ids = self.enemy_context_ids or {}
+    local old_bodies = self.enemy_body or {}
     local with_id = 0
     for i = 0, count - 1 do
         local ctx = self:call(list, "get_Item", i)
@@ -1638,13 +1649,22 @@ function Game:list_enemies()
                 end
                 ids[id] = cid
                 if cid then with_id = with_id + 1 end
+                -- The body GameObject (it carries the HitController) never changes either.
+                local body = old_bodies[id] or self:call(ctx, "get_BodyGameObject")
+                if body ~= nil then
+                    bodies[id] = body
+                    local okA, addr = pcall(body.get_address, body)
+                    if okA and addr ~= nil then by_body[addr] = id end
+                end
+                local cur = tonumber(self:call(hp, "get_CurrentHitPoint")) or 0
+                cur = self:apply_hp_guard(id, hp, cur)
                 out[#out + 1] = {
                     id = id,
                     kind = type_name_of(ctx) or "unknown",
                     ctx = cid or nil,
                     pos = pos,
                     yaw = 0,
-                    hp = tonumber(self:call(hp, "get_CurrentHitPoint")) or 0,
+                    hp = cur,
                     max_hp = tonumber(self:call(hp, "get_DefaultHitPoint")) or 0,
                     alive = self:call(hp, "get_IsLive") ~= false,
                 }
@@ -1653,6 +1673,11 @@ function Game:list_enemies()
     end
     self.enemy_ctx = ctx_by_id
     self.enemy_context_ids = ids
+    self.enemy_body = bodies
+    self.enemy_by_body = by_body
+    for id in pairs(self.hp_guard) do
+        if ctx_by_id[id] == nil then self.hp_guard[id] = nil end
+    end
     if #out > 0 then
         self:cap("enemy_spawner_id", with_id > 0, ("%d of %d enemies have a level SpawnerID"):format(with_id, #out))
     end
@@ -1718,10 +1743,17 @@ function Game:write_hp(hp_obj, value)
     return false
 end
 
+function Game:enemy_get_hp(id)
+    local ctx = self.enemy_ctx[id]
+    local hp = ctx and self:call(ctx, "get_HitPoint")
+    return hp and tonumber(self:call(hp, "get_CurrentHitPoint")) or nil
+end
+
 function Game:enemy_set_hp(id, value)
     local ctx = self.enemy_ctx[id]
     local hp = ctx and self:call(ctx, "get_HitPoint")
     if hp == nil then return false end
+    self.hp_guard[id] = nil -- an authoritative change, not a replay side effect
     return self:write_hp(hp, math.max(1, value))
 end
 
@@ -1729,6 +1761,7 @@ function Game:enemy_kill(id)
     local ctx = self.enemy_ctx[id]
     local hp = ctx and self:call(ctx, "get_HitPoint")
     if hp == nil then return false end
+    self.hp_guard[id] = nil
     if self.kill_method ~= nil then
         local m = self:method(hp, self.kill_method)
         if m ~= nil and pcall(m.call, m, hp) then return true end
@@ -1789,6 +1822,7 @@ function Game:list_pickups()
     end
 
     local out, go_by_id, comp_by_id, unreadable = {}, {}, {}, 0
+    local old_stages, stages = self.pickup_stages or {}, {}
     for _, comp in ipairs(comps) do
         local go = self:call(comp, "get_GameObject")
         local transform = go and self:call(go, "get_Transform")
@@ -1803,12 +1837,17 @@ function Game:list_pickups()
             local id = comp:get_address()
             go_by_id[id] = go
             comp_by_id[id] = comp
+            -- DropItem.getStage(): the stage the item belongs to (fixed, so read once).
+            local stage = old_stages[id]
+            if stage == nil then stage = tonumber(self:call(comp, "getStage")) or false end
+            stages[id] = stage
             out[#out + 1] = {
                 id = id,
                 item_id = item_id,
                 count = tonumber(read_field(data, "Count")) or 0,
                 pos = pos,
                 ctx = self:read_context_id(comp),
+                stage = stage or nil,
             }
         else
             unreadable = unreadable + 1
@@ -1816,6 +1855,7 @@ function Game:list_pickups()
     end
     self.pickup_objects = go_by_id
     self.pickup_comps = comp_by_id
+    self.pickup_stages = stages
     self:cap("pickups", #out > 0 or unreadable == 0,
         ("%d drop items readable, %d unreadable"):format(#out, unreadable))
     return out
@@ -1879,6 +1919,374 @@ function Game:take_pickup_events()
     for i, e in ipairs(self.pickup_events) do out[i] = e end
     for i = #self.pickup_events, 1, -1 do self.pickup_events[i] = nil end
     return out
+end
+
+-------------------------------------------------------------------------------
+-- Hits (chainsaw.HitController.callbackDamageHit)
+-------------------------------------------------------------------------------
+
+-- Every hit on a character goes through HitController.callbackDamageHit(info: DamageInfo) on
+-- the victim's HitController (a component of its body GameObject). The hook records hits the
+-- local player lands on enemies, so the partner's game can replay them, and keeps a copy of
+-- the latest such DamageInfo as a template: a replayed hit then carries valid weapon and
+-- owner objects from this game instead of fields filled in by hand.
+local MAX_HIT_EVENTS = 64
+-- A replayed hit is cosmetic (flinch/stagger). HP stays with the existing sync, so the replay
+-- deals 1 damage, is skipped on nearly dead enemies, and any HP it took is put back.
+local REPLAY_DAMAGE = 1
+local REPLAY_MIN_HP = 20
+local REPLAY_MIN_HP_FRACTION = 0.1
+local HP_GUARD_TICKS = 6 -- enemy list reads (~0.3 s) during which a delayed replay HP drop is undone
+
+local function hook_available()
+    return type(sdk) == "table" and type(sdk.hook) == "function" and type(sdk.to_managed_object) == "function"
+end
+
+local function add_ref(obj)
+    if obj == nil then return nil end
+    if not pcall(function() obj:add_ref_permanent() end) then pcall(function() obj:add_ref() end) end
+    return obj
+end
+
+function Game:remember_player_objects(body, head)
+    local objs = {}
+    local a, b = address_of(body), address_of(head)
+    if a then objs[a] = true end
+    if b then objs[b] = true end
+    self.player_objects = objs
+end
+
+-- Enemy id whose body owns this HitController (directly, or as the damage owner / parent).
+function Game:enemy_for_hit_controller(hc)
+    local go = self:call(hc, "get_GameObject")
+    local id = self.enemy_by_body[address_of(go) or false]
+    if id ~= nil then return id end
+    local owner = self:call(hc, "get_DamageOwner")
+    id = self.enemy_by_body[address_of(owner) or false]
+    if id ~= nil then return id end
+    local parent = self:call(hc, "get_ParentHitController")
+    local pgo = parent and self:call(parent, "get_GameObject")
+    return self.enemy_by_body[address_of(pgo) or false]
+end
+
+function Game:install_hit_hook()
+    self.hit_events = {}
+    self.hit_stats = { seen = 0, by_player = 0, other_owner = 0, not_enemy = 0, last_other_owner = nil,
+        replays = 0, replay_failed = 0, replay_skipped = 0, hp_restored = 0, delayed_restored = 0 }
+    self.hit_template = nil
+    self.replaying = false
+    if not hook_available() then
+        self:cap("hit_hook", false, "sdk.hook unavailable")
+        return
+    end
+    local td = find_type("chainsaw.HitController")
+    local okM, m = pcall(function() return td and td:get_method("callbackDamageHit") end)
+    if not okM or m == nil then
+        self:cap("hit_hook", false, "HitController.callbackDamageHit not found")
+        return
+    end
+    local game = self
+    local function on_hit(args)
+        if game.replaying then return end -- our own replay
+        local stats = game.hit_stats
+        stats.seen = stats.seen + 1
+        local hc = sdk.to_managed_object(args[2])
+        local info = sdk.to_managed_object(args[3])
+        if hc == nil or info == nil then return end
+        local id = game:enemy_for_hit_controller(hc)
+        if id == nil then
+            stats.not_enemy = stats.not_enemy + 1
+            return
+        end
+        local owner = game:call(info, "get_AttackOwnerObject")
+        if not game.player_objects[address_of(owner) or false] then
+            stats.other_owner = stats.other_owner + 1
+            stats.last_other_owner = owner and tostring(game:call(owner, "get_Name")) or "nil"
+            return
+        end
+        stats.by_player = stats.by_player + 1
+        game.hp_guard[id] = nil -- this HP drop is real
+        if game.hit_template == nil then
+            local okC, t = pcall(sdk.create_instance, "chainsaw.HitController.DamageInfo")
+            if okC and t ~= nil then game.hit_template = add_ref(t) end
+        end
+        if game.hit_template ~= nil then
+            pcall(function() game.hit_template:call("copy", info) end)
+        end
+        if #game.hit_events < MAX_HIT_EVENTS then
+            game.hit_events[#game.hit_events + 1] = {
+                id = id,
+                damage = tonumber(game:call(info, "get_Damage")) or 0,
+                wince = tonumber(game:call(info, "get_Wince")) or 0,
+                break_ = tonumber(game:call(info, "get_Break")) or 0,
+                stopping = tonumber(game:call(info, "get_Stopping")) or 0,
+                dir = v3(game:call(info, "get_DamageDir")),
+                weapon = tonumber(game:call(info, "get_WeaponID")),
+                critical = game:call(info, "get_IsCritical") == true,
+            }
+        end
+    end
+    local ok = pcall(sdk.hook, m, function(args) pcall(on_hit, args) end, function(retval) return retval end)
+    self:cap("hit_hook", ok, ok and "HitController.callbackDamageHit" or "sdk.hook failed")
+end
+
+-- Hits the local player landed on enemies since the last call:
+-- { {id, damage, wince, break_, stopping, dir, weapon, critical}, ... } or nil without the hook.
+function Game:take_hit_events()
+    if self.hit_events == nil or self.caps.hit_hook == nil or not self.caps.hit_hook.ok then return nil end
+    local out = self.hit_events
+    self.hit_events = {}
+    return out
+end
+
+-- Undoes HP that a replayed hit took after the fact (the game may apply damage a frame late).
+function Game:apply_hp_guard(id, hp_obj, cur)
+    local guard = self.hp_guard[id]
+    if guard == nil then return cur end
+    guard.ticks = guard.ticks - 1
+    if guard.ticks <= 0 then self.hp_guard[id] = nil end
+    if cur < guard.hp - 0.5 and self:write_hp(hp_obj, guard.hp) then
+        self.hit_stats.delayed_restored = self.hit_stats.delayed_restored + 1
+        return guard.hp
+    end
+    return cur
+end
+
+-- Replays the partner's hit on our copy of enemy `id` so it visibly reacts. Returns ok, kept:
+-- `kept` is HP the replay removed and that could not be restored (for the caller's bookkeeping).
+function Game:enemy_replay_hit(id, hit)
+    local stats = self.hit_stats
+    if self.hit_template == nil then
+        stats.replay_skipped = stats.replay_skipped + 1
+        return false, 0, "no template yet (land one hit yourself first)"
+    end
+    local ctx, body = self.enemy_ctx[id], self.enemy_body[id]
+    local hp_obj = ctx and self:call(ctx, "get_HitPoint")
+    local hc = body and self:get_component(body, "chainsaw.HitController")
+    if hp_obj == nil or hc == nil then
+        stats.replay_failed = stats.replay_failed + 1
+        return false, 0, "no HitController"
+    end
+    local before = tonumber(self:call(hp_obj, "get_CurrentHitPoint"))
+    local max_hp = tonumber(self:call(hp_obj, "get_DefaultHitPoint")) or 0
+    if before == nil or before <= REPLAY_MIN_HP or before < max_hp * REPLAY_MIN_HP_FRACTION
+        or self:call(hp_obj, "get_IsLive") == false then
+        stats.replay_skipped = stats.replay_skipped + 1
+        return false, 0, "enemy nearly dead"
+    end
+    local okC, info = pcall(sdk.create_instance, "chainsaw.HitController.DamageInfo")
+    if not okC or info == nil then
+        stats.replay_failed = stats.replay_failed + 1
+        return false, 0, "cannot create DamageInfo"
+    end
+    local dir = hit.dir or { x = 0, y = 0, z = 0 }
+    local okSet = pcall(function()
+        info:call("copy", self.hit_template)
+        info:call("set_Damage", REPLAY_DAMAGE)
+        info:call("set_Wince", hit.wince or 0)
+        info:call("set_Break", hit.break_ or 0)
+        info:call("set_Stopping", hit.stopping or 0)
+        info:call("set_DamageDir", Vector3f.new(dir.x, dir.y, dir.z))
+        info:call("set_IsCritical", hit.critical == true)
+        info:call("set_IsKill", false)
+    end)
+    if not okSet then
+        stats.replay_failed = stats.replay_failed + 1
+        return false, 0, "cannot fill DamageInfo"
+    end
+    self.replaying = true
+    local ok = pcall(function() hc:call("callbackDamageHit", info) end)
+    self.replaying = false
+    if not ok then
+        stats.replay_failed = stats.replay_failed + 1
+        return false, 0, "callbackDamageHit failed"
+    end
+    stats.replays = stats.replays + 1
+    local kept = 0
+    local after = tonumber(self:call(hp_obj, "get_CurrentHitPoint")) or before
+    if after < before - 0.5 then
+        if self:write_hp(hp_obj, before) then
+            stats.hp_restored = stats.hp_restored + 1
+        else
+            kept = before - after
+        end
+    end
+    self.hp_guard[id] = { hp = before - kept, ticks = HP_GUARD_TICKS }
+    self:cap("hit_replay", true, ("%d replayed, %d HP restored"):format(stats.replays, stats.hp_restored))
+    return true, kept
+end
+
+-------------------------------------------------------------------------------
+-- Random drops (chainsaw.DropItemManager.generateRandomDrop)
+-------------------------------------------------------------------------------
+
+-- generateRandomDrop(droptype, cc: CharacterContext, pos, stage, order, option) rolls and
+-- spawns a random drop: from a dying enemy (cc = its context) or a wooden box. The hook
+-- reports enemy drops, and on the client skips the roll for enemies listed in
+-- drop_suppress (drop_sync spawns the host's item there instead).
+local MAX_DROP_EVENTS = 32
+
+function Game:install_drop_hook()
+    self.drop_events = {}
+    self.drop_suppress = {} -- enemy id -> true
+    self.drop_stats = { calls = 0, enemy_calls = 0, suppressed = 0, spawned = 0, spawn_failed = 0, last_types = {} }
+    self.spawn_refs = {}
+    if not hook_available() then
+        self:cap("drop_hook", false, "sdk.hook unavailable")
+        return
+    end
+    local td = find_type("chainsaw.DropItemManager")
+    local okM, m = pcall(function() return td and td:get_method("generateRandomDrop") end)
+    if not okM or m == nil then
+        self:cap("drop_hook", false, "DropItemManager.generateRandomDrop not found")
+        return
+    end
+    local game = self
+    local function on_drop(args)
+        local stats = game.drop_stats
+        stats.calls = stats.calls + 1
+        local okT, raw = pcall(sdk.to_int64, args[3])
+        local droptype = okT and raw and (raw & 0xFFFFFFFF) or -1
+        local types = stats.last_types
+        types[#types + 1] = droptype
+        if #types > 8 then table.remove(types, 1) end
+        local cc = sdk.to_managed_object(args[4])
+        local id = address_of(cc)
+        if id == nil or game.enemy_ctx[id] == nil then return false end
+        stats.enemy_calls = stats.enemy_calls + 1
+        if #game.drop_events < MAX_DROP_EVENTS then
+            game.drop_events[#game.drop_events + 1] = { enemy_id = id, droptype = droptype }
+        end
+        if game.drop_suppress[id] then
+            stats.suppressed = stats.suppressed + 1
+            return true
+        end
+        return false
+    end
+    local skip = sdk.PreHookResult and sdk.PreHookResult.SKIP_ORIGINAL
+    local ok = pcall(sdk.hook, m, function(args)
+        local okD, suppress = pcall(on_drop, args)
+        if okD and suppress and skip ~= nil then return skip end
+    end, function(retval) return retval end)
+    self:cap("drop_hook", ok, ok and "DropItemManager.generateRandomDrop" or "sdk.hook failed")
+end
+
+-- Enemy random drops since the last call: { {enemy_id, droptype}, ... } or nil without the hook.
+function Game:take_drop_events()
+    if self.caps.drop_hook == nil or not self.caps.drop_hook.ok then return nil end
+    local out = self.drop_events
+    self.drop_events = {}
+    return out
+end
+
+-- Enemies whose own random drop is skipped (set of enemy ids).
+function Game:set_drop_suppress(set)
+    self.drop_suppress = set or {}
+end
+
+-- Spawns an item lying in the world, like an enemy drop:
+-- DropItemManager.requestGenerateLostItem(item, pos, stage, option).
+local GENERATE_LOST_ITEM = "requestGenerateLostItem(chainsaw.Item, via.vec3, chainsaw.StageID, chainsaw.DropItemManager.GenerateItemOption)"
+local MAX_SPAWN_REFS = 16
+
+function Game:spawn_drop(item_id, count, pos, stage)
+    local mgr = singleton("chainsaw.DropItemManager")
+    if mgr == nil then return false, "no DropItemManager" end
+    local ok, err = pcall(function()
+        local item = sdk.create_instance("chainsaw.Item")
+        item:call("setItemId", item_id)
+        item:call("setItemCount", math.max(1, count or 1))
+        local opt = sdk.create_instance("chainsaw.DropItemManager.GenerateItemOption")
+        opt:set_field("Falldown", true)
+        opt:set_field("Effect", true)
+        opt:set_field("NeedColCheck", true)
+        -- The request completes later: keep both objects alive until then.
+        local refs = self.spawn_refs
+        refs[#refs + 1] = { add_ref(item), add_ref(opt) }
+        if #refs > MAX_SPAWN_REFS then table.remove(refs, 1) end
+        mgr:call(GENERATE_LOST_ITEM, item, Vector3f.new(pos.x, pos.y, pos.z), stage or 0, opt)
+    end)
+    local stats = self.drop_stats
+    if ok then stats.spawned = stats.spawned + 1 else stats.spawn_failed = stats.spawn_failed + 1 end
+    return ok, ok and nil or tostring(err)
+end
+
+-------------------------------------------------------------------------------
+-- Inventory, time scale, gimmick research
+-------------------------------------------------------------------------------
+
+-- InventoryManager.getItemGetFlag(id): true once this save has obtained the item. A key
+-- item's flag turning true while it vanishes from the scene is an exact pickup signal.
+-- Returns { [id] = bool } for the ids it could read, or nil.
+function Game:item_get_flags(ids)
+    local inv = singleton("chainsaw.InventoryManager")
+    if inv == nil then return nil end
+    local m = self:method(inv, "getItemGetFlag")
+    if m == nil then
+        self:cap("item_flags", false, "InventoryManager.getItemGetFlag not found")
+        return nil
+    end
+    local out, n = {}, 0
+    for _, id in ipairs(ids) do
+        local ok, v = pcall(m.call, m, inv, id)
+        if ok and type(v) == "boolean" then
+            out[id] = v
+            n = n + 1
+        end
+    end
+    if #ids > 0 then self:cap("item_flags", n > 0, ("%d of %d key item flags readable"):format(n, #ids)) end
+    return out
+end
+
+-- The current scene's time scale (via.Scene.get/set_TimeScale, REFramework's own timescale
+-- feature uses the same call). 0 holds the game at a transition until the partner arrives.
+function Game:get_time_scale()
+    local scene = self:current_scene()
+    if scene == nil then return nil end
+    local ok, v = pcall(function() return scene:call("get_TimeScale") end)
+    return ok and tonumber(v) or nil
+end
+
+function Game:set_time_scale(v)
+    local scene = self:current_scene()
+    if scene == nil then return false end
+    local ok = pcall(function() scene:call("set_TimeScale(System.Single)", v) end)
+    self:cap("time_scale", ok, ok and "via.Scene.set_TimeScale" or "set_TimeScale failed")
+    return ok
+end
+
+-- CharacterManager.isActive(stageID): whether that stage is loaded and active here.
+function Game:stage_active(stage)
+    local cm = singleton(CHARACTER_MANAGER)
+    if cm == nil or stage == nil then return false end
+    return self:call(cm, "isActive", stage) == true
+end
+
+-- Research only: GimmickManager.pushDirtyList(context) runs when a gimmick changes state
+-- (box broken, door opened, ...). The log shows which types and IDs change, for syncing them.
+local MAX_GIMMICK_LOG = 40
+
+function Game:install_gimmick_hook()
+    self.gimmick_log = {}
+    self.gimmick_calls = 0
+    if not hook_available() then return end
+    local td = find_type("chainsaw.GimmickManager")
+    local okM, m = pcall(function() return td and td:get_method("pushDirtyList") end)
+    if not okM or m == nil then return end
+    local game = self
+    local function on_dirty(args)
+        game.gimmick_calls = game.gimmick_calls + 1
+        local ctx = sdk.to_managed_object(args[3])
+        if ctx == nil then return end
+        local log = game.gimmick_log
+        log[#log + 1] = {
+            type = type_name_of(ctx),
+            id = P.ctx_key(context_id_table(game:call(ctx, "get_ID") or read_field(ctx, "_ID"))),
+            n = game.gimmick_calls,
+        }
+        if #log > MAX_GIMMICK_LOG then table.remove(log, 1) end
+    end
+    pcall(sdk.hook, m, function(args) pcall(on_dirty, args) end, function(retval) return retval end)
 end
 
 -- Removes a pickup found by the last list_pickups() (its partner took it).
@@ -1985,6 +2393,9 @@ local DUMP_TYPES = {
     "chainsaw.CharacterSpawnParam", "chainsaw.HitController", "chainsaw.HitController.DamageInfo",
     "chainsaw.CharacterDamageInfo", "chainsaw.MotionController", "chainsaw.AnimationController",
     "chainsaw.TargetSensor", "chainsaw.TargetMarker", "chainsaw.StayAreaController",
+    "chainsaw.CharacterHeadUpdater", "chainsaw.CharacterBodyUpdater", "chainsaw.EnemyActionStateInfo",
+    "chainsaw.GimmickContext", "chainsaw.GimmickCore", "chainsaw.GmBase", "chainsaw.HitManager",
+    "chainsaw.InventoryControllerBase", "chainsaw.ItemGetData", "chainsaw.CampaignJumper",
     "via.motion.Motion", "via.motion.TreeLayer", "via.motion.MotionFsm2", "via.behaviortree.BehaviorTree",
     "via.physics.CharacterController",
     GUN, "chainsaw.GameStatusManager", "chainsaw.LevelManager", "chainsaw.MapManager",
@@ -1999,6 +2410,8 @@ local DUMP_ENUMS = {
     "chainsaw.HateTargetInfo.FindSourceType", "chainsaw.HateTargetInfo.FindStateType",
     "chainsaw.ContextID.EntityCategory", "chainsaw.RandomDrop.DropType", "chainsaw.CampaignManager.Difficulty",
     "chainsaw.CharacterManager.PlayerKind", "chainsaw.CharacterManager.PlayerNo", "chainsaw.StageID",
+    "chainsaw.GameSituationManager.InhibitType", "chainsaw.GameSituationManager.RequestLayer",
+    "chainsaw.CharacterContext.ManageFlags", "chainsaw.character.ControlMode", "chainsaw.EnvSceneStatus",
 }
 local ENUM_MAX_VALUES = 4000
 
@@ -2212,6 +2625,17 @@ function Game:research_snapshot(extra)
         sample.find_state = ctx and plain_value(self:call(ctx, "get_TargetFindState")) or nil
         sample.find_source = ctx and plain_value(self:call(ctx, "get_TargetFindSource")) or nil
         if i == 1 and ctx ~= nil then sample.motion = self:motion_sample(ctx) end
+        if i <= 3 and ctx ~= nil then
+            -- The AI ("head") and what can switch it off, for puppeting enemies later.
+            local head = self:call(ctx, "get_HeadGameObject")
+            sample.head = head and plain_value(head) or nil
+            sample.head_components = self:component_names(head)
+            sample.head_updater = type_name_of(self:call(ctx, "get_HeadUpdater"))
+            sample.body_updater = type_name_of(self:call(ctx, "get_BodyUpdater"))
+            sample.operation_stop = plain_value(self:call(ctx, "get_OperationStopState"))
+            sample.operation_enable = plain_value(self:call(ctx, "get_OperationEnable"))
+            sample.think_off_event = plain_value(read_field(ctx, "ThinkOffEvent"))
+        end
         snap.enemies[i] = sample
     end
 
@@ -2253,6 +2677,10 @@ function Game:research_snapshot(extra)
         recent = self.recent_pickup_events,
     }
     snap.hp_writer = self.hp_writer and self.hp_writer.label or nil
+    snap.hits = self.hit_stats
+    snap.hit_template = self.hit_template ~= nil
+    snap.drops = self.drop_stats
+    snap.gimmicks = { calls = self.gimmick_calls or 0, recent = self.gimmick_log }
     if extra ~= nil then snap.session = extra end
     return snap
 end
@@ -2334,12 +2762,22 @@ function Game:dump_types(extra)
         want(e.kind)
     end
     local first = enemies[1] and self.enemy_ctx[enemies[1].id]
-    if first ~= nil then
-        live.enemy_components = self:component_names(self:call(first, "get_BodyGameObject"))
-        for _, c in ipairs(live.enemy_components or {}) do
-            if c:find("Hate", 1, true) or c:find("Behavior", 1, true) or c:find("Motion", 1, true) then want(c) end
+    local function want_interesting(list)
+        for _, c in ipairs(list or {}) do
+            if c:find("Hate", 1, true) or c:find("Behavior", 1, true) or c:find("Motion", 1, true)
+                or c:find("Updater", 1, true) or c:find("Think", 1, true) or c:find("Brain", 1, true)
+                or c:find("Fsm", 1, true) or c:find("Target", 1, true) then
+                want(c)
+            end
         end
     end
+    if first ~= nil then
+        live.enemy_components = self:component_names(self:call(first, "get_BodyGameObject"))
+        live.enemy_head_components = self:component_names(self:call(first, "get_HeadGameObject"))
+        want_interesting(live.enemy_components)
+        want_interesting(live.enemy_head_components)
+    end
+    for _, g in ipairs(self.gimmick_log or {}) do want(g.type) end
     local cm = singleton(CHARACTER_MANAGER)
     local partner = cm and self:call(cm, "getPartnerContextRef")
     if partner ~= nil then want(type_name_of(partner)) end

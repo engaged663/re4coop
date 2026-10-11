@@ -60,6 +60,23 @@ local function make_world(id_base)
         return true
     end
 
+    -- Replays a partner hit; `replay_kept` simulates a game where the replay's HP loss
+    -- could not be put back.
+    w.replays = {}
+    w.replay_kept = 0
+    function w:enemy_replay_hit(id, hit)
+        local e = self:get(id)
+        if not e then return false, 0 end
+        self.replays[#self.replays + 1] = { id = id, wince = hit.wince, critical = hit.critical }
+        if self.replay_kept > 0 then e.hp = e.hp - self.replay_kept end
+        return true, self.replay_kept
+    end
+
+    function w:enemy_get_hp(id)
+        local e = self:get(id)
+        return e and e.hp or nil
+    end
+
     function w:enemy_set_position(id, pos)
         local e = self:get(id)
         if not e then return false end
@@ -339,6 +356,103 @@ T.run("failed_hp_writes_are_counted", function()
     pair:step(5)
     T.eq(pair.host.counters.damage_failed, 1, "host could not apply the client's damage")
     T.check(pair.client.counters.hp_failed >= 1, "client could not mirror host HP")
+end)
+
+local function hit_event(e, damage, wince)
+    return { id = e.id, damage = damage, wince = wince, break_ = 0, stopping = 0, dir = { x = 0, y = 0, z = -1 },
+        weapon = 4000, critical = false }
+end
+
+T.run("host_hits_replay_on_client", function()
+    local pair = make_pair()
+    local h, c = standard_level(pair)
+    pair:step(3)
+    pair.host:on_local_hits({ hit_event(h.a, 30, 12) }, pair.now)
+    pair:step(1)
+    T.eq(#pair.client_world.replays, 1, "replayed once")
+    T.eq(pair.client_world.replays[1].id, c.a.id, "on the client's copy of that enemy")
+    T.eq(pair.client_world.replays[1].wince, 12, "with the host's wince")
+    local hits = pair.client:recent_partner_hits(pair.now, 0.25)
+    T.eq(#hits, 1, "shot tracer available")
+    T.near(hits[1].pos.x, c.a.pos.x, 1e-6, "tracer ends at our copy")
+    T.eq(#pair.client:recent_partner_hits(pair.now + 1, 0.25), 0, "tracer expires")
+    T.eq(pair.host.counters.hits_sent, 1, "counted on the host")
+end)
+
+T.run("client_hits_replay_on_host", function()
+    local pair = make_pair()
+    local h, c = standard_level(pair)
+    pair:step(3)
+    pair.client:on_local_hits({ hit_event(c.b, 20, 8) }, pair.now)
+    pair:step(1)
+    T.eq(#pair.host_world.replays, 1, "replayed on the host")
+    T.eq(pair.host_world.replays[1].id, h.b.id, "on the host's copy")
+end)
+
+T.run("unpaired_client_hit_matched_by_spawn", function()
+    local pair = make_pair()
+    local h, c = standard_level(pair)
+    pair.client:tick(0.05, pair.client_world:list(), pair.client_world) -- client has seen its enemies, no pairs yet
+    pair.host:tick(0.05, pair.host_world:list(), pair.host_world)
+    pair.client:on_local_hits({ hit_event(c.c, 20, 8) }, 0.05)
+    for _, bytes in ipairs(pair.to_host) do pair.host:on_message(assert(P.decode(bytes)), 0.05, pair.host_world) end
+    T.eq(pair.host_world.replays[1] and pair.host_world.replays[1].id, h.c.id, "found by kind and spawn point")
+end)
+
+T.run("replay_setting_off_still_draws_tracers", function()
+    local pair = make_pair({ replay_partner_hits = false })
+    local h = standard_level(pair)
+    pair:step(3)
+    pair.host:on_local_hits({ hit_event(h.b, 30, 12) }, pair.now)
+    pair:step(1)
+    T.eq(#pair.client_world.replays, 0, "no replay")
+    T.eq(#pair.client:recent_partner_hits(pair.now, 0.25), 1, "tracer still shown")
+end)
+
+T.run("unrestorable_replay_hp_is_not_counted_twice", function()
+    local pair = make_pair()
+    local h, c = standard_level(pair)
+    pair:step(3)
+    -- Client: the replay of the host's hit costs our copy 5 HP that cannot be put back.
+    pair.client_world.replay_kept = 5
+    pair.host_world:damage(h.a, 30)
+    pair.host:on_local_hits({ hit_event(h.a, 30, 12) }, pair.now)
+    pair:step(4)
+    T.eq(pair.client.counters.damage_sent, 0, "the replay's HP loss is not reported as our damage")
+    T.eq(h.a.hp, 70, "host HP only reflects its own hit")
+    T.eq(c.a.hp, 70, "client follows the host")
+    pair.client_world.replay_kept = 0
+
+    -- Host: replaying the client's hit costs 5 HP; the client's damage report covers it.
+    pair.host_world.replay_kept = 5
+    pair.client_world:damage(c.b, 20)
+    pair.client:on_local_hits({ hit_event(c.b, 20, 8) }, pair.now)
+    pair:step(4)
+    T.eq(h.b.hp, 80, "host takes the client's 20 damage once (5 by the replay + 15)")
+    T.eq(c.b.hp, 80, "client agrees")
+end)
+
+T.run("host_damage_between_ticks_is_not_overwritten", function()
+    local pair = make_pair()
+    local h, c = standard_level(pair)
+    pair:step(3)
+    -- The client's 20 damage report arrives right after the host shot the same enemy for 30,
+    -- before the host's next enemy scan.
+    pair.client_world:damage(c.a, 20)
+    pair.client:tick(pair.now, pair.client_world:list(), pair.client_world)
+    pair.host_world:damage(h.a, 30)
+    for _, bytes in ipairs(pair.to_host) do pair.host:on_message(assert(P.decode(bytes)), pair.now, pair.host_world) end
+    pair.to_host = {}
+    T.eq(h.a.hp, 50, "both hits count (100 - 30 - 20)")
+end)
+
+T.run("hits_on_unknown_enemies_are_counted", function()
+    local pair = make_pair()
+    standard_level(pair)
+    pair:step(3)
+    pair.client:on_message(assert(P.decode(P.encode_enemy_hit({ net_id = 999, pos = { x = 0, y = 0, z = 0 } }))),
+        pair.now, pair.client_world)
+    T.eq(pair.client.counters.hits_unmatched, 1, "unmatched")
 end)
 
 T.run("snapshots_stay_compact", function()

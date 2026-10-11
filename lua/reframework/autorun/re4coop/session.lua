@@ -12,6 +12,8 @@ local Interp = require("re4coop.interp")
 local EnemySync = require("re4coop.enemy_sync")
 local ItemSync = require("re4coop.items_sync")
 local Avatar = require("re4coop.avatar")
+local DropSync = require("re4coop.drop_sync")
+local Gate = require("re4coop.gate")
 
 local Session = {}
 Session.__index = Session
@@ -36,6 +38,7 @@ local LOCAL_POS_FRESH = 0.5     -- seconds a local position stays usable for pic
 -- research dump showed items from stages 40200 and 40210 loaded together), so players a few
 -- metres apart in different stages are not separated.
 local STAGE_APART_FACTOR = 0.5
+local TRACER_SECONDS = 0.25     -- how long a partner's shot tracer stays on screen
 
 local function dist3(a, b)
     local dx, dy, dz = a.x - b.x, a.y - b.y, a.z - b.z
@@ -68,6 +71,9 @@ function Session.new(opts)
     self.local_dead = false
     self.local_cutscene = false
     self.local_stage = nil
+    self.local_chapter = nil
+    self.gate = Gate.new(opts.settings)
+    self.held_scale = nil   -- time scale to restore while the gate holds us (nil = not holding)
     self.last_item_tick = -math.huge
     self.keys_down = {}
     self.left_behind = nil
@@ -123,17 +129,28 @@ function Session:reset_peer()
     self.avatar_tx:reset()
     self.avatar_rx:reset()
     if self.enemy_sync then self.enemy_sync:reset() end
+    if self.drop_sync then self.drop_sync:reset() end
 end
 
 function Session:make_enemy_sync()
     if self.role ~= "host" and self.role ~= "client" then
         self.enemy_sync = nil
+        self.drop_sync = nil
         return
     end
     self.enemy_sync = EnemySync.new({
         role = self.role,
         protocol = P,
         settings = self.settings,
+        send = function(bytes, reliable) self:send(bytes, reliable) end,
+        log = function(...) self:log(...) end,
+    })
+    self.drop_sync = DropSync.new({
+        role = self.role,
+        protocol = P,
+        settings = self.settings,
+        enemy_sync = self.enemy_sync,
+        is_key_item = function(id) return self.game.is_key_item ~= nil and self.game.is_key_item(id) end,
         send = function(bytes, reliable) self:send(bytes, reliable) end,
         log = function(...) self:log(...) end,
     })
@@ -201,8 +218,16 @@ function Session:leave()
     end
     self.role = "none"
     self.enemy_sync = nil
+    self.drop_sync = nil
     self.item_sync:reset()
     self:reset_peer()
+    self.gate:reset()
+    self:apply_hold(false)
+end
+
+-- Undo anything that must not outlive the script (called on "Reset Scripts").
+function Session:shutdown()
+    self:apply_hold(false)
 end
 
 function Session:send(bytes, reliable)
@@ -290,9 +315,28 @@ function Session:update_left_behind(now)
     local partner = self.interp:sample(now)
     local age = self.interp:age(now)
     local mine = self:fresh_local_pos(now)
-    local cutscene = self.local_cutscene or (partner ~= nil and ((partner.flags or 0) & P.PLAYER_FLAGS.CUTSCENE) ~= 0)
+    local pflags = partner ~= nil and (partner.flags or 0) or 0
+    local partner_chapter = self.partner_state and self.partner_state.chapter
+    if self.gate.holding == nil and (pflags & P.PLAYER_FLAGS.GATE_WAITING) ~= 0 and age ~= nil and age <= 1.5 then
+        -- The partner waits for us at a transition: offer the teleport right away (or, when
+        -- they are already in the next chapter, tell us to finish this one).
+        local ahead = partner_chapter ~= nil and self.local_chapter ~= nil and partner_chapter > self.local_chapter
+        -- Across a chapter change a teleport is only safe if the partner's stage exists in our
+        -- loaded world (the chapter changed without changing the map).
+        if ahead and partner.stage ~= nil and self.game.stage_active ~= nil and self.game:stage_active(partner.stage) then
+            ahead = false
+        end
+        self.far_since = nil
+        self.left_behind = {
+            distance = mine and dist3(partner.pos, mine) or 0,
+            partner_waiting = ahead and "chapter" or "here",
+            other_stage = partner.stage ~= nil and self.local_stage ~= nil and partner.stage ~= self.local_stage,
+        }
+        return
+    end
+    local cutscene = self.local_cutscene or (pflags & P.PLAYER_FLAGS.CUTSCENE) ~= 0
     if not s.left_behind_prompt or partner == nil or age == nil or age > 1.5 or mine == nil or cutscene
-        or self.tp_watch ~= nil then
+        or self.tp_watch ~= nil or self.gate.holding ~= nil then
         self.far_since = nil
         self.left_behind = nil
         return
@@ -309,6 +353,61 @@ function Session:update_left_behind(now)
         self.left_behind = { distance = d, other_stage = other_stage }
     else
         self.left_behind = nil
+    end
+end
+
+-- Transition gate: hold (freeze) the local game until the partner reaches the transition.
+function Session:update_gate(now)
+    local partner = self.interp:sample(now)
+    local age = self.interp:age(now)
+    local fresh = partner ~= nil and age ~= nil and age <= 1.5
+    local pflags = partner ~= nil and (partner.flags or 0) or 0
+    local mine = self:fresh_local_pos(now)
+    local before = self.gate.holding
+    local hold = self.gate:update(now, {
+        connected = self.partner_connected and self.compatible and not self.gate_disabled,
+        in_game = mine ~= nil,
+        event = self.local_cutscene,
+        chapter = self.local_chapter,
+        stage = self.local_stage,
+        pos = mine,
+        partner_fresh = fresh,
+        partner_event = fresh and (pflags & P.PLAYER_FLAGS.CUTSCENE) ~= 0,
+        -- The last chapter the partner reported, even while they are on a loading screen.
+        partner_chapter = self.partner_state and self.partner_state.chapter,
+        partner_stage = fresh and partner.stage or nil,
+        partner_pos = fresh and partner.pos or nil,
+        continue_pressed = self:key_pressed(self.settings.continue_key),
+    })
+    if hold ~= nil and before == nil then
+        local key = Session.key_name(self.settings.continue_key)
+        if hold == "chapter" then
+            self:add_message(("Waiting for %s to reach this chapter - press %s to continue alone")
+                :format(self.partner_name or "your partner", key), "warn")
+        else
+            self:add_message(("Waiting for %s at this transition - press %s to continue alone")
+                :format(self.partner_name or "your partner", key), "warn")
+        end
+    elseif hold == nil and before ~= nil then
+        self:add_message("Continuing (" .. tostring(self.gate.last_release) .. ")", "good")
+    end
+    self:apply_hold(hold ~= nil)
+end
+
+-- Freezes (time scale 0) or restores the local game.
+function Session:apply_hold(want)
+    local g = self.game
+    if want then
+        if self.held_scale == nil then
+            local cur = g.get_time_scale and g:get_time_scale() or nil
+            self.held_scale = (cur ~= nil and cur > 0) and cur or 1.0
+            if g.set_time_scale then g:set_time_scale(0) end
+        elseif g.get_time_scale and g.set_time_scale and g:get_time_scale() ~= 0 then
+            g:set_time_scale(0) -- a new scene loaded while we wait
+        end
+    elseif self.held_scale ~= nil then
+        if g.set_time_scale then g:set_time_scale(self.held_scale) end
+        self.held_scale = nil
     end
 end
 
@@ -334,8 +433,12 @@ function Session:handle_hotkeys(now)
     local snooze = self:key_pressed(s.snooze_key)
     if self.left_behind ~= nil then
         if teleport then
-            self:teleport_to_partner()
-        elseif snooze then
+            if self.left_behind.partner_waiting == "chapter" then
+                self:add_message("Your partner is already in the next chapter - finish this one to join them", "warn")
+            else
+                self:teleport_to_partner()
+            end
+        elseif snooze and self.left_behind.partner_waiting == nil then
             self.prompt_snoozed_until = now + 120
             self.left_behind = nil
             self:add_message("Teleport prompt hidden for 2 minutes", "info")
@@ -364,6 +467,10 @@ function Session:status()
         avatar_tx = self.avatar_tx.counters,
         avatar_rx = self.avatar_rx.counters,
         partner_character = self.avatar_rx.avatar and self.avatar_rx.avatar.char_id or nil,
+        local_chapter = self.local_chapter,
+        partner_chapter = self.partner_state and self.partner_state.chapter or nil,
+        gate = self.gate:summary(now),
+        continue_key_name = Session.key_name(self.settings.continue_key),
     }
     local remote = self.interp:sample(now)
     if remote ~= nil then
@@ -380,6 +487,10 @@ function Session:status()
     end
     if self.enemy_sync then
         st.enemies = self.enemy_sync:summary()
+        st.partner_hits = self.enemy_sync:recent_partner_hits(now, TRACER_SECONDS)
+    end
+    if self.drop_sync then
+        st.drops = self.drop_sync:summary()
     end
     st.items = self.item_sync:summary()
     st.left_behind = self.left_behind
@@ -523,7 +634,12 @@ function Session:handle_message(data, now)
     elseif m.type == T.NOTIFY then
         self:add_message(m.text, "info")
     elseif m.type == T.ITEM_TAKEN then
-        self.item_sync:on_message(m)
+        self.item_sync:on_message(m, now)
+    elseif m.type == T.ITEM_DROPPED then
+        -- Without enemy sync our own rolls are not skipped, so the host's item would be extra.
+        if self.drop_sync and self.settings.sync_enemies then
+            self.drop_sync:on_message(m, now, self.game, self.local_stage)
+        end
     elseif self.avatar_rx:on_message(m, now) then
         return
     elseif self.enemy_sync and self.settings.sync_enemies then
@@ -538,12 +654,14 @@ function Session:send_player_state(now)
     self.last_local_pos_time = now
     self.local_cutscene = st.cutscene and true or false
     self.local_stage = st.stage
+    self.local_chapter = st.chapter
     self:watch_teleport(now, st.pos)
 
     local flags = 0
     if st.dead then flags = flags | P.PLAYER_FLAGS.DEAD end
     if st.cutscene then flags = flags | P.PLAYER_FLAGS.CUTSCENE end
     if st.aiming then flags = flags | P.PLAYER_FLAGS.AIMING end
+    if self.gate.holding ~= nil then flags = flags | P.PLAYER_FLAGS.GATE_WAITING end
 
     self:send(P.encode_player({
         time = now,
@@ -553,6 +671,7 @@ function Session:send_player_state(now)
         flags = flags,
         area_hash = P.hash(self.game:area_name() or ""),
         stage = st.stage,
+        chapter = st.chapter,
     }), false)
 
     if st.dead and not self.local_dead then
@@ -570,8 +689,12 @@ function Session:update()
     local active = self.partner_connected and self.compatible
     if self.game.set_capture then self.game:set_capture(active and self.settings.share_character ~= false) end
     if not active then
-        -- Pickup callbacks from before the partner joined are stale by the time we sync.
+        -- Game events from before the partner joined are stale by the time we sync.
         if self.game.take_pickup_events then self.game:take_pickup_events() end
+        if self.game.take_hit_events then self.game:take_hit_events() end
+        if self.game.take_drop_events then self.game:take_drop_events() end
+        if self.game.set_drop_suppress then self.game:set_drop_suppress(nil) end
+        self:update_gate(now) -- releases a hold
         return
     end
 
@@ -585,6 +708,20 @@ function Session:update()
         self.avatar_tx:tick(now, self.game)
     end
 
+    -- Hits our player landed, and enemy drops, since the last frame (hooks in game.lua).
+    local hits = self.game.take_hit_events and self.game:take_hit_events() or nil
+    if self.enemy_sync and s.sync_enemies and hits ~= nil then
+        self.enemy_sync:on_local_hits(hits, now)
+    end
+    local drops = self.game.take_drop_events and self.game:take_drop_events() or nil
+    local drops_on = self.drop_sync ~= nil and self.drop_sync:enabled() and s.sync_enemies
+    if drops_on then
+        self.drop_sync:on_drop_events(now, drops)
+        self.drop_sync:update_pairs(now, self.game)
+    elseif self.game.set_drop_suppress then
+        self.game:set_drop_suppress(nil) -- enemy pairing is off: never skip our own rolls
+    end
+
     if self.enemy_sync and s.sync_enemies and now - self.last_enemy_tick >= 1.0 / (s.enemy_tick_hz or 20) then
         self.last_enemy_tick = now
         local enemies = self.game:list_enemies()
@@ -596,13 +733,24 @@ function Session:update()
     if self.game.list_pickups and now - self.last_item_tick >= ITEM_TICK_INTERVAL then
         self.last_item_tick = now
         local accepted = self.game.take_pickup_events and self.game:take_pickup_events() or nil
-        if s.share_key_items then
-            local pos = self:fresh_local_pos(now)
-            self.item_sync:tick(now, self.game:list_pickups(), pos, self.game,
-                pos ~= nil and not self.local_cutscene, accepted)
+        if s.share_key_items or drops_on then
+            local pickups = self.game:list_pickups()
+            if s.share_key_items then
+                local pos = self:fresh_local_pos(now)
+                local flags = nil
+                if self.game.item_get_flags then
+                    flags = self.game:item_get_flags(self.item_sync:watched_item_ids())
+                end
+                self.item_sync:tick(now, pickups, pos, self.game, pos ~= nil and not self.local_cutscene,
+                    accepted, flags)
+            end
+            if drops_on then
+                self.drop_sync:on_pickups(now, pickups, self.local_stage)
+            end
         end
     end
 
+    self:update_gate(now)
     self:update_left_behind(now)
     self:handle_hotkeys(now)
 end
@@ -616,9 +764,21 @@ local OFFLINE_SAFE = {
 }
 
 -- Keeps connect/disconnect events flowing while the game thread callback is not running
--- (title screen, loading). Never touches game objects.
+-- (title screen, loading). Never touches game objects, except to undo a transition-gate hold:
+-- if holding stopped the game thread callback, the gate could never release, so it is
+-- released here and switched off for this session instead.
 function Session:update_network_only()
     local now = self.clock()
+    if self.held_scale ~= nil then
+        self:apply_hold(false)
+        self.gate:reset()
+        -- Once can be a long frame; twice within a minute means holding stops our loop.
+        if self.gate_fallback_time ~= nil and now - self.gate_fallback_time < 60 then
+            self.gate_disabled = true
+            self:add_message("Transition gate switched off: holding the game stopped the mod's game loop", "error")
+        end
+        self.gate_fallback_time = now
+    end
     for _, ev in ipairs(self.net.poll()) do
         if ev.type == "message" then
             -- Enemy messages are dropped here: they refer to objects that are being (un)loaded,

@@ -52,29 +52,31 @@ Session rules:
 | `stats()` | Table: `rtt_ms, peer, peer_name, bytes_sent, bytes_recv, resends, reliable_in_flight, …` |
 | `local_addresses()` | Array of this PC's LAN IPv4 addresses |
 | `time()` | Monotonic seconds (`os.clock` is CPU time, so don't use it for networking) |
-| `max_payload()`, `version()` | `1388`; `"0.4.0", 1` |
+| `max_payload()`, `version()` | `1388`; `"0.5.0", 1` |
 | `new_session()` | An independent session object with the same methods (tests/tools) |
 
-## Game messages (game protocol version 4)
+## Game messages (game protocol version 5)
 
 The first byte is the message type. Formats use Lua `string.pack` notation.
 
 | Type | Name | Channel | Direction | Format |
 |---|---|---|---|---|
 | 1 | HELLO | reliable | both, on connect | `<B I2 s1 s1 s1 B`: type, game protocol version, mod version, player name, chapter/area, flags (1 = reply requested) |
-| 2 | PLAYER | unreliable, 20 Hz | both | `<B d fff ffff ff B I4 i4`: time, position, rotation quaternion (x,y,z,w), HP, max HP, flags (1 dead, 2 cutscene, 4 aiming, 8 has stage), area hash, `chainsaw.StageID` (valid when flag 8 is set) |
+| 2 | PLAYER | unreliable, 20 Hz | both | `<B d fff ffff ff B I4 i4 i4`: time, position, rotation quaternion (x,y,z,w), HP, max HP, flags (1 dead, 2 cutscene, 4 aiming, 8 has stage, 16 has chapter, 32 waiting at a transition), area hash, `chainsaw.StageID` (valid with flag 8), `chainsaw.ChapterID` (valid with flag 16) |
 | 3 | *(retired)* | | | SKELETON in protocols 1–3 (the stick-figure ghost) |
 | 4 | ENEMY_SNAPSHOT | unreliable, 10 Hz | host → client | `<B d B B B` + n × `<I2 I4 fff fff f f f B i4 i4 B B`: time, chunk, chunks, count; then net id, kind hash (FNV-1a of context type name), position, spawn position, yaw, HP, max HP, flags (1 alive, 2 has ContextID), the enemy's **spawner** `chainsaw.ContextID` (`CharacterContext.get_SpawnerID()`) as group, index, kind, category. 25 entries per chunk |
 | 5 | ENEMY_DAMAGE | reliable | client → host | `<B I2 I4 fff f B i4 i4 B B`: net id (0 = unpaired), kind hash, spawn position, amount, flags (1 lethal, 2 has ContextID), spawner ContextID (sent only once spawner IDs are trusted, see below) |
 | 6 | ENEMY_DEAD | reliable | host → client | `<B I2`: net id |
 | 7 | CHAT | reliable | both | `<B s2`: text (≤ 512 bytes) |
 | 8 | NOTIFY | reliable | both | `<B B s1`: code (1 died, 2 revived, 3 teleported, 4 info), text |
-| 9 | ITEM_TAKEN | reliable | both | `<B I4 fff B i4 i4 B B`: item ID, position, flags (1 has ContextID), ContextID of the `chainsaw.DropItem` (level IDs only). The receiver removes its copy of that key item |
+| 9 | ITEM_TAKEN | reliable | both | `<B I4 fff B i4 i4 B B i4`: item ID, position, flags (1 has ContextID, 2 it was the only copy in the sender's scene, 4 has stage), ContextID of the `chainsaw.DropItem` (level IDs only), its `chainsaw.StageID`. The receiver removes its copy of that key item |
 | 10 | FRAG | reliable | both | `<B I2 B B` + bytes: message id, piece index (1-based), piece count, a slice of a reliable message longer than one datagram. Pieces arrive in order and are concatenated |
 | 11 | AVATAR | reliable (fragmented) | both | see below: how the sender's character is built |
 | 12 | GEAR | reliable | both | see below: the weapons the character carries |
 | 13 | POSE | unreliable, 30 Hz | both | see below: root placement, every joint's local rotation, weapon placement |
 | 14 | ACTIONS | reliable | both | see below: sound/effect calls and shots to replay |
+| 15 | ENEMY_HIT | unreliable | both | `<B I2 I4 fff i4 fff fff i4 B`: net id (host numbering; 0 = unpaired), kind hash, enemy spawn position, damage, wince, break, stopping, damage direction, weapon ID, flags (1 critical). A hit the sender's player landed (`HitController.callbackDamageHit`); the receiver replays it on its copy (cosmetic: 1 damage, HP restored) |
+| 16 | ITEM_DROPPED | reliable | host → client | `<B I2 I4 i4 fff i4 B`: net id of the enemy, item ID, count, position, stage, flags (1 has stage). The item the host's random roll dropped; the client spawns it where its copy of that enemy is |
 
 Compatibility: only the `version` field of HELLO is guaranteed across game protocol versions.
 A peer with a different version gets an "update both" message, and its game messages are

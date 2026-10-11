@@ -172,6 +172,8 @@ local function draw_options(settings)
         checkbox(settings, "sync_deaths", "Sync enemy deaths")
         slider_float(settings, "match_radius", "Pairing radius (m)", 0.5, 10.0)
         slider_float(settings, "snap_distance", "Client: snap enemies further than (m, 0 = off)", 0.0, 20.0)
+        checkbox(settings, "replay_partner_hits", "Enemies react to your partner's hits")
+        checkbox(settings, "sync_drops", "Enemies drop the same item for both players")
 
         imgui.separator()
         imgui.text_colored("Progression", COLOR_DIM)
@@ -179,6 +181,9 @@ local function draw_options(settings)
         checkbox(settings, "left_behind_prompt", "Offer a teleport when the partner is far away")
         slider_float(settings, "left_behind_distance", "Far-away distance (m)", 10.0, 200.0, "%.0f")
         slider_float(settings, "left_behind_seconds", "...for at least (s)", 1.0, 60.0, "%.0f")
+        checkbox(settings, "transition_gate", "Wait for the partner at cutscenes and chapter changes (F8 skips)")
+        slider_float(settings, "gate_grace", "...only events longer than (s)", 0.2, 10.0, "%.1f")
+        slider_float(settings, "gate_radius", "...partner counts as arrived within (m)", 3.0, 50.0, "%.0f")
 
         imgui.separator()
         imgui.text_colored("Network", COLOR_DIM)
@@ -239,6 +244,8 @@ local function draw_diagnostics(game, session_status, puppet)
             local c = session_status.enemies.counters
             imgui.text(("enemy sync: damage sent %d, applied %d, failed %d | hp mirrored %d, failed %d | kills %d | id pairs %d"):format(
                 c.damage_sent, c.damage_applied, c.damage_failed, c.hp_applied, c.hp_failed, c.kills_applied, c.id_matches))
+            imgui.text(("hits: sent %d, received %d, replayed %d, unmatched %d"):format(
+                c.hits_sent, c.hits_received, c.hits_replayed, c.hits_unmatched))
             local tr = session_status.enemies.spawner_trust
             if tr then
                 imgui.text(("spawner IDs: %s (agree %d, disagree %d)"):format(
@@ -249,17 +256,34 @@ local function draw_diagnostics(game, session_status, puppet)
             local c = session_status.items.counters
             imgui.text(("key items: tracked %d | taken by me %d, by partner %d | removed %d, remove failed %d"):format(
                 session_status.items.tracked, c.taken_by_me, c.taken_by_partner, c.removed, c.remove_failed))
-            imgui.text(("pickup detection: game callback %s | confirmed %d, heuristic %d, unconfirmed ignored %d"):format(
-                session_status.items.hook or "?", c.confirmed, c.heuristic, c.unconfirmed_ignored))
+            imgui.text(("pickup detection: item flags %s, game callback %s | flag %d, callback %d, heuristic %d, unconfirmed %d, remove had no effect %d"):format(
+                session_status.items.flags or "?", session_status.items.hook or "?", c.flag, c.confirmed, c.heuristic,
+                c.unconfirmed_ignored, c.remove_ineffective))
+            for _, e in ipairs(session_status.items.events or {}) do
+                imgui.text_colored(("  %.1f s: %s"):format(e.t, e.text), COLOR_DIM)
+            end
+        end
+        if session_status and session_status.drops then
+            local c = session_status.drops.counters
+            imgui.text(("drops: %s | seen %d, sent %d, received %d, spawned %d (verified %d, missing %d)"):format(
+                session_status.drops.state, c.drops_seen, c.sent, c.received, c.spawned, c.verified, c.unverified))
+        end
+        if session_status and session_status.gate then
+            local g = session_status.gate
+            imgui.text(("transition gate: %s | chapter you %s, partner %s | last release: %s"):format(
+                g.holding and ("holding (" .. g.holding .. ")") or "open", tostring(session_status.local_chapter or "?"),
+                tostring(session_status.partner_chapter or "?"), tostring(g.last_release or "-")))
         end
         imgui.separator()
         draw_models(session_status, game, puppet)
         if imgui.button("Write research dump (adds a run to reframework/data/)") then
             local extra = session_status and {
                 role = session_status.role, enemies = session_status.enemies, items = session_status.items,
+                drops = session_status.drops, gate = session_status.gate,
                 local_stage = session_status.local_stage, partner_stage = session_status.partner_stage,
                 character_sent = session_status.avatar_tx, character_received = session_status.avatar_rx,
                 partner_model = puppet and puppet:status() or nil,
+                local_chapter = session_status.local_chapter, partner_chapter = session_status.partner_chapter,
             } or nil
             local ok, runs = game:dump_types(extra)
             dump_result = ok and ("run %d saved - send re4coop_typedump.json and re4coop_research_log.json"):format(runs)

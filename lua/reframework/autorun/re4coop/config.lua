@@ -23,6 +23,8 @@ Config.DEFAULTS = {
     sync_deaths = true,
     match_radius = 3.0,   -- metres between spawn points to treat two enemies as the same one
     snap_distance = 0.0,  -- client: teleport enemies further than this from the host's copy (0 = off)
+    replay_partner_hits = true, -- enemies visibly react to the partner's hits (cosmetic replay)
+    sync_drops = true,    -- enemies drop the same item for both players (the host's roll)
 
     -- progression
     share_key_items = true,       -- a key item exists once: the partner's copy disappears when you take it
@@ -31,6 +33,10 @@ Config.DEFAULTS = {
     left_behind_seconds = 6.0,
     teleport_key = 0x75,          -- F6 (Windows virtual-key code): accept the teleport prompt
     snooze_key = 0x76,            -- F7: hide the prompt for 2 minutes
+    transition_gate = true,       -- wait at cutscenes/chapter changes until the partner arrives
+    gate_grace = 1.5,             -- seconds an event must last before it holds you (doors etc. don't)
+    gate_radius = 10.0,           -- metres: a partner this close counts as arrived
+    continue_key = 0x77,          -- F8: stop waiting and continue alone
 
     -- partner character
     show_partner = true,               -- the partner's animated 3D character, built from their body prefab
@@ -85,6 +91,10 @@ function Config.sanitize(cfg)
     cfg.snooze_key = math.floor(cfg.snooze_key)
     if cfg.teleport_key < 1 or cfg.teleport_key > 254 then cfg.teleport_key = Config.DEFAULTS.teleport_key end
     if cfg.snooze_key < 1 or cfg.snooze_key > 254 then cfg.snooze_key = Config.DEFAULTS.snooze_key end
+    cfg.continue_key = math.floor(cfg.continue_key)
+    if cfg.continue_key < 1 or cfg.continue_key > 254 then cfg.continue_key = Config.DEFAULTS.continue_key end
+    cfg.gate_grace = math.max(0.2, math.min(10.0, cfg.gate_grace))
+    cfg.gate_radius = math.max(3.0, math.min(50.0, cfg.gate_radius))
     return cfg
 end
 

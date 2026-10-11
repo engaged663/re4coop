@@ -30,11 +30,14 @@ local function make_net_pair()
 end
 
 local function make_game(x)
-    local g = { pos = { x = x, y = 0, z = 0 }, keys = {}, teleports = {}, cutscene = false, floor = nil }
+    local g = { pos = { x = x, y = 0, z = 0 }, keys = {}, teleports = {}, cutscene = false, floor = nil,
+        chapter = 21100, time_scale = 1.0 }
     function g:read_player_state()
         return { pos = { x = self.pos.x, y = self.pos.y, z = self.pos.z }, rot = { x = 0, y = 0, z = 0, w = 1 },
-            hp = 100, max_hp = 100, cutscene = self.cutscene, stage = self.stage }
+            hp = 100, max_hp = 100, cutscene = self.cutscene, stage = self.stage, chapter = self.chapter }
     end
+    function g:get_time_scale() return self.time_scale end
+    function g:set_time_scale(v) self.time_scale = v return true end
     function g:list_enemies() return {} end
     function g:area_name() return "" end
     function g:is_key_down(vk) return self.keys[vk] == true end
@@ -147,6 +150,8 @@ end)
 
 T.run("no_prompt_during_cutscenes", function()
     local w = make_world()
+    -- Without the transition gate a cutscene never prompts (with it, see the gate tests).
+    w.sa.settings.transition_gate, w.sb.settings.transition_gate = false, false
     w.ga.pos = { x = 90, y = 0, z = 0 }
     w.gb.cutscene = true
     w:advance(10)
@@ -182,6 +187,121 @@ T.run("item_taken_during_loading_is_kept", function()
         ctx = { category = 5, kind = 0, group = 1, index = 1 } }), true)
     w.sb:update_network_only() -- game loop not ticking (loading screen)
     T.eq(w.sb.item_sync.counters.taken_by_partner, 1, "recorded")
+end)
+
+T.run("gate_holds_at_a_long_event_until_partner_teleports_in", function()
+    local w = make_world()
+    w.gb.pos = { x = 80, y = 0, z = 0 }
+    w:advance(1)
+    w.ga.cutscene = true -- A triggers the chapter's ending cutscene
+    w:advance(2)
+    T.eq(w.sa.gate.holding, "event", "A waits")
+    T.eq(w.ga.time_scale, 0, "A's game is frozen")
+    local lb = w.sb.left_behind
+    T.check(lb ~= nil and lb.partner_waiting == "here", "B is told right away (no delay)")
+    T.eq(w.sb:status().left_behind.partner_waiting, "here", "shown on B's HUD")
+    T.eq(w.sa:status().gate.holding, "event", "shown on A's HUD")
+    w.gb.keys[0x75] = true -- B presses F6
+    w:advance(0.1)
+    w.gb.keys[0x75] = false
+    T.eq(#w.gb.teleports, 1, "B teleported to A")
+    w:advance(1.5)
+    T.eq(w.sa.gate.holding, nil, "A released once B stood nearby")
+    T.eq(w.ga.time_scale, 1.0, "A's game runs again")
+    local told = false
+    for _, m in ipairs(w.sa.messages) do
+        if m.text:find("partner arrived") then told = true end
+    end
+    T.check(told, "A is told why it continues")
+end)
+
+T.run("gate_continue_key_and_shutdown_restore_time", function()
+    local w = make_world()
+    w.gb.pos = { x = 80, y = 0, z = 0 }
+    w.ga.time_scale = 0.5 -- someone uses a slow-motion setting
+    w.ga.cutscene = true
+    w:advance(2)
+    T.eq(w.ga.time_scale, 0, "frozen")
+    w.ga.keys[0x77] = true -- F8
+    w:advance(0.1)
+    w.ga.keys[0x77] = false
+    T.eq(w.sa.gate.holding, nil, "continued alone")
+    T.eq(w.ga.time_scale, 0.5, "previous time scale restored")
+    w.ga.cutscene = false
+    w:advance(0.5)
+    w.ga.cutscene = true
+    w:advance(2)
+    T.eq(w.ga.time_scale, 0, "next event frozen again")
+    w.sa:shutdown() -- "Reset Scripts"
+    T.eq(w.ga.time_scale, 0.5, "never left frozen")
+end)
+
+T.run("gate_releases_on_disconnect", function()
+    local w = make_world()
+    w.gb.pos = { x = 80, y = 0, z = 0 }
+    w.ga.cutscene = true
+    w:advance(2)
+    T.eq(w.ga.time_scale, 0, "frozen")
+    w.sa.partner_connected = false
+    w.sa:update()
+    T.eq(w.ga.time_scale, 1.0, "released when the partner is gone")
+end)
+
+T.run("chapter_gate_holds_the_player_ahead", function()
+    local w = make_world()
+    w:advance(1)
+    w.ga.chapter = 21200 -- A reached the next part of the chapter
+    w:advance(0.5)
+    T.eq(w.sa.gate.holding, "chapter", "A waits")
+    T.eq(w.ga.time_scale, 0, "frozen")
+    T.check(w.sb.left_behind ~= nil and w.sb.left_behind.partner_waiting == "chapter", "B is told to finish the part")
+    w.gb.keys[0x75] = true
+    w:advance(0.1)
+    w.gb.keys[0x75] = false
+    T.eq(#w.gb.teleports, 0, "no teleport across chapters")
+    w.gb.chapter = 21200
+    w:advance(0.5)
+    T.eq(w.sa.gate.holding, nil, "B arrived: A continues")
+    T.eq(w.ga.time_scale, 1.0, "running")
+end)
+
+T.run("chapter_wait_allows_teleport_when_partner_stage_is_loaded", function()
+    local w = make_world()
+    w.ga.stage, w.gb.stage = 43300, 43300
+    w.gb.pos = { x = 40, y = 0, z = 0 }
+    function w.gb:stage_active(stage) return stage == 43300 end
+    w:advance(1)
+    w.ga.chapter = 21200 -- the chapter part changed without a new map
+    w:advance(0.5)
+    T.eq(w.sb.left_behind and w.sb.left_behind.partner_waiting, "here", "same map: teleport offered")
+    w.gb.keys[0x75] = true
+    w:advance(0.1)
+    T.eq(#w.gb.teleports, 1, "teleported")
+end)
+
+T.run("gate_hold_that_stops_the_game_loop_is_undone", function()
+    local w = make_world()
+    w.gb.pos = { x = 80, y = 0, z = 0 }
+    w.ga.cutscene = true
+    w:advance(2)
+    T.eq(w.ga.time_scale, 0, "frozen")
+    w.sa:update_network_only() -- the game-thread callback stopped running
+    T.eq(w.ga.time_scale, 1.0, "released")
+    w:advance(2)
+    T.eq(w.ga.time_scale, 0, "a single stall may have been a long frame: held again")
+    w.sa:update_network_only() -- stalled again
+    T.eq(w.ga.time_scale, 1.0, "released")
+    w:advance(3)
+    T.eq(w.ga.time_scale, 1.0, "gate stays off this session (no freeze/unfreeze loop)")
+end)
+
+T.run("gate_switched_off_never_freezes", function()
+    local w = make_world()
+    w.sa.settings.transition_gate = false
+    w.gb.pos = { x = 80, y = 0, z = 0 }
+    w.ga.cutscene = true
+    w:advance(3)
+    T.eq(w.ga.time_scale, 1.0, "not frozen")
 end)
 
 T.run("key_names", function()

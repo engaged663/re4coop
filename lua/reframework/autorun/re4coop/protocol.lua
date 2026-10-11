@@ -3,8 +3,8 @@
 
 local P = {}
 
-P.VERSION = 4            -- bump on any incompatible change to the layouts below
-P.MOD_VERSION = "0.4.0"
+P.VERSION = 5            -- bump on any incompatible change to the layouts below
+P.MOD_VERSION = "0.5.0"
 P.MAX_PAYLOAD = 1388     -- re4coop_net.max_payload(): biggest message one datagram carries
 
 P.T = {
@@ -22,13 +22,17 @@ P.T = {
     GEAR = 12,          -- reliable, the weapons the sender's character carries
     POSE = 13,          -- unreliable, ~30 Hz, the full skeleton pose + weapon placement
     ACTIONS = 14,       -- reliable, sounds/effects/shots to replay on the partner's model
+    ENEMY_HIT = 15,     -- unreliable, both directions: a hit the sender's player landed on an enemy
+    ITEM_DROPPED = 16,  -- reliable, host -> client: an enemy's random drop on the host
 }
 
 P.PLAYER_FLAGS = {
     DEAD = 1,
     CUTSCENE = 2,
     AIMING = 4,
-    HAS_STAGE = 8, -- the message carries the player's chainsaw.StageID
+    HAS_STAGE = 8,     -- the message carries the player's chainsaw.StageID
+    HAS_CHAPTER = 16,  -- the message carries the player's chainsaw.ChapterID
+    GATE_WAITING = 32, -- the player is held at a transition until the partner arrives
 }
 
 P.ENEMY_FLAGS = {
@@ -43,6 +47,16 @@ P.DAMAGE_FLAGS = {
 
 P.ITEM_FLAGS = {
     HAS_CTX = 1,
+    ONLY_INSTANCE = 2, -- the sender's scene had no other copy of this key item
+    HAS_STAGE = 4,
+}
+
+P.HIT_FLAGS = {
+    CRITICAL = 1,
+}
+
+P.DROP_FLAGS = {
+    HAS_STAGE = 1,
 }
 
 -- AVATAR part flags.
@@ -218,21 +232,27 @@ function P.encode_hello(m)
         m.name or "", m.area or "", m.flags or 0)
 end
 
--- m = { time, pos={x,y,z}, rot={x,y,z,w}, hp, max_hp, flags, area_hash, stage }
--- stage: the player's chainsaw.StageID (nil if unknown).
-local PLAYER_FORMAT = "<BdfffffffffBI4i4"
+-- An optional Int32 field: returns value, true when it fits, or 0, false.
+local function opt_i32(v)
+    v = math.tointeger(v)
+    if v ~= nil and v >= -0x80000000 and v <= 0x7FFFFFFF then return v, true end
+    return 0, false
+end
+
+-- m = { time, pos={x,y,z}, rot={x,y,z,w}, hp, max_hp, flags, area_hash, stage, chapter }
+-- stage/chapter: the player's chainsaw.StageID / chainsaw.ChapterID (nil if unknown).
+local PLAYER_FORMAT = "<BdfffffffffBI4i4i4"
 function P.encode_player(m)
     local pos, rot = m.pos, m.rot
-    local flags = (m.flags or 0) & ~P.PLAYER_FLAGS.HAS_STAGE
-    local stage = math.tointeger(m.stage)
-    if stage ~= nil and stage >= -0x80000000 and stage <= 0x7FFFFFFF then
-        flags = flags | P.PLAYER_FLAGS.HAS_STAGE
-    else
-        stage = 0
-    end
+    local F = P.PLAYER_FLAGS
+    local flags = (m.flags or 0) & ~(F.HAS_STAGE | F.HAS_CHAPTER)
+    local stage, has_stage = opt_i32(m.stage)
+    local chapter, has_chapter = opt_i32(m.chapter)
+    if has_stage then flags = flags | F.HAS_STAGE end
+    if has_chapter then flags = flags | F.HAS_CHAPTER end
     return string.pack(PLAYER_FORMAT, P.T.PLAYER, m.time or 0,
         pos.x, pos.y, pos.z, rot.x, rot.y, rot.z, rot.w,
-        m.hp or 0, m.max_hp or 0, flags, m.area_hash or 0, stage)
+        m.hp or 0, m.max_hp or 0, flags, m.area_hash or 0, stage, chapter)
 end
 
 -- Splits the enemy list into as many messages as needed. Returns an array of strings.
@@ -272,12 +292,41 @@ function P.encode_enemy_damage(m)
         m.pos.x, m.pos.y, m.pos.z, m.amount or 0, flags, g, idx, k, c)
 end
 
--- m = { item_id, pos={x,y,z}, ctx }  (ctx = the pickup's chainsaw.ContextID, may be nil)
+-- m = { item_id, pos={x,y,z}, ctx, stage, only_instance }
+-- ctx = the pickup's chainsaw.ContextID (may be nil), stage = its chainsaw.StageID (may be nil),
+-- only_instance = the sender saw no other copy of this item in its scene.
+local ITEM_TAKEN = "<BI4fffBi4i4BBi4"
 function P.encode_item_taken(m)
-    local flags = m.ctx ~= nil and P.ITEM_FLAGS.HAS_CTX or 0
+    local F = P.ITEM_FLAGS
+    local flags = m.ctx ~= nil and F.HAS_CTX or 0
+    if m.only_instance then flags = flags | F.ONLY_INSTANCE end
+    local stage, has_stage = opt_i32(m.stage)
+    if has_stage then flags = flags | F.HAS_STAGE end
     local g, idx, k, c = ctx_fields(m.ctx)
-    return string.pack("<BI4fffBi4i4BB", P.T.ITEM_TAKEN, m.item_id or 0,
-        m.pos.x, m.pos.y, m.pos.z, flags, g, idx, k, c)
+    return string.pack(ITEM_TAKEN, P.T.ITEM_TAKEN, m.item_id or 0,
+        m.pos.x, m.pos.y, m.pos.z, flags, g, idx, k, c, stage)
+end
+
+-- m = { net_id (0 if unknown), kind_hash, pos={x,y,z} (enemy spawn point, for matching),
+--       damage, wince, break_, stopping, dir={x,y,z}, weapon, critical }
+-- The parameters of a chainsaw.HitController.DamageInfo the sender's player caused.
+local ENEMY_HIT = "<BI2I4fffi4ffffffi4B"
+function P.encode_enemy_hit(m)
+    local dir = m.dir or { x = 0, y = 0, z = 0 }
+    local damage = opt_i32(m.damage and math.floor(m.damage + 0.5))
+    local weapon = opt_i32(m.weapon)
+    return string.pack(ENEMY_HIT, P.T.ENEMY_HIT, m.net_id or 0, m.kind_hash or 0,
+        m.pos.x, m.pos.y, m.pos.z, damage, m.wince or 0, m.break_ or 0, m.stopping or 0,
+        dir.x, dir.y, dir.z, weapon, m.critical and P.HIT_FLAGS.CRITICAL or 0)
+end
+
+-- m = { net_id (host's enemy), item_id, count, pos={x,y,z}, stage }
+local ITEM_DROPPED = "<BI2I4i4fffi4B"
+function P.encode_item_dropped(m)
+    local stage, has_stage = opt_i32(m.stage)
+    local count = opt_i32(m.count)
+    return string.pack(ITEM_DROPPED, P.T.ITEM_DROPPED, m.net_id or 0, m.item_id or 0, count,
+        m.pos.x, m.pos.y, m.pos.z, stage, has_stage and P.DROP_FLAGS.HAS_STAGE or 0)
 end
 
 function P.encode_enemy_dead(net_id)
@@ -494,7 +543,7 @@ decoders[P.T.HELLO] = function(data)
 end
 
 decoders[P.T.PLAYER] = function(data)
-    local _, time, px, py, pz, qx, qy, qz, qw, hp, max_hp, flags, area_hash, stage =
+    local _, time, px, py, pz, qx, qy, qz, qw, hp, max_hp, flags, area_hash, stage, chapter =
         string.unpack(PLAYER_FORMAT, data)
     return {
         time = time,
@@ -502,6 +551,7 @@ decoders[P.T.PLAYER] = function(data)
         rot = { x = qx, y = qy, z = qz, w = qw },
         hp = hp, max_hp = max_hp, flags = flags, area_hash = area_hash,
         stage = (flags & P.PLAYER_FLAGS.HAS_STAGE) ~= 0 and stage or nil,
+        chapter = (flags & P.PLAYER_FLAGS.HAS_CHAPTER) ~= 0 and chapter or nil,
     }
 end
 
@@ -531,10 +581,32 @@ decoders[P.T.ENEMY_DAMAGE] = function(data)
 end
 
 decoders[P.T.ITEM_TAKEN] = function(data)
-    local _, item_id, x, y, z, flags, g, idx, k, c = string.unpack("<BI4fffBi4i4BB", data)
+    local _, item_id, x, y, z, flags, g, idx, k, c, stage = string.unpack(ITEM_TAKEN, data)
+    local F = P.ITEM_FLAGS
     return {
         item_id = item_id, pos = { x = x, y = y, z = z },
-        ctx = (flags & P.ITEM_FLAGS.HAS_CTX) ~= 0 and ctx_from(g, idx, k, c) or nil,
+        ctx = (flags & F.HAS_CTX) ~= 0 and ctx_from(g, idx, k, c) or nil,
+        only_instance = (flags & F.ONLY_INSTANCE) ~= 0,
+        stage = (flags & F.HAS_STAGE) ~= 0 and stage or nil,
+    }
+end
+
+decoders[P.T.ENEMY_HIT] = function(data)
+    local _, net_id, kind_hash, x, y, z, damage, wince, break_, stopping, dx, dy, dz, weapon, flags =
+        string.unpack(ENEMY_HIT, data)
+    return {
+        net_id = net_id, kind_hash = kind_hash, pos = { x = x, y = y, z = z },
+        damage = damage, wince = wince, break_ = break_, stopping = stopping,
+        dir = { x = dx, y = dy, z = dz }, weapon = weapon,
+        critical = (flags & P.HIT_FLAGS.CRITICAL) ~= 0,
+    }
+end
+
+decoders[P.T.ITEM_DROPPED] = function(data)
+    local _, net_id, item_id, count, x, y, z, stage, flags = string.unpack(ITEM_DROPPED, data)
+    return {
+        net_id = net_id, item_id = item_id, count = count, pos = { x = x, y = y, z = z },
+        stage = (flags & P.DROP_FLAGS.HAS_STAGE) ~= 0 and stage or nil,
     }
 end
 

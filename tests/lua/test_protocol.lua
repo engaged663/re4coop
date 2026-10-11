@@ -342,13 +342,63 @@ T.run("small_messages_roundtrip", function()
     T.eq(it.item_id, 119235200, "item id")
     T.near(it.pos.z, 6, 1e-6, "position")
     T.eq(P.ctx_key(it.ctx), "5:0:9:2", "item ContextID")
-    T.eq(assert(P.decode(P.encode_item_taken({ item_id = 1, pos = { x = 0, y = 0, z = 0 } }))).ctx, nil, "item without ctx")
+    T.eq(it.stage, nil, "no stage")
+    T.eq(it.only_instance, false, "not flagged as only instance")
+    local bare = assert(P.decode(P.encode_item_taken({ item_id = 1, pos = { x = 0, y = 0, z = 0 } })))
+    T.eq(bare.ctx, nil, "item without ctx")
+    local it2 = assert(P.decode(P.encode_item_taken({ item_id = 119288000, pos = { x = 0, y = 0, z = 0 },
+        stage = 43400, only_instance = true })))
+    T.eq(it2.stage, 43400, "item stage")
+    T.eq(it2.only_instance, true, "only instance")
     T.eq(assert(P.decode(P.encode_enemy_dead(65535))).net_id, 65535, "dead id")
     T.eq(assert(P.decode(P.encode_chat("hola amigo"))).text, "hola amigo", "chat")
     T.eq(#assert(P.decode(P.encode_chat(string.rep("x", 2000)))).text, 512, "chat truncated")
     local n = assert(P.decode(P.encode_notify(3, "teleported")))
     T.eq(n.code, 3, "notify code")
     T.eq(n.text, "teleported", "notify text")
+end)
+
+T.run("player_chapter_and_gate_flag", function()
+    local m = assert(P.decode(P.encode_player({ time = 1, pos = { x = 0, y = 0, z = 0 }, rot = { x = 0, y = 0, z = 0, w = 1 },
+        chapter = 21100, stage = 43300, flags = P.PLAYER_FLAGS.GATE_WAITING })))
+    T.eq(m.chapter, 21100, "chapter")
+    T.eq(m.stage, 43300, "stage still there")
+    T.check((m.flags & P.PLAYER_FLAGS.GATE_WAITING) ~= 0, "gate flag")
+    local m2 = assert(P.decode(P.encode_player({ time = 1, pos = { x = 0, y = 0, z = 0 }, rot = { x = 0, y = 0, z = 0, w = 1 } })))
+    T.eq(m2.chapter, nil, "no chapter")
+end)
+
+T.run("enemy_hit_roundtrip", function()
+    local h = assert(P.decode(P.encode_enemy_hit({ net_id = 12, kind_hash = 77, pos = { x = 1, y = 2, z = 3 },
+        damage = 140.4, wince = 30, break_ = 2.5, stopping = 1, dir = { x = 0, y = 0, z = -1 }, weapon = 4000,
+        critical = true })))
+    T.eq(h.type, P.T.ENEMY_HIT, "type")
+    T.eq(h.net_id, 12, "net id")
+    T.eq(h.kind_hash, 77, "kind")
+    T.near(h.pos.z, 3, 1e-6, "spawn position")
+    T.eq(h.damage, 140, "damage rounded to Int32")
+    T.near(h.wince, 30, 1e-6, "wince")
+    T.near(h.break_, 2.5, 1e-6, "break")
+    T.near(h.stopping, 1, 1e-6, "stopping")
+    T.near(h.dir.z, -1, 1e-6, "direction")
+    T.eq(h.weapon, 4000, "weapon")
+    T.eq(h.critical, true, "critical")
+    local h2 = assert(P.decode(P.encode_enemy_hit({ pos = { x = 0, y = 0, z = 0 } })))
+    T.eq(h2.damage, 0, "defaults")
+    T.eq(h2.critical, false, "not critical")
+end)
+
+T.run("item_dropped_roundtrip", function()
+    local d = assert(P.decode(P.encode_item_dropped({ net_id = 5, item_id = 124000000, count = 300,
+        pos = { x = 7, y = 0.5, z = -2 }, stage = 43400 })))
+    T.eq(d.type, P.T.ITEM_DROPPED, "type")
+    T.eq(d.net_id, 5, "enemy")
+    T.eq(d.item_id, 124000000, "item")
+    T.eq(d.count, 300, "count")
+    T.near(d.pos.x, 7, 1e-6, "position")
+    T.eq(d.stage, 43400, "stage")
+    T.eq(assert(P.decode(P.encode_item_dropped({ item_id = 1, count = 1, pos = { x = 0, y = 0, z = 0 } }))).stage, nil,
+        "no stage")
 end)
 
 T.run("malformed_input_never_raises", function()
@@ -368,6 +418,10 @@ T.run("malformed_input_never_raises", function()
             ctx = { category = 5, kind = 0, group = 9, index = 2 } }),
         P.encode_enemy_damage({ net_id = 3, kind_hash = 7, pos = { x = 0, y = 0, z = 0 }, amount = 5,
             ctx = { category = 2, kind = 1, group = 4, index = 5 } }),
+        P.encode_enemy_hit({ pos = { x = 0, y = 0, z = 0 } }),
+        P.encode_item_dropped({ item_id = 1, count = 1, pos = { x = 0, y = 0, z = 0 } }),
+        P.encode_player({ time = 1, pos = { x = 0, y = 0, z = 0 }, rot = { x = 0, y = 0, z = 0, w = 1 },
+            stage = 43300, chapter = 21100 }),
     }
     for _, good in ipairs(samples) do
         local t = good:byte(1)
@@ -379,7 +433,7 @@ T.run("malformed_input_never_raises", function()
             end
         end
     end
-    for t = 1, 14 do
+    for t = 1, 16 do
         if t ~= 3 then
             local m = P.decode(string.char(t) .. "\0")
             T.check(m == nil, "short message type " .. t)

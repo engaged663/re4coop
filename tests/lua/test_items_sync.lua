@@ -7,8 +7,10 @@ local function is_key(id) return id >= 119000000 and id <= 119999999 end
 
 local function make_world()
     local w = { items = {}, next_id = 1, removed = {} }
-    function w:place(item_id, x, y, z, ctx)
-        local p = { id = self.next_id, item_id = item_id, pos = { x = x, y = y, z = z }, ctx = ctx }
+    w.flags = nil -- InventoryManager "obtained" flags by item id (nil = unreadable)
+    w.removal_works = true
+    function w:place(item_id, x, y, z, ctx, stage)
+        local p = { id = self.next_id, item_id = item_id, pos = { x = x, y = y, z = z }, ctx = ctx, stage = stage }
         self.next_id = self.next_id + 1
         table.insert(self.items, p)
         return p
@@ -21,7 +23,7 @@ local function make_world()
     function w:list()
         local out = {}
         for i, p in ipairs(self.items) do
-            out[i] = { id = p.id, item_id = p.item_id, pos = p.pos, ctx = p.ctx }
+            out[i] = { id = p.id, item_id = p.item_id, pos = p.pos, ctx = p.ctx, stage = p.stage }
         end
         return out
     end
@@ -37,7 +39,14 @@ local function make_world()
         self.events = {}
         return out
     end
+    function w:item_flags(ids)
+        if self.flags == nil then return nil end
+        local out = {}
+        for _, id in ipairs(ids) do out[id] = self.flags[id] == true end
+        return out
+    end
     function w:remove_pickup(id)
+        if not self.removal_works then return true end -- the call "succeeds" but nothing happens
         for i, p in ipairs(self.items) do
             if p.id == id then
                 table.remove(self.items, i)
@@ -64,8 +73,10 @@ local function make_pair(settings)
     function pair:step(n)
         for _ = 1, n or 1 do
             self.now = self.now + 0.25
-            self.sa:tick(self.now, self.a:list(), self.pos_a, self.a, self.detect_a, self.a:take_events())
-            self.sb:tick(self.now, self.b:list(), self.pos_b, self.b, true, self.b:take_events())
+            self.sa:tick(self.now, self.a:list(), self.pos_a, self.a, self.detect_a, self.a:take_events(),
+                self.a:item_flags(self.sa:watched_item_ids()))
+            self.sb:tick(self.now, self.b:list(), self.pos_b, self.b, true, self.b:take_events(),
+                self.b:item_flags(self.sb:watched_item_ids()))
             for _, m in ipairs(self.to_a) do self.sa:on_message(assert(P.decode(m))) end
             for _, m in ipairs(self.to_b) do self.sb:on_message(assert(P.decode(m))) end
             self.to_a, self.to_b = {}, {}
@@ -321,6 +332,118 @@ T.run("callback_without_disappearance_is_nothing", function()
     T.eq(pair.sa.counters.taken_by_me, 0, "item still there: not taken")
     T.eq(#pair.b.items, 1, "partner keeps it")
     T.eq(pair.sa:summary().hook, "waiting for first pickup", "not proven by it either")
+end)
+
+T.run("inventory_flag_confirms_pickup_anywhere", function()
+    local pair = make_pair()
+    pair.a.flags = {} -- flags readable, nothing obtained yet
+    local cog_a = pair.a:place(COG, 25, 0, 0, runtime(600)) -- far from where A stands: heuristic says no
+    pair.b:place(COG, 25, 0, 0, runtime(601))
+    pair:step(2)
+    T.eq(pair.sa:summary().flags, "waiting for first pickup", "flags readable, not yet proven")
+    pair.a:take(cog_a)
+    pair.a.flags[COG] = true -- the game marks the Cog as obtained
+    pair:step(3)
+    T.eq(pair.sa.counters.flag, 1, "confirmed by the inventory flag")
+    T.eq(#pair.b.items, 0, "partner's copy removed")
+    T.eq(pair.sa:summary().flags, "confirmed", "flags proven")
+end)
+
+T.run("inventory_flag_set_a_scan_later_still_confirms", function()
+    local pair = make_pair()
+    pair.a.flags = {}
+    local cog_a = pair.a:place(COG, 25, 0, 0, runtime(610))
+    pair.b:place(COG, 25, 0, 0, runtime(611))
+    pair:step(2)
+    pair.a:take(cog_a)
+    pair:step(1)
+    pair.a.flags[COG] = true
+    pair:step(2)
+    T.eq(pair.sa.counters.flag, 1, "late flag confirms the pending pickup")
+    T.eq(#pair.b.items, 0, "removed")
+end)
+
+T.run("flag_already_set_is_no_signal", function()
+    local pair = make_pair()
+    pair.a.flags = { [COG] = true } -- obtained before (e.g. an earlier copy)
+    local cog_a = pair.a:place(COG, 25, 0, 0, runtime(620))
+    pair.b:place(COG, 25, 0, 0, runtime(621))
+    pair:step(2)
+    pair.a:take(cog_a) -- far away: an area unload
+    pair:step(4)
+    T.eq(pair.sa.counters.taken_by_me, 0, "no flip, no pickup")
+    T.eq(#pair.b.items, 1, "partner keeps it")
+end)
+
+T.run("proven_flags_ignore_unconfirmed_vanish", function()
+    local pair = make_pair()
+    pair.a.flags = {}
+    local cog_a = pair.a:place(COG, 1, 0, 0, runtime(630))
+    local fuel_a = pair.a:place(119273600, 1.5, 0, 0, runtime(631))
+    pair.b:place(119273600, 1.5, 0, 0, runtime(632))
+    pair.pos_a = { x = 1, y = 0, z = 0 }
+    pair:step(2)
+    pair.a:take(cog_a)
+    pair.a.flags[COG] = true
+    pair:step(2)
+    T.eq(pair.sa:summary().flags, "confirmed", "proven by the Cog")
+    pair.a:take(fuel_a) -- vanishes next to A, but the game never marks it as obtained
+    pair:step(16)
+    T.eq(#pair.b.items, 1, "partner keeps the fuel")
+    T.eq(pair.sa.counters.unconfirmed_ignored, 1, "noted")
+end)
+
+T.run("only_copy_in_same_stage_matches_elsewhere", function()
+    local pair = make_pair()
+    pair.a.flags = {}
+    -- An enemy dropped the key item: it lies at different spots on the two machines.
+    local key_a = pair.a:place(119288000, 3, 0, 0, runtime(700), 43400)
+    pair.b:place(119288000, 9, 0, 4, runtime(701), 43400)
+    pair:step(2)
+    pair.a:take(key_a)
+    pair.a.flags[119288000] = true
+    pair:step(3)
+    T.eq(#pair.b.items, 0, "same stage, only copy on both sides: removed")
+end)
+
+T.run("only_copy_rule_needs_the_same_stage_and_a_single_copy", function()
+    local pair = make_pair()
+    pair.a.flags = {}
+    local key_a = pair.a:place(119288000, 3, 0, 0, runtime(710), 43400)
+    pair.b:place(119288000, 9, 0, 4, runtime(711), 43410) -- another stage
+    pair:step(2)
+    pair.a:take(key_a)
+    pair.a.flags[119288000] = true
+    pair:step(3)
+    T.eq(#pair.b.items, 1, "other stage: kept")
+
+    local pair2 = make_pair()
+    pair2.a.flags = {}
+    local k2 = pair2.a:place(119288000, 3, 0, 0, runtime(720), 43400)
+    pair2.b:place(119288000, 9, 0, 4, runtime(721), 43400)
+    pair2.b:place(119288000, 30, 0, 4, runtime(722), 43400) -- two copies here: which one?
+    pair2:step(2)
+    pair2.a:take(k2)
+    pair2.a.flags[119288000] = true
+    pair2:step(3)
+    T.eq(#pair2.b.items, 2, "ambiguous: both kept")
+end)
+
+T.run("ineffective_removal_is_reported", function()
+    local pair = make_pair()
+    pair.b.removal_works = false
+    local cog_a = pair.a:place(COG, 1, 0, 0, CTX)
+    pair.b:place(COG, 1, 0, 0, CTX)
+    pair.pos_a = { x = 1, y = 0, z = 0 }
+    pair:step(2)
+    pair.a:take(cog_a)
+    pair:step(3)
+    T.check(pair.sb.counters.remove_ineffective >= 1, "removal without effect counted")
+    local logged = false
+    for _, e in ipairs(pair.sb:summary().events) do
+        if e.text:find("had no effect") then logged = true end
+    end
+    T.check(logged, "and shown in the event log")
 end)
 
 T.run("disabled_setting_does_nothing", function()
