@@ -175,7 +175,8 @@ M.classes = classes
 
 -- An enum type: its literals are static fields.
 local function enum(name, values)
-    local td = class(name, "System.Object", {})
+    if classes["System.Enum"] == nil then class("System.Enum", "System.Object", {}) end
+    local td = class(name, "System.Enum", {})
     td.static_values = values
     return td
 end
@@ -224,7 +225,9 @@ local function new(type_name, data)
     local o = setmetatable(data or {}, Managed)
     o.__type = type_name
     o.__addr = next_address
-    o.__fields = o.__fields or {}
+    o.__fields = o.__fields or o.data or {}
+    -- A DamageInfo keeps its values in its fields (read by reflection); `data` is the same table.
+    if type_name == "chainsaw.HitController.DamageInfo" then o.data = o.__fields end
     objects[o.__addr] = o
     return o
 end
@@ -457,6 +460,9 @@ function M.install(opts)
         get_MotionBankID = { 0, function(self) return self.bank end },
         get_MotionID = { 0, function(self) return self.motion end },
         get_Frame = { 0, function(self) return self.frame end },
+        set_Frame = { 1, function(self, f) self.frame = f self.seeks = (self.seeks or 0) + 1 end },
+        get_Speed = { 0, function(self) return self.speed or 1.0 end },
+        set_Speed = { 1, function(self, v) self.speed = v end },
         ["changeMotion(System.UInt32, System.UInt32, System.Single, System.Single, via.motion.InterpolationMode, via.motion.InterpolationCurve)"] = {
             6, function(self, bank, id, frame) self.bank, self.motion, self.frame = bank, id, frame
                 self.changes = (self.changes or 0) + 1 end,
@@ -599,7 +605,18 @@ function M.install(opts)
         info_methods["get_" .. f] = { 0, function(self) return self.data[f] end }
         info_methods["set_" .. f] = { 1, function(self, v) self.data[f] = v end }
     end
-    class("chainsaw.HitController.DamageInfo", "System.Object", info_methods)
+    -- The fields, the way the type database lists them: primitive values, vectors, an enum,
+    -- object references, a value that only means something in one game (SerialNo), and a
+    -- parent type with a field of its own.
+    enum("chainsaw.AttackType", { Shot = 0, Melee = 1, Explosion = 2 })
+    class("chainsaw.HitController.HitInfo", "System.Object", {}, { HitPos = "via.vec3", SerialNo = "System.UInt32" })
+    class("chainsaw.HitController.DamageInfo", "chainsaw.HitController.HitInfo", info_methods, {
+        Damage = "System.Int32", Wince = "System.Single", Break = "System.Single", Stopping = "System.Single",
+        DamageDir = "via.vec3", WeaponID = "System.Int32", IsCritical = "System.Boolean", IsKill = "System.Boolean",
+        AttackType = "chainsaw.AttackType", AttackOwnerObject = "via.GameObject", WeaponGameObject = "via.GameObject",
+        AttackGameObject = "via.GameObject", DamageGameObject = "via.GameObject",
+        ChildHitController = "chainsaw.HitController", AttackCollidable = "via.physics.Collidable",
+        DamageCollidable = "via.physics.Collidable" })
     -- A head's updater: linked to its character (Context) while in use, unlinked in the pool.
     class("chainsaw.HeadUpdater", "via.Component", {
         get_Context = { 0, function(self) return self.context end },
@@ -611,7 +628,8 @@ function M.install(opts)
             local ctx = self.ctx
             self.received = self.received or {}
             self.received[#self.received + 1] = { damage = info.data.Damage, wince = info.data.Wince,
-                attacker = info.data.AttackOwnerObject, critical = info.data.IsCritical }
+                attacker = info.data.AttackOwnerObject, critical = info.data.IsCritical, kill = info.data.IsKill,
+                attack_type = info.data.AttackType, hit_pos = info.data.HitPos, serial = info.data.SerialNo }
             if M.deferred_damage then
                 M.pending_damage = { owner = ctx, amount = info.data.Damage or 0 }
             elseif ctx ~= nil then
@@ -874,7 +892,6 @@ function M.install(opts)
         typeof = function(name) return { name = name } end,
         create_instance = function(name)
             local o = new(name)
-            if name == "chainsaw.HitController.DamageInfo" then o.data = {} end
             return o
         end,
         PreHookResult = { CALL_ORIGINAL = 0, SKIP_ORIGINAL = M.SKIP_ORIGINAL },
@@ -1190,7 +1207,8 @@ local function runtime_id(ctx)
 end
 
 local function motion_layers()
-    return { new("via.motion.TreeLayer", { bank = 100, motion = 1201, frame = 12.5 }) }
+    return { new("via.motion.TreeLayer", { bank = 100, motion = 1201, frame = 12.5 }),
+        new("via.motion.TreeLayer", { bank = 100, motion = 50, frame = 0 }) }
 end
 
 -- Creates a character context with HP, a body GameObject, a Transform and a joint tree
@@ -1213,6 +1231,7 @@ function M.make_character(type_name, pos, hp, spawner)
         { link = ctx.pos })
     M.add_joints(body.transform, JOINT_NAMES, JOINT_PARENTS)
     M.add_component(body, "via.motion.Motion", { layers = motion_layers() })
+    M.add_component(body, "via.motion.MotionFsm2")
     M.add_component(body, "via.physics.CharacterController", { ctx = ctx })
     M.add_component(body, "chainsaw.HitController", { ctx = ctx })
     ctx.body = body
@@ -1357,7 +1376,7 @@ function M.hit(enemy, damage, wince, attacker)
     local info = new("chainsaw.HitController.DamageInfo", { data = {
         Damage = damage, Wince = wince or 10, Break = 0, Stopping = 0, DamageDir = vec(0, 0, -1),
         AttackOwnerObject = attacker or (M.world.player and M.world.player.body), WeaponID = 4000, IsCritical = false,
-        IsKill = false } })
+        IsKill = false, AttackType = 0, HitPos = vec(0, 1.6, 0), SerialNo = 777 } })
     M.component(enemy.body, "chainsaw.HitController"):call("callbackDamageHit", info)
     return info
 end

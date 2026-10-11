@@ -32,8 +32,9 @@ T.run("settings_from_0_1_are_upgraded", function()
 end)
 
 T.run("loads_and_sanitizes_saved_values", function()
-    local files = { [Config.FILE] = { port = 99999, player_name = "", player_hz = 500, last_address = "10.0.0.5",
-        enemy_erase = "yes", enemy_interp_delay = 5, unknown_key = 1 } }
+    local files = { [Config.FILE] = { config_version = Config.VERSION, port = 99999, player_name = "", player_hz = 500,
+        last_address = "10.0.0.5", enemy_erase = "yes", enemy_interp_delay = 5, enemy_authority = "everyone",
+        enemy_anim_layers = 9, roster_hz = 1000, unknown_key = 1 } }
     local cfg = Config.load(fake_json(files))
     T.eq(cfg.port, Config.DEFAULTS.port, "invalid port replaced")
     T.eq(cfg.player_name, "Player", "empty name replaced")
@@ -41,6 +42,9 @@ T.run("loads_and_sanitizes_saved_values", function()
     T.eq(cfg.last_address, "10.0.0.5", "address kept")
     T.eq(cfg.enemy_erase, true, "wrong type ignored")
     T.near(cfg.enemy_interp_delay, 0.4, 1e-9, "enemy smoothing clamped")
+    T.eq(cfg.enemy_authority, "shared", "unknown authority replaced")
+    T.eq(cfg.enemy_anim_layers, 3, "animation layers clamped")
+    T.eq(cfg.roster_hz, 20, "roster rate clamped")
     T.eq(cfg.unknown_key, nil, "unknown keys dropped")
 end)
 
@@ -51,7 +55,7 @@ T.run("enemy_sync_settings_of_0_7_are_reset_once", function()
     local files = { [Config.FILE] = { config_version = 7, sync_enemies = false, enemy_mirror = false,
         enemy_ownership = false, enemy_motion_sync = false, hit_ownership = false, sync_hp = false,
         sync_deaths = false, enemy_puppet_ai = false, match_radius = 8.0, snap_distance = 3.0, sync_drops = false,
-        replay_partner_hits = true, interp_delay = 0.12 } }
+        interp_delay = 0.12 } }
     local json = fake_json(files)
     local cfg = Config.load(json)
     for _, k in ipairs({ "sync_enemies", "enemy_mirror", "enemy_motion_sync" }) do
@@ -62,13 +66,32 @@ T.run("enemy_sync_settings_of_0_7_are_reset_once", function()
         T.eq(cfg[k], nil, k .. " removed")
     end
     T.eq(cfg.sync_drops, false, "an unrelated choice is kept")
-    T.eq(cfg.replay_partner_hits, true, "0.7's own reset already happened: the player's choice stays")
     T.near(cfg.interp_delay, 0.12, 1e-9, "same for the 0.7-era rates")
     T.eq(cfg.enemy_erase, true, "dead enemies are erased by default")
     T.near(cfg.enemy_interp_delay, 0.1, 1e-9, "enemy smoothing default")
     cfg.enemy_mirror = false
     Config.save(json, cfg)
     T.eq(Config.load(json).enemy_mirror, false, "switched off again after the upgrade: kept")
+end)
+
+T.run("enemy_settings_of_0_8_are_reset_once_for_the_new_enemy_sync", function()
+    -- 0.9 rebuilt enemy sync from scratch: switches turned off to work around 0.8 come back,
+    -- and 0.8's options that no longer exist are dropped.
+    local files = { [Config.FILE] = { config_version = 8, sync_enemies = false, enemy_mirror = false,
+        enemy_motion_sync = false, snapshot_hz = 5, enemy_interp_delay = 0.3, enemy_host_only = false,
+        client_enemy_hz = 10, replay_partner_hits = true, enemy_erase = false } }
+    local cfg = Config.load(fake_json(files))
+    for _, k in ipairs({ "sync_enemies", "enemy_mirror", "enemy_motion_sync" }) do
+        T.eq(cfg[k], true, k .. " back on")
+    end
+    T.eq(cfg.snapshot_hz, 20, "state rate back to default")
+    T.near(cfg.enemy_interp_delay, 0.1, 1e-9, "smoothing back to default")
+    for _, k in ipairs({ "enemy_host_only", "client_enemy_hz", "replay_partner_hits" }) do
+        T.eq(cfg[k], nil, k .. " removed")
+    end
+    T.eq(cfg.enemy_erase, false, "an unrelated choice is kept")
+    T.eq(cfg.enemy_authority, "shared", "enemies are shared between the players by default")
+    T.eq(cfg.enemy_hit_predict, true, "hits take HP at once by default")
 end)
 
 T.run("save_roundtrip", function()
@@ -85,11 +108,10 @@ end)
 
 T.run("unsafe_defaults_of_older_versions_are_reset_once", function()
     -- A 0.6 config saved every setting, including the old defaults that are now experimental.
-    local files = { [Config.FILE] = { player_name = "Leon", replay_partner_hits = true, sync_cutscenes = true,
+    local files = { [Config.FILE] = { player_name = "Leon", sync_cutscenes = true,
         travel_reload = true, stage_travel = true, interp_delay = 0.1, snapshot_hz = 15, sync_flags = false } }
     local json = fake_json(files)
     local cfg = Config.load(json)
-    T.eq(cfg.replay_partner_hits, false, "hit replay back to off")
     T.eq(cfg.sync_cutscenes, false, "cutscene replay back to off")
     T.eq(cfg.travel_reload, false, "automatic reload back to off")
     T.eq(cfg.stage_travel, false, "stage warp back to off")
@@ -99,18 +121,19 @@ T.run("unsafe_defaults_of_older_versions_are_reset_once", function()
     T.eq(cfg.player_name, "Leon", "name kept")
     T.eq(cfg.config_version, Config.VERSION, "upgraded")
     -- Switched back on by the player and saved: kept from then on.
-    cfg.replay_partner_hits = true
+    cfg.sync_cutscenes = true
     Config.save(json, cfg)
-    T.eq(Config.load(json).replay_partner_hits, true, "the player's own choice sticks")
+    T.eq(Config.load(json).sync_cutscenes, true, "the player's own choice sticks")
 end)
 
 T.run("experimental_features_are_off_by_default", function()
     local cfg = Config.load(fake_json({}))
-    for _, k in ipairs({ "replay_partner_hits", "sync_cutscenes", "travel_reload", "stage_travel", "exp_table_reload",
+    for _, k in ipairs({ "sync_cutscenes", "travel_reload", "stage_travel", "exp_table_reload",
         "exp_force_routine" }) do
         T.eq(cfg[k], false, k)
     end
-    T.eq(cfg.hit_ownership, nil, "no enemy ownership: the host runs every enemy")
+    T.eq(cfg.hit_ownership, nil, "0.7's ownership switches are gone")
+    T.eq(cfg.replay_partner_hits, nil, "the cosmetic hit replay is gone: partner hits run for real")
     T.eq(cfg.sync_animals, true, "animals follow the host")
     T.eq(cfg.sync_drops, true, "per-player loot on")
     T.eq(cfg.profiler, true, "profiler on")

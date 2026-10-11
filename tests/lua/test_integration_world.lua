@@ -68,7 +68,7 @@ local client_game = {
         { id = 3, kind = "chainsaw.Ch1c0z0Context", uid = mock.context_code(KILLED_ID), pos = { x = 50, y = 0, z = 0 },
           yaw = 0, hp = 100, max_hp = 100, alive = true },
     },
-    ai_off = {},
+    puppet = {},
     transforms = 0,
     reload_id = 1,
 }
@@ -83,21 +83,21 @@ function client_game:list_enemies()
     for _, e in ipairs(self.enemies) do
         if not e.erased then
             out[#out + 1] = { id = e.id, kind = e.kind, uid = e.uid, pos = { x = e.pos.x, y = e.pos.y, z = e.pos.z },
-                yaw = e.yaw, hp = e.hp, max_hp = e.max_hp, alive = e.alive }
+                rot = { x = 0, y = 0, z = 0, w = 1 }, hp = e.hp, max_hp = e.max_hp, alive = e.alive }
         end
     end
     return out
 end
-function client_game:enemy_set_hp(id, hp) self.enemies[id].hp = hp return true end
+function client_game:enemy_set_hp(id, hp) self.enemies[id].hp = math.max(1, hp) return true end
 function client_game:enemy_kill(id) self.enemies[id].hp, self.enemies[id].alive = 0, false return true end
 function client_game:enemy_erase(id) self.enemies[id].erased = true return true end
-function client_game:enemy_set_transform(id, pos, yaw)
+function client_game:enemy_set_transform(id, pos, rot)
     local e = self.enemies[id]
-    e.pos, e.yaw = { x = pos.x, y = pos.y, z = pos.z }, yaw
+    e.pos, e.rot = { x = pos.x, y = pos.y, z = pos.z }, rot
     self.transforms = self.transforms + 1
     return true
 end
-function client_game:enemy_set_ai(id, on) self.ai_off[id] = (not on) or nil return true end
+function client_game:enemy_set_puppet(id, on) self.puppet[id] = on or nil return true end
 function client_game:teleport_player(pos) self.player.pos = pos return true end
 function client_game:is_key_down() return false end
 
@@ -238,8 +238,8 @@ T.run("enemies_by_level_identity", function()
         return math.abs(e.pos.x - 30) < 0.05 and math.abs(e.pos.z - 30) < 0.05
     end, step, 5)
     T.check(ok, "the client's villager stands where the host's is (" .. client_game.enemies[2].pos.x .. ")")
-    T.eq(client.enemy_sync.counters.uid_pairs >= 1, true, "paired by level ID")
-    T.eq(client_game.ai_off[2], true, "following the host's copy with its AI off")
+    T.eq(client.enemy_net.counters.uid_pairs >= 1, true, "paired by level ID")
+    T.eq(client_game.puppet[2], true, "following the host's copy with its AI off")
     -- The host kills it: it dies (or is removed) in the client's game too.
     villager.hp = 0
     ok = T.wait_until(function() return not client_game.enemies[2].alive or client_game.enemies[2].erased end, step, 5)
@@ -247,7 +247,7 @@ T.run("enemies_by_level_identity", function()
 end)
 
 T.run("a_client_reload_takes_the_hosts_world_again", function()
-    local before = client.enemy_sync:summary().dead_known
+    local before = client.enemy_net:summary().dead_known
     T.check(before >= 2, "the client knows both dead villagers (" .. before .. ")")
     -- The client dies and reloads a checkpoint: its game has the villager killed earlier back.
     client_game.enemies[3].erased = nil
@@ -336,17 +336,19 @@ T.run("cutscene_plays_for_both", function()
     for _ = 1, 10 do step() end
 end)
 
-T.run("an_enemy_next_to_the_client_is_still_run_by_the_host", function()
+T.run("an_enemy_next_to_the_client_is_run_by_the_clients_game", function()
+    local ok = T.wait_until(function() return client_game.puppet[1] == true end, step, 3)
+    T.check(ok, "far from the client, its copy of the Ganado follows the host's")
     client_game.player.pos = { x = 21, y = 0, z = 1 } -- the client walks up to the Ganado
-    local ok = T.wait_until(function() return client_game.ai_off[1] == true end, step, 3)
-    T.check(ok, "the client's copy follows the host's with its AI off")
-    T.wait_until(function() return false end, step, 1)
-    T.eq(ganado.head.update_self ~= false, true, "the host's Ganado keeps its AI (the host runs every enemy)")
-    T.eq(client_game.ai_off[1], true, "still following after a while next to the client")
-    ganado.pos.x, ganado.pos.z = 23, 2 -- the host's AI moves it
-    ok = T.wait_until(function() return math.abs(client_game.enemies[1].pos.x - 23) < 0.05 end, step, 3)
-    T.check(ok, "the client's copy follows (x=" .. client_game.enemies[1].pos.x .. ")")
-    client_game.player.pos = { x = 80, y = 0, z = 0 }
+    ok = T.wait_until(function() return client_game.puppet[1] == nil and ganado.head.update_self == false end, step, 5)
+    T.check(ok, "the Ganado changed hands: the client's game runs it, the host's follows")
+    T.eq(mock.component(ganado.body, "via.motion.MotionFsm2").enabled, false, "the host's copy plays only the client's animation")
+    client_game.enemies[1].pos = { x = 24, y = 0, z = 3 } -- the client's AI moves it
+    ok = T.wait_until(function() return math.abs(ganado.pos.x - 24) < 0.05 and math.abs(ganado.pos.z - 3) < 0.05 end, step, 3)
+    T.check(ok, "the host's copy follows the client's (x=" .. ganado.pos.x .. ")")
+    client_game.player.pos = { x = 80, y = 0, z = 0 } -- the client walks away again
+    ok = T.wait_until(function() return client_game.puppet[1] == true and ganado.head.update_self == true end, step, 6)
+    T.check(ok, "back to the host's game")
 end)
 
 T.run("reset_scripts_keeps_the_session_and_no_pause", function()

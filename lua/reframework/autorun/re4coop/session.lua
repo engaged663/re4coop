@@ -18,7 +18,7 @@
 
 local P = require("re4coop.protocol")
 local Interp = require("re4coop.interp")
-local EnemySync = require("re4coop.enemy_sync")
+local EnemyNet = require("re4coop.enemy_net")
 local ItemSync = require("re4coop.items_sync")
 local Avatar = require("re4coop.avatar")
 local DropSync = require("re4coop.drop_sync")
@@ -85,12 +85,12 @@ local OFFLINE_SAFE = {
 -- Reliable messages that must not be lost but touch game objects: kept until the game loop
 -- runs again. Everything else arriving then (enemy snapshots, hits) is resent continuously.
 local DEFER = {
-    [P.T.ENEMY_DAMAGE] = true, [P.T.ENEMY_DEAD] = true, [P.T.ENEMY_GRAVE] = true,
+    [P.T.ENEMY_HIT] = true, [P.T.ENEMY_DEATH] = true, [P.T.ENEMY_OWNER] = true, [P.T.ENEMY_GRAVE] = true,
     [P.T.FLAGS] = true, [P.T.FLAG_WORDS] = true, [P.T.GIMMICKS] = true, [P.T.OBJECTS] = true,
     [P.T.CUTSCENE] = true, [P.T.WORLD_REQUEST] = true, [P.T.WORLD_DONE] = true,
 }
 
-local SYNC_NAMES = { "enemy_sync", "drop_sync", "flag_sync", "gimmick_sync", "object_sync", "animal_sync",
+local SYNC_NAMES = { "enemy_net", "drop_sync", "flag_sync", "gimmick_sync", "object_sync", "animal_sync",
     "cutscene_sync" }
 
 function Session.new(opts)
@@ -229,7 +229,7 @@ function Session:make_syncs()
     local enemy_opts = {}
     for k, v in pairs(base) do enemy_opts[k] = v end
     enemy_opts.on_kill = function(id, now) self.drop_sync:on_remote_kill(id, now) end
-    self.enemy_sync = EnemySync.new(enemy_opts)
+    self.enemy_net = EnemyNet.new(enemy_opts)
     self.flag_sync = FlagSync.new(base)
     self.gimmick_sync = GimmickSync.new(base)
     self.object_sync = ObjectSync.new(base)
@@ -345,7 +345,7 @@ function Session:restore_game()
     if self.pause and self.pause.set_active then
         self.pause:set_active(false, self.settings.no_pause_mode, false, self.clock())
     end
-    if self.game.restore_enemy_ai then self.game:restore_enemy_ai() end
+    if self.game.restore_enemies then self.game:restore_enemies() end
     if self.world and self.world.restore_animals then self.world:restore_animals() end
     if self.world and self.world.disarm_chapter_switch then self.world:disarm_chapter_switch() end
 end
@@ -701,9 +701,9 @@ function Session:status()
             st.partner_distance = math.sqrt(dx * dx + dy * dy + dz * dz)
         end
     end
-    if self.enemy_sync then
-        st.enemies = self.enemy_sync:summary()
-        st.partner_hits = self.enemy_sync:recent_partner_hits(now, TRACER_SECONDS)
+    if self.enemy_net then
+        st.enemies = self.enemy_net:summary()
+        st.partner_hits = self.enemy_net:recent_partner_hits(now, TRACER_SECONDS)
     end
     if self.drop_sync then
         st.drops = self.drop_sync:summary()
@@ -838,8 +838,8 @@ function Session:on_world_request(m)
     end
     -- Enemies: the list of every enemy dead in our world follows in a moment (reading our
     -- save's backups takes a few ticks).
-    if (m.what & P.WORLD.ENEMIES) ~= 0 and s.sync_enemies ~= false and self.enemy_sync then
-        self.enemy_sync:request_graveyard(self.clock())
+    if (m.what & P.WORLD.ENEMIES) ~= 0 and s.sync_enemies ~= false and self.enemy_net then
+        self.enemy_net:request_graveyard(self.clock())
     end
     if m.sync_id == 0 then return end -- an enemies-only request (no shared world on the client)
     self:send(P.encode_world_done(m.sync_id, m.what, n_groups, n_gimmicks), true)
@@ -924,8 +924,8 @@ function Session:handle_message(data, now)
         if self.cutscene_sync and self.world then self.cutscene_sync:on_message(m, now) end
     elseif self.avatar_rx:on_message(m, now) then
         return
-    elseif self.enemy_sync and self.settings.sync_enemies then
-        self.enemy_sync:on_message(m, now, self.game)
+    elseif self.enemy_net and self.settings.sync_enemies then
+        self.enemy_net:on_message(m, now, self.game)
     end
 end
 
@@ -995,7 +995,7 @@ function Session:on_reload(now)
     self.perf:crumb("session.reload", nil, true)
     if self.game.on_reload then self.game:on_reload() end
     if self.world and self.world.on_reload then self.world:on_reload() end
-    if self.enemy_sync then self.enemy_sync:on_local_reload() end
+    if self.enemy_net then self.enemy_net:on_local_reload() end
     if self.animal_sync then self.animal_sync:on_local_reload() end
     if self.drop_sync then self.drop_sync:forget_enemies() end
     self.in_game_since = now
@@ -1026,7 +1026,10 @@ function Session:players_info(now)
     if remote.stage ~= nil and self.local_stage ~= nil and remote.stage // 1000 ~= self.local_stage // 1000 then
         return { local_pos = local_pos } -- another region: the partner is not near our enemies
     end
-    return { local_pos = local_pos, partner_pos = remote.pos }
+    -- A partner who is down or watching a cutscene cannot fight: enemies stay with us.
+    local flags = remote.flags or 0
+    local busy = (flags & (P.PLAYER_FLAGS.DEAD | P.PLAYER_FLAGS.CUTSCENE)) ~= 0
+    return { local_pos = local_pos, partner_pos = remote.pos, partner_busy = busy }
 end
 
 -- No-pause: while hosting or connected, menus do not freeze the world (see game_pause.lua).
@@ -1101,7 +1104,7 @@ function Session:apply_pending_restores()
         self:restore_game()
     elseif self.ai_restore_pending then
         self.ai_restore_pending = false
-        if self.game.restore_enemy_ai then self.game:restore_enemy_ai() end
+        if self.game.restore_enemies then self.game:restore_enemies() end
         if self.world and self.world.restore_animals then self.world:restore_animals() end
     end
 end
@@ -1175,38 +1178,36 @@ function Session:update()
     -- Hits our player landed and enemy loot rolls since the last frame (hooks in game.lua).
     t0 = perf:start()
     local hits = self.game.take_hit_events and self.game:take_hit_events() or nil
-    if self.enemy_sync and s.sync_enemies and hits ~= nil and #hits > 0 then
-        self.enemy_sync:on_local_hits(hits, now)
+    if self.enemy_net and s.sync_enemies and hits ~= nil and #hits > 0 then
+        self.enemy_net:on_local_hits(hits, now)
     end
     local drops = self.game.take_drop_events and self.game:take_drop_events() or nil
 
     local enemies, ticked = nil, false
     local in_game = self:fresh_local_pos(now) ~= nil
-    if self.enemy_sync and s.sync_enemies and in_game then
-        -- The animation is only read while enemies are mirrored with their animation.
-        self.game.read_motion = s.enemy_mirror ~= false and s.enemy_motion_sync ~= false
+    if self.enemy_net and s.sync_enemies and in_game then
         local interval = 1.0 / (s.enemy_tick_hz or 20)
         if now - self.last_enemy_tick >= interval then
             self.last_enemy_tick = (now - self.last_enemy_tick >= 2 * interval) and now or (self.last_enemy_tick + interval)
-            local es = self.enemy_sync
-            enemies = self.game:list_enemies(self:fresh_local_pos(now), function(id) return es:wants_motion(id) end)
+            local es = self.enemy_net
+            enemies = self.game:list_enemies(self:fresh_local_pos(now), function(id) return es:wants_state(id) end)
             if enemies ~= nil then
                 ticked = true
-                self.enemy_sync:tick(now, enemies, self.game, self:players_info(now))
+                self.enemy_net:tick(now, enemies, self.game, self:players_info(now))
             end
         end
-    elseif self.enemy_sync and not s.sync_enemies then
-        self.enemy_sync:release_all(self.game) -- enemy sync switched off: our AI runs everything
+    elseif self.enemy_net and not s.sync_enemies then
+        self.enemy_net:release_all(self.game) -- enemy sync switched off: our AI runs everything
     end
     if self.drop_sync and s.sync_enemies then
         self.drop_sync:update(now, enemies, drops, self.game)
     end
     perf:stop("update.enemies", t0)
 
-    -- Every frame: enemies the partner's game runs follow their copies smoothly.
-    if self.enemy_sync and s.sync_enemies and in_game then
+    -- Every frame: the enemies the partner's game runs stand where the partner's are.
+    if self.enemy_net and s.sync_enemies and in_game then
         t0 = perf:start()
-        self.enemy_sync:frame(now, self.game)
+        self.enemy_net:frame(now, self.game)
         perf:stop("update.mirror", t0)
     end
 

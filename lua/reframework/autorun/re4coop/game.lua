@@ -182,7 +182,6 @@ function Game.new(log, clock)
     self.n_calls = 0       -- engine calls made through Game:call (for the profiler)
     self.method_cache = {}
     self.caps = {}        -- name -> { ok=bool, detail=string }
-    self.enemy_ctx = {}   -- id -> context object from the latest list_enemies()
     self.area_probe = nil
     self.prefab_exist = {} -- path -> bool
     self.claimed = {}      -- addresses of objects that belong to the partner's model
@@ -199,20 +198,10 @@ function Game.new(log, clock)
     self.call_budget = { t = 0, n = 0 }
     self.counters = { calls = 0, calls_fallback = 0, calls_skipped = 0, shots = 0, events_dropped = 0, reloads = 0 }
     self.pickup_events = {} -- filled by the DropItem callback hooks, drained by take_pickup_events()
-    self.enemy_by_body = {} -- body GameObject address -> enemy id
-    self.hp_guard = {}      -- enemy id -> {hp, ticks}: undo HP changes a cosmetic hit replay made
     self.player_objects = {} -- addresses of the local player's body/head GameObjects
-    self.enemy_info = {}    -- enemy id -> cached per-context data (see list_enemies)
-    self.enemy_ai_off = {}  -- enemy id -> { go = head, upd = HeadUpdater } while we have it switched off
-    self.parked_heads = {}  -- head address -> { go, upd }: switched off and in the game's pool (service_heads)
-    self.enemy_hidden = {}  -- enemy id -> { body_addr, gos = {GameObjects we stopped drawing} }
-    self.parked_bodies = {} -- body address -> gos: hidden by us when its enemy left the list
-    self.read_motion = false -- list_enemies() also reads each enemy's animation (enemy mirroring)
+    self:init_enemies()      -- enemies and hits (game_enemies.lua)
     self.extra_dump_types = {} -- types other adapters want in the research dump
     self.active = false     -- a partner is connected: the hooks do work only then
-    self.hit_events = {}
-    self.hit_stats = { seen = 0, by_player = 0, other_owner = 0, not_enemy = 0, last_other_owner = nil,
-        replays = 0, replay_failed = 0, replay_skipped = 0, hp_restored = 0, delayed_restored = 0, stale_owner = 0 }
     self.drop_events = {}
     self.drop_stats = { calls = 0, enemy_calls = 0, requested = 0, request_failed = 0, last_types = {} }
     self.drop_research = {}
@@ -242,17 +231,8 @@ end
 function Game:on_reload()
     self.counters.reloads = self.counters.reloads + 1
     self.perf:crumb("game.reload", nil, true)
-    -- Pooled heads can outlive a checkpoint reload: never leave one switched off.
-    for id in pairs(self.enemy_ai_off) do self:restore_head(id) end
-    for id in pairs(self.enemy_hidden) do self:park_body(id) end
-    self.enemy_ctx = {}
-    self.enemy_info = {}
-    self.enemy_by_body = {}
-    self.enemy_ai_off = {}
-    self.elim_scan = nil
-    self.hp_guard = {}
-    self.hit_template = nil
-    self.hit_events = {}
+    -- Pooled heads and bodies can outlive a checkpoint reload: never leave one switched off.
+    self:reload_enemies()
     self.drop_events = {}
     self.pickup_cache = {}
     self.pickup_objects = {}
@@ -1767,125 +1747,8 @@ function Game:replay_call(comp, ev, resolve)
 end
 
 -------------------------------------------------------------------------------
--- Enemies
+-- Enemy HP writer (the enemy and hit adapter itself is game_enemies.lua)
 -------------------------------------------------------------------------------
-
--- Enemies further than this from the local player are read in full only every
--- FAR_ENEMY_EVERY ticks (facing, max HP, animation, body check); HP, position and
--- alive state are read for every enemy on every tick.
-local NEAR_ENEMY = 50.0
-local FAR_ENEMY_EVERY = 4
-
--- Per-context data that does not change (kind, level identity) or is validated before use
--- (body, transform, animation layer). A context whose body changed is treated as a new enemy.
-function Game:new_enemy_info(ctx, body, body_addr)
-    local uid = self:read_enemy_uid(ctx)
-    return {
-        kind = type_name_of(ctx) or "unknown",
-        uid = uid or false,
-        body = body,
-        body_addr = body_addr,
-        transform = body and self:call(body, "get_Transform") or false,
-        yaw = 0,
-        max_hp = 0,
-        tick = 0,
-    }
-end
-
--- local_pos: the local player's position (enemies near it are read in full every tick).
--- want_motion(id) -> bool (optional): with read_motion, only these enemies' animation is read.
-function Game:list_enemies(local_pos, want_motion)
-    local cm = singleton(CHARACTER_MANAGER)
-    if cm == nil then return nil end
-    local list = self:call(cm, "get_EnemyContextList")
-    if list == nil then
-        self:cap("enemy_list", false, "get_EnemyContextList failed")
-        return nil
-    end
-    local count = tonumber(self:call(list, "get_Count")) or 0
-    self:cap("enemy_list", true, ("%d enemy contexts"):format(count))
-
-    local out, ctx_by_id, by_body, infos = {}, {}, {}, {}
-    local old = self.enemy_info
-    local with_id = 0
-    for i = 0, count - 1 do
-        local ctx = self:call(list, "get_Item", i)
-        local id = ctx and address_of(ctx)
-        local pos = id and v3(self:call(ctx, "get_Position"))
-        local hp = pos and self:call(ctx, "get_HitPoint")
-        if hp ~= nil then
-            local info = old[id]
-            local near = local_pos == nil or dist(pos, local_pos) <= NEAR_ENEMY
-            local full = info == nil or near or (info.tick % FAR_ENEMY_EVERY) == 0
-            if full then
-                local body = self:call(ctx, "get_BodyGameObject")
-                local body_addr = body and address_of(body)
-                if info == nil or info.body_addr ~= body_addr then
-                    info = self:new_enemy_info(ctx, body, body_addr)
-                    self.hp_guard[id] = nil
-                    self:restore_head(id) -- a new character in this context: its own AI runs
-                    self:park_body(id)    -- and the body we hid (if any) is no longer this enemy's
-                    self:unpark_body(body_addr)
-                end
-            end
-            info.tick = info.tick + 1
-            -- Only enemies whose body still exists: a dissolving or unloading enemy keeps its
-            -- context a little longer, and nothing may be written to it any more.
-            if info.transform and (not full or self:alive(info.transform)) then
-                infos[id] = info
-                ctx_by_id[id] = ctx
-                if info.body_addr ~= nil then by_body[info.body_addr] = id end
-                if info.uid then with_id = with_id + 1 end
-                local cur = tonumber(self:call(hp, "get_CurrentHitPoint")) or 0
-                cur = self:apply_hp_guard(id, hp, cur)
-                if full then
-                    info.max_hp = tonumber(self:call(hp, "get_DefaultHitPoint")) or info.max_hp
-                    local q = self:call(info.transform, "get_Rotation")
-                    if q ~= nil then info.yaw = yaw_of(q) end
-                    info.motion = (self.read_motion and (want_motion == nil or want_motion(id)))
-                        and self:enemy_motion_state(info) or nil
-                end
-                out[#out + 1] = {
-                    id = id,
-                    kind = info.kind,
-                    uid = info.uid or nil,
-                    pos = pos,
-                    yaw = info.yaw,
-                    hp = cur,
-                    max_hp = info.max_hp,
-                    alive = self:call(hp, "get_IsLive") ~= false,
-                    motion = info.motion,
-                }
-            end
-        end
-    end
-    self.enemy_ctx = ctx_by_id
-    self.enemy_info = infos
-    self.enemy_by_body = by_body
-    -- An enemy that left the list (area unload, despawn) while we had its AI head switched
-    -- off: the game pools heads and gives them to the next enemies it spawns, so the head
-    -- must run again or that enemy would stand still.
-    for id in pairs(self.enemy_ai_off) do
-        if ctx_by_id[id] == nil then self:restore_head(id) end
-    end
-    for id in pairs(self.enemy_hidden) do
-        if ctx_by_id[id] == nil then self:park_body(id) end
-    end
-    for id in pairs(self.hp_guard) do
-        if ctx_by_id[id] == nil then self.hp_guard[id] = nil end
-    end
-    if #out > 0 then
-        self:cap("enemy_uid", with_id > 0, ("%d of %d enemies have a level identity"):format(with_id, #out))
-    end
-    return out
-end
-
--- The cached data of an enemy whose body is still there right now, or nil.
-function Game:live_enemy(id)
-    local info = self.enemy_info[id]
-    if info == nil or self.enemy_ctx[id] == nil or not self:alive(info.transform) then return nil end
-    return info
-end
 
 -- Applies one writer and reports whether get_CurrentHitPoint now reads the written value.
 function Game:try_hp_writer(w, hp_obj, value)
@@ -1944,317 +1807,6 @@ function Game:write_hp(hp_obj, value)
         end
     end
     return false
-end
-
-function Game:enemy_get_hp(id)
-    local ctx = self:live_enemy(id) and self.enemy_ctx[id]
-    local hp = ctx and self:call(ctx, "get_HitPoint")
-    return hp and tonumber(self:call(hp, "get_CurrentHitPoint")) or nil
-end
-
-function Game:enemy_set_hp(id, value)
-    local ctx = self:live_enemy(id) and self.enemy_ctx[id]
-    local hp = ctx and self:call(ctx, "get_HitPoint")
-    if hp == nil then return false end
-    self.hp_guard[id] = nil -- an authoritative change, not a replay side effect
-    self.perf:crumb("enemy.set_hp", self.enemy_info[id].kind)
-    return self:write_hp(hp, math.max(1, value))
-end
-
--- Removes an enemy that is already dead in the partner's world, the way the game removes an
--- enemy it has finished with: CharacterContext.eliminate() marks it eliminated (the backup the
--- game stores when it unlinks the character keeps that, so its spawn param never spawns it
--- again - CharacterSpawnParam.isNextSpawn checks it), and the spawn param's
--- invalidateSpawn(true) despawns it now (updateSpawn: suspend, destroy body and head). No
--- death animation, no corpse, no loot. False when the enemy has no spawn param (the caller
--- kills it instead).
-function Game:enemy_erase(id)
-    local info = self:live_enemy(id)
-    local ctx = info and self.enemy_ctx[id]
-    if ctx == nil then return false end
-    local sp = self:call(ctx, "get_CharacterSpawnParam")
-    if sp == nil or not self:alive(sp) then
-        self:cap("enemy_erase", false, "enemy without a spawn param (killed instead)")
-        return false
-    end
-    self.perf:crumb("enemy.erase", info.kind, true)
-    self.hp_guard[id] = nil
-    if self.enemy_ai_off[id] then self:enemy_set_ai(id, true) end -- its pooled head is reused later
-    local ok = pcall(ctx.call, ctx, "eliminate") and pcall(sp.call, sp, "invalidateSpawn", true)
-    self:cap("enemy_erase", ok, ok and "CharacterContext.eliminate + CharacterSpawnParam.invalidateSpawn"
-        or "eliminate/invalidateSpawn failed")
-    return ok
-end
-
--- Host: the uids of every enemy our save has eliminated. The game keeps the state of every
--- character it unloaded in CharacterManager.CharacterBackupDB (ConcurrentDictionary of
--- ContextID code -> chainsaw.CharacterBackup, saved with the game); a backup with
--- _IsEliminated set is an enemy that died and must never spawn again. Reads `budget` backups
--- per call from a snapshot of the table (get_Values copies it). Returns done, uids.
-function Game:scan_eliminated(budget)
-    local s = self.elim_scan
-    if s == nil then
-        local cm = singleton(CHARACTER_MANAGER)
-        local db = cm and self:call(cm, "get_CharacterBackupDB")
-        local values = db and self:call(db, "get_Values")
-        if values == nil then
-            self:cap("enemy_backups", false, "CharacterManager.CharacterBackupDB not readable")
-            return true, {}
-        end
-        s = { values = values, n = tonumber(self:call(values, "get_Count")) or 0, i = 0, uids = {} }
-        self.elim_scan = s
-    end
-    local stop = math.min(s.n, s.i + (budget or 64))
-    while s.i < stop do
-        local b = self:call(s.values, "get_Item", s.i)
-        s.i = s.i + 1
-        if b ~= nil and self:call(b, "get_IsEliminated") == true then
-            local id = self:call(b, "get_ContextID")
-            if P.character_id_stable(context_id_table(id)) then
-                local code = math.tointeger(tonumber(self:call(id, "get_Code")))
-                if code ~= nil and code > 0 and code <= 0xFFFFFFFF then s.uids[#s.uids + 1] = code end
-            end
-        end
-    end
-    if s.i < s.n then return false, nil end
-    self.elim_scan = nil
-    self:cap("enemy_backups", true, ("%d of %d saved characters eliminated"):format(#s.uids, s.n))
-    return true, s.uids
-end
-
-function Game:enemy_kill(id)
-    local info = self:live_enemy(id)
-    local ctx = info and self.enemy_ctx[id]
-    local hp = ctx and self:call(ctx, "get_HitPoint")
-    if hp == nil then return false end
-    self.hp_guard[id] = nil
-    self.perf:crumb("enemy.kill", info.kind, true)
-    -- A mirrored enemy's AI is off; its death (animation, ragdoll, drop) needs it running.
-    if self.enemy_ai_off[id] then self:enemy_set_ai(id, true) end
-    if self.kill_method ~= nil then
-        local m = self:method(hp, self.kill_method)
-        if m ~= nil and pcall(m.call, m, hp) then return true end
-    end
-    return self:write_hp(hp, 0)
-end
-
--- Layer 0 of the body's via.motion.Motion: what the enemy is animating now.
-function Game:enemy_motion_layer(info)
-    if info.layer == nil then
-        local motion = info.body and self:get_component(info.body, "via.motion.Motion")
-        info.layer = (motion and self:call(motion, "getLayer", 0)) or false
-    end
-    return info.layer or nil
-end
-
-function Game:enemy_motion_state(info)
-    local layer = self:enemy_motion_layer(info)
-    if layer == nil then return nil end
-    local bank = tonumber(self:call(layer, "get_MotionBankID"))
-    local mid = tonumber(self:call(layer, "get_MotionID"))
-    if bank == nil or mid == nil then return nil end
-    return { bank = bank, id = mid, frame = tonumber(self:call(layer, "get_Frame")) or 0 }
-end
-
--- The client's copy follows the host's enemy: position and facing, with the
--- CharacterController warped so physics does not pull it back. Runs every frame for every
--- mirrored enemy, so the body is checked right before each write.
-function Game:enemy_set_transform(id, pos, yaw)
-    local info = self:live_enemy(id)
-    local tf = info and info.transform
-    if not tf then return false end
-    self.n_calls = self.n_calls + 2
-    local ok = pcall(tf.call, tf, "set_Position", Vector3f.new(pos.x, pos.y, pos.z))
-    if ok and yaw ~= nil then
-        local h = yaw * 0.5
-        ok = pcall(tf.call, tf, "set_Rotation", Quaternion.new(math.cos(h), 0.0, math.sin(h), 0.0))
-    end
-    if not ok then
-        self:cap("enemy_mirror", false, "set_Position/set_Rotation failed")
-        return false
-    end
-    if info.cc == nil then
-        info.cc = self:get_component(info.body, "via.physics.CharacterController") or false
-    end
-    if info.cc then self:call(info.cc, "warp") end
-    if not self.caps.enemy_mirror or not self.caps.enemy_mirror.ok then
-        self:cap("enemy_mirror", true, "transform + CharacterController.warp")
-    end
-    return true
-end
-
--- Plays the host's animation on the client's copy: TreeLayer.changeMotion(bank, motion,
--- start frame, interpolation frames, mode, curve), the call EMV Engine uses.
-function Game:enemy_set_motion(id, motion)
-    local info = self:live_enemy(id)
-    local layer = info and self:enemy_motion_layer(info)
-    if layer == nil then return false end
-    self.perf:crumb("enemy.motion")
-    local ok = pcall(function()
-        layer:call("changeMotion(System.UInt32, System.UInt32, System.Single, System.Single, via.motion.InterpolationMode, via.motion.InterpolationCurve)",
-            motion.bank, motion.id, motion.frame or 0.0, 8.0, 2, 0)
-    end)
-    self:cap("enemy_motion", ok, ok and "TreeLayer.changeMotion" or "changeMotion failed")
-    return ok
-end
-
--- Switches an enemy's AI on or off. Every character has a separate AI "head" GameObject
--- (CharacterContext.get_HeadGameObject: think, targeting, HateController) and the body that
--- carries out its commands; a mirrored enemy's head stops updating, so it no longer chases
--- or attacks the local player while its body follows the partner's copy. The head we
--- switched off is remembered (enemy_ai_off[id] = { go, upd }): heads are pooled
--- (CharacterInstanceCoordinator.HeadPoolList) and must never be handed to a new enemy
--- switched off - but a head must also never be switched on while it sits in the pool: its
--- HeadUpdater has no Context there, and CharacterHeadUpdater.update reads Context+0x148
--- without a null check (re4.exe 0x1412733c0, the crash of 2026-10-11). See restore_head.
-function Game:enemy_set_ai(id, on)
-    local ctx = self:live_enemy(id) and self.enemy_ctx[id]
-    if ctx == nil then -- gone with its area: put back the head we switched off, if it still exists
-        self:restore_head(id)
-        return false
-    end
-    local head = self:call(ctx, "get_HeadGameObject")
-    if head == nil or not self:go_alive(head) then
-        self:cap("enemy_ai_switch", false, "no head GameObject")
-        return false
-    end
-    local upd = self:call(ctx, "get_HeadUpdater")
-    if on and not self:head_linked(upd) then
-        -- Being unlinked right now: the pool decides; we switch it on once it is linked again.
-        self:park_head({ go = head, upd = upd })
-        self.enemy_ai_off[id] = nil
-        return true
-    end
-    self.perf:crumb("enemy.ai", on and "on" or "off")
-    local ok = pcall(head.call, head, "set_UpdateSelf", on and true or false)
-    self:cap("enemy_ai_switch", ok, ok and "head GameObject set_UpdateSelf" or "set_UpdateSelf failed")
-    if ok then
-        local prev = self.enemy_ai_off[id]
-        if on then
-            self.enemy_ai_off[id] = nil
-        else
-            self.enemy_ai_off[id] = { go = head, upd = upd }
-        end
-        -- The context got another head since we switched the old one off: that one runs again too.
-        if prev ~= nil and address_of(prev.go) ~= address_of(head) then self:wake_head(prev) end
-    end
-    return ok
-end
-
--- Whether a head's updater is linked to a character (HeadUpdater.Context set). A head in the
--- game's pool has none, and must not update.
-function Game:head_linked(upd)
-    return upd ~= nil and self:alive(upd) and self:call(upd, "get_Context") ~= nil
-end
-
--- Switches a head we switched off back on if it is linked to a character now; a pooled head
--- is parked until the game links it to its next enemy (service_heads). Returns true when done.
-function Game:wake_head(entry)
-    if entry == nil or not self:go_alive(entry.go) then return true end
-    if not self:head_linked(entry.upd) then
-        self:park_head(entry)
-        return false
-    end
-    self.perf:crumb("enemy.ai", "restore")
-    pcall(entry.go.call, entry.go, "set_UpdateSelf", true)
-    return true
-end
-
-function Game:park_head(entry)
-    local addr = address_of(entry.go)
-    if addr ~= nil then self.parked_heads[addr] = entry end
-end
-
--- Every frame (cheap: only while we parked heads): a parked head the game linked to a new
--- enemy runs again; one that was destroyed is forgotten.
-function Game:service_heads()
-    if next(self.parked_heads) == nil then return end
-    local now = self.clock()
-    if now - (self.heads_checked or -math.huge) < 0.1 then return end
-    self.heads_checked = now
-    for addr, entry in pairs(self.parked_heads) do
-        if not self:go_alive(entry.go) then
-            self.parked_heads[addr] = nil
-        elseif self:head_linked(entry.upd) then
-            self.parked_heads[addr] = nil
-            self.perf:crumb("enemy.ai", "relinked")
-            pcall(entry.go.call, entry.go, "set_UpdateSelf", true)
-        end
-    end
-end
-
--- Puts back the head we switched off for enemy `id`, whether or not the enemy is still listed
--- (a despawned enemy's head goes back to the game's pool), and forgets it.
-function Game:restore_head(id)
-    local entry = self.enemy_ai_off[id]
-    if entry == nil then return end
-    self.enemy_ai_off[id] = nil
-    self:wake_head(entry)
-end
-
--- Switches every enemy's AI back on and shows every enemy we hid (session ended, script reset).
-function Game:restore_enemy_ai()
-    for id in pairs(self.enemy_ai_off) do
-        if not self:enemy_set_ai(id, true) then self:restore_head(id) end
-    end
-    self.enemy_ai_off = {}
-    for id in pairs(self.enemy_hidden) do
-        if not self:enemy_set_visible(id, true) then self:park_body(id) end
-    end
-    self.enemy_hidden = {}
-    for addr, gos in pairs(self.parked_bodies) do
-        self:draw_again(gos)
-        self.parked_bodies[addr] = nil
-    end
-end
-
--- Client: an enemy the host's game does not run is not shown (on = false), or is shown again.
--- Its body and everything attached to it (weapons, accessories) stop drawing; only the
--- objects that were drawn are hidden, and exactly those are drawn again. Returns true when
--- the enemy is now as asked.
-function Game:enemy_set_visible(id, on)
-    local hidden = self.enemy_hidden[id]
-    if on then
-        if hidden == nil then return true end
-        self.enemy_hidden[id] = nil
-        self:draw_again(hidden.gos)
-        return true
-    end
-    if hidden ~= nil then return true end
-    local info = self:live_enemy(id)
-    if info == nil or not info.body then return false end
-    local gos = {}
-    for _, node in ipairs(self:collect_tree(info.body, 4)) do
-        if self:call(node.go, "get_DrawSelf") ~= false and pcall(node.go.call, node.go, "set_DrawSelf", false) then
-            gos[#gos + 1] = node.go
-        end
-    end
-    self.perf:crumb("enemy.hide", info.kind)
-    self.enemy_hidden[id] = { body_addr = info.body_addr, gos = gos }
-    self:cap("enemy_hide", #gos > 0, ("%d objects hidden"):format(#gos))
-    return true
-end
-
-function Game:draw_again(gos)
-    for _, go in ipairs(gos or {}) do
-        if self:go_alive(go) then pcall(go.call, go, "set_DrawSelf", true) end
-    end
-end
-
--- The enemy left the list while hidden: its body is destroyed, or kept by the game to be
--- reused. A reused body is drawn again when an enemy shows up with it (unpark_body).
-function Game:park_body(id)
-    local hidden = self.enemy_hidden[id]
-    self.enemy_hidden[id] = nil
-    if hidden == nil or hidden.body_addr == nil then return end
-    self.parked_bodies[hidden.body_addr] = hidden.gos
-end
-
-function Game:unpark_body(body_addr)
-    local gos = body_addr and self.parked_bodies[body_addr]
-    if gos == nil then return end
-    self.parked_bodies[body_addr] = nil
-    self:draw_again(gos)
 end
 
 -------------------------------------------------------------------------------
@@ -2408,38 +1960,6 @@ function Game:take_pickup_events()
     return out
 end
 
--------------------------------------------------------------------------------
--- Hits (chainsaw.HitController.callbackDamageHit)
--------------------------------------------------------------------------------
-
--- Every hit on a character goes through HitController.callbackDamageHit(info: DamageInfo) on
--- the victim's HitController (a component of its body GameObject). The hook records hits the
--- local player lands on enemies, so the partner's game knows about them (shot tracers; see
--- enemy_sync.lua).
---
--- Replaying the partner's hits on our copy (experimental, off by default) needs a DamageInfo.
--- v0.6 kept a permanent copy of an old one; its objects (the victim's collider, the attacker,
--- the weapon) could be long gone by the time it was replayed, which is the kind of stale data
--- that crashes the game's hit code. Now the template is the latest real hit of this scene
--- (dropped on reload), and every object a replay carries is checked or replaced first.
-local MAX_HIT_EVENTS = 64
--- A replayed hit is cosmetic (flinch/stagger). HP stays with the existing sync, so the replay
--- deals 1 damage, is skipped on nearly dead enemies, and any HP it took is put back.
-local REPLAY_DAMAGE = 1
-local REPLAY_MIN_HP = 20
-local REPLAY_MIN_HP_FRACTION = 0.1
-local HP_GUARD_TICKS = 6 -- enemy list reads (~0.3 s) during which a delayed replay HP drop is undone
-local TEMPLATE_MAX_AGE = 30.0
-local DAMAGE_INFO = "chainsaw.HitController.DamageInfo"
--- Object fields of a DamageInfo (and its HitInfo/ContactInfo parents) and what a replay does
--- with them: "attacker" = our live body, "target" = the enemy's body, "go" = kept if the
--- GameObject is alive, "comp" = kept if the component is alive, "clear" = null.
-local REPLAY_OBJECT_FIELDS = {
-    { "AttackOwnerObject", "attacker" }, { "WeaponGameObject", "go" }, { "AttackGameObject", "go" },
-    { "DamageGameObject", "target" }, { "ChildHitController", "comp" }, { "AttackCollidable", "clear" },
-    { "DamageCollidable", "clear" },
-}
-
 local function hook_available()
     return type(sdk) == "table" and type(sdk.hook) == "function" and type(sdk.to_managed_object) == "function"
 end
@@ -2453,205 +1973,6 @@ local function keep_ref(obj)
 end
 
 local function drop_ref(_) end
-
-function Game:remember_player_objects(body, head)
-    local objs = {}
-    local a, b = address_of(body), address_of(head)
-    if a then objs[a] = true end
-    if b then objs[b] = true end
-    self.player_objects = objs
-    self.player_body = body
-end
-
--- Enemy id whose body owns this HitController (directly, or as the damage owner / parent).
-function Game:enemy_for_hit_controller(hc)
-    local go = self:call(hc, "get_GameObject")
-    local id = self.enemy_by_body[address_of(go) or false]
-    if id ~= nil then return id end
-    local owner = self:call(hc, "get_DamageOwner")
-    id = self.enemy_by_body[address_of(owner) or false]
-    if id ~= nil then return id end
-    local parent = self:call(hc, "get_ParentHitController")
-    local pgo = parent and self:call(parent, "get_GameObject")
-    return self.enemy_by_body[address_of(pgo) or false]
-end
-
-function Game:install_hit_hook()
-    self.hit_hook_installed = true
-    self.replaying = false
-    if not hook_available() then
-        self:cap("hit_hook", false, "sdk.hook unavailable")
-        return
-    end
-    local td = find_type("chainsaw.HitController")
-    local okM, m = pcall(function() return td and td:get_method("callbackDamageHit") end)
-    if not okM or m == nil then
-        self:cap("hit_hook", false, "HitController.callbackDamageHit not found")
-        return
-    end
-    local game = self
-    local function on_hit(args)
-        local stats = game.hit_stats
-        stats.seen = stats.seen + 1
-        local hc = sdk.to_managed_object(args[2])
-        local info = sdk.to_managed_object(args[3])
-        if hc == nil or info == nil then return end
-        local id = game:enemy_for_hit_controller(hc)
-        if id == nil then
-            stats.not_enemy = stats.not_enemy + 1
-            return
-        end
-        local owner = game:call(info, "get_AttackOwnerObject")
-        if not game.player_objects[address_of(owner) or false] then
-            stats.other_owner = stats.other_owner + 1
-            stats.last_other_owner = owner and tostring(game:call(owner, "get_Name")) or "nil"
-            return
-        end
-        stats.by_player = stats.by_player + 1
-        game.hp_guard[id] = nil -- this HP drop is real
-        if game.settings.replay_partner_hits == true then game:keep_hit_template(info) end
-        if #game.hit_events < MAX_HIT_EVENTS then
-            game.hit_events[#game.hit_events + 1] = {
-                id = id,
-                damage = tonumber(game:call(info, "get_Damage")) or 0,
-                wince = tonumber(game:call(info, "get_Wince")) or 0,
-                break_ = tonumber(game:call(info, "get_Break")) or 0,
-                stopping = tonumber(game:call(info, "get_Stopping")) or 0,
-                dir = v3(game:call(info, "get_DamageDir")),
-                weapon = tonumber(game:call(info, "get_WeaponID")),
-                critical = game:call(info, "get_IsCritical") == true,
-            }
-        end
-    end
-    local ok = pcall(sdk.hook, m, function(args)
-        if game.active and not game.replaying then pcall(on_hit, args) end
-    end, function(retval) return retval end)
-    self:cap("hit_hook", ok, ok and "HitController.callbackDamageHit" or "sdk.hook failed")
-end
-
--- Copies the hit into our own DamageInfo (the game reuses its objects).
-function Game:keep_hit_template(info)
-    local okC, t = pcall(sdk.create_instance, DAMAGE_INFO)
-    if not okC or t == nil or not pcall(t.call, t, "copy", info) then return end
-    drop_ref(self.hit_template)
-    self.hit_template = keep_ref(t)
-    self.hit_template_time = self.clock()
-end
-
--- Hits the local player landed on enemies since the last call:
--- { {id, damage, wince, break_, stopping, dir, weapon, critical}, ... } or nil without the hook.
-function Game:take_hit_events()
-    if self.caps.hit_hook == nil or not self.caps.hit_hook.ok then return nil end
-    local out = self.hit_events
-    if #out == 0 then return out end
-    self.hit_events = {}
-    return out
-end
-
--- Undoes HP that a replayed hit took after the fact (the game may apply damage a frame late).
-function Game:apply_hp_guard(id, hp_obj, cur)
-    local guard = self.hp_guard[id]
-    if guard == nil then return cur end
-    guard.ticks = guard.ticks - 1
-    if guard.ticks <= 0 then self.hp_guard[id] = nil end
-    if cur < guard.hp - 0.5 and self:write_hp(hp_obj, guard.hp) then
-        self.hit_stats.delayed_restored = self.hit_stats.delayed_restored + 1
-        return guard.hp
-    end
-    return cur
-end
-
--- Makes every object field of a replayed DamageInfo safe: our live body as the attacker, the
--- enemy as the damaged object, other objects only while they still exist. False if no live
--- attacker exists.
-function Game:sanitize_damage_info(info, target_body)
-    local body = self.player_body
-    if body == nil or not self:go_alive(body) then return false end
-    for _, f in ipairs(REPLAY_OBJECT_FIELDS) do
-        local name, rule = f[1], f[2]
-        local value
-        if rule == "attacker" then
-            value = body
-        elseif rule == "target" then
-            value = target_body
-        elseif rule == "go" or rule == "comp" then
-            local cur = self:call(info, "get_" .. name)
-            local alive = cur ~= nil and (rule == "go" and self:go_alive(cur) or self:alive(cur))
-            value = alive and cur or nil
-            if cur ~= nil and not alive then self.hit_stats.stale_owner = self.hit_stats.stale_owner + 1 end
-        end
-        pcall(info.call, info, "set_" .. name, value)
-    end
-    return true
-end
-
--- Replays the partner's hit on our copy of enemy `id` so it visibly reacts. Returns ok, kept:
--- `kept` is HP the replay removed and that could not be restored (for the caller's bookkeeping).
-function Game:enemy_replay_hit(id, hit)
-    local stats = self.hit_stats
-    if self.settings.replay_partner_hits ~= true then return false, 0, "switched off" end
-    local tmpl = self.hit_template
-    if tmpl == nil or self.clock() - (self.hit_template_time or -math.huge) > TEMPLATE_MAX_AGE then
-        stats.replay_skipped = stats.replay_skipped + 1
-        return false, 0, "no recent hit of your own to copy"
-    end
-    local info = self:live_enemy(id)
-    local ctx = info and self.enemy_ctx[id]
-    local hp_obj = ctx and self:call(ctx, "get_HitPoint")
-    local hc = info and info.body and self:get_component(info.body, "chainsaw.HitController")
-    if hp_obj == nil or hc == nil then
-        stats.replay_failed = stats.replay_failed + 1
-        return false, 0, "no HitController"
-    end
-    local before = tonumber(self:call(hp_obj, "get_CurrentHitPoint"))
-    local max_hp = tonumber(self:call(hp_obj, "get_DefaultHitPoint")) or 0
-    if before == nil or before <= REPLAY_MIN_HP or before < max_hp * REPLAY_MIN_HP_FRACTION
-        or self:call(hp_obj, "get_IsLive") == false then
-        stats.replay_skipped = stats.replay_skipped + 1
-        return false, 0, "enemy nearly dead"
-    end
-    local okC, dinfo = pcall(sdk.create_instance, DAMAGE_INFO)
-    if not okC or dinfo == nil then
-        stats.replay_failed = stats.replay_failed + 1
-        return false, 0, "cannot create DamageInfo"
-    end
-    local dir = hit.dir or { x = 0, y = 0, z = 0 }
-    local okSet = pcall(function()
-        dinfo:call("copy", tmpl)
-        dinfo:call("set_Damage", REPLAY_DAMAGE)
-        dinfo:call("set_Wince", hit.wince or 0)
-        dinfo:call("set_Break", hit.break_ or 0)
-        dinfo:call("set_Stopping", hit.stopping or 0)
-        dinfo:call("set_DamageDir", Vector3f.new(dir.x, dir.y, dir.z))
-        dinfo:call("set_IsCritical", hit.critical == true)
-        dinfo:call("set_IsKill", false)
-    end)
-    if not okSet or not self:sanitize_damage_info(dinfo, info.body) then
-        stats.replay_failed = stats.replay_failed + 1
-        return false, 0, "cannot fill DamageInfo"
-    end
-    self.perf:crumb("enemy.replay_hit", info.kind, true)
-    self.replaying = true
-    local ok = pcall(hc.call, hc, "callbackDamageHit", dinfo)
-    self.replaying = false
-    if not ok then
-        stats.replay_failed = stats.replay_failed + 1
-        return false, 0, "callbackDamageHit failed"
-    end
-    stats.replays = stats.replays + 1
-    local kept = 0
-    local after = tonumber(self:call(hp_obj, "get_CurrentHitPoint")) or before
-    if after < before - 0.5 then
-        if self:write_hp(hp_obj, before) then
-            stats.hp_restored = stats.hp_restored + 1
-        else
-            kept = before - after
-        end
-    end
-    self.hp_guard[id] = { hp = before - kept, ticks = HP_GUARD_TICKS }
-    self:cap("hit_replay", true, ("%d replayed, %d HP restored"):format(stats.replays, stats.hp_restored))
-    return true, kept
-end
 
 -------------------------------------------------------------------------------
 -- Random drops: each player rolls their own loot
@@ -3249,7 +2570,11 @@ function Game:research_snapshot(extra)
         sample.alive = e.alive
         sample.find_state = ctx and plain_value(self:call(ctx, "get_TargetFindState")) or nil
         sample.find_source = ctx and plain_value(self:call(ctx, "get_TargetFindSource")) or nil
-        if i == 1 and ctx ~= nil then sample.motion = self:motion_sample(ctx) end
+        if i == 1 and ctx ~= nil then
+            sample.motion = self:motion_sample(ctx)
+            local info = self.enemy_info[e.id]
+            sample.layers = info and self:read_layers(info) or nil
+        end
         if i <= 3 and ctx ~= nil then
             -- The AI ("head") and what can switch it off, for puppeting enemies later.
             local head = self:call(ctx, "get_HeadGameObject")
@@ -3303,7 +2628,11 @@ function Game:research_snapshot(extra)
     }
     snap.hp_writer = self.hp_writer and self.hp_writer.label or nil
     snap.hits = self.hit_stats
-    snap.hit_template = self.hit_template ~= nil
+    snap.anim = self.anim_stats
+    -- The DamageInfo values a hit carries to the partner (found by reflection).
+    local schema = self:damage_schema()
+    snap.hit_values = {}
+    for i, f in ipairs(schema and schema.list or {}) do snap.hit_values[i] = f.name .. ":" .. f.tag end
     snap.drops = self.drop_stats
     snap.drop_calls = self.drop_research
     snap.drop_types = self.drop_types
@@ -3478,5 +2807,11 @@ function Game:dump_types(extra)
     local okL = pcall(json.dump_file, RESEARCH_LOG_FILE, { mod_version = P.MOD_VERSION, runs = runs })
     return ok and okL, dump.runs
 end
+
+require("re4coop.game_enemies").install(Game, {
+    singleton = singleton, find_type = find_type, address_of = address_of, type_name_of = type_name_of,
+    v3 = v3, q4 = q4, dist = dist, field_type_name = field_type_name, field_is_static = field_is_static,
+    type_hierarchy = type_hierarchy, context_id_table = context_id_table, CHARACTER_MANAGER = CHARACTER_MANAGER,
+})
 
 return Game

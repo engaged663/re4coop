@@ -132,13 +132,8 @@ local function draw_status(session, status)
         end
         if status.enemies then
             local e = status.enemies
-            if e.role == "client" then
-                imgui.text(("Enemies: %d here, %d paired with the host's (%d at the host), %d following the host's, %d dead in the shared world"):format(
-                    e.local_count, e.paired, e.remote_count, e.puppets or 0, e.dead_known or 0))
-            else
-                imgui.text(("Enemies: %d here (your game runs them all), %d with a copy at the client, %d dead in the shared world"):format(
-                    e.local_count, e.paired, e.dead_known or 0))
-            end
+            imgui.text(("Enemies: %d here, %d shared with your partner (your game runs %d, theirs %d), %d dead in the shared world"):format(
+                e.local_count, e.paired, e.run_here or 0, e.run_by_partner or 0, e.dead_known or 0))
         end
         if status.animals and status.animals.role == "client" and status.animals.puppets > 0 then
             imgui.text_colored(("Animals: %d following the host's"):format(status.animals.puppets), COLOR_DIM)
@@ -192,13 +187,21 @@ local function draw_options(settings)
         checkbox(settings, "show_hud", "Show status HUD (top-left)")
 
         imgui.separator()
-        imgui.text_colored("Enemies and animals (the host's game runs them; the client's follow)", COLOR_DIM)
+        imgui.text_colored("Enemies and animals (each enemy is run by one game; the other shows it)", COLOR_DIM)
         checkbox(settings, "sync_enemies", "Sync enemies (every creature: villagers, dogs, bosses...)")
-        checkbox(settings, "enemy_mirror", "Client: enemies stand and move where the host's are")
-        checkbox(settings, "enemy_host_only", "Client: enemies the host's game does not run stay still and hidden")
-        checkbox(settings, "enemy_motion_sync", "Client: enemies and animals play the host's animation")
+        if imgui.button("Who runs enemies: " .. tostring(settings.enemy_authority)) then
+            settings.enemy_authority = settings.enemy_authority == "shared" and "host" or "shared"
+        end
+        imgui.same_line()
+        imgui.text_colored("shared = the closer player's game (enemies attack both), host = the host's game (host decides)", COLOR_DIM)
+        checkbox(settings, "enemy_mirror", "Enemies your partner's game runs stand and move where theirs are")
+        checkbox(settings, "enemy_motion_sync", "...and play their animation (also animals)")
+        checkbox(settings, "enemy_anim_lock", "...with their own animation state machine switched off")
+        slider_int(settings, "enemy_anim_layers", "...animation layers sent per enemy", 1, 3)
+        checkbox(settings, "enemy_hit_predict", "Your hits on them take HP at once (the owner still decides deaths)")
+        checkbox(settings, "enemy_kill_with_hit", "Enemies your partner kills die here from the same killing hit")
         checkbox(settings, "enemy_erase", "Enemies your partner already killed never appear in your game (no corpse)")
-        slider_float(settings, "enemy_interp_delay", "Client: enemy smoothing (seconds behind; higher = smoother, later)", 0.03, 0.4)
+        slider_float(settings, "enemy_interp_delay", "Enemy smoothing (seconds behind; higher = smoother, later)", 0.03, 0.4)
         checkbox(settings, "sync_drops", "Every enemy that dies gives each player their own loot (also your partner's kills)")
         checkbox(settings, "sync_animals", "Animals near the client (crows, chickens, fish...) move as in the host's game")
 
@@ -239,7 +242,7 @@ local function draw_options(settings)
         imgui.text_colored("Network", COLOR_DIM)
         slider_int(settings, "player_hz", "Player updates per second", 5, 60)
         slider_int(settings, "pose_hz", "Character pose updates per second", 10, 60)
-        slider_int(settings, "snapshot_hz", "Host: enemy snapshots per second", 2, 30)
+        slider_int(settings, "snapshot_hz", "Enemy states per second (the enemies your game runs)", 2, 30)
         slider_float(settings, "interp_delay", "Interpolation delay (s)", 0.0, 0.5)
 
         imgui.separator()
@@ -249,7 +252,6 @@ local function draw_options(settings)
 
         imgui.separator()
         imgui.text_colored("Experimental (may crash the game - off by default)", COLOR_WARN)
-        checkbox(settings, "replay_partner_hits", "Replay your partner's hits on your copy of the enemy (flinch)")
         checkbox(settings, "sync_cutscenes", "A cutscene one player triggers starts in the partner's game")
         checkbox(settings, "cutscene_travel", "...bringing the partner over first")
         checkbox(settings, "stage_travel", "Teleports to another area preload it and use the game's warp")
@@ -330,17 +332,18 @@ local function draw_diagnostics(session, game, session_status, puppet, perf)
         if session_status and session_status.enemies then
             local en = session_status.enemies
             local c = en.counters
-            imgui.text(("enemy sync: %d of %d enemies here have a level ID | pairs by ID %d, by position %d"):format(
-                en.with_uid or 0, en.local_count or 0, c.uid_pairs, c.spatial_pairs))
-            imgui.text(("enemy health: damage sent %d, applied %d, failed %d | HP mirrored %d, failed %d"):format(
-                c.damage_sent, c.damage_applied, c.damage_failed, c.hp_applied, c.hp_failed))
-            imgui.text(("enemy deaths: %d dead in the shared world%s | killed here %d, erased %d, late %d | lists sent %d, received %d"):format(
-                en.dead_known or 0, en.listing_dead and " (reading the save...)" or "", c.kills_applied, c.erased,
-                c.late_kills, c.graves_sent, c.graves_received))
-            imgui.text(("hits: sent %d, received %d, replayed %d, unmatched %d"):format(
-                c.hits_sent, c.hits_received, c.hits_replayed, c.hits_unmatched))
-            imgui.text(("enemy puppets: %d now | moves %d, animations %d, AI switched %d"):format(
-                en.puppets or 0, c.mirrored, c.motions, c.ai_switched))
+            imgui.text(("enemy sync (%s authority): %d of %d enemies here have a level ID | pairs by ID %d, by position %d"):format(
+                en.authority or "?", en.with_uid or 0, en.local_count or 0, c.uid_pairs, c.spatial_pairs))
+            imgui.text(("enemy owners: %d run here, %d by the partner | changes %d, taken over %d, handed over %d, retired %d"):format(
+                en.run_here or 0, en.run_by_partner or 0, c.owner_changes, c.taken_over, c.handed_over, c.retired))
+            imgui.text(("enemy states: sent %d, received %d | puppets %d, held %d | moves %d, animations %d, switches %d"):format(
+                c.states_sent, c.states_received, en.puppets or 0, en.held or 0, c.moves, c.anims, c.puppet_switches))
+            imgui.text(("enemy hits: forwarded %d, shown %d, received %d, run %d, as HP %d, bounced %d, unmatched %d, other damage %d | HP set %d, failed %d"):format(
+                c.hits_forwarded, c.hits_sent, c.hits_received, c.hits_applied, c.hits_fallback, c.hits_bounced,
+                c.hits_unmatched, c.damage_reported, c.hp_applied, c.hp_failed))
+            imgui.text(("enemy deaths: %d dead in the shared world%s | sent %d, received %d, killed here %d, erased %d, late %d | lists sent %d, received %d"):format(
+                en.dead_known or 0, en.listing_dead and " (reading the save...)" or "", c.deaths_sent, c.deaths_received,
+                c.kills_applied, c.erased, c.late_kills, c.graves_sent, c.graves_received))
         end
         if session_status and session_status.animals then
             local an = session_status.animals

@@ -12,7 +12,7 @@ local host_e1 = mock.make_character("chainsaw.Ch1c0z0Context", { x = 5, y = 0, z
 local host_e2 = mock.make_character("chainsaw.Ch1d0z0Context", { x = 0, y = 0, z = 8 }, 300)
 world.enemies = { host_e1, host_e2 }
 mock.files["re4coop.json"] = { player_name = "HostLeon", port = PORT, left_behind_distance = 30, left_behind_seconds = 1,
-    config_version = 7, replay_partner_hits = true } -- experimental hit replay covered here
+    config_version = 9 }
 
 local function run_entry_script()
     for name in pairs(package.loaded) do
@@ -103,14 +103,25 @@ end
 function client_game:list_enemies()
     local out = {}
     for i, e in ipairs(self.enemies) do
-        out[i] = { id = e.id, kind = e.kind, pos = { x = e.pos.x, y = e.pos.y, z = e.pos.z }, yaw = 0,
-            hp = e.hp, max_hp = e.max_hp, alive = e.alive }
+        out[i] = { id = e.id, kind = e.kind, pos = { x = e.pos.x, y = e.pos.y, z = e.pos.z },
+            rot = { x = 0, y = 0, z = 0, w = 1 }, hp = e.hp, max_hp = e.max_hp, alive = e.alive }
     end
     return out
 end
-function client_game:enemy_set_hp(id, hp) self.enemies[id].hp = hp return true end
-function client_game:enemy_kill(id) self.enemies[id].hp = 0 self.enemies[id].alive = false self.kills = self.kills + 1 return true end
-function client_game:enemy_set_position() return true end
+function client_game:enemy_set_hp(id, hp) self.enemies[id].hp = math.max(1, hp) return true end
+function client_game:enemy_kill(id, fields)
+    self.enemies[id].hp = 0
+    self.enemies[id].alive = false
+    self.enemies[id].killing_hit = fields
+    self.kills = self.kills + 1
+    return true
+end
+client_game.puppet = {}
+function client_game:enemy_set_puppet(id, on) self.puppet[id] = on or nil return true end
+function client_game:enemy_set_transform(id, pos)
+    self.enemies[id].pos = { x = pos.x, y = pos.y, z = pos.z }
+    return true
+end
 function client_game:area_name() return "1" end
 function client_game:teleport_player() return true end
 client_game.pickups, client_game.removed = {}, {}
@@ -133,10 +144,6 @@ end
 function client_game:is_key_down() return false end
 -- Hits and drops (game.lua hooks on a real client).
 client_game.replays, client_game.hit_queue, client_game.drop_queue, client_game.spawned = {}, {}, {}, {}
-function client_game:enemy_replay_hit(id, hit)
-    self.replays[#self.replays + 1] = { id = id, wince = hit.wince }
-    return true, 0
-end
 function client_game:take_hit_events()
     local q = self.hit_queue
     self.hit_queue = {}
@@ -156,7 +163,6 @@ end
 local client_settings = Config.load(nil)
 client_settings.player_name = "ClientLeon"
 client_settings.port = PORT
-client_settings.replay_partner_hits = true
 local client_net_obj = re4coop_net.new_session()
 local client = Session.new({ net = wrap(client_net_obj), game = client_game, clock = re4coop_net.time,
     settings = client_settings })
@@ -297,14 +303,37 @@ T.run("sounds_and_shots_cross_over", function()
     T.check(ok, "host's sound and shot delivered to the client")
 end)
 
-T.run("enemy_sync_end_to_end", function()
-    -- Let the client pair its enemies with the host's snapshot.
-    T.wait_until(function() return client.enemy_sync:summary().paired == 2 end, step, 5)
-    T.eq(client.enemy_sync:summary().paired, 2, "client paired both enemies")
+-- What game.lua's hit hook reports for a hit our player landed (and what it let happen here).
+local function client_hit(id, damage, wince)
+    local e = client_game.enemies[id]
+    local hp = e.hp
+    local local_damage = damage
+    if client_game.puppet[id] and damage >= hp then local_damage = hp - 1 end
+    e.hp = e.hp - local_damage
+    client_game.hit_queue[#client_game.hit_queue + 1] = { id = id, damage = damage, hp = hp, local_damage = local_damage,
+        lethal = damage >= hp, fields = { { h = P.hash("Damage"), t = P.HIT_VALUE.I32, v = damage },
+            { h = P.hash("Wince"), t = P.HIT_VALUE.F32, v = wince } } }
+end
 
-    client_game.enemies[1].hp = 60 -- client shoots enemy 1 for 40
+T.run("enemy_sync_end_to_end", function()
+    -- Both enemies are nearer the host: its game runs them, the client's copies follow.
+    T.wait_until(function() return client.enemy_net:summary().paired == 2 end, step, 5)
+    T.eq(client.enemy_net:summary().paired, 2, "client paired both enemies")
+    T.wait_until(function() return client_game.puppet[1] and client_game.puppet[2] end, step, 5)
+    T.eq(client_game.puppet[1], true, "the client's copies are puppets of the host's")
+
+    -- The client shoots enemy 1: the hit runs through the host's own hit code, with its values.
+    client_hit(1, 40, 7)
     local ok = T.wait_until(function() return host_e1.hp == 60 end, step, 5)
-    T.check(ok, "host enemy took the client's damage via chainsaw.HitPoint setter (hp=" .. host_e1.hp .. ")")
+    T.check(ok, "the host's enemy took the client's hit (hp=" .. host_e1.hp .. ")")
+    local r = mock.component(host_e1.body, "chainsaw.HitController").received
+    T.eq(r[#r].wince, 7, "and reacted with the client's wince")
+    T.eq(r[#r].attacker, world.player.body, "a live attacker in the host's game")
+
+    -- The host's AI walks enemy 1: the client's copy follows.
+    host_e1.pos.x, host_e1.pos.z = 7, 1.5
+    ok = T.wait_until(function() return math.abs(client_game.enemies[1].pos.x - 7) < 0.05 end, step, 5)
+    T.check(ok, "the client's copy follows the host's (x=" .. client_game.enemies[1].pos.x .. ")")
 
     host_e2.hp = 0 -- host kills enemy 2
     ok = T.wait_until(function() return client_game.enemies[2].alive == false end, step, 5)
@@ -312,46 +341,34 @@ T.run("enemy_sync_end_to_end", function()
     T.eq(client_game.kills, 1, "exactly one kill applied")
     for _ = 1, 50 do step() end
     T.eq(host_e1.hp, 60, "no damage echo after settling")
+    T.eq(client_game.enemies[1].hp, 60, "both agree")
 end)
 
 T.run("hits_and_drops_end_to_end", function()
-    -- Host shoots enemy 1: the hooked HitController.callbackDamageHit reports it, the client replays it.
+    -- The host shoots enemy 1: the client draws the shot.
     mock.hit(host_e1, 10, 15)
-    local ok = T.wait_until(function() return #client_game.replays > 0 end, step, 5)
-    T.check(ok, "client replayed the host's hit")
-    T.eq(client_game.replays[1] and client_game.replays[1].id, 1, "on its copy of enemy 1")
-    T.eq(client_game.replays[1] and client_game.replays[1].wince, 15, "with the host's wince")
-    local hp_after_host_hit = host_e1.hp
+    local ok = T.wait_until(function() return #client.enemy_net:recent_partner_hits(re4coop_net.time(), 5) > 0 end, step, 5)
+    T.check(ok, "the client saw the host's hit")
+    ok = T.wait_until(function() return client_game.enemies[1].hp == 50 end, step, 5)
+    T.check(ok, "and its HP")
 
-    -- Client shoots enemy 1: the host replays it through the real game adapter.
-    client_game.hit_queue = { { id = 1, damage = 30, wince = 7, break_ = 0, stopping = 0,
-        dir = { x = 0, y = 0, z = 1 }, weapon = 4000, critical = false } }
-    ok = T.wait_until(function()
-        local r = mock.component(host_e1.body, "chainsaw.HitController").received
-        return r ~= nil and r[#r].wince == 7
-    end, step, 5)
-    T.check(ok, "host's enemy reacted to the client's hit")
-    local r = mock.component(host_e1.body, "chainsaw.HitController").received
-    T.eq(r[#r].damage, 1, "cosmetic replay")
-    T.eq(host_e1.hp, hp_after_host_hit, "replay did not change the host's HP")
-
-    -- Loot: each player rolls their own, also for the partner's kills. The host's game rolls
-    -- loot for enemy 2 (killed earlier): that proves the host's drop hooks.
-    mock.enemy_drop(host_e2, 112806400)
-    -- The client kills enemy 1: the host's copy dies through enemy sync, and since the mocked
-    -- death runs no loot code, the host rolls that enemy's loot for its own player.
-    local before = #(world.generated or {})
-    client_game.enemies[1].hp = 0
-    client_game.enemies[1].alive = false
+    -- A lethal hit from the client never kills the puppet in the client's game: the host
+    -- decides, and the client's copy dies from the host's death notice with the killing hit.
+    client_game.drop_queue = { { enemy_id = 2, via = "hook" } } -- the client's own loot hooks work
+    client_hit(1, 999, 3)
+    T.eq(client_game.enemies[1].hp, 1, "the client's game left it alive")
     ok = T.wait_until(function() return host_e1.hp == 0 end, step, 5)
-    T.check(ok, "host's copy died from the client's kill")
-    ok = T.wait_until(function() return #(world.generated or {}) > before end, step, 6)
-    T.check(ok, "the host rolled loot for the client's kill")
-    local g = world.generated[#world.generated]
-    T.eq(g and g.order, host_e1, "from that enemy")
-    T.eq(g and g.cc, world.player, "for the host's own player")
+    T.check(ok, "the host's game killed it")
+    ok = T.wait_until(function() return client_game.enemies[1].alive == false end, step, 5)
+    T.check(ok, "and the client's copy died")
+    local kh = client_game.enemies[1].killing_hit
+    T.check(kh ~= nil and kh[1] ~= nil, "from the killing hit")
+    -- Loot: the client's game did not roll for a death it did not run: it rolls its own.
+    ok = T.wait_until(function() return #client_game.spawned > 0 end, step, 6)
+    T.check(ok, "the client rolled its own loot for that enemy")
+    T.eq(client_game.spawned[1] and client_game.spawned[1].enemy, 1, "from that enemy")
     for _ = 1, 50 do step() end
-    T.eq(#world.generated, before + 1, "exactly once")
+    T.eq(#client_game.spawned, 1, "exactly once")
 end)
 
 T.run("key_items_exist_once", function()

@@ -404,37 +404,35 @@ T.run("aggressive_mode_refuses_pause_requests", function()
     T.check(world.active_pauses[1] ~= nil, "normal again when off")
 end)
 
-T.run("enemy_mirroring_facing_animation_and_ai", function()
+T.run("enemy_puppet_transform_animation_and_ai", function()
     local _, game, world = fresh()
     local e = mock.make_character("chainsaw.Ch1c0z0Context", { x = 5, y = 0, z = 0 }, 100)
     e.body.transform.wrot = { x = 0, y = math.sin(0.5), z = 0, w = math.cos(0.5) } -- facing 1 rad
     world.enemies = { e }
     local list = game:list_enemies()
-    T.near(list[1].yaw, 1.0, 1e-6, "facing read from the body transform")
-    T.check(list[1].motion == nil, "animation not read unless mirroring needs it")
-    game.read_motion = true
-    list = game:list_enemies()
-    T.eq(list[1].motion and list[1].motion.id, 1201, "animation read from motion layer 0")
-    T.eq(list[1].motion.bank, 100, "bank")
+    T.near(list[1].rot.y, math.sin(0.5), 1e-6, "rotation read from the body transform")
+    T.check(list[1].layers == nil, "animation not read unless the partner shows the enemy")
+    list = game:list_enemies(nil, function() return true end)
+    T.eq(list[1].layers and list[1].layers[1].id, 1201, "animation read from motion layer 0")
     local id = list[1].id
-    T.check(game:enemy_set_transform(id, { x = 9, y = 1, z = 2 }, -0.5), "mirrored")
+    local rot = { x = 0, y = math.sin(-0.25), z = 0, w = math.cos(-0.25) }
+    T.check(game:enemy_set_transform(id, { x = 9, y = 1, z = 2 }, rot), "placed")
     T.near(e.pos.x, 9, 1e-6, "moved")
-    T.near(game:list_enemies()[1].yaw, -0.5, 1e-6, "turned")
-    T.eq(e.warped, 1, "CharacterController warped so physics does not pull it back")
-    T.check(game:enemy_set_motion(id, { bank = 4, id = 1300, frame = 2 }), "animation set")
+    T.near(game:list_enemies()[1].rot.y, math.sin(-0.25), 1e-6, "turned")
+    T.check(game:enemy_set_anim(id, { { bank = 4, id = 1300, frame = 2, speed = 1 } }), "animation set")
     local layer = mock.component(e.body, "via.motion.Motion").layers[1]
     T.eq(layer.motion, 1300, "changeMotion called with the owner's motion")
-    T.check(game:enemy_set_ai(id, false), "AI off")
+    T.check(game:enemy_set_puppet(id, true), "a puppet")
     T.eq(e.head.update_self, false, "the AI head stops updating")
-    T.eq(game:capabilities().enemy_ai_switch.ok, true, "reported")
+    T.eq(game:capabilities().enemy_puppet.ok, true, "reported")
     T.check(game:enemy_kill(id), "killed")
     T.eq(e.head.update_self, true, "AI back on before the death")
     T.eq(e.hp, 0, "dead")
     local e2 = mock.make_character("chainsaw.Ch1c0z0Context", { x = 8, y = 0, z = 0 }, 100)
     world.enemies = { e, e2 }
     local id2 = game:list_enemies()[2].id
-    game:enemy_set_ai(id2, false)
-    game:restore_enemy_ai()
+    game:enemy_set_puppet(id2, true)
+    game:restore_enemies()
     T.eq(e2.head.update_self, true, "restored when the session ends")
 end)
 

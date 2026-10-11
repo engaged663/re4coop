@@ -8,7 +8,7 @@
 -- interpolation buffer, playing the host's animation. The host is the only authority: an
 -- animal near the client that the host does not report (not loaded in its game) is held -
 -- taken off the update where it is - and a puppet without news from the host stays where it
--- is. (With enemy_host_only off, those run on their own as in 0.8.)
+-- is. (With animal_host_only off, those run on their own as in 0.8.)
 --
 -- Deaths: a host animal that dies (its routine reaches Die/Dead) dies in the client's game
 -- with its own death, where the host's copy was. An animal the client's player shoots dies
@@ -80,7 +80,7 @@ end
 
 -- The host is the only authority: no animal near the client runs on its own.
 function AnimalSync:host_only()
-    return self.settings.enemy_host_only ~= false
+    return self.settings.animal_host_only ~= false
 end
 
 -------------------------------------------------------------------------------

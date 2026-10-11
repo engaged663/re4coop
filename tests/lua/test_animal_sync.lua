@@ -185,7 +185,7 @@ T.run("the_host_runs_every_animal_near_the_client", function()
 end)
 
 T.run("without_host_only_only_animals_near_both_players_follow_the_host", function()
-    local pair = make_pair({ enemy_host_only = false })
+    local pair = make_pair({ animal_host_only = false })
     local _, near = pair:both(1, 5, 0, 5)
     local _, far = pair:both(2, 120, 0, 0)
     local only_client = pair.client_world:add(3, 6, 0, 6)

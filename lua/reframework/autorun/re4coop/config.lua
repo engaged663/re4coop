@@ -6,7 +6,7 @@ Config.FILE = "re4coop.json"
 
 -- Bumped when defaults change for safety: settings saved by an older version take the new
 -- default for the keys listed in Config.RESET_ON_UPGRADE.
-Config.VERSION = 8
+Config.VERSION = 9
 
 Config.DEFAULTS = {
     config_version = Config.VERSION,
@@ -19,20 +19,27 @@ Config.DEFAULTS = {
     player_hz = 20,
     pose_hz = 30,         -- partner model pose updates per second
     enemy_tick_hz = 20,
-    snapshot_hz = 20,
-    client_enemy_hz = 20, -- client: reports of the host's enemies it has a copy of, per second
+    snapshot_hz = 20,     -- states per second of the enemies your game runs
+    roster_hz = 5,        -- client: reports of the host's enemies it has a copy of, per second
     interp_delay = 0.066, -- seconds the partner is shown in the past (smooths network jitter)
 
-    -- enemy sync: the host's game runs every enemy (AI, HP, deaths); pairing is by the level's
-    -- own enemy IDs
+    -- enemy sync (enemy_net.lua): every enemy is run by one game, its owner; the other shows it.
+    -- Pairing is by the level's own enemy IDs.
     sync_enemies = true,
-    enemy_mirror = true,      -- the client's enemies stand and move where the host's are (their own AI off)
-    enemy_host_only = true,   -- client: enemies the host's game does not run stay still and unseen (no client AI at all)
-    enemy_motion_sync = true, -- those enemies (and animals) also play the host's animation
-    enemy_erase = true,       -- enemies dead in the partner's world that only now spawn here never appear (no corpse)
-    enemy_interp_delay = 0.1, -- seconds the host's enemies are shown in the past on the client (smoothness vs. delay)
+    enemy_authority = "shared", -- "shared": each enemy is run by the game of the player it is closer to
+                                -- (enemies fight both players); "host": the host's game runs every enemy.
+                                -- The host's setting decides.
+    enemy_mirror = true,        -- enemies the partner's game runs stand and move where the partner's are
+    enemy_motion_sync = true,   -- those enemies (and animals) also play the partner's animation
+    enemy_anim_lock = true,     -- their own animation state machine is switched off (only the partner's animation plays)
+    enemy_anim_layers = 2,      -- animation layers sent per enemy (1-3)
+    enemy_hit_predict = true,   -- your hits on them take HP at once (never the last HP: the owner decides deaths)
+    enemy_kill_with_hit = true, -- an enemy the partner's game killed dies here from the same killing hit
+    enemy_erase = true,         -- enemies dead in the partner's world that only now spawn here never appear (no corpse)
+    enemy_interp_delay = 0.1,   -- seconds the partner's enemies are shown in the past (smoothness vs. delay)
     sync_drops = true,        -- every enemy that dies gives each player their own loot roll, also the partner's kills
     sync_animals = true,      -- crows, chickens, fish, bats and rats near the client move as in the host's game
+    animal_host_only = true,  -- client: animals the host's game does not report stay where they are
 
     -- shared world
     sync_flags = true,        -- story/scenario flags: objectives, map, doors, items taken, events seen
@@ -77,7 +84,6 @@ Config.DEFAULTS = {
     perf_file = true,  -- write the measurements to reframework/data/re4coop_perf.json every 10 s
 
     -- experimental: features that change the game in ways not proven safe yet (off by default)
-    replay_partner_hits = false, -- replay the partner's hits on enemies your game runs (flinch)
     sync_cutscenes = false,      -- a cutscene one player triggers is started in the partner's game
     travel_reload = false,       -- load the partner's chapter by triggering game over -> Continue
     stage_travel = false,        -- teleports to another stage preload it and use the game's warp
@@ -88,11 +94,14 @@ Config.DEFAULTS = {
 -- Keys that take their (new) default once when a config saved before that config version is
 -- loaded: version 7 (0.7) made 0.6's risky defaults experimental (crashes, stutter); version 8
 -- (0.8) rebuilt enemy sync around the host, so switches turned off to work around 0.7's
--- problems come back on. (0.7's enemy_ownership and hit_ownership no longer exist: the host
--- runs every enemy.)
+-- problems come back on; version 9 (0.9) rebuilt enemy sync from scratch (enemy_net.lua), so the
+-- enemy switches start from their defaults once more. (Gone: 0.7's enemy_ownership and
+-- hit_ownership, 0.8's enemy_host_only - now enemy_authority - and the cosmetic hit replay
+-- replay_partner_hits - partner hits now run for real in the enemy owner's game.)
 Config.RESET_ON_UPGRADE = {
     [7] = { "interp_delay", "snapshot_hz", "replay_partner_hits", "sync_cutscenes", "travel_reload", "stage_travel" },
     [8] = { "sync_enemies", "enemy_mirror", "enemy_motion_sync" },
+    [9] = { "sync_enemies", "enemy_mirror", "enemy_motion_sync", "snapshot_hz", "enemy_interp_delay" },
 }
 
 local function copy(t)
@@ -135,7 +144,11 @@ function Config.sanitize(cfg)
     cfg.player_hz = math.max(5, math.min(60, cfg.player_hz))
     cfg.pose_hz = math.max(10, math.min(60, cfg.pose_hz))
     cfg.enemy_tick_hz = math.max(5, math.min(60, cfg.enemy_tick_hz))
-    cfg.client_enemy_hz = math.max(5, math.min(60, cfg.client_enemy_hz))
+    cfg.roster_hz = math.max(2, math.min(20, cfg.roster_hz))
+    if cfg.enemy_authority ~= "shared" and cfg.enemy_authority ~= "host" then
+        cfg.enemy_authority = Config.DEFAULTS.enemy_authority
+    end
+    cfg.enemy_anim_layers = math.max(1, math.min(3, math.floor(cfg.enemy_anim_layers)))
     if cfg.no_pause_mode ~= "menus" and cfg.no_pause_mode ~= "all" and cfg.no_pause_mode ~= "off" then
         cfg.no_pause_mode = Config.DEFAULTS.no_pause_mode
     end

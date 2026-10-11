@@ -290,52 +290,174 @@ T.run("fragment_and_reassemble", function()
     T.eq(again, big, "next complete message still reassembles")
 end)
 
-T.run("enemy_snapshot_chunking", function()
+T.run("enemy_states_roundtrip_and_packing", function()
     local entries = {}
     for i = 1, 75 do
-        entries[i] = { net_id = i, kind_hash = P.hash("k" .. (i % 3)), pos = { x = i, y = 0, z = -i },
-            spawn = { x = i + 0.5, y = 0, z = -i }, yaw = 0.5, hp = i * 10, max_hp = 1000, flags = P.ENEMY_FLAGS.ALIVE,
-            motion = { bank = 100 + i, id = 2000 + i, frame = i / 4 } }
+        entries[i] = { net_id = i, epoch = i % 7, kind_hash = P.hash("k" .. (i % 3)), pos = { x = i, y = 0.5, z = -i },
+            rot = { x = 0, y = math.sin(i / 20), z = 0, w = math.cos(i / 20) }, vel = { x = 1.25, y = 0, z = -i / 10 },
+            hp = i * 10, max_hp = 1000, ack = 60000 + i, uid = 0x10000 + i,
+            layers = { { bank = 100 + i, id = 2000 + i, frame = i / 4, speed = 1.5 }, { bank = 7, id = 8, frame = 9, speed = 1 } } }
     end
     entries[10].uid = 0xFEDCBA98
-    entries[13].uid = 0 -- "no identity" is not sent as an identity
-    entries[11].motion = nil
-    entries[12].flags = 0 -- (dead)
-    local msgs = P.encode_enemy_snapshots(9.5, entries)
-    local per = P.ENEMIES_PER_SNAPSHOT
-    T.eq(per, 19, "19 enemies per snapshot")
-    T.eq(#msgs, 4, "75 enemies -> 4 chunks")
+    entries[13].uid = nil -- a runtime enemy: its spawn point travels instead
+    entries[13].spawn = { x = 99, y = 1, z = 98 }
+    entries[11].layers = nil
+    entries[12].hidden = true
+    local msgs = P.encode_enemy_states(9.5, entries)
+    T.check(#msgs >= 4 and #msgs <= 6, ("75 enemies with two layers in %d messages"):format(#msgs))
     local seen = 0
     for c, data in ipairs(msgs) do
-        T.check(#data <= MAX, ("chunk %d fits in one datagram (%d bytes)"):format(c, #data))
+        T.check(#data <= MAX, ("message %d fits in one datagram (%d bytes)"):format(c, #data))
         local m = assert(P.decode(data))
+        T.eq(m.type, P.T.ENEMY_STATE, "type")
         T.eq(m.chunk, c, "chunk index")
-        T.eq(m.chunks, 4, "chunk count")
+        T.eq(m.chunks, #msgs, "chunk count")
+        T.near(m.time, 9.5, 1e-9, "time")
         for _, e in ipairs(m.enemies) do
             seen = seen + 1
+            local src = entries[seen]
             T.eq(e.net_id, seen, "order preserved")
-            T.near(e.spawn.x, seen + 0.5, 1e-5, "spawn")
+            T.eq(e.epoch, seen % 7, "ownership epoch")
             T.eq(e.hp, seen * 10, "hp")
-            T.eq((e.flags & P.ENEMY_FLAGS.ALIVE) ~= 0, seen ~= 12, "alive flag kept")
-            if seen == 10 then
-                T.eq(e.uid, 0xFEDCBA98, "uid round-trips (all 32 bits)")
-            else
+            T.eq(e.max_hp, 1000, "max hp")
+            T.eq(e.ack, (60000 + seen) & 0xFFFF, "hit ack")
+            T.eq(e.alive, true, "alive")
+            T.eq(e.hidden, seen == 12, "visibility")
+            T.near(e.pos.y, 0.5, 1e-6, "position")
+            local dot = e.rot.x * src.rot.x + e.rot.y * src.rot.y + e.rot.z * src.rot.z + e.rot.w * src.rot.w
+            T.check(math.abs(dot) > 0.99999, "rotation (q and -q are the same)")
+            T.near(e.vel.x, 1.25, 0.01, "velocity")
+            T.near(e.vel.z, -seen / 10, 0.01, "velocity z")
+            if seen == 13 then
                 T.eq(e.uid, nil, "no uid when none was sent")
+                T.near(e.spawn.x, 99, 1e-6, "spawn point for a runtime enemy")
+            else
+                T.eq(e.uid, src.uid, "uid round-trips (all 32 bits)")
+                T.eq(e.spawn, nil, "no spawn point needed with a uid")
             end
             if seen == 11 then
-                T.eq(e.motion, nil, "no animation when none was sent")
+                T.eq(#e.layers, 0, "no animation when none was sent")
             else
-                T.check(e.motion and e.motion.bank == 100 + seen and e.motion.id == 2000 + seen, "animation round-trips")
-                T.near(e.motion and e.motion.frame or -1, seen / 4, 1e-5, "animation frame")
+                T.eq(#e.layers, 2, "two layers")
+                T.eq(e.layers[1].bank, 100 + seen, "bank")
+                T.eq(e.layers[1].id, 2000 + seen, "motion")
+                T.near(e.layers[1].frame, seen / 4, 1e-5, "frame")
+                T.near(e.layers[1].speed, 1.5, 1e-6, "speed")
+                T.eq(e.layers[2].id, 8, "second layer")
             end
         end
     end
     T.eq(seen, 75, "all entries")
-    local full = {}
-    for i = 1, per do full[i] = entries[i] end
-    for i = 1, per do full[i].uid = 0xFFFFFFFF end
-    T.check(#P.encode_enemy_snapshots(1, full)[1] <= MAX, "a full chunk with uids and animation fits")
-    T.eq(#P.encode_enemy_snapshots(1, {}), 1, "empty list still yields one heartbeat snapshot")
+    local one = P.encode_enemy_states(1, {})
+    T.eq(#one, 1, "an empty list still yields one message (the owner is alive)")
+    T.eq(#assert(P.decode(one[1])).enemies, 0, "empty")
+    local many = { { net_id = 1, pos = { x = 0, y = 0, z = 0 }, layers = {} } }
+    for i = 1, 5 do many[1].layers[i] = { bank = 1, id = i, frame = 0, speed = 1 } end
+    T.eq(#assert(P.decode(P.encode_enemy_states(1, many)[1])).enemies[1].layers, P.MAX_ENEMY_LAYERS,
+        "layers capped")
+end)
+
+T.run("enemy_hits_carry_every_value", function()
+    local fields = {
+        { h = P.hash("Damage"), t = P.HIT_VALUE.I32, v = -140 },
+        { h = P.hash("Wince"), t = P.HIT_VALUE.F32, v = 30.5 },
+        { h = P.hash("IsCritical"), t = P.HIT_VALUE.BOOL, v = true },
+        { h = P.hash("DamageDir"), t = P.HIT_VALUE.VEC3, v = { x = 0, y = 0.5, z = -1 } },
+        { h = P.hash("Flags"), t = P.HIT_VALUE.U32, v = 0xFFFFFFFF },
+        { h = P.hash("Big"), t = P.HIT_VALUE.I64, v = 1 << 40 },
+        { h = P.hash("Exact"), t = P.HIT_VALUE.F64, v = 1 / 3 },
+        { h = 1, t = 99, v = 5 }, -- unknown tag: not sent
+    }
+    local h = assert(P.decode(P.encode_enemy_hit({ net_id = 12, epoch = 200, kind_hash = 77, pos = { x = 1, y = 2, z = 3 },
+        damage = 140.5, hp = 90, seq = 65535, uid = 0xABCDEF01, critical = true,
+        flags = P.HIT_FLAGS.APPLY | P.HIT_FLAGS.LETHAL, fields = fields })))
+    T.eq(h.type, P.T.ENEMY_HIT, "type")
+    T.eq(h.net_id, 12, "net id")
+    T.eq(h.epoch, 200, "epoch")
+    T.eq(h.kind_hash, 77, "kind")
+    T.near(h.pos.z, 3, 1e-6, "identity position")
+    T.near(h.damage, 140.5, 1e-6, "damage")
+    T.near(h.hp, 90, 1e-6, "HP it had")
+    T.eq(h.seq, 65535, "sequence")
+    T.eq(h.uid, 0xABCDEF01, "uid")
+    T.eq(h.apply, true, "for the owner to run")
+    T.eq(h.lethal, true, "lethal")
+    T.eq(h.critical, true, "critical")
+    T.eq(h.bounce, false, "not sent back")
+    T.eq(#h.fields, 7, "every known value, the unknown one dropped")
+    T.eq(h.fields[1].v, -140, "int32")
+    T.near(h.fields[2].v, 30.5, 1e-6, "float")
+    T.eq(h.fields[3].v, true, "bool")
+    T.near(h.fields[4].v.y, 0.5, 1e-6, "vector")
+    T.eq(h.fields[5].v, 0xFFFFFFFF, "uint32")
+    T.eq(h.fields[6].v, 1 << 40, "int64")
+    T.near(h.fields[7].v, 1 / 3, 1e-15, "double")
+    T.eq(h.fields[1].h, P.hash("Damage"), "by name hash")
+    local bare = assert(P.decode(P.encode_enemy_hit({ pos = { x = 0, y = 0, z = 0 } })))
+    T.eq(bare.uid, nil, "no uid")
+    T.eq(#bare.fields, 0, "no values")
+    T.eq(bare.apply, false, "a tracer only")
+    local big = {}
+    for i = 1, 80 do big[i] = { h = i, t = P.HIT_VALUE.VEC3, v = { x = i, y = i, z = i } } end
+    local data = P.encode_enemy_hit({ pos = { x = 0, y = 0, z = 0 }, fields = big })
+    T.check(#data <= MAX, ("the largest hit fits a datagram (%d bytes)"):format(#data))
+    T.eq(#assert(P.decode(data)).fields, P.MAX_HIT_FIELDS, "values capped")
+end)
+
+T.run("enemy_deaths_owners_and_rosters", function()
+    local d = assert(P.decode(P.encode_enemy_death({ net_id = 65535, epoch = 3, uid = 0x89ABCDEF, kind_hash = 5,
+        pos = { x = 4, y = 5, z = 6 }, rot = { x = 0, y = 1, z = 0, w = 0 },
+        fields = { { h = 1, t = P.HIT_VALUE.I32, v = 999 } } })))
+    T.eq(d.type, P.T.ENEMY_DEATH, "type")
+    T.eq(d.net_id, 65535, "net id")
+    T.eq(d.epoch, 3, "epoch")
+    T.eq(d.uid, 0x89ABCDEF, "uid")
+    T.near(d.pos.y, 5, 1e-6, "where it died")
+    T.near(math.abs(d.rot.y), 1, 0.003, "its rotation")
+    T.eq(d.fields[1].v, 999, "the killing hit")
+    T.eq(d.reset, false, "not a reset")
+    T.eq(d.erased, false, "a death")
+    local bare = assert(P.decode(P.encode_enemy_death({ net_id = 9, flags = P.DEATH_FLAGS.ERASED })))
+    T.eq(bare.uid, nil, "runtime enemy: no uid")
+    T.eq(bare.fields, nil, "no killing hit")
+    T.eq(bare.erased, true, "erased")
+    local reset = assert(P.decode(P.encode_enemy_reset()))
+    T.eq(reset.reset, true, "reset")
+
+    local owners = {}
+    for i = 1, 200 do owners[i] = { net_id = i, epoch = i % 256, owner = i % 2, uid = 0x100 + i, hp = i } end
+    owners[200].owner = P.OWNER.NONE
+    owners[199].hp = nil
+    local msgs = P.encode_enemy_owners(owners)
+    T.eq(#msgs, 3, "200 owners -> 3 messages")
+    local got = {}
+    for _, data in ipairs(msgs) do
+        T.check(#data <= MAX, ("owner message fits (%d bytes)"):format(#data))
+        for _, o in ipairs(assert(P.decode(data)).owners) do got[#got + 1] = o end
+    end
+    T.eq(#got, 200, "all")
+    T.eq(got[7].owner, P.OWNER.CLIENT, "owner")
+    T.eq(got[8].owner, P.OWNER.HOST, "owner")
+    T.eq(got[7].epoch, 7, "epoch")
+    T.eq(got[7].uid, 0x107, "uid")
+    T.eq(got[7].hp, 7, "HP at the change")
+    T.eq(got[199].hp, nil, "no HP")
+    T.eq(got[200].owner, P.OWNER.NONE, "retired")
+    T.eq(#P.encode_enemy_owners({}), 0, "nothing to send")
+
+    local roster = {}
+    for i = 1, 300 do roster[i] = { net_id = i, flags = P.ROSTER_FLAGS.ALIVE | (i % 2 == 0 and P.ROSTER_FLAGS.LOCAL_RUN or 0), hp = i / 2 } end
+    local rm = P.encode_enemy_roster(4.5, roster)
+    T.eq(#rm, 2, "300 entries -> 2 messages")
+    local r = assert(P.decode(rm[1]))
+    T.check(#rm[1] <= MAX, "fits")
+    T.eq(r.type, P.T.ENEMY_ROSTER, "type")
+    T.near(r.time, 4.5, 1e-9, "time")
+    T.eq(r.entries[2].local_run, true, "running on the client's own AI")
+    T.eq(r.entries[1].local_run, false, "not")
+    T.eq(r.entries[1].alive, true, "alive")
+    T.near(r.entries[3].hp, 1.5, 1e-6, "hp")
+    T.eq(#P.encode_enemy_roster(1, {}), 1, "an empty roster is still sent")
 end)
 
 T.run("character_identity", function()
@@ -348,18 +470,7 @@ T.run("character_identity", function()
     T.check(not P.character_id_stable(nil), "no ID")
 end)
 
-T.run("enemy_deaths_and_graveyard", function()
-    local d = assert(P.decode(P.encode_enemy_dead(65535, 0x89ABCDEF)))
-    T.eq(d.type, P.T.ENEMY_DEAD, "type")
-    T.eq(d.net_id, 65535, "net id")
-    T.eq(d.uid, 0x89ABCDEF, "uid")
-    T.eq(d.reset, false, "not a reset")
-    local bare = assert(P.decode(P.encode_enemy_dead(9)))
-    T.eq(bare.uid, nil, "runtime enemy: no uid")
-    local reset = assert(P.decode(P.encode_enemy_dead_reset()))
-    T.eq(reset.reset, true, "reset")
-    T.eq(reset.net_id, P.ENEMY_DEAD_RESET, "reset net id")
-
+T.run("enemy_graveyard", function()
     local uids = {}
     for i = 1, 700 do uids[i] = 0x10000000 + i end
     uids[701] = 0 -- never sent
@@ -382,17 +493,6 @@ T.run("enemy_deaths_and_graveyard", function()
 end)
 
 T.run("small_messages_roundtrip", function()
-    local d = assert(P.decode(P.encode_enemy_damage({ net_id = 7, kind_hash = 99, pos = { x = 1, y = 2, z = 3 },
-        amount = 12.5, flags = P.DAMAGE_FLAGS.LETHAL })))
-    T.eq(d.net_id, 7, "net id")
-    T.eq(d.kind_hash, 99, "kind")
-    T.near(d.amount, 12.5, 1e-6, "amount")
-    T.eq(d.flags, P.DAMAGE_FLAGS.LETHAL, "lethal")
-    T.eq(d.uid, nil, "no uid")
-    local d2 = assert(P.decode(P.encode_enemy_damage({ net_id = 0, kind_hash = 1, pos = { x = 0, y = 0, z = 0 },
-        amount = 3, flags = 0, uid = 4242 })))
-    T.eq(d2.uid, 4242, "damage carries the uid")
-    T.eq(d2.flags & P.DAMAGE_FLAGS.LETHAL, 0, "not lethal")
     local it = assert(P.decode(P.encode_item_taken({ item_id = 119235200, pos = { x = 4, y = 5, z = 6 },
         ctx = { category = 5, kind = 0, group = 9, index = 2 } })))
     T.eq(it.type, P.T.ITEM_TAKEN, "item taken type")
@@ -424,28 +524,6 @@ T.run("player_chapter_and_gate_flag", function()
     T.eq(m2.chapter, nil, "no chapter")
 end)
 
-T.run("enemy_hit_roundtrip", function()
-    local h = assert(P.decode(P.encode_enemy_hit({ net_id = 12, kind_hash = 77, pos = { x = 1, y = 2, z = 3 },
-        damage = 140.4, wince = 30, break_ = 2.5, stopping = 1, dir = { x = 0, y = 0, z = -1 }, weapon = 4000,
-        critical = true })))
-    T.eq(h.type, P.T.ENEMY_HIT, "type")
-    T.eq(h.net_id, 12, "net id")
-    T.eq(h.kind_hash, 77, "kind")
-    T.near(h.pos.z, 3, 1e-6, "spawn position")
-    T.eq(h.damage, 140, "damage rounded to Int32")
-    T.near(h.wince, 30, 1e-6, "wince")
-    T.near(h.break_, 2.5, 1e-6, "break")
-    T.near(h.stopping, 1, 1e-6, "stopping")
-    T.near(h.dir.z, -1, 1e-6, "direction")
-    T.eq(h.weapon, 4000, "weapon")
-    T.eq(h.critical, true, "critical")
-    T.eq(h.uid, nil, "no uid")
-    local h2 = assert(P.decode(P.encode_enemy_hit({ pos = { x = 0, y = 0, z = 0 }, uid = 77 })))
-    T.eq(h2.damage, 0, "defaults")
-    T.eq(h2.critical, false, "not critical")
-    T.eq(h2.uid, 77, "uid")
-end)
-
 T.run("item_dropped_roundtrip", function()
     local d = assert(P.decode(P.encode_item_dropped({ net_id = 5, item_id = 124000000, count = 300,
         pos = { x = 7, y = 0.5, z = -2 }, stage = 43400 })))
@@ -472,20 +550,6 @@ T.run("guid_and_ctx_helpers", function()
     T.check(P.guid_to_bytes(42) == nil, "non-string rejected")
     local back = P.ctx_from_key(P.ctx_key({ category = 1, kind = 7, group = 40210, index = -5 }))
     T.check(back.category == 1 and back.kind == 7 and back.group == 40210 and back.index == -5, "ctx key round trip")
-end)
-
-T.run("enemy_client_roundtrip_and_caps", function()
-    local paired = {}
-    for i = 1, 700 do paired[i] = 1000 + i end
-    local data = P.encode_enemy_client(3.5, paired)
-    T.check(#data <= MAX, "fits in one datagram (" .. #data .. " bytes)")
-    local m = assert(P.decode(data))
-    T.eq(m.type, P.T.ENEMY_CLIENT, "type")
-    T.near(m.time, 3.5, 1e-9, "time")
-    T.eq(#m.paired, P.MAX_CLIENT_PAIRED, "paired capped")
-    T.eq(m.paired[1], 1001, "paired ids")
-    T.eq(m.paired[P.MAX_CLIENT_PAIRED], 1000 + P.MAX_CLIENT_PAIRED, "in order")
-    T.eq(#assert(P.decode(P.encode_enemy_client(1, {}))).paired, 0, "none")
 end)
 
 T.run("animals_roundtrip_and_chunking", function()
@@ -659,6 +723,9 @@ T.run("malformed_input_never_raises", function()
     T.check(P.decode(nil) == nil, "nil")
     T.check(P.decode(string.char(250)) == nil, "unknown type")
     T.check(P.decode(string.char(3) .. "\0") == nil, "retired SKELETON type is unknown")
+    for _, t in ipairs({ 4, 5, 6, 15, 17 }) do
+        T.check(P.decode(string.char(t) .. string.rep("\0", 64)) == nil, "retired enemy message " .. t .. " is unknown")
+    end
     local samples = {
         P.encode_player({ time = 1, pos = { x = 0, y = 0, z = 0 }, rot = { x = 0, y = 0, z = 0, w = 1 } }),
         P.encode_avatar(sample_avatar(2, 3)),
@@ -669,15 +736,17 @@ T.run("malformed_input_never_raises", function()
         P.fragment(string.rep("z", 3000), 1)[1],
         P.encode_item_taken({ item_id = 119235200, pos = { x = 1, y = 2, z = 3 },
             ctx = { category = 5, kind = 0, group = 9, index = 2 } }),
-        P.encode_enemy_damage({ net_id = 3, kind_hash = 7, pos = { x = 0, y = 0, z = 0 }, amount = 5, uid = 99 }),
-        P.encode_enemy_hit({ pos = { x = 0, y = 0, z = 0 }, uid = 5 }),
-        P.encode_enemy_dead(4, 77),
+        P.encode_enemy_hit({ pos = { x = 0, y = 0, z = 0 }, uid = 5, fields = { { h = 1, t = P.HIT_VALUE.VEC3,
+            v = { x = 1, y = 2, z = 3 } }, { h = 2, t = P.HIT_VALUE.BOOL, v = true } } }),
+        P.encode_enemy_death({ net_id = 4, uid = 77, fields = { { h = 1, t = P.HIT_VALUE.I32, v = 3 } } }),
         P.encode_enemy_grave({ 1, 2, 3 })[1],
-        P.encode_enemy_snapshots(1, { { net_id = 1, uid = 8, kind_hash = 2, pos = { x = 0, y = 0, z = 0 }, flags = 1 } })[1],
+        P.encode_enemy_states(1, { { net_id = 1, uid = 8, kind_hash = 2, pos = { x = 0, y = 0, z = 0 },
+            layers = { { bank = 1, id = 2, frame = 3, speed = 1 } } }, { net_id = 2, pos = { x = 0, y = 0, z = 0 } } })[1],
+        P.encode_enemy_owners({ { net_id = 1, epoch = 2, owner = 1, uid = 3, hp = 4 } })[1],
+        P.encode_enemy_roster(1, { { net_id = 5, flags = 1, hp = 3 } })[1],
         P.encode_item_dropped({ item_id = 1, count = 1, pos = { x = 0, y = 0, z = 0 } }),
         P.encode_player({ time = 1, pos = { x = 0, y = 0, z = 0 }, rot = { x = 0, y = 0, z = 0, w = 1 },
             stage = 43300, chapter = 21100 }),
-        P.encode_enemy_client(1, { 5, 6 }),
         P.encode_animals(1, { { guid = G1, pos = { x = 0, y = 0, z = 0 }, routine = 2, motion = { bank = 1, id = 2, frame = 3 } } })[1],
         P.encode_flags({ { guid = G1, value = true } })[1],
         P.encode_flag_words(1, P.FLAG_WORDS_MODE.FULL, { { name = "Main", words = { 1, 2 } } })[1],
@@ -700,8 +769,8 @@ T.run("malformed_input_never_raises", function()
         end
     end
     -- An empty FLAGS or OBJECTS batch (count 0) is a complete, valid message.
-    local empty_ok = { [3] = true, [P.T.FLAGS] = true, [P.T.OBJECTS] = true }
-    for t = 1, 26 do
+    local empty_ok = { [3] = true, [P.T.FLAGS] = true, [P.T.OBJECTS] = true, [P.T.ENEMY_OWNER] = true }
+    for t = 1, 31 do
         if not empty_ok[t] then
             local m = P.decode(string.char(t) .. "\0")
             T.check(m == nil, "short message type " .. t)

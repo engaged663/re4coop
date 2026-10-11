@@ -259,7 +259,7 @@ T.run("erasing_an_enemy_the_partner_already_killed", function()
     local game, world = fresh_game()
     local list = game:list_enemies()
     local ctx = world.enemies[1]
-    T.check(game:enemy_set_ai(list[1].id, false), "mirrored: AI off")
+    T.check(game:enemy_set_puppet(list[1].id, true), "a puppet: AI off")
     T.check(game:enemy_erase(list[1].id), "erased")
     T.eq(ctx.eliminated, true, "CharacterContext.eliminate(): the stored backup keeps it dead")
     T.eq(ctx.spawn_param.invalid, true, "CharacterSpawnParam.invalidateSpawn(true)")
@@ -277,15 +277,18 @@ T.run("a_head_switched_off_goes_back_to_the_pool_switched_on", function()
     local game, world = fresh_game()
     local list = game:list_enemies()
     local ctx = world.enemies[1]
-    T.check(game:enemy_set_ai(list[1].id, false), "AI off")
+    T.check(game:enemy_set_puppet(list[1].id, true), "a puppet")
     T.eq(ctx.head.update_self, false, "head off")
+    local fsm = mock.component(ctx.body, "via.motion.MotionFsm2")
+    T.eq(fsm.enabled, false, "its animation state machine off")
+    T.check(game:capabilities().enemy_puppet.ok, "reported")
     -- The area unloads: the game despawns the enemy, its head goes back to the pool unlinked.
     mock.despawn(ctx)
     game:list_enemies()
     -- Switching an unlinked head on makes CharacterHeadUpdater.update read a null Context
     -- (the crash at re4.exe+0x1273425): it stays off while it sits in the pool.
     T.eq(ctx.head.update_self, false, "not switched on while in the pool")
-    T.eq(next(game.enemy_ai_off), nil, "forgotten")
+    T.eq(next(game.puppets), nil, "forgotten")
     game:begin_frame()
     T.eq(ctx.head.update_self, false, "still unlinked: still off")
     -- The game gives the head to its next enemy: it thinks again.
@@ -296,27 +299,65 @@ T.run("a_head_switched_off_goes_back_to_the_pool_switched_on", function()
     T.eq(next(game.parked_heads), nil, "no longer parked")
     -- The same through a reload.
     local list2 = game:list_enemies()
-    T.check(game:enemy_set_ai(list2[1].id, false), "another one off")
+    T.check(game:enemy_set_puppet(list2[1].id, true), "another one off")
     local head2 = world.enemies[1].head
     game:on_reload()
     T.eq(head2.update_self, true, "restored on reload")
-    -- And when the context gets another head while ours is off.
+    -- The context got another head while ours was off: ours runs again when the puppet ends.
     local list3 = game:list_enemies()
     local ctx3 = world.enemies[1]
-    T.check(game:enemy_set_ai(list3[1].id, false), "off")
+    T.check(game:enemy_set_puppet(list3[1].id, true), "off")
     local old_head = ctx3.head
     ctx3.head = mock.make_go("Ch1d0z0_head")
-    T.check(game:enemy_set_ai(list3[1].id, false), "the new head off")
-    T.eq(old_head.update_self, true, "the old head runs again")
-    T.eq(ctx3.head.update_self, false, "the new one is off")
+    T.check(game:enemy_set_puppet(list3[1].id, false), "back to the game")
+    T.eq(old_head.update_self, true, "the head we switched off runs again")
     -- Session ends while a switched-off head is already unlinked: it is parked, not woken.
     local list4 = game:list_enemies()
     local ctx4 = world.enemies[1]
-    T.check(game:enemy_set_ai(list4[1].id, false), "off again")
+    T.check(game:enemy_set_puppet(list4[1].id, true), "off again")
     ctx4.head_updater.context = nil
-    game:restore_enemy_ai()
+    game:restore_enemies()
     T.eq(ctx4.head.update_self, false, "an unlinked head is never woken")
     T.check(next(game.parked_heads) ~= nil, "parked until the game links it")
+end)
+
+T.run("puppets_take_the_owners_transform_and_animation", function()
+    local game, world = fresh_game()
+    local e = world.enemies[1]
+    e.body.transform.wrot = { x = 0, y = math.sin(0.5), z = 0.1, w = math.cos(0.5) }
+    local list = game:list_enemies()
+    T.near(list[1].rot.y, math.sin(0.5), 1e-6, "full rotation read from the body transform")
+    T.near(list[1].rot.z, 0.1, 1e-6, "not just the heading")
+    T.eq(list[1].layers, nil, "animation not read unless the partner shows it")
+    list = game:list_enemies(nil, function() return true end)
+    T.eq(#list[1].layers, 2, "two animation layers read")
+    T.eq(list[1].layers[1].id, 1201, "motion of layer 0")
+    T.eq(list[1].layers[1].bank, 100, "its bank")
+    T.near(list[1].layers[1].frame, 12.5, 1e-6, "its frame")
+    T.eq(list[1].layers[1].speed, 1.0, "its speed")
+    T.eq(list[1].layers[2].id, 50, "layer 1")
+    T.eq(list[1].hidden, false, "drawn")
+    local id = list[1].id
+    local rot = { x = 0, y = math.sin(-0.25), z = 0, w = math.cos(-0.25) }
+    T.check(game:enemy_set_transform(id, { x = 9, y = 1, z = 2 }, rot), "placed")
+    T.near(e.pos.x, 9, 1e-6, "moved")
+    T.near(game:list_enemies()[1].rot.y, math.sin(-0.25), 1e-6, "turned")
+    T.eq(e.warped, 1, "CharacterController warped so physics does not pull it back")
+    local layers = mock.component(e.body, "via.motion.Motion").layers
+    -- Another motion: changed. The same motion far off: moved to the frame. Speed copied.
+    T.check(game:enemy_set_anim(id, { { bank = 4, id = 1300, frame = 2, speed = 1.0 },
+        { bank = 100, id = 50, frame = 30, speed = 0.5 } }), "animation set")
+    T.eq(layers[1].motion, 1300, "changeMotion with the owner's motion")
+    T.eq(layers[1].bank, 4, "and bank")
+    T.eq(layers[2].motion, 50, "the second layer keeps its motion")
+    T.near(layers[2].frame, 30, 1e-6, "but jumps to the owner's frame")
+    T.eq(layers[2].speed, 0.5, "and plays at its speed")
+    local changes = layers[1].changes
+    layers[1].frame = 3.5
+    game:enemy_set_anim(id, { { bank = 4, id = 1300, frame = 4, speed = 1.0 } })
+    T.eq(layers[1].changes, changes, "a small drift is left to the game")
+    T.eq(layers[1].seeks, nil, "no seek either")
+    T.check(game:capabilities().enemy_motion.ok, "reported")
 end)
 
 T.run("an_enemy_the_host_does_not_run_is_hidden_and_shown_again", function()
@@ -329,7 +370,7 @@ T.run("an_enemy_the_host_does_not_run_is_hidden_and_shown_again", function()
     T.eq(ctx.body.draw_self, true, "drawn again")
     -- Hidden when the session ends: drawn again.
     T.check(game:enemy_set_visible(list[1].id, false), "hidden again")
-    game:restore_enemy_ai()
+    game:restore_enemies()
     T.eq(ctx.body.draw_self, true, "restored with the session's end")
     -- Hidden when the enemy leaves the list: the body is drawn again only when an enemy
     -- shows up with it.
@@ -537,11 +578,19 @@ T.run("pickup_callbacks_hooked", function()
     T.check(not nohook:capabilities().pickup_hook.ok, "capability reports it")
 end)
 
-T.run("hit_hook_captures_player_hits", function()
+local function field(fields, name)
+    for _, f in ipairs(fields or {}) do
+        if f.h == P.hash(name) then return f.v end
+    end
+    return nil
+end
+
+T.run("hit_hook_captures_player_hits_with_every_value", function()
     local game, world = fresh_game()
     T.eq(game:capabilities().hit_hook, nil, "hooks wait until a partner connects")
     game:set_active(true)
     T.check(game:capabilities().hit_hook.ok, "hit hook installed")
+    T.check(game:capabilities().hit_values.ok, "DamageInfo values found: " .. game:capabilities().hit_values.detail)
     game:read_player_state() -- learns the player's body/head objects
     game:list_enemies()      -- learns the enemies' bodies
     local e1 = world.enemies[1]
@@ -550,16 +599,24 @@ T.run("hit_hook_captures_player_hits", function()
     T.eq(#ev, 1, "one hit by the player")
     T.eq(ev[1].id, e1:get_address(), "the enemy that was hit")
     T.eq(ev[1].damage, 25, "damage")
-    T.eq(ev[1].wince, 12, "wince")
-    T.near(ev[1].dir.z, -1, 1e-6, "direction")
-    T.eq(ev[1].weapon, 4000, "weapon")
-    T.eq(e1.hp, 75, "the game still applies its own damage")
+    T.eq(ev[1].hp, 100, "its HP before the hit")
+    T.eq(ev[1].local_damage, 25, "an enemy our game runs takes it all")
+    T.eq(field(ev[1].fields, "Damage"), 25, "the Damage value")
+    T.eq(field(ev[1].fields, "Wince"), 12, "the Wince value")
+    T.near(field(ev[1].fields, "DamageDir").z, -1, 1e-6, "a vector value")
+    T.eq(field(ev[1].fields, "AttackType"), 0, "an enum value")
+    T.near(field(ev[1].fields, "HitPos").y, 1.6, 1e-6, "a value of the parent type")
+    T.eq(field(ev[1].fields, "SerialNo"), nil, "a serial number only means something in its own game")
+    T.eq(field(ev[1].fields, "AttackOwnerObject"), nil, "objects never travel")
+    T.eq(e1.hp, 75, "the game applies its own damage")
     T.eq(#game:take_hit_events(), 0, "drained")
+    T.eq(field(game:enemy_last_hit(e1:get_address()), "Damage"), 25, "kept as its last hit")
 
     local other = mock.make_character("chainsaw.Ch1d0z0Context", { x = 9, y = 0, z = 9 }, 100)
     mock.hit(e1, 5, 1, other.body)
     T.eq(#game:take_hit_events(), 0, "hits by other characters are not sent")
     T.eq(game.hit_stats.other_owner, 1, "counted")
+    T.eq(field(game:enemy_last_hit(e1:get_address()), "Damage"), 5, "but remembered as its last hit")
     mock.hit(other, 5, 1)
     T.eq(#game:take_hit_events(), 0, "player hits on non-enemies are not sent")
     T.eq(game.hit_stats.not_enemy, 1, "counted")
@@ -568,69 +625,79 @@ T.run("hit_hook_captures_player_hits", function()
     T.eq(#game:take_hit_events(), 0, "the hook does nothing while no partner is connected")
 end)
 
-T.run("hit_replay_is_cosmetic", function()
+T.run("our_hit_never_kills_a_puppet", function()
     local game, world = fresh_game()
     game:set_active(true)
     game:read_player_state()
-    game:list_enemies()
+    local list = game:list_enemies()
+    local e1 = world.enemies[1]
+    game:enemy_set_puppet(list[1].id, true)
+    mock.hit(e1, 30, 5)
+    T.eq(e1.hp, 70, "a normal hit takes its HP at once")
+    mock.hit(e1, 500, 5)
+    T.eq(e1.hp, 1, "a lethal one leaves the last HP: the owner decides the death")
+    local ev = game:take_hit_events()
+    T.eq(ev[2].damage, 500, "the full hit goes to the owner")
+    T.eq(ev[2].local_damage, 69, "what it took here")
+    T.eq(ev[2].lethal, true, "marked lethal")
+    T.eq(field(ev[2].fields, "Damage"), 500, "with its original values")
+    T.eq(mock.component(e1.body, "chainsaw.HitController").received[2].kill, false, "never a kill here")
+    T.eq(game.hit_stats.clamped, 1, "counted")
+    game.settings.enemy_hit_predict = false
+    mock.hit(e1, 10, 5)
+    T.eq(e1.hp, 1, "without prediction it takes nothing here")
+end)
+
+T.run("a_partners_hit_runs_through_the_games_hit_code", function()
+    local game, world = fresh_game()
+    game:set_active(true)
+    game:read_player_state()
+    local list = game:list_enemies()
     local e2 = world.enemies[2]
-    local id = e2:get_address()
-    local hit = { damage = 50, wince = 30, break_ = 1, stopping = 2, dir = { x = 1, y = 0, z = 0 }, critical = true }
-    T.eq(game:enemy_replay_hit(id, hit), false, "experimental: off unless switched on")
-    game.settings.replay_partner_hits = true
-    local ok = game:enemy_replay_hit(id, hit)
-    T.eq(ok, false, "no replay before our player landed a hit (no template yet)")
-
-    mock.hit(world.enemies[1], 10, 5) -- our own hit provides the DamageInfo template
-    game:take_hit_events()
-    local kept
-    ok, kept = game:enemy_replay_hit(id, hit)
-    T.check(ok, "replayed")
-    T.eq(kept, 0, "HP put back")
+    local id = list[2].id
+    mock.hit(world.enemies[1], 10, 5)
+    local fields = game:take_hit_events()[1].fields
+    for _, f in ipairs(fields) do
+        if f.h == P.hash("Damage") then f.v = 50 end
+        if f.h == P.hash("Wince") then f.v = 30 end
+    end
+    T.check(game:enemy_apply_hit(id, { damage = 50, fields = fields }), "run")
     local r = mock.component(e2.body, "chainsaw.HitController").received[1]
-    T.eq(r.wince, 30, "the partner's wince")
-    T.eq(r.damage, 1, "cosmetic damage only")
-    T.eq(r.critical, true, "critical flag")
+    T.eq(r.damage, 50, "the partner's damage")
+    T.eq(r.wince, 30, "the partner's reaction")
+    T.near(r.hit_pos.y, 1.6, 1e-6, "every value it had")
+    T.eq(r.serial, nil, "except what only meant something in its game")
     T.eq(r.attacker, world.player.body, "the attacker is our live player body")
-    T.eq(e2.hp, 300, "HP unchanged")
-    T.eq(#game:take_hit_events(), 0, "our replay is not reported as our own hit")
+    T.eq(e2.hp, 250, "the HP the game's own hit code took")
+    T.eq(#game:take_hit_events(), 0, "not reported as our own hit")
+    T.eq(field(game:enemy_last_hit(id), "Damage"), 50, "its last hit now")
+    T.check(game:capabilities().hit_apply.ok, "reported")
+    T.check(not game:enemy_apply_hit(id, { damage = 5, fields = {} }), "nothing to run without values")
+end)
 
-    -- The game applies the replayed damage a frame late: the next enemy read undoes it.
-    mock.deferred_damage = true
-    game:enemy_replay_hit(id, hit)
-    mock.deferred_damage = false
-    local pd = mock.pending_damage
-    pd.owner.hp = pd.owner.hp - pd.amount
-    T.eq(game:list_enemies()[2].hp, 300, "delayed replay damage undone")
-    T.eq(e2.hp, 300, "in the game too")
-
-    -- Authoritative changes and our own hits are never undone.
-    game:enemy_replay_hit(id, hit)
-    T.check(game:enemy_set_hp(id, 200), "authoritative HP write")
-    T.eq(game:list_enemies()[2].hp, 200, "kept")
-    game:enemy_replay_hit(id, hit)
-    mock.hit(e2, 40, 5)
-    game:take_hit_events()
-    T.eq(game:list_enemies()[2].hp, 160, "our own hit right after a replay counts")
-
-    e2.hp = 15
-    T.eq(game:enemy_replay_hit(id, hit), false, "nearly dead enemies are not replayed")
-    T.eq(e2.hp, 15, "untouched")
-    e2.hp = 300
-
-    -- The template's objects may be gone by the time a replay happens: dead ones are not
-    -- handed to the game (the weapon here), and the attacker is always our live body.
-    local hc = mock.component(e2.body, "chainsaw.HitController")
-    local weapon = mock.make_go("wp4000_old")
-    game.hit_template.data.WeaponGameObject = weapon
-    mock.destroy(weapon)
-    T.check(game:enemy_replay_hit(id, hit), "replayed")
-    local last = hc.received[#hc.received]
-    T.eq(last.attacker, world.player.body, "live attacker")
-    T.eq(game.hit_stats.stale_owner, 1, "the dead weapon object was cleared")
-    -- After a reload nothing from the old scene is reused.
-    game:on_reload()
-    T.eq(game:enemy_replay_hit(id, hit), false, "template dropped with the old scene")
+T.run("a_death_from_the_partners_game_comes_with_its_killing_hit", function()
+    local game, world = fresh_game()
+    game:set_active(true)
+    game:read_player_state()
+    local list = game:list_enemies()
+    local e2 = world.enemies[2]
+    local id = list[2].id
+    game:enemy_set_puppet(id, true)
+    local fields = { { h = P.hash("Wince"), t = P.HIT_VALUE.F32, v = 44 },
+        { h = P.hash("IsCritical"), t = P.HIT_VALUE.BOOL, v = true } }
+    T.check(game:enemy_kill(id, fields), "killed")
+    local r = mock.component(e2.body, "chainsaw.HitController").received[1]
+    T.eq(r.wince, 44, "by the killing hit")
+    T.eq(r.critical, true, "with its values")
+    T.eq(r.kill, true, "as a kill")
+    T.eq(e2.hp, 0, "dead")
+    T.eq(e2.head.update_self, true, "its AI back on for its death")
+    T.eq(mock.component(e2.body, "via.motion.MotionFsm2").enabled, true, "and its animation driver")
+    T.eq(game.hit_stats.kills_with_hit, 1, "counted")
+    -- Without the hit: HitPoint.dead().
+    local e1 = world.enemies[1]
+    T.check(game:enemy_kill(list[1].id, nil), "killed")
+    T.eq(e1.hp, 0, "dead")
 end)
 
 T.run("drop_hooks_see_the_games_rolls_and_roll_for_partner_kills", function()

@@ -56,21 +56,23 @@ Session rules:
 | `stats()` | Table: `rtt_ms, peer, peer_name, bytes_sent, bytes_recv, resends, reliable_in_flight, out_of_order, unordered_duplicates, …` |
 | `local_addresses()` | Array of this PC's LAN IPv4 addresses |
 | `time()` | Monotonic seconds (`os.clock` is CPU time, so don't use it for networking) |
-| `max_payload()`, `version()` | `1188`; `"0.8.0", 2` |
+| `max_payload()`, `version()` | `1188`; `"0.9.0", 2` |
 | `new_session()` | An independent session object with the same methods (tests/tools) |
 
-## Game messages (game protocol version 8)
+## Game messages (game protocol version 9)
 
-Version 8 (mod 0.8.0) rebuilt enemy sync on the game's own enemy identity, with the host
-running every enemy: ENEMY_SNAPSHOT, ENEMY_DAMAGE, ENEMY_DEAD and ENEMY_HIT carry the enemy's
-**uid** (see "ContextIDs on the wire" below) instead of a spawner ContextID, ENEMY_SNAPSHOT
-carries 19 entries per chunk and no dead entries any more, ENEMY_GRAVE (25) carries the list of
-every enemy dead in the host's world, ENEMY_CLIENT only lists the host enemies the client has a
-copy of (enemies no longer change hands), and ANIMALS (26) carries the host's animals near both
-players.
-Version 7 (mod 0.7.0): ENEMY_CLIENT up to 24 states, OBJECTS up to 50 events (everything fits
-the 1188-byte payload), ACTIONS travel on the unordered lane, and ITEM_DROPPED is retired
-(each player rolls their own loot).
+Version 9 (mod 0.9.0) replaced the enemy sync with a new one (`enemy_net.lua`): every enemy has
+one **owner**, the game that runs it, and an ownership **epoch** that the host bumps whenever it
+gives the enemy to the other game. The owner sends the enemy's full state (ENEMY_STATE, 27);
+hits the other player lands travel to the owner with every value of the game's DamageInfo
+(ENEMY_HIT, 28); the owner announces the death with its killing hit (ENEMY_DEATH, 29); the host
+assigns owners (ENEMY_OWNER, 30) from what the client has (ENEMY_ROSTER, 31). ENEMY_GRAVE (25)
+stays. Retired: ENEMY_SNAPSHOT (4), ENEMY_DAMAGE (5), ENEMY_DEAD (6), the old ENEMY_HIT (15) and
+ENEMY_CLIENT (17).
+Version 8 (mod 0.8.0) paired enemies by the game's own identity (uid) and let the host run every
+enemy; it added ENEMY_GRAVE (25) and ANIMALS (26).
+Version 7 (mod 0.7.0): OBJECTS up to 50 events (everything fits the 1188-byte payload), ACTIONS
+travel on the unordered lane, and ITEM_DROPPED is retired (each player rolls their own loot).
 
 The first byte is the message type. Formats use Lua `string.pack` notation.
 
@@ -79,9 +81,9 @@ The first byte is the message type. Formats use Lua `string.pack` notation.
 | 1 | HELLO | reliable | both, on connect | `<B I2 s1 s1 s1 B`: type, game protocol version, mod version, player name, chapter/area, flags (1 = reply requested) |
 | 2 | PLAYER | unreliable, 20 Hz | both | `<B d fff ffff ff B I4 i4 i4`: time, position, rotation quaternion (x,y,z,w), HP, max HP, flags (1 dead, 2 cutscene, 4 aiming, 8 has stage, 16 has chapter, 32 waiting at a transition), area hash, `chainsaw.StageID` (valid with flag 8), `chainsaw.ChapterID` (valid with flag 16) |
 | 3 | *(retired)* | | | SKELETON in protocols 1–3 (the stick-figure ghost) |
-| 4 | ENEMY_SNAPSHOT | unreliable, 20 Hz | host → client | `<B d B B B` + n × `<I2 I4 fff fff f f f B I4 I4 I4 f>` (59 B): time, chunk, chunks, count; then the host's living enemies: net id, kind hash (FNV-1a of context type name), position, spawn position (where the host first saw it), yaw, HP, max HP, flags (1 alive, 2 has uid, 8 has animation; 4 and 16 meant "run by the client" and "hand-over decided" in development builds and are retired), uid, then motion bank, motion ID and frame of its motion layer 0 (read only for enemies the client has a copy of). 19 entries per chunk. The client's copies follow these: position, facing and animation, with their own AI off |
-| 5 | ENEMY_DAMAGE | reliable | client → host | `<B I2 I4 fff f B I4`: net id (0 = unpaired), kind hash, spawn position, amount, flags (1 lethal, 2 has uid), uid. A lethal report for an enemy the host has not loaded puts it in the host's graveyard |
-| 6 | ENEMY_DEAD | reliable | host → client | `<B I2 B I4`: net id, flags (1 has uid, 2 reset), uid. One enemy died in the host's world (also a corpse the host found that died earlier). Flag 2 (net id 0): the host reloaded a checkpoint, forget every death it reported |
+| 4 | *(retired)* | | | ENEMY_SNAPSHOT in protocols 1–8 |
+| 5 | *(retired)* | | | ENEMY_DAMAGE in protocols 1–8 |
+| 6 | *(retired)* | | | ENEMY_DEAD in protocols 1–8 |
 | 7 | CHAT | reliable | both | `<B s2`: text (≤ 512 bytes) |
 | 8 | NOTIFY | reliable | both | `<B B s1`: code (1 died, 2 revived, 3 teleported, 4 info), text |
 | 9 | ITEM_TAKEN | reliable | both | `<B I4 fff B i4 i4 B B i4`: item ID, position, flags (1 has ContextID, 2 it was the only copy in the sender's scene, 4 has stage), ContextID of the `chainsaw.DropItem` (level IDs only), its `chainsaw.StageID`. The receiver removes its copy of that key item |
@@ -90,9 +92,9 @@ The first byte is the message type. Formats use Lua `string.pack` notation.
 | 12 | GEAR | reliable | both | see below: the weapons the character carries |
 | 13 | POSE | unreliable, 30 Hz | both | see below: root placement, every joint's local rotation, weapon placement |
 | 14 | ACTIONS | reliable, unordered lane | both | see below: sound/effect calls and shots to replay |
-| 15 | ENEMY_HIT | unreliable | both | `<B I2 I4 fff i4 fff fff i4 B I4`: net id (host numbering; 0 = unpaired), kind hash, enemy spawn position, damage, wince, break, stopping, damage direction, weapon ID, flags (1 critical, 2 has uid), uid. A hit the sender's player landed (`HitController.callbackDamageHit`): the receiver draws a shot tracer, and with the experimental replay switch also replays it on its copy (cosmetic: 1 damage, HP restored) |
+| 15 | *(retired)* | | | the old ENEMY_HIT (protocols 5–8: tracers and a cosmetic replay) |
 | 16 | *(retired)* | | | ITEM_DROPPED in protocols 4–6 (the host's roll spawned on the client); still decoded, ignored |
-| 17 | ENEMY_CLIENT | unreliable, 20 Hz | client → host | `<B d I2` + n × `<I2>`: time, count (≤ 500), the net ids of the host enemies the client has a living copy of. The host reads (and sends) the animation of those enemies only |
+| 17 | *(retired)* | | | ENEMY_CLIENT in protocols 6–8 |
 | 18 | FLAGS | reliable | both | `<B B` + n × (`guid` + `<B`): scenario flags that changed (≤ 64 per message), with their new value |
 | 19 | FLAG_WORDS | reliable | both | `<B I2 B B B B` (sync id, mode, chunk, chunks, item count) + per item `<s1 I2 I2` (group name, first word, count) + words. Mode 1 = full copy: `<I4` words. Mode 2 = changes: `<I2 I4 I4` (word index, bits set, bits cleared) |
 | 20 | GIMMICKS | reliable | both | `<B I2 B B B B` (sync id, mode, chunk, chunks, count) + per gimmick: `ctx` (`<i4 i4 B B>`: group, index, kind, category), `<s1` attribute bytes, `<B` + n × `<I4 I4` (trigger save ID, done), `<B` detected, `<B` + n × (`<B` kind, `<f` or `<I4` value) accessory values. Mode 1 = the whole table, 2 = records that changed, 3 = records that appeared (applied only where the receiver has no record of that gimmick) |
@@ -102,10 +104,24 @@ The first byte is the message type. Formats use Lua `string.pack` notation.
 | 24 | WORLD_DONE | reliable | host → client | `<B I2 B I4 I4`: sync id, what, flag groups sent, gimmicks sent. Follows the FLAG_WORDS / GIMMICKS / OBJECTS of a full transfer (the ordered lane keeps them in order). A request with sync id 0 (enemies only, from a client without a world adapter) gets no WORLD_DONE |
 | 25 | ENEMY_GRAVE | reliable | host → client | `<B B B I2` + n × `<I4>`: chunk, chunks, count (≤ 290), uids. Every enemy dead in the host's world: the deaths it saw, the client's kills of enemies it had not loaded, and the enemies its save has eliminated (`CharacterManager.CharacterBackupDB`). Sent after a WORLD_REQUEST with bit 4 (joining, the client's game reloading), once the host has read its save (a few ticks). The first message replaces what the client knew |
 | 26 | ANIMALS | unreliable, 10 Hz | host → client | `<B d B B B` + n × (`guid` + `<fff I4 i4 I4 I4 f B>`) (49 B): time, chunk, chunks, count (≤ 23); then the host's animals (`chainsaw.GmAnimal`: crows, chickens, fish, bats, rats) within 50 m of both players, nearest to the client first, at most 24: GameObject GUID, position, packed rotation, `_Routine`, motion bank, motion ID, motion frame, flags (1 has animation, 2 dead: its routine reached Die/Dead, 4 has routine). The client's copies follow them with their own AI off the game's update; a dead one dies in the client's game with its own death. Animal kills travel as OBJECTS |
+| 27 | ENEMY_STATE | unreliable, 20 Hz | both | `<B d B B B>` (time, chunk, chunks, count) + n entries, packed into as few datagrams as fit. Entry `<I2 B I2 I4 I4 fff I4 hhh f f I2 B>` (46 B): net id, ownership epoch, flags (1 alive, 2 has uid, 4 hidden: the owner's game does not draw it, 8 has spawn point), uid, kind hash, position, packed rotation (full quaternion), velocity (cm/s), HP, max HP, hit ack (the last of the receiver's hits the owner ran on this enemy), layer count; then `<fff>` spawn point (flag 8: enemies without a uid), then per animation layer (≤ 3) `<I4 I4 f f>`: motion bank, motion id, frame, speed. The enemies the sender owns (the host: every enemy it runs, also those the client has not loaded; the client: the ones the host gave it), always at least one message. The receiver's copies follow them: position and rotation every frame, animation corrected when a layer plays another motion or drifted more than 4 frames, HP, visibility. Entries of another epoch than the receiver knows are ignored (a newer host epoch is taken as the host's new ownership) |
+| 28 | ENEMY_HIT | reliable | both | `<B I2 B B I4 I4 fff f f I2>` + values: net id (0 = not paired), epoch, flags (1 apply: the receiver owns the enemy and runs the hit, 2 critical, 4 bounce: sent back because the receiver of the original did not own the enemy, 8 lethal in the sender's game, 16 has uid), uid, kind hash, identity position (spawn point), damage, the enemy's HP before the hit in the sender's game, sequence number; then the hit's values `<B>` count (≤ 64) + per value `<I4 B>` (FNV-1a of the `chainsaw.HitController.DamageInfo` field name, tag) and the value by tag: 1 `i4`, 2 `f`, 3 `B` bool, 4 `fff` vector, 5 `I4`, 6 `i8`, 7 `d`. Every hit the sender's player lands: on an enemy the receiver owns with flag 1 (the owner runs it through `HitController.callbackDamageHit` with these values: the same damage and reaction; without values it subtracts the damage); otherwise without values, for the shot tracer. A plain damage report (an explosion hurt the sender's puppet) is a hit with flag 1 and no values |
+| 29 | ENEMY_DEATH | reliable | both | `<B I2 B B I4 I4 fff I4>` + values: net id, epoch, flags (1 has uid, 2 reset, 4 erased, 8 has the killing hit), uid, kind hash, position and packed rotation where it died, then the killing hit's values (as in ENEMY_HIT). An enemy the sender decides died (also a corpse the host finds); the receiver puts its copy there and kills it with the same hit, or removes it later (graveyard). Flag 2 (net id 0, host): the host reloaded a checkpoint: forget every death it reported, and its net ids |
+| 30 | ENEMY_OWNER | reliable | host → client | `<B B>` count (≤ 95) + per entry `<I2 B B I4 f>`: net id, epoch, owner (0 host, 1 client, 255 retired: the host no longer has that enemy and its number is free), uid, the host's HP of the enemy at the change (0 = none). A client that loses an enemy reports the HP its own player took off it since; one that gains it never has more HP than this |
+| 31 | ENEMY_ROSTER | unreliable, 5 Hz | client → host | `<B d I2>` (time, count ≤ 160) + per entry `<I2 B f>`: net id, flags (1 alive, 2 local run: the client's own AI has been running it, no owner assigned yet), HP. The host enemies the client has a copy of; at least one message. The host assigns owners only for these, takes back an enemy the client no longer reports, and reads the animation of these only |
 
 `guid` is 16 raw bytes: the 32 hex digits of the canonical GUID string, in order. Scenario
 flags are addressed by GUID in the game itself; scene objects by their GameObject GUID, which
 comes from the scene file and is the same on both machines.
+
+Enemy ownership: the host numbers its enemies (net ids) and owns all of them at first (epoch 0).
+When the client reports a copy (ENEMY_ROSTER), the host assigns an owner right away (epoch 1):
+with `enemy_authority = "shared"` the game of the player the enemy is closer to, otherwise the
+host. Later an enemy changes hands when the other player has been at least 3 m closer for
+0.75 s and the enemy has been with its owner for 2.5 s (the player who hit it in the last 3 s
+counts 4 m closer); a partner who is down or in a cutscene gets none, a client farther than 80 m
+neither. The old owner stops at once, the new one continues from the latest state it received
+(position extrapolated by the velocity, HP never raised).
 
 Joining: once the client is in the host's chapter it sends WORLD_REQUEST; the host answers
 with full FLAG_WORDS and GIMMICKS, the OBJECTS destroyed so far and WORLD_DONE, and then
@@ -135,7 +151,7 @@ ignored.
 
 ### Quaternions
 
-Rotations in AVATAR/POSE/ANIMALS travel as 32 bits, "smallest three": bits 31–30 hold the index (x, y,
+Rotations in AVATAR/POSE/ANIMALS/ENEMY_STATE/ENEMY_DEATH travel as 32 bits, "smallest three": bits 31–30 hold the index (x, y,
 z, w) of the largest component, which is dropped (its sign is made positive, since q and −q are
 the same rotation); the other three are 10 bits each (bits 29–20, 19–10, 9–0), mapped from
 [−1/√2, 1/√2] to 0…1022 with 511 = 0. The receiver rebuilds the dropped component from unit

@@ -41,7 +41,7 @@ local function fake_game()
     function g:area_name() return tostring(self.chapter) end
     function g:teleport_player(pos) self.teleports[#self.teleports + 1] = pos self.pos = pos return true end
     function g:is_key_down(vk) return self.keys[vk] == true end
-    function g:restore_enemy_ai() self.ai_restored = self.ai_restored + 1 end
+    function g:restore_enemies() self.ai_restored = self.ai_restored + 1 end
     return g
 end
 
@@ -120,10 +120,10 @@ T.run("world_messages_wait_for_the_game_loop", function()
     local g = "0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9"
     net.push(P.encode_flags({ { guid = g, value = true } })[1])
     net.push(P.encode_chat("still here"))
-    net.push(P.encode_enemy_snapshots(1, {})[1])
+    net.push(P.encode_enemy_states(1, {})[1])
     s:update_network_only() -- loading screen: the game loop is not running
     T.check(world.flags[g] == nil, "flag not applied outside the game loop")
-    T.eq(#s.deferred, 1, "kept for later (enemy snapshots are not: they are resent)")
+    T.eq(#s.deferred, 1, "kept for later (enemy states are not: they are resent)")
     T.eq(s.messages[#s.messages].text, "Host: still here", "chat handled right away")
     clock.t = 1
     s:update()
@@ -303,7 +303,7 @@ T.run("host_reload_resets_old_deaths_on_the_client", function()
     local reset = false
     for _, m in ipairs(net.sent) do
         local d = P.decode(m.data)
-        if d and d.type == P.T.ENEMY_DEAD and d.net_id == P.ENEMY_DEAD_RESET then reset = true end
+        if d and d.type == P.T.ENEMY_DEATH and d.reset then reset = true end
     end
     T.check(reset, "client told to forget the host's earlier deaths")
 end)

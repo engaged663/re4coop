@@ -3,17 +3,15 @@
 
 local P = {}
 
-P.VERSION = 8            -- bump on any incompatible change to the layouts below
-P.MOD_VERSION = "0.8.1"
+P.VERSION = 9            -- bump on any incompatible change to the layouts below
+P.MOD_VERSION = "0.9.0"
 P.MAX_PAYLOAD = 1188     -- re4coop_net.max_payload(): biggest message one datagram carries
 
 P.T = {
     HELLO = 1,          -- reliable, both directions, right after connecting
     PLAYER = 2,         -- unreliable, ~20 Hz, both directions: position, HP, flags
     -- 3 was SKELETON (protocols 1-3, the stick-figure ghost)
-    ENEMY_SNAPSHOT = 4, -- unreliable, ~20 Hz, host -> client: the host's living enemies
-    ENEMY_DAMAGE = 5,   -- reliable, client -> host
-    ENEMY_DEAD = 6,     -- reliable, host -> client: one enemy died in the host's world (or a reset)
+    -- 4, 5, 6 were ENEMY_SNAPSHOT, ENEMY_DAMAGE, ENEMY_DEAD (protocols 1-8, the old enemy sync)
     CHAT = 7,           -- reliable
     NOTIFY = 8,         -- reliable, short status notices (died, cutscene, teleported...)
     ITEM_TAKEN = 9,     -- reliable, both directions: a shared pickup (key item) was taken
@@ -22,9 +20,9 @@ P.T = {
     GEAR = 12,          -- reliable, the weapons the sender's character carries
     POSE = 13,          -- unreliable, ~30 Hz, the full skeleton pose + weapon placement
     ACTIONS = 14,       -- reliable, sounds/effects/shots to replay on the partner's model
-    ENEMY_HIT = 15,     -- unreliable, both directions: a hit the sender's player landed on an enemy
+    -- 15 was the old ENEMY_HIT (protocols 5-8)
     ITEM_DROPPED = 16,  -- retired in 0.7 (each player rolls their own loot); still decoded, ignored
-    ENEMY_CLIENT = 17,  -- unreliable, ~20 Hz, client -> host: the host's enemies the client has a copy of
+    -- 17 was ENEMY_CLIENT (protocols 6-8)
     FLAGS = 18,         -- reliable, both directions: scenario flags that changed, by GUID
     FLAG_WORDS = 19,    -- reliable, both directions: scenario flag bits per group (full copy or masks)
     GIMMICKS = 20,      -- reliable, both directions: gimmick save states (doors, locks, levers...)
@@ -34,6 +32,12 @@ P.T = {
     WORLD_DONE = 24,    -- reliable, host -> client: end of a full world state transfer
     ENEMY_GRAVE = 25,   -- reliable, host -> client: every enemy dead in the host's world (full list)
     ANIMALS = 26,       -- unreliable, ~10 Hz, host -> client: the host's animals near its player
+    -- Enemy sync (protocol 9): every enemy has one owner whose game runs it; see enemy_net.lua.
+    ENEMY_STATE = 27,   -- unreliable, ~20 Hz, both directions: the enemies the sender owns (full state)
+    ENEMY_HIT = 28,     -- reliable, both directions: a hit the sender's player landed (applied by the owner)
+    ENEMY_DEATH = 29,   -- reliable, both directions: an enemy the sender owns died (or the host's world reset)
+    ENEMY_OWNER = 30,   -- reliable, host -> client: who owns which enemy (ownership epochs)
+    ENEMY_ROSTER = 31,  -- unreliable, ~5 Hz, client -> host: the host's enemies the client has a copy of
 }
 
 P.PLAYER_FLAGS = {
@@ -45,13 +49,44 @@ P.PLAYER_FLAGS = {
     GATE_WAITING = 32, -- the player is held at a transition until the partner arrives
 }
 
--- The host runs every enemy; the client's copies follow it. (Bits 4 and 16 meant "run by the
--- client" and "hand-over decided" while enemies changed hands between the games; retired.)
-P.ENEMY_FLAGS = {
+-- ENEMY_STATE entry flags.
+P.ENEMY_STATE_FLAGS = {
     ALIVE = 1,
-    HAS_UID = 2,      -- entry carries the enemy's level identity (see "Enemy identity" below)
-    HAS_MOTION = 8,   -- entry carries the enemy's animation (motion bank, motion id, frame)
+    HAS_UID = 2,    -- entry carries the enemy's level identity (see "Enemy identity" below)
+    HIDDEN = 4,     -- the owner's game does not draw the enemy right now
+    HAS_SPAWN = 8,  -- entry carries where the owner first saw the enemy (enemies without a uid)
 }
+
+-- Who owns an enemy (ENEMY_OWNER): its game runs the enemy's AI and sends its state.
+P.OWNER = { HOST = 0, CLIENT = 1, NONE = 255 } -- NONE: the host retired that net id
+
+-- ENEMY_ROSTER entry flags.
+P.ROSTER_FLAGS = {
+    ALIVE = 1,
+    LOCAL_RUN = 2, -- the client's own AI has been running it (no owner assigned yet)
+}
+
+-- ENEMY_HIT flags.
+P.HIT_FLAGS = {
+    APPLY = 1,     -- the receiver owns the enemy: run the hit through its game's hit code
+    CRITICAL = 2,
+    BOUNCE = 4,    -- sent back: the receiver of the original hit did not own the enemy, the sender does
+    LETHAL = 8,    -- in the sender's game this hit would have killed the enemy
+    HAS_UID = 16,
+}
+
+-- ENEMY_DEATH flags.
+P.DEATH_FLAGS = {
+    HAS_UID = 1,
+    RESET = 2,      -- the host's world reloaded: every death it reported before is void
+    ERASED = 4,     -- the owner removed it without a death (dead in the partner's world before)
+    HAS_HIT = 8,    -- the message carries the killing hit
+}
+
+-- Values of a hit (chainsaw.HitController.DamageInfo fields) on the wire: tag of each value.
+P.HIT_VALUE = { I32 = 1, F32 = 2, BOOL = 3, VEC3 = 4, U32 = 5, I64 = 6, F64 = 7 }
+P.MAX_HIT_FIELDS = 64
+P.MAX_ENEMY_LAYERS = 3
 
 P.ANIMAL_FLAGS = {
     HAS_MOTION = 1,  -- entry carries the animal's animation (motion bank, motion id, frame)
@@ -76,11 +111,6 @@ function P.character_id_stable(ctx)
     return ctx ~= nil and ctx.category == P.CHARACTER_CATEGORY and ctx.group ~= nil
         and ctx.group ~= P.DYNAMIC_CHARACTER_GROUP and (ctx.group ~= 0 or ctx.index ~= 0)
 end
-
-P.ENEMY_DEAD_FLAGS = {
-    HAS_UID = 1,
-    RESET = 2, -- the host's world reloaded: every death it reported before is void
-}
 
 P.FLAG_WORDS_MODE = {
     FULL = 1,  -- the sender's complete words for those groups (replace)
@@ -109,24 +139,10 @@ P.CUTSCENE_FLAGS = {
     LOCAL_TRIGGER = 1, -- started by the sender's own game (not a replay of ours)
 }
 
-P.DAMAGE_FLAGS = {
-    LETHAL = 1,
-    HAS_UID = 2,
-}
-
 P.ITEM_FLAGS = {
     HAS_CTX = 1,
     ONLY_INSTANCE = 2, -- the sender's scene had no other copy of this key item
     HAS_STAGE = 4,
-}
-
--- ENEMY_DEAD with this net id (and the RESET flag): the host's enemies were reset (checkpoint
--- reload), forget every death it reported. Real net ids start at 1.
-P.ENEMY_DEAD_RESET = 0
-
-P.HIT_FLAGS = {
-    CRITICAL = 1,
-    HAS_UID = 2,
 }
 
 P.DROP_FLAGS = {
@@ -177,16 +193,18 @@ P.MAX_WEAPONS = 4
 P.MAX_WEAPON_JOINTS = 32
 P.MAX_TRANSLATIONS = 32
 P.MAX_EVENT_ARGS = 16
-P.ENEMIES_PER_SNAPSHOT = 19 -- 12 B header + 19 * 59 B entries stays under the 1188 B payload limit
-P.MAX_CLIENT_PAIRED = 500 -- 11 B + 500 * 2 B paired ids < 1188 B
+P.OWNERS_PER_MESSAGE = 95 -- 2 B + 95 * 12 B
+P.ROSTER_PER_MESSAGE = 160 -- 11 B + 160 * 7 B
 P.ANIMALS_PER_MESSAGE = 23 -- 12 B header + 23 * 49 B entries < 1188 B
 P.FLAGS_PER_MESSAGE = 64
 P.OBJECTS_PER_MESSAGE = 50 -- 2 B + 50 * 21 B
 P.GRAVE_PER_MESSAGE = 290 -- 5 B header + 290 * 4 B uids
 
--- net id, kind hash, position, spawn position, yaw, hp, max hp, flags, uid (ContextID code),
--- motion bank, motion id, motion frame
-local ENEMY_ENTRY = "<I2I4fffffffffBI4I4I4f"
+-- ENEMY_STATE entry: net id, epoch, flags, uid (ContextID code), kind hash, position, packed
+-- rotation, velocity (cm/s), HP, max HP, hit ack, layer count; then the spawn position (flag
+-- HAS_SPAWN) and per animation layer: motion bank, motion id, frame, speed.
+local ENEMY_STATE_ENTRY = "<I2BI2I4I4fffI4hhhffI2B"
+local ENEMY_LAYER = "<I4I4ff"
 -- GameObject GUID (16 raw bytes), position, packed rotation, _Routine, motion bank, motion id,
 -- motion frame, flags
 local ANIMAL_ENTRY = "<c16fffI4i4I4I4fB"
@@ -404,51 +422,202 @@ local function uid_or_zero(uid)
     return uid
 end
 
--- Splits the enemy list into as many messages as needed. Returns an array of strings.
--- entry = { net_id, kind_hash, pos={x,y,z}, spawn={x,y,z}, yaw, hp, max_hp, flags, uid,
---           motion={bank, id, frame}|nil }
--- `uid` is the enemy's level identity (nil for characters created at runtime). `spawn` is
--- where the host first saw the enemy: with the kind, the fallback identity without a uid.
--- `motion` is the animation playing on the enemy (for mirroring it on the client).
-function P.encode_enemy_snapshots(time, entries)
+-------------------------------------------------------------------------------
+-- Enemies (protocol 9). Every enemy has one owner: the game that runs its AI. The owner sends
+-- the enemy's whole state (ENEMY_STATE); hits the other player lands travel to the owner
+-- (ENEMY_HIT) and are run through the owner's own hit code; the owner announces the death
+-- (ENEMY_DEATH) with the killing hit. The host decides who owns what (ENEMY_OWNER) from what
+-- the client has (ENEMY_ROSTER). See enemy_net.lua.
+-------------------------------------------------------------------------------
+
+-- Velocity in cm/s as int16 (+-327 m/s).
+local function cms(v)
+    return clamp_i16((v or 0) * 100.0)
+end
+
+-- A hit's values: { {h = FNV-1a of the DamageInfo field name, t = P.HIT_VALUE.*, v = value}, ... }
+-- (VEC3 values are {x,y,z}). Values with an unknown tag are skipped.
+local HIT_VALUE_FORMAT = { [1] = "<i4", [2] = "<f", [5] = "<I4", [6] = "<i8", [7] = "<d" }
+
+local function pack_hit_fields(fields)
+    local V = P.HIT_VALUE
+    local parts, n = {}, 0
+    for _, f in ipairs(fields or {}) do
+        if n >= P.MAX_HIT_FIELDS then break end
+        local h, t, v = clamp_u32(f.h), f.t, f.v
+        local packed
+        if t == V.VEC3 and type(v) == "table" then
+            packed = string.pack("<I4Bfff", h, t, tonumber(v.x) or 0, tonumber(v.y) or 0, tonumber(v.z) or 0)
+        elseif t == V.BOOL then
+            packed = string.pack("<I4BB", h, t, v and 1 or 0)
+        elseif t == V.I32 then
+            packed = string.pack("<I4Bi4", h, t, clamp_i32(v))
+        elseif t == V.U32 then
+            packed = string.pack("<I4BI4", h, t, clamp_u32(v))
+        elseif t == V.I64 then
+            packed = string.pack("<I4Bi8", h, t, math.tointeger(v) or 0)
+        elseif t == V.F32 or t == V.F64 then
+            packed = string.pack(t == V.F32 and "<I4Bf" or "<I4Bd", h, t, tonumber(v) or 0)
+        end
+        if packed ~= nil then
+            n = n + 1
+            parts[n] = packed
+        end
+    end
+    return string.pack("<B", n) .. table.concat(parts)
+end
+
+local function unpack_hit_fields(data, off)
+    local V = P.HIT_VALUE
+    local n
+    n, off = string.unpack("<B", data, off)
+    local fields = {}
+    for i = 1, n do
+        local h, t, v
+        h, t, off = string.unpack("<I4B", data, off)
+        if t == V.VEC3 then
+            local x, y, z
+            x, y, z, off = string.unpack("<fff", data, off)
+            v = { x = x, y = y, z = z }
+        elseif t == V.BOOL then
+            local b
+            b, off = string.unpack("<B", data, off)
+            v = b ~= 0
+        elseif HIT_VALUE_FORMAT[t] ~= nil then
+            v, off = string.unpack(HIT_VALUE_FORMAT[t], data, off)
+        else
+            error("bad hit value tag")
+        end
+        fields[i] = { h = h, t = t, v = v }
+    end
+    return fields, off
+end
+
+-- The state of the enemies the sender owns. entry = { net_id, epoch, uid, kind_hash,
+-- pos={x,y,z}, rot={x,y,z,w}, vel={x,y,z}|nil, hp, max_hp, alive, hidden, spawn={x,y,z}|nil
+-- (sent only for enemies without a uid), ack (the last of the receiver's hits applied to this
+-- enemy), layers = { {bank, id, frame, speed}, ... } (at most P.MAX_ENEMY_LAYERS) }.
+-- Entries are packed into as few messages as fit the payload; returns an array of strings with
+-- at least one message (an empty one says "I own nothing right now").
+local STATE_HEADER = "<BdBBB" -- type, time, chunk, chunks, count
+local STATE_HEADER_SIZE = 12
+function P.encode_enemy_states(time, entries)
+    local F = P.ENEMY_STATE_FLAGS
+    local packed = {}
+    for _, e in ipairs(entries) do
+        local uid = uid_or_zero(e.uid)
+        local flags = 0
+        if e.alive ~= false then flags = flags | F.ALIVE end
+        if uid ~= 0 then flags = flags | F.HAS_UID end
+        if e.hidden then flags = flags | F.HIDDEN end
+        local spawn = uid == 0 and (e.spawn or e.pos) or nil
+        if spawn ~= nil then flags = flags | F.HAS_SPAWN end
+        local layers = e.layers or {}
+        local nl = math.min(#layers, P.MAX_ENEMY_LAYERS)
+        local vel = e.vel or { x = 0, y = 0, z = 0 }
+        local parts = { string.pack(ENEMY_STATE_ENTRY, (e.net_id or 0) & 0xFFFF, (e.epoch or 0) & 0xFF, flags, uid,
+            clamp_u32(e.kind_hash), e.pos.x, e.pos.y, e.pos.z, pack_rot(e.rot), cms(vel.x), cms(vel.y), cms(vel.z),
+            e.hp or 0, e.max_hp or 0, (e.ack or 0) & 0xFFFF, nl) }
+        if spawn ~= nil then parts[#parts + 1] = string.pack("<fff", spawn.x, spawn.y, spawn.z) end
+        for i = 1, nl do
+            local l = layers[i]
+            parts[#parts + 1] = string.pack(ENEMY_LAYER, clamp_u32(l.bank), clamp_u32(l.id), l.frame or 0, l.speed or 1)
+        end
+        packed[#packed + 1] = table.concat(parts)
+    end
+    local groups, cur, size = {}, {}, STATE_HEADER_SIZE
+    for _, p in ipairs(packed) do
+        if #cur > 0 and (size + #p > P.MAX_PAYLOAD or #cur >= 255) then
+            groups[#groups + 1] = cur
+            cur, size = {}, STATE_HEADER_SIZE
+        end
+        cur[#cur + 1] = p
+        size = size + #p
+    end
+    groups[#groups + 1] = cur
     local out = {}
-    local per = P.ENEMIES_PER_SNAPSHOT
-    local chunks = math.max(1, math.ceil(#entries / per))
-    local F = P.ENEMY_FLAGS
+    local chunks = math.min(255, #groups)
     for c = 1, chunks do
-        local first = (c - 1) * per + 1
-        local last = math.min(#entries, c * per)
-        local count = math.max(0, last - first + 1)
-        local parts = { string.pack("<BdBBB", P.T.ENEMY_SNAPSHOT, time, c, chunks, count) }
+        local g = groups[c]
+        out[c] = string.pack(STATE_HEADER, P.T.ENEMY_STATE, time or 0, c, chunks, #g) .. table.concat(g)
+    end
+    return out
+end
+
+-- A hit the sender's player landed on an enemy. m = { net_id (0 = not paired), epoch, flags
+-- (P.HIT_FLAGS: APPLY, BOUNCE, LETHAL), critical, uid, kind_hash, pos={x,y,z} (the enemy's
+-- identity position: its spawn point without a uid), damage, hp (the enemy's HP in the
+-- sender's game before the hit), seq (the sender's hit counter), fields (the DamageInfo values) }
+local ENEMY_HIT_HEADER = "<BI2BBI4I4fffffI2"
+function P.encode_enemy_hit(m)
+    local uid = uid_or_zero(m.uid)
+    local flags = (m.flags or 0) & ~P.HIT_FLAGS.HAS_UID
+    if uid ~= 0 then flags = flags | P.HIT_FLAGS.HAS_UID end
+    if m.critical then flags = flags | P.HIT_FLAGS.CRITICAL end
+    local pos = m.pos or { x = 0, y = 0, z = 0 }
+    return string.pack(ENEMY_HIT_HEADER, P.T.ENEMY_HIT, (m.net_id or 0) & 0xFFFF, (m.epoch or 0) & 0xFF, flags & 0xFF,
+        uid, clamp_u32(m.kind_hash), pos.x, pos.y, pos.z, m.damage or 0, m.hp or 0, (m.seq or 0) & 0xFFFF)
+        .. pack_hit_fields(m.fields)
+end
+
+-- An enemy the sender owns died (or was erased). m = { net_id, epoch, flags (P.DEATH_FLAGS:
+-- ERASED), uid, kind_hash, pos={x,y,z} and rot={x,y,z,w} where it died, fields (the killing hit,
+-- optional) }.
+local ENEMY_DEATH_HEADER = "<BI2BBI4I4fffI4"
+function P.encode_enemy_death(m)
+    local F = P.DEATH_FLAGS
+    local uid = uid_or_zero(m.uid)
+    local flags = (m.flags or 0) & ~(F.HAS_UID | F.HAS_HIT)
+    if uid ~= 0 then flags = flags | F.HAS_UID end
+    if m.fields ~= nil and #m.fields > 0 then flags = flags | F.HAS_HIT end
+    local pos = m.pos or { x = 0, y = 0, z = 0 }
+    return string.pack(ENEMY_DEATH_HEADER, P.T.ENEMY_DEATH, (m.net_id or 0) & 0xFFFF, (m.epoch or 0) & 0xFF,
+        flags & 0xFF, uid, clamp_u32(m.kind_hash), pos.x, pos.y, pos.z, pack_rot(m.rot))
+        .. pack_hit_fields((flags & F.HAS_HIT) ~= 0 and m.fields or nil)
+end
+
+-- The host's world reloaded (checkpoint): every death it reported before is void.
+function P.encode_enemy_reset()
+    return P.encode_enemy_death({ net_id = 0, flags = P.DEATH_FLAGS.RESET })
+end
+
+-- Host -> client: owners = { {net_id, epoch, owner = P.OWNER.*, uid, hp}, ... } (hp: the
+-- host's HP of the enemy when it changed hands, 0 = none). Returns an array of strings (empty
+-- for an empty list).
+function P.encode_enemy_owners(owners)
+    local out = {}
+    local per = P.OWNERS_PER_MESSAGE
+    for first = 1, #owners, per do
+        local last = math.min(#owners, first + per - 1)
+        local parts = { string.pack("<BB", P.T.ENEMY_OWNER, last - first + 1) }
         for i = first, last do
-            local e = entries[i]
-            local spawn = e.spawn or e.pos
-            local uid = uid_or_zero(e.uid)
-            local flags = (e.flags or 0) & ~(F.HAS_UID | F.HAS_MOTION)
-            if uid ~= 0 then flags = flags | F.HAS_UID end
-            local motion = e.motion or {}
-            if e.motion ~= nil then flags = flags | F.HAS_MOTION end
-            parts[#parts + 1] = string.pack(ENEMY_ENTRY, e.net_id, e.kind_hash,
-                e.pos.x, e.pos.y, e.pos.z, spawn.x, spawn.y, spawn.z,
-                e.yaw or 0, e.hp or 0, e.max_hp or 0, flags, uid,
-                clamp_u32(motion.bank), clamp_u32(motion.id), motion.frame or 0)
+            local o = owners[i]
+            parts[#parts + 1] = string.pack("<I2BBI4f", (o.net_id or 0) & 0xFFFF, (o.epoch or 0) & 0xFF,
+                (o.owner or 0) & 0xFF, uid_or_zero(o.uid), o.hp or 0)
         end
         out[#out + 1] = table.concat(parts)
     end
     return out
 end
 
--- Client -> host, every ~50 ms: paired = { net_id ... }, every host enemy the client has a
--- living copy of (the host reads those enemies' animation for the client to mirror).
-function P.encode_enemy_client(time, paired)
-    local np = math.min(#paired, P.MAX_CLIENT_PAIRED)
-    local parts = { string.pack("<BdI2", P.T.ENEMY_CLIENT, time, np) }
-    for i = 1, np do
-        parts[#parts + 1] = string.pack("<I2", paired[i])
-    end
-    return table.concat(parts)
+-- Client -> host: the host enemies the client has a copy of. entries = { {net_id, flags
+-- (P.ROSTER_FLAGS), hp}, ... }. Returns an array of strings, at least one.
+function P.encode_enemy_roster(time, entries)
+    local out = {}
+    local per = P.ROSTER_PER_MESSAGE
+    local first = 1
+    repeat
+        local last = math.min(#entries, first + per - 1)
+        local parts = { string.pack("<BdI2", P.T.ENEMY_ROSTER, time or 0, math.max(0, last - first + 1)) }
+        for i = first, last do
+            local e = entries[i]
+            parts[#parts + 1] = string.pack("<I2Bf", (e.net_id or 0) & 0xFFFF, (e.flags or 0) & 0xFF, e.hp or 0)
+        end
+        out[#out + 1] = table.concat(parts)
+        first = last + 1
+    until first > #entries
+    return out
 end
-
 -- Host -> client, ~10 Hz: the host's animals near its player. Returns an array of strings.
 -- animal = { guid = "xxxxxxxx-....", pos = {x,y,z}, rot = {x,y,z,w}, routine = int|nil,
 --            motion = {bank, id, frame}|nil, dead = bool }. Entries with a bad GUID are skipped.
@@ -639,16 +808,6 @@ function P.encode_world_done(sync_id, what, n_flag_groups, n_gimmicks)
         clamp_u32(n_flag_groups), clamp_u32(n_gimmicks))
 end
 
--- m = { net_id (0 if unknown), kind_hash, pos={x,y,z} (spawn point), amount, flags, uid }
-local ENEMY_DAMAGE = "<BI2I4ffffBI4"
-function P.encode_enemy_damage(m)
-    local uid = uid_or_zero(m.uid)
-    local flags = (m.flags or 0) & ~P.DAMAGE_FLAGS.HAS_UID
-    if uid ~= 0 then flags = flags | P.DAMAGE_FLAGS.HAS_UID end
-    return string.pack(ENEMY_DAMAGE, P.T.ENEMY_DAMAGE, m.net_id or 0, m.kind_hash or 0,
-        m.pos.x, m.pos.y, m.pos.z, m.amount or 0, flags, uid)
-end
-
 -- m = { item_id, pos={x,y,z}, ctx, stage, only_instance }
 -- ctx = the pickup's chainsaw.ContextID (may be nil), stage = its chainsaw.StageID (may be nil),
 -- only_instance = the sender saw no other copy of this item in its scene.
@@ -664,22 +823,6 @@ function P.encode_item_taken(m)
         m.pos.x, m.pos.y, m.pos.z, flags, g, idx, k, c, stage)
 end
 
--- m = { net_id (0 if unknown), kind_hash, pos={x,y,z} (enemy spawn point, for matching),
---       damage, wince, break_, stopping, dir={x,y,z}, weapon, critical, uid }
--- The parameters of a chainsaw.HitController.DamageInfo the sender's player caused.
-local ENEMY_HIT = "<BI2I4fffi4ffffffi4BI4"
-function P.encode_enemy_hit(m)
-    local dir = m.dir or { x = 0, y = 0, z = 0 }
-    local damage = opt_i32(m.damage and math.floor(m.damage + 0.5))
-    local weapon = opt_i32(m.weapon)
-    local uid = uid_or_zero(m.uid)
-    local flags = m.critical and P.HIT_FLAGS.CRITICAL or 0
-    if uid ~= 0 then flags = flags | P.HIT_FLAGS.HAS_UID end
-    return string.pack(ENEMY_HIT, P.T.ENEMY_HIT, m.net_id or 0, m.kind_hash or 0,
-        m.pos.x, m.pos.y, m.pos.z, damage, m.wince or 0, m.break_ or 0, m.stopping or 0,
-        dir.x, dir.y, dir.z, weapon, flags, uid)
-end
-
 -- m = { net_id (host's enemy), item_id, count, pos={x,y,z}, stage }
 local ITEM_DROPPED = "<BI2I4i4fffi4B"
 function P.encode_item_dropped(m)
@@ -687,18 +830,6 @@ function P.encode_item_dropped(m)
     local count = opt_i32(m.count)
     return string.pack(ITEM_DROPPED, P.T.ITEM_DROPPED, m.net_id or 0, m.item_id or 0, count,
         m.pos.x, m.pos.y, m.pos.z, stage, has_stage and P.DROP_FLAGS.HAS_STAGE or 0)
-end
-
--- One enemy died in the host's world: its net id and (if it has one) its uid.
-local ENEMY_DEAD = "<BI2BI4"
-function P.encode_enemy_dead(net_id, uid)
-    uid = uid_or_zero(uid)
-    return string.pack(ENEMY_DEAD, P.T.ENEMY_DEAD, net_id or 0, uid ~= 0 and P.ENEMY_DEAD_FLAGS.HAS_UID or 0, uid)
-end
-
--- The host's world reloaded (checkpoint): every death it reported before is void.
-function P.encode_enemy_dead_reset()
-    return string.pack(ENEMY_DEAD, P.T.ENEMY_DEAD, P.ENEMY_DEAD_RESET, P.ENEMY_DEAD_FLAGS.RESET, 0)
 end
 
 -- The uids of every enemy dead in the host's world. The first message of a list replaces
@@ -946,34 +1077,89 @@ decoders[P.T.PLAYER] = function(data)
     }
 end
 
-decoders[P.T.ENEMY_SNAPSHOT] = function(data)
+decoders[P.T.ENEMY_STATE] = function(data)
     local _, time, chunk, chunks, count, off = string.unpack("<BdBBB", data)
+    if chunk < 1 or chunk > chunks then error("bad chunk") end
+    local F = P.ENEMY_STATE_FLAGS
     local m = { time = time, chunk = chunk, chunks = chunks, enemies = {} }
-    local F = P.ENEMY_FLAGS
     for i = 1, count do
-        local net_id, kind_hash, x, y, z, sx, sy, sz, yaw, hp, max_hp, flags, uid, bank, mid, frame
-        net_id, kind_hash, x, y, z, sx, sy, sz, yaw, hp, max_hp, flags, uid, bank, mid, frame, off =
-            string.unpack(ENEMY_ENTRY, data, off)
-        m.enemies[i] = {
-            net_id = net_id, kind_hash = kind_hash,
-            pos = { x = x, y = y, z = z }, spawn = { x = sx, y = sy, z = sz },
-            yaw = yaw, hp = hp, max_hp = max_hp, flags = flags,
+        local net_id, epoch, flags, uid, kind_hash, x, y, z, rot, vx, vy, vz, hp, max_hp, ack, nl
+        net_id, epoch, flags, uid, kind_hash, x, y, z, rot, vx, vy, vz, hp, max_hp, ack, nl, off =
+            string.unpack(ENEMY_STATE_ENTRY, data, off)
+        if nl > P.MAX_ENEMY_LAYERS then error("too many layers") end
+        local e = {
+            net_id = net_id, epoch = epoch, flags = flags, kind_hash = kind_hash,
             uid = ((flags & F.HAS_UID) ~= 0 and uid ~= 0) and uid or nil,
-            motion = (flags & F.HAS_MOTION) ~= 0 and { bank = bank, id = mid, frame = frame } or nil,
+            pos = { x = x, y = y, z = z }, rot = unpack_rot(rot),
+            vel = { x = vx / 100.0, y = vy / 100.0, z = vz / 100.0 },
+            hp = hp, max_hp = max_hp, ack = ack,
+            alive = (flags & F.ALIVE) ~= 0, hidden = (flags & F.HIDDEN) ~= 0,
+            layers = {},
         }
+        if (flags & F.HAS_SPAWN) ~= 0 then
+            local sx, sy, sz
+            sx, sy, sz, off = string.unpack("<fff", data, off)
+            e.spawn = { x = sx, y = sy, z = sz }
+        end
+        for l = 1, nl do
+            local bank, id, frame, speed
+            bank, id, frame, speed, off = string.unpack(ENEMY_LAYER, data, off)
+            e.layers[l] = { bank = bank, id = id, frame = frame, speed = speed }
+        end
+        m.enemies[i] = e
     end
     return m
 end
 
-decoders[P.T.ENEMY_CLIENT] = function(data)
-    local _, time, np, off = string.unpack("<BdI2", data)
-    local m = { time = time, paired = {} }
-    for i = 1, np do
-        m.paired[i], off = string.unpack("<I2", data, off)
-    end
-    return m
+decoders[P.T.ENEMY_HIT] = function(data)
+    local _, net_id, epoch, flags, uid, kind_hash, x, y, z, damage, hp, seq, off = string.unpack(ENEMY_HIT_HEADER, data)
+    local F = P.HIT_FLAGS
+    local fields = unpack_hit_fields(data, off)
+    return {
+        net_id = net_id, epoch = epoch, flags = flags, kind_hash = kind_hash,
+        uid = ((flags & F.HAS_UID) ~= 0 and uid ~= 0) and uid or nil,
+        pos = { x = x, y = y, z = z }, damage = damage, hp = hp, seq = seq, fields = fields,
+        apply = (flags & F.APPLY) ~= 0, bounce = (flags & F.BOUNCE) ~= 0, lethal = (flags & F.LETHAL) ~= 0,
+        critical = (flags & F.CRITICAL) ~= 0,
+    }
 end
 
+decoders[P.T.ENEMY_DEATH] = function(data)
+    local _, net_id, epoch, flags, uid, kind_hash, x, y, z, rot, off = string.unpack(ENEMY_DEATH_HEADER, data)
+    local F = P.DEATH_FLAGS
+    local fields = unpack_hit_fields(data, off)
+    return {
+        net_id = net_id, epoch = epoch, flags = flags, kind_hash = kind_hash,
+        uid = ((flags & F.HAS_UID) ~= 0 and uid ~= 0) and uid or nil,
+        pos = { x = x, y = y, z = z }, rot = unpack_rot(rot),
+        fields = (flags & F.HAS_HIT) ~= 0 and fields or nil,
+        reset = (flags & F.RESET) ~= 0, erased = (flags & F.ERASED) ~= 0,
+    }
+end
+
+decoders[P.T.ENEMY_OWNER] = function(data)
+    local _, n, off = string.unpack("<BB", data)
+    local owners = {}
+    for i = 1, n do
+        local net_id, epoch, owner, uid, hp
+        net_id, epoch, owner, uid, hp, off = string.unpack("<I2BBI4f", data, off)
+        owners[i] = { net_id = net_id, epoch = epoch, owner = owner, uid = uid ~= 0 and uid or nil,
+            hp = hp > 0 and hp or nil }
+    end
+    return { owners = owners }
+end
+
+decoders[P.T.ENEMY_ROSTER] = function(data)
+    local _, time, n, off = string.unpack("<BdI2", data)
+    local entries = {}
+    for i = 1, n do
+        local net_id, flags, hp
+        net_id, flags, hp, off = string.unpack("<I2Bf", data, off)
+        entries[i] = { net_id = net_id, flags = flags, hp = hp,
+            alive = (flags & P.ROSTER_FLAGS.ALIVE) ~= 0, local_run = (flags & P.ROSTER_FLAGS.LOCAL_RUN) ~= 0 }
+    end
+    return { time = time, entries = entries }
+end
 decoders[P.T.ANIMALS] = function(data)
     local _, time, chunk, chunks, count, off = string.unpack("<BdBBB", data)
     if chunk < 1 or chunk > chunks then error("bad chunk") end
@@ -1096,14 +1282,6 @@ decoders[P.T.WORLD_DONE] = function(data)
     return { sync_id = sync_id, what = what, n_flag_groups = n_flag_groups, n_gimmicks = n_gimmicks }
 end
 
-decoders[P.T.ENEMY_DAMAGE] = function(data)
-    local _, net_id, kind_hash, x, y, z, amount, flags, uid = string.unpack(ENEMY_DAMAGE, data)
-    return {
-        net_id = net_id, kind_hash = kind_hash, pos = { x = x, y = y, z = z }, amount = amount, flags = flags,
-        uid = ((flags & P.DAMAGE_FLAGS.HAS_UID) ~= 0 and uid ~= 0) and uid or nil,
-    }
-end
-
 decoders[P.T.ITEM_TAKEN] = function(data)
     local _, item_id, x, y, z, flags, g, idx, k, c, stage = string.unpack(ITEM_TAKEN, data)
     local F = P.ITEM_FLAGS
@@ -1115,33 +1293,11 @@ decoders[P.T.ITEM_TAKEN] = function(data)
     }
 end
 
-decoders[P.T.ENEMY_HIT] = function(data)
-    local _, net_id, kind_hash, x, y, z, damage, wince, break_, stopping, dx, dy, dz, weapon, flags, uid =
-        string.unpack(ENEMY_HIT, data)
-    return {
-        net_id = net_id, kind_hash = kind_hash, pos = { x = x, y = y, z = z },
-        damage = damage, wince = wince, break_ = break_, stopping = stopping,
-        dir = { x = dx, y = dy, z = dz }, weapon = weapon,
-        critical = (flags & P.HIT_FLAGS.CRITICAL) ~= 0,
-        uid = ((flags & P.HIT_FLAGS.HAS_UID) ~= 0 and uid ~= 0) and uid or nil,
-    }
-end
-
 decoders[P.T.ITEM_DROPPED] = function(data)
     local _, net_id, item_id, count, x, y, z, stage, flags = string.unpack(ITEM_DROPPED, data)
     return {
         net_id = net_id, item_id = item_id, count = count, pos = { x = x, y = y, z = z },
         stage = (flags & P.DROP_FLAGS.HAS_STAGE) ~= 0 and stage or nil,
-    }
-end
-
-decoders[P.T.ENEMY_DEAD] = function(data)
-    local _, net_id, flags, uid = string.unpack(ENEMY_DEAD, data)
-    local F = P.ENEMY_DEAD_FLAGS
-    return {
-        net_id = net_id,
-        uid = ((flags & F.HAS_UID) ~= 0 and uid ~= 0) and uid or nil,
-        reset = (flags & F.RESET) ~= 0,
     }
 end
 

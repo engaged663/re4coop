@@ -26,7 +26,7 @@ framework for RE Engine games. It loads as `dinput8.dll` next to `re4.exe` and p
 | **Lua scripting** (`reframework/autorun/*.lua`), Lua 5.4.3 via sol2 | All game logic, UI and rendering of the partner |
 | **Type database (TDB) reflection**: `sdk.find_type_definition`, `get_method`, `:call()`, `get_field`/`set_field` | Reading the player, enemies and HP without hard-coded offsets |
 | **Managed singletons**: `sdk.get_managed_singleton("chainsaw.CharacterManager")` | Entry points into game state |
-| **Method hooks**: `sdk.hook(method, pre, post)` | Capturing the local player's sounds, effects and shots so the partner's copy can replay them (§4.1). Enemy damage is still detected by polling (§4) |
+| **Method hooks**: `sdk.hook(method, pre, post)` | Capturing the local player's sounds, effects and shots so the partner's copy can replay them (§4.1), and every hit on an enemy (`HitController.callbackDamageHit`) with all its values, so the enemy's owner can run it (§3.10) |
 | **Application-entry callbacks**: `re.on_application_entry("LateUpdateBehavior", fn)`, `"PrepareRendering"` | Game-thread tick for networking and sync; end-of-frame pose capture and pose check (§4.1) |
 | **Drawing**: `re.on_frame` + `draw.world_to_screen/line/text/...` | Partner name tag, HP bar, HUD |
 | **ImGui**: `re.on_draw_ui` + `imgui.*` | Host/Join panel inside the REFramework menu |
@@ -631,6 +631,81 @@ harmless, but it logged a warning every time and could release an object early i
 the same pointer to Lua again in the meantime. The mod now only calls `add_ref()` on objects it
 creates and lets the collector release them.
 
+### 3.10 v0.9: enemy sync rebuilt from scratch
+
+v0.8 made the host's game run every enemy and turned the client's copies into followers. That
+left gaps players see at once: the host's enemies only ever attack the host (RE4's AI targets
+the player of its own game), the client's hits only changed a number on the host (no flinch, no
+stagger, no knock-down: the host's enemy never reacted), deaths happened in the client's game
+with its own, unrelated death reaction, the client's copies played only the base animation layer
+and drifted out of step (the body's own animation state machine kept choosing motions), and only
+the heading travelled. v0.9 deletes `enemy_sync.lua` and its five messages and replaces them
+with `enemy_net.lua` (logic), `game_enemies.lua` (the game side) and protocol 9.
+
+**One owner per enemy, with epochs.** Every enemy is run by exactly one game, its owner; the
+other game shows a puppet. The host numbers its enemies (net ids, as before) and decides who
+owns what; every change bumps the enemy's ownership epoch (u8, 0 = never assigned), and state
+or hits of another epoch are ignored, so two AIs never run one enemy. With
+`enemy_authority = "shared"` (default) an enemy belongs to the game of the player it is closer
+to (3 m margin, 0.75 s hold, at least 2.5 s with an owner, +4 m for the player who hit it in the
+last 3 s, never a player who is down, in a cutscene or 80 m away): **enemies attack both
+players**, each with its own game's real AI. `"host"` keeps every enemy with the host (0.8's
+behaviour). A hand-over continues from the latest state the new owner received (position
+extrapolated by the sender's velocity, HP never raised), so nothing jumps. Races are closed by
+design: a hit that crossed a hand-over is sent back (BOUNCE) and runs once; the old owner reports
+the HP its own player took off the enemy after the host's last look at it (the HP travels in
+ENEMY_OWNER); an owner that lost its copy (area unloaded, reload) gives the enemy back; a host
+enemy that left the host's world is retired and the client's copy runs on its own again.
+Enemies the host has not loaded run on the client's own AI (shared) or are held still and unseen
+(host authority); when the host's level spawns them, the damage the client did stays.
+
+**Full state.** The owner sends, 20 times a second, for each of its enemies: position, the full
+rotation (smallest-three quaternion: enemies that climb, crawl or fly turn about every axis),
+velocity, HP, max HP, whether its game draws it, and up to three animation layers (motion bank,
+motion id, frame, speed: `via.motion.TreeLayer`). Entries are packed into as few datagrams as fit
+(about 46 bytes plus 16 per layer).
+
+**Puppets.** A puppet's AI head is switched off (`set_UpdateSelf(false)` on the head
+GameObject, with 0.8.1's pool safety: a head is never switched on while its HeadUpdater has no
+Context) and so is the body's animation state machine (`via.motion.MotionFsm2`, re-enabled with
+the AI): otherwise the body keeps choosing its own motions and overrides what we write, which is
+what made 0.8's copies drift and snap. Position and rotation are written every frame from a
+100 ms interpolation buffer (+ `CharacterController.warp`). Each animation layer is corrected at
+the state rate: another motion → `changeMotion(bank, id, frame, 6 blend frames)`, the same motion
+more than 4 frames off → `set_Frame` (or `changeMotion` without blending), another speed →
+`set_Speed`; in between the game plays the motion on by itself, so the animation is as smooth as
+the owner's. Visibility follows the owner's (`set_DrawSelf` on the body tree).
+
+**Hits run in the owner's game.** `HitController.callbackDamageHit(DamageInfo)` is hooked on
+every character. The pre-hook reads every primitive field of the DamageInfo and its parent types
+by reflection (ints, floats, bools, enums, `via.vec3`; no objects, nothing named like a serial,
+handle, frame or time) - no field name is hard-coded, both games run the same build, so FNV-1a
+of the name addresses the same value on both sides (*Diagnostics*: `hit_values`; the research
+dump lists them). A hit our player lands on an enemy the partner owns travels as ENEMY_HIT with
+all those values; the owner builds a fresh DamageInfo, writes them, makes its object fields safe
+(our live body as attacker, the enemy as damaged object, dead objects cleared - the v0.7 crash
+rules) and runs it through the enemy's own HitController: **the same damage, the same reaction
+(flinch, stagger, knock-down, part breaks), the same result** as in the shooter's game. In the
+shooter's game the hit happens too (blood, part breaks, its HP at once), but the pre-hook lowers
+a lethal hit's Damage so it leaves 1 HP and clears IsKill: a puppet never dies there. Its HP
+then follows the owner's, and is not given back while one of our hits is in flight (the owner's
+state acknowledges the last hit it ran; after 1 s the owner's HP counts again). Damage a puppet
+takes from anything else (a barrel, a fall) is reported to the owner as plain damage. Without
+values (or if the hit cannot be built) the owner subtracts HP.
+
+**Deaths with the killing hit.** Only the owner decides a death. It announces it (ENEMY_DEATH)
+with where the enemy died, its rotation and the values of the last hit it took (kept by the hook
+for every hit, whoever landed it). The other game takes its puppet off the stream, puts it
+there, switches its AI and animation driver back on and kills it by running that hit with
+`IsKill` and enough damage: **the same kind of death in both games**, and its own death logic
+(ragdoll, dissolve, loot roll). Without a hit, `HitPoint.dead()`. The graveyard, erasing and the
+save scan of §3.8 stay, now for both directions.
+
+What is still not the same in both games: physics after death (ragdolls are simulated in each
+game), effects spawned by the AI itself (both games play them from the animation, but not the
+same particles), and grabs: a puppet's grab plays its animation, the grabbed character's own
+reaction exists only in the owner's game.
+
 ## 4. Sync architecture
 
 ```
@@ -638,11 +713,11 @@ creates and lets the collector release them.
  RE4 + REFramework                                    RE4 + REFramework
  ┌────────────────────────┐   UDP 33040 (direct IP)   ┌────────────────────────┐
  │ re4coop.lua            │ ◄───────────────────────► │ re4coop.lua            │
- │  session ─ enemy_sync  │   PLAYER (20 Hz, unrel.)  │  session ─ enemy_sync  │
+ │  session ─ enemy_net   │   PLAYER (20 Hz, unrel.)  │  session ─ enemy_net   │
  │   items, drops, gate   │   POSE / AVATAR / ACTIONS │   items, drops, gate   │
- │   flag/gimmick/object/ │   ENEMY_SNAPSHOT (15 Hz)  │   flag/gimmick/object/ │
- │   animal/cutscene sync │   ENEMY_CLIENT, ANIMALS   │   animal/cutscene sync │
- │   travel               │   ENEMY_DAMAGE/DEAD/HIT   │   travel               │
+ │   flag/gimmick/object/ │   ENEMY_STATE (20 Hz)     │   flag/gimmick/object/ │
+ │   animal/cutscene sync │   ENEMY_ROSTER, ANIMALS   │   animal/cutscene sync │
+ │   travel               │   ENEMY_HIT/DEATH/OWNER   │   travel               │
  │  game / game_world /   │   FLAGS, FLAG_WORDS,      │  game / game_world /   │
  │  game_pause (sdk)      │   GIMMICKS, OBJECTS,      │  game_pause (sdk)      │
  │  puppet (partner model)│   CUTSCENE, WORLD_*       │  puppet (partner model)│
@@ -660,21 +735,22 @@ creates and lets the collector release them.
   second (POSE). The receiver spawns the partner's body prefab, dresses it and poses it, 100 ms in
   the past for smooth interpolation. Details in §4.1. Name tag, distance and HP bar are drawn on
   top.
-* **Enemies: one shared set.**
+* **Enemies: one shared set, one owner each** (§3.10).
   * Identity: every level enemy's own ContextID (its spawn param's, level data) is its **uid**
     on both machines; the host numbers its enemies for the wire and the client pairs by uid.
     Runtime enemies are paired by kind + spawn point (§3.8).
-  * Health and death: the host is authoritative. Client damage is detected by HP polling and
-    sent as `ENEMY_DAMAGE`; the client only ever lowers HP. Deaths go through the host's
-    **graveyard** (every enemy dead in its world, also from its save): the client kills or
-    erases those enemies wherever they appear, and the host erases enemies the client killed
-    where it had not loaded them (§3.8).
-  * Movement and AI: **the host's game runs every enemy**; nothing changes hands. The client's
-    copy of each enemy the host has loaded **follows** it every frame (position, facing,
-    animation) with its AI head switched off; enemies the host has not loaded yet run in the
-    client's game until the host's level spawns them (§3.9).
-  * Hits each player lands are sent to the other side (tracers, optional cosmetic replay), and
-    each player rolls their own loot from every enemy that dies in their game (§3.7).
+  * Authority: each enemy is run by one game, its owner - by default the game of the player it
+    is closer to, so enemies attack both players; the host decides and every change bumps the
+    enemy's ownership epoch. The other game's copy is a puppet (AI head and animation state
+    machine off) that follows the owner's stream: position, full rotation, up to three
+    animation layers, visibility, HP.
+  * Hits: a hit on an enemy the partner runs is sent with every DamageInfo value and run through
+    the owner's own hit code (same damage, same reaction); our game never kills a puppet.
+  * Deaths: the owner announces each death with the killing hit; the other game kills its copy
+    with that hit where it died. The host's **graveyard** keeps every enemy dead in its world
+    (also from its save), and an enemy dead in the partner's world is killed or erased wherever
+    it appears (§3.8).
+  * Each player rolls their own loot from every enemy that dies in their game (§3.7).
 * **Animals: the host's** (§3.9). The client's copies of the host's animals near both players
   follow them, AI off the game's update; deaths cross both ways.
 * **World: event + state replication** (§3.6): scenario flags by GUID through the game's own
@@ -758,25 +834,30 @@ joint.
 different chapters, and when no pose arrived for 3 s. If the game unloads the copy with an area,
 it is rebuilt.
 
-### 4.2 Known limitations (v0.8)
+### 4.2 Known limitations (v0.9)
 
 * v0.6 crashed in game; v0.7 removes the causes we found (§3.7), but has not been run in game
   yet. After a crash, `re4coop_breadcrumb.json` names the last thing the mod did.
 * Most of this has not been verified in the running game yet. The riskiest assumptions are that the
   body prefab can be spawned outside the game's character spawner once its logic is disabled
   (*Build partner from meshes only* is the escape hatch), that switching an enemy's AI head off
-  leaves its body and HitController working (*Client: enemies stand and move where the host's are* switches
-  mirroring off), and that the probed flag/gimmick/cutscene methods are the ones named in §3.6
-  (*Diagnostics*). The enemy identity, kill and erase calls of §3.8 come from the game's code,
-  but have not run in the game yet either.
+  leaves its body and HitController working (*Enemies your partner's game runs stand and move
+  where theirs are* switches puppets off), that disabling `via.motion.MotionFsm2` lets the
+  written animation play (*…with their own animation state machine switched off*), that a
+  DamageInfo built from the partner's values runs like a real hit (`hit_apply` in
+  *Diagnostics*; without it the owner applies HP), and that the probed flag/gimmick/cutscene
+  methods are the ones named in §3.6. The enemy identity, kill and erase calls of §3.8 come from
+  the game's code, but have not run in the game yet either.
 * Enemies the client's *own* save has eliminated but the host's world has alive cannot be
   brought back in the client's game: the host fights them alone (the client sees nothing
   there). Joining with an older save than the host avoids it.
 * After a host checkpoint reload the host's enemies come back; enemies the client already
   removed stay gone in the client's game.
-* The copy is visual only: no collision, enemies don't see it, bullets pass through it. The
-  host's game runs every enemy, and its enemies only target the host's character: the client's
-  character is not attacked by enemies the host has loaded (§3.9).
+* The partner's character is visual only: no collision, enemies of your game don't see it,
+  bullets pass through it. Enemies attack the partner because the partner's game runs the
+  enemies near them (§3.10); an enemy fighting both players at the same distance belongs to one
+  game and attacks that game's player. With *Who runs enemies: host* only the host is attacked.
+* Ragdolls, AI-spawned effects and grab reactions are each game's own (§3.10).
 * Animal puppets rely on `GimmickManager.unregisterMove`/`registerMove` (§3.9), not yet run in
   the game; *Options → Animals near both players…* switches them off. Animals placed at runtime
   (not from the scene file) may have GUIDs that differ between the games: those run on their own.
@@ -798,21 +879,21 @@ it is rebuilt.
 
 ## 5. Roadmap
 
-1. **In-game validation of v0.8** with the checklist in [TESTING.md](TESTING.md), enemies
-   first (steps 12-14: `enemy_uid`, `enemy_erase`, `enemy_backups`), then the profiler's
+1. **In-game validation of v0.9** with the checklist in [TESTING.md](TESTING.md), enemies
+   first (steps 12-14: `enemy_uid`, `enemy_puppet`, `hit_values`, `hit_apply`, `enemy_motion`,
+   `enemy_erase`, `enemy_backups`), then the profiler's
    numbers, the breadcrumb file after any crash, `drop_calls` in the research log, and the
    experimental features one at a time.
 2. Enemy positions through `CharacterContext.setTransform` (the game's own character teleport)
-   if the transform write proves jittery in game.
+   if the transform write proves jittery in game; root motion switched off on puppets if it
+   fights the transform writes.
 3. Shared checkpoints: when one player dies, both reload (RE5/RE6 style), or the other revives
    them.
-4. Event-driven damage via `chainsaw.EnemyManager.notifyHitDamage` hooks, to remove polling
-   latency.
-5. Replicate thrown objects (grenades, eggs, bolts) and hit effects on enemies.
-6. Enemies that attack the client: the partner's model as a target in the host's game
-   (`HateController.find/addHate` on a stand-in character), with the hits it takes sent to the
-   client as damage.
-7. Optional Steam networking transport for NAT traversal.
+4. Replicate thrown objects (grenades, eggs, bolts) and hit effects on enemies.
+5. Enemies that can target both players in one game: the partner's model as a target
+   (`HateController.find/addHate` on a stand-in character), so an enemy between the players can
+   switch targets without changing hands.
+6. Optional Steam networking transport for NAT traversal.
 
 ## Sources
 
