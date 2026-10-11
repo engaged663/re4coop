@@ -294,17 +294,22 @@ T.run("enemy_snapshot_chunking", function()
     local entries = {}
     for i = 1, 75 do
         entries[i] = { net_id = i, kind_hash = P.hash("k" .. (i % 3)), pos = { x = i, y = 0, z = -i },
-            spawn = { x = i + 0.5, y = 0, z = -i }, yaw = 0.5, hp = i * 10, max_hp = 1000, flags = P.ENEMY_FLAGS.ALIVE }
+            spawn = { x = i + 0.5, y = 0, z = -i }, yaw = 0.5, hp = i * 10, max_hp = 1000, flags = P.ENEMY_FLAGS.ALIVE,
+            motion = { bank = 100 + i, id = 2000 + i, frame = i / 4 } }
     end
     entries[10].ctx = { category = 2, kind = 1, group = -5, index = 123456 }
+    entries[11].motion = nil
+    entries[12].flags = P.ENEMY_FLAGS.ALIVE | P.ENEMY_FLAGS.CLIENT_OWNED
     local msgs = P.encode_enemy_snapshots(9.5, entries)
-    T.eq(#msgs, 3, "75 enemies -> 3 chunks of 25")
+    local per = P.ENEMIES_PER_SNAPSHOT
+    T.eq(per, 20, "20 enemies per snapshot")
+    T.eq(#msgs, 4, "75 enemies -> 4 chunks")
     local seen = 0
     for c, data in ipairs(msgs) do
         T.check(#data <= MAX, ("chunk %d fits in one datagram (%d bytes)"):format(c, #data))
         local m = assert(P.decode(data))
         T.eq(m.chunk, c, "chunk index")
-        T.eq(m.chunks, 3, "chunk count")
+        T.eq(m.chunks, 4, "chunk count")
         for _, e in ipairs(m.enemies) do
             seen = seen + 1
             T.eq(e.net_id, seen, "order preserved")
@@ -318,9 +323,19 @@ T.run("enemy_snapshot_chunking", function()
             else
                 T.eq(e.ctx, nil, "no ContextID when none was sent")
             end
+            if seen == 11 then
+                T.eq(e.motion, nil, "no animation when none was sent")
+            else
+                T.check(e.motion and e.motion.bank == 100 + seen and e.motion.id == 2000 + seen, "animation round-trips")
+                T.near(e.motion and e.motion.frame or -1, seen / 4, 1e-5, "animation frame")
+            end
+            T.eq((e.flags & P.ENEMY_FLAGS.CLIENT_OWNED) ~= 0, seen == 12, "client-owned flag")
         end
     end
     T.eq(seen, 75, "all entries")
+    local full = {}
+    for i = 1, per do full[i] = entries[i] end
+    T.check(#P.encode_enemy_snapshots(1, full)[1] <= MAX, "a full chunk with ContextIDs and animation fits")
     T.eq(#P.encode_enemy_snapshots(1, {}), 1, "empty list still yields one heartbeat snapshot")
 end)
 
@@ -401,6 +416,169 @@ T.run("item_dropped_roundtrip", function()
         "no stage")
 end)
 
+local G1 = "0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9"
+local G2 = "ffffffff-0000-1111-2222-333344445555"
+
+T.run("guid_and_ctx_helpers", function()
+    local b = P.guid_to_bytes(G1)
+    T.eq(#b, 16, "16 bytes")
+    T.eq(P.guid_from_bytes(b), G1, "round trip")
+    T.eq(P.normalize_guid("{0A1B2C3D-4E5F-6071-8293-A4B5C6D7E8F9}"), G1, "braces and case")
+    T.eq(P.normalize_guid("0a1b2c3d4e5f60718293a4b5c6d7e8f9"), G1, "no dashes")
+    T.check(P.normalize_guid("not-a-guid") == nil, "garbage rejected")
+    T.check(P.guid_to_bytes(42) == nil, "non-string rejected")
+    local back = P.ctx_from_key(P.ctx_key({ category = 1, kind = 7, group = 40210, index = -5 }))
+    T.check(back.category == 1 and back.kind == 7 and back.group == 40210 and back.index == -5, "ctx key round trip")
+end)
+
+T.run("enemy_client_roundtrip_and_caps", function()
+    local states, paired = {}, {}
+    for i = 1, 40 do
+        states[i] = { net_id = i, pos = { x = i, y = 1, z = 2 }, yaw = 1.5,
+            motion = i % 2 == 0 and { bank = 1, id = i, frame = 3 } or nil }
+    end
+    for i = 1, 250 do paired[i] = 1000 + i end
+    local data = P.encode_enemy_client(3.5, states, paired)
+    T.check(#data <= MAX, "fits in one datagram (" .. #data .. " bytes)")
+    local m = assert(P.decode(data))
+    T.eq(m.type, P.T.ENEMY_CLIENT, "type")
+    T.eq(#m.states, P.MAX_CLIENT_ENEMY_STATES, "states capped")
+    T.eq(#m.paired, P.MAX_CLIENT_PAIRED, "paired capped")
+    T.near(m.states[3].yaw, 1.5, 1e-6, "yaw")
+    T.eq(m.states[2].motion and m.states[2].motion.id, 2, "animation kept")
+    T.eq(m.states[1].motion, nil, "no animation")
+    T.eq(m.paired[1], 1001, "paired ids")
+end)
+
+T.run("flags_roundtrip_and_batching", function()
+    local flags = {}
+    for i = 1, 150 do
+        flags[i] = { guid = ("%08x-0000-0000-0000-%012x"):format(i, i * 7), value = i % 3 ~= 0 }
+    end
+    flags[151] = { guid = "bogus", value = true }
+    local msgs = P.encode_flags(flags)
+    T.eq(#msgs, 3, "150 flags -> 3 messages")
+    local got = {}
+    for _, data in ipairs(msgs) do
+        T.check(#data <= MAX, "fits")
+        for _, f in ipairs(assert(P.decode(data)).flags) do got[#got + 1] = f end
+    end
+    T.eq(#got, 150, "invalid guid skipped")
+    T.eq(got[1].guid, flags[1].guid, "first guid")
+    T.eq(got[3].value, false, "value false")
+    T.eq(got[150].guid, flags[150].guid, "last guid")
+    T.eq(#P.encode_flags({}), 1, "empty batch is one (empty) message")
+end)
+
+T.run("flag_words_full_and_delta", function()
+    local big = {}
+    for i = 1, 700 do big[i] = (i * 2654435761) & 0xFFFFFFFF end
+    local msgs = P.encode_flag_words(9, P.FLAG_WORDS_MODE.FULL, {
+        { name = "Main", words = big }, { name = "Sub", words = { 1, 2, 3 } },
+        { name = string.rep("L", 300), words = big } })
+    T.check(#msgs >= 4, "large groups split into chunks (" .. #msgs .. ")")
+    local words, long = {}, {}
+    local n_sub = 0
+    for c, data in ipairs(msgs) do
+        T.check(#data <= MAX, ("chunk %d fits (%d bytes)"):format(c, #data))
+        local m = assert(P.decode(data))
+        T.eq(m.sync_id, 9, "sync id")
+        T.eq(m.chunk, c, "chunk")
+        T.eq(m.chunks, #msgs, "chunks")
+        for _, g in ipairs(m.groups) do
+            local into = g.name == "Main" and words or (g.name == "Sub" and {} or long)
+            if g.name == "Sub" then n_sub = n_sub + #g.words end
+            for k, w in ipairs(g.words) do into[g.first + k] = w end
+        end
+    end
+    local same, same_long = true, true
+    for i = 1, 700 do
+        if words[i] ~= big[i] then same = false end
+        if long[i] ~= big[i] then same_long = false end
+    end
+    T.check(same, "all 700 words arrive in order")
+    T.check(same_long, "a group with a 255-byte name too")
+    T.eq(n_sub, 3, "second group")
+
+    local changes = {}
+    for i = 1, 400 do changes[i] = { word = i, set = i, clear = 0x80000000 } end
+    local dmsgs = P.encode_flag_words(0, P.FLAG_WORDS_MODE.DELTA, { { name = "Main", changes = changes } })
+    local n = 0
+    for _, data in ipairs(dmsgs) do
+        T.check(#data <= MAX, "delta chunk fits (" .. #data .. " bytes)")
+        local m = assert(P.decode(data))
+        T.eq(m.mode, P.FLAG_WORDS_MODE.DELTA, "delta mode")
+        for _, g in ipairs(m.groups) do
+            for _, c in ipairs(g.changes) do
+                n = n + 1
+                if c.word ~= n or c.set ~= n or c.clear ~= 0x80000000 then T.check(false, "change " .. n) end
+            end
+        end
+    end
+    T.eq(n, 400, "every change arrives")
+end)
+
+T.run("gimmicks_roundtrip_and_chunking", function()
+    local items = {}
+    for i = 1, 80 do
+        items[i] = { ctx = { category = 1, kind = 1, group = 40200 + i, index = -i }, attr = string.rep(string.char(i % 256), 20),
+            triggers = { { id = i, done = 1 }, { id = i + 1000, done = 0 } }, detected = i % 2 == 0,
+            acc = { { kind = 1, value = 1.5 }, { kind = 2, value = i } } }
+    end
+    items[81] = { ctx = { category = 1, kind = 0, group = 1, index = 1 }, attr = string.rep("A", 255),
+        triggers = {}, detected = false, acc = {} }
+    for t = 1, 64 do items[81].triggers[t] = { id = t, done = 1 } end
+    for a = 1, 64 do items[81].acc[a] = { kind = 2, value = a } end
+    local msgs = P.encode_gimmicks(4, P.GIMMICK_MODE.FULL, items)
+    T.check(#msgs >= 2, "chunked")
+    local got = {}
+    for _, data in ipairs(msgs) do
+        T.check(#data <= MAX, "chunk fits (" .. #data .. " bytes)")
+        local m = assert(P.decode(data))
+        T.eq(m.mode, P.GIMMICK_MODE.FULL, "mode")
+        T.eq(m.sync_id, 4, "sync id")
+        for _, it in ipairs(m.items) do got[#got + 1] = it end
+    end
+    T.eq(#got, 81, "all items")
+    T.eq(P.ctx_key(got[10].ctx), "1:1:40210:-10", "ContextID")
+    T.eq(got[10].attr, items[10].attr, "attr bytes")
+    T.eq(got[10].triggers[2].id, 1010, "trigger id")
+    T.eq(got[10].detected, true, "detected")
+    T.near(got[10].acc[1].value, 1.5, 1e-6, "float accessory value")
+    T.eq(got[10].acc[2].value, 10, "uint accessory value")
+    T.eq(#got[81].triggers, 64, "largest item survives")
+end)
+
+T.run("objects_cutscene_world_roundtrip", function()
+    local o = assert(P.decode(P.encode_objects({ { guid = G1, event = P.OBJECT_EVENT.DESTROYED, value = -1 },
+        { guid = G2, event = P.OBJECT_EVENT.ROUTINE, value = 4 } })[1]))
+    T.eq(#o.events, 2, "two events")
+    T.eq(o.events[1].guid, G1, "guid")
+    T.eq(o.events[1].value, -1, "value")
+    T.eq(o.events[2].event, P.OBJECT_EVENT.ROUTINE, "event")
+    local many = {}
+    for i = 1, 130 do many[i] = { guid = ("%08x-0000-0000-0000-000000000000"):format(i), event = 1, value = i } end
+    local msgs = P.encode_objects(many)
+    T.eq(#msgs, 3, "130 events -> 3 messages")
+    for _, data in ipairs(msgs) do T.check(#data <= MAX, "fits") end
+
+    local c = assert(P.decode(P.encode_cutscene({ id = 20130, method = "requestPlay", chapter = 21300, stage = 45200,
+        pos = { x = 1, y = 2, z = 3 }, flags = P.CUTSCENE_FLAGS.LOCAL_TRIGGER })))
+    T.eq(c.id, 20130, "cutscene id")
+    T.eq(c.method, "requestPlay", "method")
+    T.eq(c.chapter, 21300, "chapter")
+    T.eq(c.stage, 45200, "stage")
+    T.near(c.pos.z, 3, 1e-6, "pos")
+    T.eq(c.flags, P.CUTSCENE_FLAGS.LOCAL_TRIGGER, "flags")
+
+    local r = assert(P.decode(P.encode_world_request(77, P.WORLD.FLAGS | P.WORLD.GIMMICKS)))
+    T.eq(r.sync_id, 77, "request id")
+    T.eq(r.what, 3, "what")
+    local d = assert(P.decode(P.encode_world_done(77, 3, 12, 345)))
+    T.eq(d.n_flag_groups, 12, "flag groups")
+    T.eq(d.n_gimmicks, 345, "gimmicks")
+end)
+
 T.run("malformed_input_never_raises", function()
     T.check(P.decode("") == nil, "empty")
     T.check(P.decode(nil) == nil, "nil")
@@ -422,6 +600,16 @@ T.run("malformed_input_never_raises", function()
         P.encode_item_dropped({ item_id = 1, count = 1, pos = { x = 0, y = 0, z = 0 } }),
         P.encode_player({ time = 1, pos = { x = 0, y = 0, z = 0 }, rot = { x = 0, y = 0, z = 0, w = 1 },
             stage = 43300, chapter = 21100 }),
+        P.encode_enemy_client(1, { { net_id = 1, pos = { x = 0, y = 0, z = 0 }, yaw = 0, motion = { bank = 1, id = 2, frame = 3 } } }, { 5 }),
+        P.encode_flags({ { guid = G1, value = true } })[1],
+        P.encode_flag_words(1, P.FLAG_WORDS_MODE.FULL, { { name = "Main", words = { 1, 2 } } })[1],
+        P.encode_flag_words(1, P.FLAG_WORDS_MODE.DELTA, { { name = "Main", changes = { { word = 1, set = 1, clear = 0 } } } })[1],
+        P.encode_gimmicks(1, P.GIMMICK_MODE.DELTA, { { ctx = { category = 1, kind = 0, group = 2, index = 3 }, attr = "ab",
+            triggers = { { id = 1, done = 1 } }, detected = true, acc = { { kind = 1, value = 2 } } } })[1],
+        P.encode_objects({ { guid = G1, event = 1, value = 2 } })[1],
+        P.encode_cutscene({ id = 1, method = "requestPlay", chapter = 2, stage = 3 }),
+        P.encode_world_request(1, 15),
+        P.encode_world_done(1, 15, 2, 3),
     }
     for _, good in ipairs(samples) do
         local t = good:byte(1)
@@ -433,8 +621,10 @@ T.run("malformed_input_never_raises", function()
             end
         end
     end
-    for t = 1, 16 do
-        if t ~= 3 then
+    -- An empty FLAGS or OBJECTS batch (count 0) is a complete, valid message.
+    local empty_ok = { [3] = true, [P.T.FLAGS] = true, [P.T.OBJECTS] = true }
+    for t = 1, 24 do
+        if not empty_ok[t] then
             local m = P.decode(string.char(t) .. "\0")
             T.check(m == nil, "short message type " .. t)
         end

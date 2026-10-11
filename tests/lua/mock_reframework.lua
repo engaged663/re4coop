@@ -57,11 +57,16 @@ end
 local function make_method(key, nparams, fn, param_types, opts)
     return {
         key = key, name = key:match("^([^(]+)") or key, nparams = nparams, fn = fn,
-        param_types = param_types or {}, static = opts and opts.static or false,
+        param_types = param_types or {}, static = opts and opts.static or false, ret = opts and opts.ret or nil,
         call = function(self, obj, ...) return invoke(self, obj, ...) end,
         get_name = function(self) return self.name end,
         get_num_params = function(self) return self.nparams end,
         is_static = function(self) return self.static end,
+        get_return_type = function(self)
+            local r = self.ret
+            if r == nil then return nil end -- not declared in this mock
+            return { get_full_name = function() return r end }
+        end,
         get_param_types = function(self)
             local out = {}
             for i, t in ipairs(self.param_types) do
@@ -251,6 +256,61 @@ function ValueType:get_field(name) return self.f[name] end
 local function value_type(fields) return setmetatable({ f = fields }, ValueType) end
 M.value_type = value_type
 
+-- A boxed primitive, the way REFramework hands out elements of primitive arrays.
+local Boxed = {}
+Boxed.__index = Boxed
+function Boxed:get_field(f)
+    if f == "mValue" then return self.mValue end
+    error("mock: boxed value has no field " .. tostring(f))
+end
+function Boxed:call(name)
+    if name == "ToString()" or name == "ToString" then return tostring(self.mValue) end
+    error("mock: boxed value has no method " .. tostring(name))
+end
+local function box(v) return setmetatable({ __boxed = true, mValue = v }, Boxed) end
+M.box = box
+
+-- A typed System.Array (UInt32[], Byte[], or of objects) with REFramework's element access:
+-- arr[i] reads (boxed for primitives) and writes (unboxing what it is given).
+local TypedArray = {}
+local typed_methods = {}
+function typed_methods:get_size() return rawget(self, "__size") end
+function typed_methods:get_element(i)
+    local v = rawget(self, "__items")[i + 1]
+    if rawget(self, "__primitive") and v ~= nil then return box(v) end
+    return v
+end
+function typed_methods:get_elements()
+    local out = {}
+    for i = 1, rawget(self, "__size") do out[i] = self:get_element(i - 1) end
+    return out
+end
+function typed_methods:get_address() return rawget(self, "__addr") end
+function typed_methods:get_type_definition() return classes["System.Array"] end
+function typed_methods:call(name)
+    if name == "get_Length" or name == "get_Count" then return rawget(self, "__size") end
+    error("mock: array has no method " .. tostring(name))
+end
+TypedArray.__index = function(t, k)
+    if type(k) == "number" then return typed_methods.get_element(t, k) end
+    return typed_methods[k]
+end
+TypedArray.__newindex = function(t, k, v)
+    if type(k) ~= "number" then error("mock: arrays have no fields") end
+    if k < 0 or k >= rawget(t, "__size") then error("mock: index out of range") end
+    if type(v) == "table" and v.__boxed then v = v.mValue end
+    rawget(t, "__items")[k + 1] = v
+end
+local PRIMITIVE = { ["System.Byte"] = true, ["System.UInt32"] = true, ["System.Int32"] = true, ["System.Single"] = true }
+local next_array_address = 0x7000000
+local function typed_array(elem, items, size)
+    next_array_address = next_array_address + 0x100
+    items = items or {}
+    return setmetatable({ __items = items, __size = size or #items, __elem = elem, __primitive = PRIMITIVE[elem] or false,
+        __addr = next_array_address }, TypedArray)
+end
+M.typed_array = typed_array
+
 local function context_id(ctx)
     if ctx == nil then return nil end
     return value_type({ _Category = ctx.category or 0, _Kind = ctx.kind or 0, _Group = ctx.group, _Index = ctx.index })
@@ -371,6 +431,11 @@ function M.install(opts)
         get_MotionBankID = { 0, function(self) return self.bank end },
         get_MotionID = { 0, function(self) return self.motion end },
         get_Frame = { 0, function(self) return self.frame end },
+        ["changeMotion(System.UInt32, System.UInt32, System.Single, System.Single, via.motion.InterpolationMode, via.motion.InterpolationCurve)"] = {
+            6, function(self, bank, id, frame) self.bank, self.motion, self.frame = bank, id, frame
+                self.changes = (self.changes or 0) + 1 end,
+            { "System.UInt32", "System.UInt32", "System.Single", "System.Single", "via.motion.InterpolationMode",
+                "via.motion.InterpolationCurve" } },
     })
     class("via.motion.Motion", "via.Component", {
         getLayer = { 1, function(self, i) return (self.layers or {})[i + 1] end, { "System.UInt32" } },
@@ -450,6 +515,10 @@ function M.install(opts)
         get_Draw = { 0, function(self) return M.drawn(self) end },
         get_DrawSelf = { 0, function(self) return self.draw_self ~= false end },
         set_DrawSelf = { 1, function(self, v) self.draw_self = v end },
+        get_UpdateSelf = { 0, function(self) return self.update_self ~= false end },
+        set_UpdateSelf = { 1, function(self, v) self.update_self = v end },
+        -- RE Engine prints a GameObject as "name@<guid>" (the GUID from the scene file).
+        ["ToString()"] = { 0, function(self) return ("%s@%s]"):format(self.name or "", self.guid or "") end },
         destroy = { 1, function(self, go) M.destroy(go or self) end },
         [".ctor"] = { 0, function() end },
         ["create(System.String)"] = { 1, function(_, name)
@@ -579,6 +648,7 @@ function M.install(opts)
         get_Item = { 1, function(self, i) return world.enemies[i + 1] end },
     })
     local enemy_list = new("System.Collections.Generic.List`1<chainsaw.EnemyBaseContext>")
+    world.enemy_list = enemy_list
 
     class("chainsaw.CharacterManager", "System.Object", {
         getPlayerContextRef = { 0, function() return world.player end },
@@ -670,6 +740,8 @@ function M.install(opts)
     world.singletons["chainsaw.InventoryManager"] = new("chainsaw.InventoryManager")
     world.singletons["chainsaw.GimmickManager"] = new("chainsaw.GimmickManager")
 
+    if not opts.no_world then M.install_world(world, opts) end
+
     M.prefab_files = {
         [M.PREFAB.leon_body] = function(pos) return M.build_body_prefab(pos) end,
         [M.PREFAB.ada_body] = function(pos) return M.build_body_prefab(pos, "ch3a8z0_body") end,
@@ -737,6 +809,25 @@ function M.install(opts)
         to_managed_object = function(addr)
             if type(addr) == "table" then return addr end -- value stand-ins passed as is
             return objects[addr]
+        end,
+        to_valuetype = function(addr)
+            if type(addr) == "table" then return addr end
+            return objects[addr]
+        end,
+        create_managed_array = function(elem, n)
+            local items = {}
+            if PRIMITIVE[elem] then for i = 1, n do items[i] = 0 end end
+            return typed_array(elem, items, n)
+        end,
+        create_int32 = function(v) return box(v) end,
+        create_uint32 = function(v) return box(v & 0xFFFFFFFF) end,
+        create_byte = function(v) return box(v & 0xFF) end,
+        set_native_field = function(obj, _, name, v)
+            if obj.__fields ~= nil and classes[obj.__type] and classes[obj.__type]:get_field(name) then
+                obj.__fields[name] = v
+            else
+                rawset(obj, name, v)
+            end
         end,
         is_managed_object = function(v)
             if type(v) == "table" then return v.__addr ~= nil end
@@ -1177,6 +1268,352 @@ function M.joint(tf, name)
         if j.name == name then return j end
     end
     return nil
+end
+
+-------------------------------------------------------------------------------
+-- The shared-world side of RE4: scenario flags, gimmick save table, pauses, timeline events
+-- (cutscenes), chapter loads, game over, stage loading and warps, breakables and animals.
+-------------------------------------------------------------------------------
+
+local function guid_value(s)
+    return new("System.Guid", { text = tostring(s):lower() })
+end
+M.guid_value = guid_value
+
+local function ctx_object(ctx)
+    return new("chainsaw.ContextID", { __fields = { _Category = ctx.category or 0, _Kind = ctx.kind or 0,
+        _Group = ctx.group or 0, _Index = ctx.index or 0 } })
+end
+
+local function key_of_ctx_object(id)
+    local f = id.__fields
+    return ("%d:%d:%d:%d"):format(f._Category or 0, f._Kind or 0, f._Group or 0, f._Index or 0)
+end
+
+function M.install_world(world, opts)
+    world.flag_groups = { { name = "Main", words = { 0, 0, 0, 0 } }, { name = "Chapter", words = { 0, 0 } } }
+    world.flag_map, world.flag_log = {}, {}
+    world.gimmick_table = {}
+    world.pause_params, world.active_pauses = {}, {}
+    world.played_events, world.preloaded_events = {}, 0
+    world.event_id = 0
+    world.scene_requests, world.warps = {}, {}
+    world.game_over_requests, world.loads = 0, 0
+
+    class("System.Guid", "System.Object", {
+        ["Parse(System.String)"] = { 1, function(_, text) return guid_value(text) end, { "System.String" },
+            { static = true, ret = "System.Guid" } },
+        ["ToString()"] = { 0, function(self) return self.text end, {}, { ret = "System.String" } },
+    })
+    M.value_types["System.Guid"] = true
+    class("chainsaw.ContextID", "System.Object", {}, { _Category = "chainsaw.ContextID.EntityCategory",
+        _Kind = "System.Byte", _Group = "System.Int32", _Index = "System.Int32" })
+    class("via.vec3", "System.Object", {})
+    class("via.Quaternion", "System.Object", {})
+
+    -- Scenario flags: GUID -> (group, bit). requestSetFlag applies at once and runs hooks.
+    local function flag_bit(text)
+        local f = world.flag_map[tostring(text):lower()]
+        if f == nil then return nil end
+        return world.flag_groups[f.group], f.bit
+    end
+    class("chainsaw.ScenarioFlagManager.SaveGroup", "System.Object", {}, { GroupName = "System.String",
+        Flags = "System.UInt32[]" })
+    class("chainsaw.ScenarioFlagManager.SaveData", "System.Object", {}, { VersionValue = "System.UInt32",
+        Datas = "chainsaw.ScenarioFlagManager.SaveGroup[]" })
+    class("chainsaw.ScenarioFlagManager", "System.Object", {
+        requestSetFlag = { 2, function(_, g, value)
+            local grp, bit = flag_bit(g.text)
+            if grp == nil then return end
+            local w = bit // 32 + 1
+            if value then grp.words[w] = grp.words[w] | (1 << (bit % 32))
+            else grp.words[w] = grp.words[w] & ~(1 << (bit % 32)) end
+            world.flag_log[#world.flag_log + 1] = { guid = g.text, value = value }
+        end, { "System.Guid", "System.Boolean" } },
+        checkFlag = { 1, function(_, g)
+            local grp, bit = flag_bit(g.text)
+            if grp == nil then return false end
+            return (grp.words[bit // 32 + 1] & (1 << (bit % 32))) ~= 0
+        end, { "System.Guid" }, { ret = "System.Boolean" } },
+        -- Decoys a careless probe could pick: a counter and a flag *watcher*.
+        getFlagCount = { 0, function() return 0 end, {}, { ret = "System.Int32" } },
+        setFlagWatch = { 2, function() world.watch_calls = (world.watch_calls or 0) + 1 end,
+            { "System.Guid", "System.Boolean" } },
+        saveGameSaveData = { 0, function()
+            local groups = {}
+            for i, g in ipairs(world.flag_groups) do
+                local words = {}
+                for k, w in ipairs(g.words) do words[k] = w end
+                groups[i] = new("chainsaw.ScenarioFlagManager.SaveGroup", { __fields = { GroupName = g.name,
+                    Flags = typed_array("System.UInt32", words) } })
+            end
+            return new("chainsaw.ScenarioFlagManager.SaveData", { __fields = {
+                Datas = typed_array("chainsaw.ScenarioFlagManager.SaveGroup", groups) } })
+        end, {}, { ret = "chainsaw.ScenarioFlagManager.SaveData" } },
+        loadGameSaveData = { 1, function(_, sd)
+            for _, sg in ipairs(rawget(sd.__fields.Datas, "__items")) do
+                for _, g in ipairs(world.flag_groups) do
+                    if g.name == sg.__fields.GroupName then
+                        for k, w in ipairs(rawget(sg.__fields.Flags, "__items")) do g.words[k] = w end
+                    end
+                end
+            end
+            world.flag_loads = (world.flag_loads or 0) + 1
+        end, { "chainsaw.ScenarioFlagManager.SaveData" } },
+    })
+
+    world.singletons["chainsaw.ScenarioFlagManager"] = new("chainsaw.ScenarioFlagManager")
+
+    -- Gimmick save table, keyed by ContextID; pushDirtyList announces a state change.
+    class("chainsaw.GimmickContext.TriggerDone", "System.Object", {}, { SaveID = "System.UInt32", Done = "System.UInt32" })
+    class("chainsaw.GimmickContext.AccessoryData", "System.Object", {})
+    class("chainsaw.GimmickContext.AccessoryDataFloat", "chainsaw.GimmickContext.AccessoryData", {}, { Value = "System.Single" })
+    class("chainsaw.GimmickContext.AccessoryDataUint", "chainsaw.GimmickContext.AccessoryData", {}, { Value = "System.UInt32" })
+    class("chainsaw.GimmickContext.SaveData", "System.Object", {}, { Attr = "System.Byte[]",
+        TriggerSave = "chainsaw.GimmickContext.TriggerDone[]", IsDetected = "System.Boolean",
+        AccDatas = "chainsaw.GimmickContext.AccessoryData[]" })
+    class("chainsaw.GimmickManager.SaveItem", "System.Object", {}, { ID = "chainsaw.ContextID",
+        SaveData = "chainsaw.GimmickContext.SaveData" })
+    class("System.Collections.Generic.List`1<chainsaw.GimmickManager.SaveItem>", "System.Object", {
+        get_Count = { 0, function(self) return #self.items end, {}, { ret = "System.Int32" } },
+        get_Item = { 1, function(self, i) return self.items[i + 1] end, { "System.Int32" } },
+        Add = { 1, function(self, x) self.items[#self.items + 1] = x end, { "chainsaw.GimmickManager.SaveItem" } },
+    })
+    class("chainsaw.GimmickManager.SaveData", "System.Object", {}, { VersionValue = "System.UInt32",
+        Datas = "System.Collections.Generic.List`1<chainsaw.GimmickManager.SaveItem>" })
+    class("chainsaw.GimmickManager", "System.Object", {
+        pushDirtyList = { 1, function() end },
+        saveGameSaveData = { 0, function()
+            local keys = {}
+            for k in pairs(world.gimmick_table) do keys[#keys + 1] = k end
+            table.sort(keys)
+            local items = {}
+            for _, k in ipairs(keys) do
+                local g = world.gimmick_table[k]
+                local trig, acc = {}, {}
+                for i, t in ipairs(g.triggers) do
+                    trig[i] = new("chainsaw.GimmickContext.TriggerDone", { __fields = { SaveID = t.id, Done = t.done } })
+                end
+                for i, a in ipairs(g.acc) do
+                    acc[i] = new(a.kind == 1 and "chainsaw.GimmickContext.AccessoryDataFloat"
+                        or "chainsaw.GimmickContext.AccessoryDataUint", { __fields = { Value = a.value } })
+                end
+                local data = new("chainsaw.GimmickContext.SaveData", { __fields = {
+                    Attr = typed_array("System.Byte", { table.unpack(g.attr) }),
+                    TriggerSave = typed_array("chainsaw.GimmickContext.TriggerDone", trig),
+                    IsDetected = g.detected, AccDatas = typed_array("chainsaw.GimmickContext.AccessoryData", acc) } })
+                items[#items + 1] = new("chainsaw.GimmickManager.SaveItem", { __fields = { ID = ctx_object(g.ctx), SaveData = data } })
+            end
+            local list = new("System.Collections.Generic.List`1<chainsaw.GimmickManager.SaveItem>", { items = items })
+            return new("chainsaw.GimmickManager.SaveData", { __fields = { Datas = list } })
+        end, {}, { ret = "chainsaw.GimmickManager.SaveData" } },
+        loadGameSaveData = { 1, function(_, sd)
+            for _, item in ipairs(sd.__fields.Datas.items) do
+                local id = item.__fields.ID
+                local data = item.__fields.SaveData.__fields
+                local g = { ctx = { category = id.__fields._Category, kind = id.__fields._Kind, group = id.__fields._Group,
+                    index = id.__fields._Index }, attr = {}, triggers = {}, acc = {}, detected = data.IsDetected == true }
+                for i = 1, data.Attr:get_size() do g.attr[i] = rawget(data.Attr, "__items")[i] end
+                for i = 1, data.TriggerSave:get_size() do
+                    local t = rawget(data.TriggerSave, "__items")[i]
+                    if t ~= nil then g.triggers[#g.triggers + 1] = { id = t.__fields.SaveID, done = t.__fields.Done } end
+                end
+                for i = 1, data.AccDatas:get_size() do
+                    local a = rawget(data.AccDatas, "__items")[i]
+                    if a ~= nil then
+                        g.acc[#g.acc + 1] = { kind = a.__type:find("Float") and 1 or 2, value = a.__fields.Value }
+                    end
+                end
+                world.gimmick_table[key_of_ctx_object(id)] = g
+            end
+            world.gimmick_loads = (world.gimmick_loads or 0) + 1
+        end, { "chainsaw.GimmickManager.SaveData" } },
+    })
+
+    -- Pauses: each pause type's parameter says what it freezes.
+    enum("share.PauseManager.PauseType", { Inventory = 1, Map = 2, PauseMenu = 3, ItemGet = 4, Event = 5, Loading = 6 })
+    enum("chainsaw.PauseManagerCustom.CustomPause", { Typewriter = 100, Movie = 101 })
+    class("share.PauseManager.PauseParameter", "System.Object", {}, { TargetUpdate = "share.PauseManager.TargetFlag",
+        TargetDraw = "share.PauseManager.TargetFlag" })
+    local DICT = "System.Collections.Generic.Dictionary`2<System.UInt32,share.PauseManager.PauseParameter>"
+    class(DICT, "System.Object", {
+        ContainsKey = { 1, function(_, k) return world.pause_params[k] ~= nil end, { "System.UInt32" }, { ret = "System.Boolean" } },
+        get_Item = { 1, function(_, k) return world.pause_params[k] end, { "System.UInt32" } },
+        set_Item = { 2, function(_, k, v) world.pause_params[k] = v end, { "System.UInt32", "share.PauseManager.PauseParameter" } },
+    })
+    class("share.PauseManager", "System.Object", {
+        requestPause = { 2, function(_, t, owner) world.active_pauses[t] = owner or true end,
+            { "share.PauseManager.PauseType", "System.String" } },
+        requestUnpause = { 2, function(_, t) world.active_pauses[t] = nil end,
+            { "share.PauseManager.PauseType", "System.String" } },
+    }, { _ParamTable = DICT })
+    for _, k in ipairs({ 1, 2, 3, 4, 5, 6, 100, 101 }) do
+        world.pause_params[k] = new("share.PauseManager.PauseParameter", { __fields = { TargetUpdate = 0xFF, TargetDraw = 0x0F } })
+    end
+    world.singletons["share.PauseManager"] = new("share.PauseManager", { __fields = { _ParamTable = new(DICT) } })
+
+    -- Timeline events (cutscenes).
+    local TE = "chainsaw.TimelineEventDefine.ID"
+    enum(TE, { None = 0, cs_intro = 10157, cs_church = 20130 })
+    class("chainsaw.TimelineEventPlayParam", "System.Object", {})
+    class("chainsaw.TimelineEventManager", "System.Object", {
+        requestPlay = { 1, function(_, id)
+            world.played_events[#world.played_events + 1] = id
+            world.event_id = id
+            world.gui_event = true
+        end, { TE } },
+        requestPlayWithParam = { 2, function() error("mock: needs a real parameter object") end,
+            { TE, "chainsaw.TimelineEventPlayParam" } },
+        requestPreloadPlay = { 1, function() world.preloaded_events = world.preloaded_events + 1 end, { TE } },
+        requestStop = { 1, function() world.gui_event = false end, { TE } },
+        isPlaying = { 1, function() return world.gui_event end, { TE }, { ret = "System.Boolean" } },
+        get_CurrentEventID = { 0, function() return world.event_id end, {}, { ret = TE } },
+    })
+    world.singletons["chainsaw.TimelineEventManager"] = new("chainsaw.TimelineEventManager")
+
+    -- Chapter loads go through CampaignManager.loadGameSaveData(GameData).
+    class("chainsaw.CampaignInitialSetting", "System.Object", {}, { _Chapter = "chainsaw.ChapterID",
+        _SpecialJumpSequence = "chainsaw.CampaignJumper.Order.SpecialOrderType" })
+    class("chainsaw.CampaignManager.GameData", "System.Object", {}, { _InitialSettings = "chainsaw.CampaignInitialSetting" })
+    class("chainsaw.CampaignManager", "System.Object", {
+        get_CurrentChapter = { 0, function() return world.chapter or 1 end, {}, { ret = "chainsaw.ChapterID" } },
+        get_CurrentDifficulty = { 0, function() return 20 end },
+        get_CurrentStageIdentifier = { 0, function()
+            local sid = new("chainsaw.StageIdentifier")
+            sid.__fields._StageID, sid.__fields._AreaNo = world.stage or 40100, 3
+            return sid
+        end },
+        loadGameSaveData = { 1, function(_, data)
+            local init = data.__fields._InitialSettings
+            world.chapter = init.__fields._Chapter
+            world.jump_sequence = init.__fields._SpecialJumpSequence
+            world.loads = world.loads + 1
+        end, { "chainsaw.CampaignManager.GameData" } },
+    })
+    class("chainsaw.GameOverRequest", "System.Object", {})
+    class("chainsaw.GameOverMediator", "System.Object", {
+        requestGameOver = { 1, function() world.game_over_requests = world.game_over_requests + 1 end,
+            { "chainsaw.GameOverRequest" } },
+    })
+    class("chainsaw.GameOverManager", "System.Object", {
+        get_Mediator = { 0, function(self) return self.mediator end },
+    })
+    world.singletons["chainsaw.GameOverManager"] = new("chainsaw.GameOverManager", { mediator = new("chainsaw.GameOverMediator") })
+
+    -- Stage loading and the game's own warp.
+    local STATUS = "System.Nullable`1<chainsaw.EnvSceneStatus>"
+    local PRIO = "chainsaw.EnvSceneStatusRequestPriority"
+    for name, id_type in pairs({ ["chainsaw.PrefectureSceneManager"] = "chainsaw.PrefectureID",
+        ["chainsaw.LocationSceneManager"] = "chainsaw.LocID", ["chainsaw.EnvSceneManager"] = "chainsaw.StageID" }) do
+        local mgr = name
+        class(mgr, "System.Object", {
+            [("requestToChangeStatus(%s, %s, %s)"):format(id_type, STATUS, PRIO)] = { 3, function(_, id, status, prio)
+                world.scene_requests[#world.scene_requests + 1] = { mgr = mgr, id = id,
+                    status = type(status) == "table" and status.mValue or status, prio = prio }
+            end, { id_type, STATUS, PRIO } },
+        })
+        world.singletons[mgr] = new(mgr)
+    end
+    class("chainsaw.StageIdentifier", "System.Object", {
+        ["setup(chainsaw.LocID, chainsaw.StageID, chainsaw.AreaID)"] = { 3, function(self, loc, stage, area)
+            self.loc, self.stage, self.area = loc, stage, area
+        end, { "chainsaw.LocID", "chainsaw.StageID", "chainsaw.AreaID" } },
+    }, { _StageID = "chainsaw.StageID", _AreaNo = "System.Int32" })
+    local WARP = "requestWarp(chainsaw.ContextID, System.Nullable`1<via.vec3>, System.Nullable`1<via.Quaternion>, chainsaw.StageIdentifier)"
+    class("chainsaw.CharacterManager", "System.Object", {
+        getPlayerContextRef = { 0, function() return world.player end },
+        getPartnerContextRef = { 0, function() return world.partner end },
+        get_EnemyContextList = { 0, function() return world.enemy_list end },
+        isActive = { 1, function(_, stage) return world.active_stages ~= nil and world.active_stages[stage] == true end },
+        [WARP] = { 4, function(_, id, pos, rot, sid)
+            world.warps[#world.warps + 1] = { pos = { x = pos.x, y = pos.y, z = pos.z }, rot = rot, stage = sid.stage, id = id }
+            if world.refuse_warp or world.player == nil then return end
+            local p = world.player.pos
+            p.x, p.y, p.z = pos.x, pos.y, pos.z
+            world.player.stage = sid.stage
+        end, { "chainsaw.ContextID", "System.Nullable`1<via.vec3>", "System.Nullable`1<via.Quaternion>",
+            "chainsaw.StageIdentifier" } },
+    })
+
+    -- Breakables and animals: scene components with a _Routine state machine.
+    enum("chainsaw.GmWoodBoxBase.RoutineType", { Wait = 0, Damage = 1, Break = 2, BrokenWait = 3 })
+    enum("chainsaw.GmCrow.RoutineType", { Idle = 0, TakeOff = 1, Dead = 2 })
+    class("chainsaw.GmBase", "via.Component", {})
+    class("chainsaw.GmWoodBoxBase", "chainsaw.GmBase", {}, { _Routine = "chainsaw.GmWoodBoxBase.RoutineType" })
+    class("chainsaw.GmWoodBox", "chainsaw.GmWoodBoxBase", {})
+    class("chainsaw.GmCrow", "chainsaw.GmBase", {
+        requestDead = { 0, function(self) self.__fields._Routine = 2 end },
+    }, { _Routine = "chainsaw.GmCrow.RoutineType" })
+    class("chainsaw.GmBottle", "chainsaw.GmBase", {})
+end
+
+-- Defines a scenario flag: its GUID lives at bit `bit` of flag group `group` (1-based index).
+function M.add_flag(guid, group, bit)
+    M.world.flag_map[guid:lower()] = { group = group, bit = bit }
+end
+
+function M.flag_value(guid)
+    local f = M.world.flag_map[guid:lower()]
+    local g = M.world.flag_groups[f.group]
+    return (g.words[f.bit // 32 + 1] & (1 << (f.bit % 32))) ~= 0
+end
+
+-- Game code sets a scenario flag (hooks on the setter run).
+function M.game_set_flag(guid, value)
+    return M.world.singletons["chainsaw.ScenarioFlagManager"]:call("requestSetFlag", guid_value(guid), value)
+end
+
+-- A gimmick's record in the save table: attr = { bytes }, triggers = { {id, done} }.
+function M.set_gimmick(ctx, attr, triggers, announce)
+    local key = ("%d:%d:%d:%d"):format(ctx.category or 0, ctx.kind or 0, ctx.group, ctx.index)
+    M.world.gimmick_table[key] = { ctx = ctx, attr = attr, triggers = triggers or {}, acc = {}, detected = false }
+    if announce then
+        M.world.singletons["chainsaw.GimmickManager"]:call("pushDirtyList",
+            new("chainsaw.GmContextBox", { id = ctx_object(ctx) }))
+    end
+    return key
+end
+
+-- The game starts a cutscene (hooks on the request run).
+function M.start_cutscene(id)
+    return M.world.singletons["chainsaw.TimelineEventManager"]:call("requestPlay", id)
+end
+
+function M.end_cutscene()
+    M.world.gui_event = false
+    M.world.event_id = 0
+end
+
+-- The game loads a save (Continue / Load) of `chapter` through CampaignManager.loadGameSaveData.
+function M.load_save(chapter)
+    local init = new("chainsaw.CampaignInitialSetting", { __fields = { _Chapter = chapter, _SpecialJumpSequence = 0 } })
+    local data = new("chainsaw.CampaignManager.GameData", { __fields = { _InitialSettings = init } })
+    M.world.singletons["chainsaw.CampaignManager"]:call("loadGameSaveData", data)
+end
+
+-- A breakable or animal in the scene, with the GameObject GUID from the scene file.
+function M.make_object(type_name, guid, pos, routine)
+    local go = M.make_go(type_name:match("([^.]+)$"), { wpos = vec(pos.x, pos.y, pos.z) })
+    go.guid = guid
+    local comp = M.add_component(go, type_name, { __fields = { _Routine = routine or 0 } })
+    local list = M.world.components[type_name] or {}
+    list[#list + 1] = comp
+    M.world.components[type_name] = list
+    return comp
+end
+
+-- Removes a scene object (broken and cleaned up, or unloaded with its area).
+function M.remove_object(comp)
+    local list = M.world.components[comp.__type] or {}
+    for i, c in ipairs(list) do
+        if c == comp then table.remove(list, i) break end
+    end
+end
+
+-- Whether a pause of this type freezes anything right now (what the player would notice).
+function M.pause_freezes(t)
+    local p = M.world.pause_params[t]
+    return p ~= nil and ((p.__fields.TargetUpdate or 0) ~= 0 or (p.__fields.TargetDraw or 0) ~= 0)
 end
 
 return M

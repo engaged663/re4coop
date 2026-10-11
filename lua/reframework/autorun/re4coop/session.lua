@@ -1,10 +1,14 @@
 -- Co-op session: drives the network connection and decides what to send and apply.
 --
 -- Dependencies are injected so the whole thing runs in tests without the game:
---   net    : re4coop_net (or a Session object from re4coop_net.new_session())
---   game   : adapter from game.lua (or a fake) - read_player_state, list_enemies, the
---            avatar capture methods listed in avatar.lua, ...
---   clock  : function() -> seconds
+--   net      : re4coop_net (or a Session object from re4coop_net.new_session())
+--   game     : adapter from game.lua (or a fake) - read_player_state, list_enemies, the
+--              avatar capture methods listed in avatar.lua, ...
+--   world    : adapter from game_world.lua (or a fake) - scenario flags, gimmicks, breakables,
+--              cutscenes, location / warp / chapter switch. Optional: without it the shared
+--              world, cutscene replay and travelling to the partner are off.
+--   pause    : adapter from game_pause.lua (or a fake). Optional: menus keep pausing.
+--   clock    : function() -> seconds
 --   settings : live config table (see config.lua)
 
 local P = require("re4coop.protocol")
@@ -14,6 +18,11 @@ local ItemSync = require("re4coop.items_sync")
 local Avatar = require("re4coop.avatar")
 local DropSync = require("re4coop.drop_sync")
 local Gate = require("re4coop.gate")
+local FlagSync = require("re4coop.flag_sync")
+local GimmickSync = require("re4coop.gimmick_sync")
+local ObjectSync = require("re4coop.object_sync")
+local CutsceneSync = require("re4coop.cutscene_sync")
+local Travel = require("re4coop.travel")
 
 local Session = {}
 Session.__index = Session
@@ -39,23 +48,54 @@ local LOCAL_POS_FRESH = 0.5     -- seconds a local position stays usable for pic
 -- metres apart in different stages are not separated.
 local STAGE_APART_FACTOR = 0.5
 local TRACER_SECONDS = 0.25     -- how long a partner's shot tracer stays on screen
+local LOCATION_INTERVAL = 0.5   -- seconds between reads of where we are (chapter, stage)
+local FOLLOW_CHAPTER_DELAY = 15.0 -- client: the host has been in a later chapter this long -> follow
+local RELOAD_GAP = 2.0          -- seconds without a player that mean the game (re)loaded
+local MAX_DEFERRED = 4000
 
 local function dist3(a, b)
     local dx, dy, dz = a.x - b.x, a.y - b.y, a.z - b.z
     return math.sqrt(dx * dx + dy * dy + dz * dz)
 end
 
+local function yaw_of(q)
+    if q == nil then return 0 end
+    return math.atan(2 * (q.w * q.y + q.x * q.z), 1 - 2 * (q.x * q.x + q.y * q.y))
+end
+
 local EMPTY = {}
+
+-- Messages that only update state (no game objects) and may be handled while the game
+-- loop is not running (title screen, loading).
+local OFFLINE_SAFE = {
+    [P.T.CHAT] = true, [P.T.NOTIFY] = true, [P.T.HELLO] = true, [P.T.PLAYER] = true,
+    [P.T.ITEM_TAKEN] = true, -- only recorded here; the pickup is removed on the next game tick
+    [P.T.FRAG] = true, [P.T.AVATAR] = true, [P.T.GEAR] = true, [P.T.POSE] = true, [P.T.ACTIONS] = true,
+}
+
+-- Reliable messages that must not be lost but touch game objects: kept until the game loop
+-- runs again. Everything else arriving then (enemy snapshots, hits) is resent continuously.
+local DEFER = {
+    [P.T.ENEMY_DAMAGE] = true, [P.T.ENEMY_DEAD] = true,
+    [P.T.FLAGS] = true, [P.T.FLAG_WORDS] = true, [P.T.GIMMICKS] = true, [P.T.OBJECTS] = true,
+    [P.T.CUTSCENE] = true, [P.T.WORLD_REQUEST] = true, [P.T.WORLD_DONE] = true,
+}
+
+local SYNC_NAMES = { "enemy_sync", "drop_sync", "flag_sync", "gimmick_sync", "object_sync", "cutscene_sync" }
 
 function Session.new(opts)
     local self = setmetatable({}, Session)
     self.net = opts.net
     self.game = opts.game
+    self.world = opts.world
+    self.pause = opts.pause
     self.clock = opts.clock
     self.settings = opts.settings
     self.log_sink = opts.log or function() end
     self.messages = {}       -- chat + notices shown in the UI/HUD: {time, text, kind}
+    self.deferred = {}       -- reliable messages received while the game loop was not running
     self.frag_id = 0
+    self.next_sync_id = 1
     self.avatar_tx = Avatar.new_sender({
         protocol = P,
         settings = self.settings,
@@ -68,10 +108,13 @@ function Session.new(opts)
     self.last_error = nil
     self.last_player_send = -math.huge
     self.last_enemy_tick = -math.huge
+    self.last_location = -math.huge
     self.local_dead = false
     self.local_cutscene = false
     self.local_stage = nil
     self.local_chapter = nil
+    self.local_loc = nil     -- world:location(): {chapter, stage, pos, yaw, loading, playable}
+    self.player_id = nil     -- identity of the player context (a new one = the game reloaded)
     self.gate = Gate.new(opts.settings)
     self.held_scale = nil   -- time scale to restore while the gate holds us (nil = not holding)
     self.last_item_tick = -math.huge
@@ -82,11 +125,26 @@ function Session.new(opts)
     self.tp_watch = nil
     self:make_item_sync()
 
+    if self.world ~= nil and self.world.install_hooks ~= nil then
+        self.world:install_hooks({
+            on_flag = function(guid, value)
+                if self.flag_sync and self.partner_connected and self.compatible then
+                    self.flag_sync:on_local_flag(guid, value, self.clock())
+                end
+            end,
+            on_cutscene = function(id, method)
+                if self.cutscene_sync and self.partner_connected and self.compatible then
+                    self.cutscene_sync:on_local_start(id, method, self.clock(), self.local_loc)
+                end
+            end,
+        })
+    end
+
     -- Resume a session that survived "Reset Scripts" (the plugin keeps it alive).
     local state = self.net.state()
     if state ~= "idle" then
         self.role = self.net.role()
-        self:make_enemy_sync()
+        self:make_syncs()
         if state == "connected" then
             self.partner_connected = true
             self.partner_name = self.net.stats().peer_name
@@ -128,33 +186,54 @@ function Session:reset_peer()
     self.reassembler = P.new_reassembler()
     self.avatar_tx:reset()
     self.avatar_rx:reset()
-    if self.enemy_sync then self.enemy_sync:reset() end
-    if self.drop_sync then self.drop_sync:reset() end
+    for _, name in ipairs(SYNC_NAMES) do
+        if self[name] then self[name]:reset() end
+    end
+    self.join_travel_pending = false
+    self.sync_on_join = false
+    self.world_sync_pending = nil
+    self.chapter_ahead_since = nil
+    self.deferred = {} -- queued messages belonged to the previous partner
+    if self.travel then self.travel:cancel("partner left") end
 end
 
-function Session:make_enemy_sync()
+-- Creates the per-role sync modules (nothing while not in a session).
+function Session:make_syncs()
     if self.role ~= "host" and self.role ~= "client" then
-        self.enemy_sync = nil
-        self.drop_sync = nil
+        for _, name in ipairs(SYNC_NAMES) do self[name] = nil end
+        self.travel = nil
         return
     end
-    self.enemy_sync = EnemySync.new({
+    local base = {
         role = self.role,
         protocol = P,
         settings = self.settings,
         send = function(bytes, reliable) self:send(bytes, reliable) end,
         log = function(...) self:log(...) end,
-    })
+        notify = function(text, kind) self:add_message(text, kind) end,
+    }
+    self.enemy_sync = EnemySync.new(base)
     self.drop_sync = DropSync.new({
         role = self.role,
         protocol = P,
         settings = self.settings,
         enemy_sync = self.enemy_sync,
         is_key_item = function(id) return self.game.is_key_item ~= nil and self.game.is_key_item(id) end,
-        send = function(bytes, reliable) self:send(bytes, reliable) end,
-        log = function(...) self:log(...) end,
+        send = base.send,
+        log = base.log,
+    })
+    self.flag_sync = FlagSync.new(base)
+    self.gimmick_sync = GimmickSync.new(base)
+    self.object_sync = ObjectSync.new(base)
+    self.cutscene_sync = CutsceneSync.new(base)
+    self.travel = Travel.new({
+        settings = self.settings,
+        log = base.log,
+        notify = base.notify,
+        on_sync = function() self:request_world_sync() end,
     })
 end
+Session.make_enemy_sync = Session.make_syncs -- older name
 
 function Session:make_item_sync()
     self.item_sync = ItemSync.new({
@@ -184,9 +263,10 @@ function Session:host()
     self.role = "host"
     self.last_error = nil
     self:reset_peer()
-    self:make_enemy_sync()
+    self:make_syncs()
     self.item_sync:reset()
     self:add_message(("Hosting on UDP port %d - waiting for partner"):format(s.port), "info")
+    self:update_pause()
     return true
 end
 
@@ -205,10 +285,21 @@ function Session:join(address)
     self.role = "client"
     self.last_error = nil
     self:reset_peer()
-    self:make_enemy_sync()
+    self:make_syncs()
     self.item_sync:reset()
     self:add_message(("Connecting to %s:%d ..."):format(host, port), "info")
+    self:update_pause()
     return true
+end
+
+-- Everything the session changed in the game goes back to normal.
+function Session:restore_game()
+    self:apply_hold(false)
+    if self.pause and self.pause.set_active then
+        self.pause:set_active(false, self.settings.no_pause_mode, false, self.clock())
+    end
+    if self.game.restore_enemy_ai then self.game:restore_enemy_ai() end
+    if self.world and self.world.disarm_chapter_switch then self.world:disarm_chapter_switch() end
 end
 
 function Session:leave()
@@ -217,17 +308,16 @@ function Session:leave()
         self:add_message("Left the co-op session", "info")
     end
     self.role = "none"
-    self.enemy_sync = nil
-    self.drop_sync = nil
     self.item_sync:reset()
     self:reset_peer()
+    self:make_syncs()
     self.gate:reset()
-    self:apply_hold(false)
+    self:restore_game()
 end
 
 -- Undo anything that must not outlive the script (called on "Reset Scripts").
 function Session:shutdown()
-    self:apply_hold(false)
+    self:restore_game()
 end
 
 function Session:send(bytes, reliable)
@@ -266,11 +356,30 @@ function Session:send_chat(text)
     return false
 end
 
+-- Where the partner is: { chapter, stage, pos, yaw } (pos interpolated), or nil.
+function Session:partner_location()
+    local m = self.partner_state
+    if m == nil then return nil end
+    local st = self.interp:sample(self.clock())
+    return { chapter = m.chapter, stage = m.stage, pos = st and st.pos or m.pos, yaw = yaw_of(m.rot) }
+end
+
+-- True when we can travel (warp across stages, switch chapters) instead of teleporting.
+function Session:can_travel()
+    return self.travel ~= nil and self.world ~= nil and self.settings.stage_travel ~= false
+end
+
 function Session:teleport_to_partner()
     local st = self.interp:sample(self.clock())
     if st == nil then
         self:add_message("No partner position yet", "error")
         return false
+    end
+    -- The partner is in another stage: the game's own warp loads it first.
+    local target = self:partner_location()
+    if self:can_travel() and target ~= nil and target.stage ~= nil and self.local_stage ~= nil
+        and target.stage ~= self.local_stage then
+        return self:travel_to_partner()
     end
     local ok, err = self.game:teleport_player(st.pos)
     if ok then
@@ -284,6 +393,45 @@ function Session:teleport_to_partner()
         self:add_message("Teleport failed: " .. tostring(err), "error")
     end
     return ok
+end
+
+-- Stage-aware travel to the partner: preloads their stage and warps there, or loads their
+-- chapter first (through a reload) when they are in another one.
+function Session:travel_to_partner()
+    if not self:can_travel() then
+        return self:teleport_to_partner()
+    end
+    local target = self:partner_location()
+    if target == nil then
+        self:add_message("No partner position yet", "error")
+        return false
+    end
+    self.travel:request({ chapter = target.chapter, stage = target.stage, pos = target.pos, yaw = target.yaw,
+        reason = "manual", follow = true })
+    self:send(P.encode_notify(NOTIFY.TELEPORTED, self.settings.player_name .. " is travelling to you"), true)
+    self.left_behind = nil
+    self.far_since = nil
+    return true
+end
+
+-- Client: ask the host for its complete world state (flags, gimmicks, broken objects).
+function Session:request_world_sync()
+    if self.role ~= "client" or not self.partner_connected then
+        if self.travel then self.travel:sync_done() end
+        return false
+    end
+    local s = self.settings
+    local what = 0
+    if s.sync_flags ~= false then what = what | P.WORLD.FLAGS end
+    if s.sync_gimmicks ~= false then what = what | P.WORLD.GIMMICKS end
+    if s.sync_objects ~= false then what = what | P.WORLD.OBJECTS end
+    if s.sync_enemies ~= false then what = what | P.WORLD.ENEMIES end
+    local id = self.next_sync_id
+    self.next_sync_id = id % 65535 + 1
+    self.world_sync_pending = id
+    self:send(P.encode_world_request(id, what), true)
+    self:add_message("Synchronising the world with the host...", "info")
+    return true
 end
 
 -- Re-teleports if the player fell below the target right after a teleport (the area under
@@ -317,6 +465,11 @@ function Session:update_left_behind(now)
     local mine = self:fresh_local_pos(now)
     local pflags = partner ~= nil and (partner.flags or 0) or 0
     local partner_chapter = self.partner_state and self.partner_state.chapter
+    if self.travel ~= nil and self.travel:busy() then
+        self.far_since = nil
+        self.left_behind = nil
+        return
+    end
     if self.gate.holding == nil and (pflags & P.PLAYER_FLAGS.GATE_WAITING) ~= 0 and age ~= nil and age <= 1.5 then
         -- The partner waits for us at a transition: offer the teleport right away (or, when
         -- they are already in the next chapter, tell us to finish this one).
@@ -331,6 +484,8 @@ function Session:update_left_behind(now)
             distance = mine and dist3(partner.pos, mine) or 0,
             partner_waiting = ahead and "chapter" or "here",
             other_stage = partner.stage ~= nil and self.local_stage ~= nil and partner.stage ~= self.local_stage,
+            -- A client can load the host's chapter (F6 reloads into it).
+            can_follow = ahead and self.role == "client" and self:can_travel(),
         }
         return
     end
@@ -434,7 +589,12 @@ function Session:handle_hotkeys(now)
     if self.left_behind ~= nil then
         if teleport then
             if self.left_behind.partner_waiting == "chapter" then
-                self:add_message("Your partner is already in the next chapter - finish this one to join them", "warn")
+                if self.left_behind.can_follow then
+                    self:add_message("Loading your partner's chapter...", "warn")
+                    self:travel_to_partner()
+                else
+                    self:add_message("Your partner is already in the next chapter - finish this one to join them", "warn")
+                end
             else
                 self:teleport_to_partner()
             end
@@ -471,6 +631,7 @@ function Session:status()
         partner_chapter = self.partner_state and self.partner_state.chapter or nil,
         gate = self.gate:summary(now),
         continue_key_name = Session.key_name(self.settings.continue_key),
+        world_sync_pending = self.world_sync_pending ~= nil,
     }
     local remote = self.interp:sample(now)
     if remote ~= nil then
@@ -492,6 +653,14 @@ function Session:status()
     if self.drop_sync then
         st.drops = self.drop_sync:summary()
     end
+    if self.world ~= nil then
+        if self.flag_sync then st.flags = self.flag_sync:summary() end
+        if self.gimmick_sync then st.gimmicks = self.gimmick_sync:summary() end
+        if self.object_sync then st.objects = self.object_sync:summary() end
+        if self.cutscene_sync then st.cutscenes = self.cutscene_sync:summary() end
+        if self.travel then st.travel = self.travel:status() end
+    end
+    if self.pause and self.pause.status then st.pause = self.pause:status() end
     st.items = self.item_sync:summary()
     st.left_behind = self.left_behind
     st.teleport_key_name = Session.key_name(self.settings.teleport_key)
@@ -557,9 +726,19 @@ function Session:handle_event(ev, now)
         self.avatar_tx:reset()
         self.avatar_rx:reset()
         self.reassembler = P.new_reassembler()
-        if self.enemy_sync then self.enemy_sync:reset() end
+        for _, name in ipairs(SYNC_NAMES) do
+            if self[name] then self[name]:reset() end
+        end
         self:add_message(("%s connected (%s)"):format(ev.name or "Partner", ev.peer or "?"), "good")
         self:send_hello()
+        -- The client joins the host's game: go where the host is, with the host's world.
+        if self.role == "client" and self.world ~= nil then
+            if self.settings.auto_travel ~= false and self.travel ~= nil then
+                self.join_travel_pending = true
+            else
+                self.sync_on_join = true -- no travel, but still take over the host's world state
+            end
+        end
     elseif ev.type == "disconnected" or ev.type == "rejected" then
         local who = self.partner_name or "Partner"
         local was_connected = self.partner_connected
@@ -573,13 +752,36 @@ function Session:handle_event(ev, now)
             self.last_error = ev.data
             self:add_message(tostring(ev.data), "error")
         end
+        if self.game.restore_enemy_ai then self.game:restore_enemy_ai() end
         if self.role == "client" then
             self.role = "none"
-            self.enemy_sync = nil
+            self:make_syncs()
+            self:update_pause()
         end
     elseif ev.type == "message" then
         self:handle_message(ev.data, now)
     end
+end
+
+-- Host: a joining client wants our whole world.
+function Session:on_world_request(m)
+    local world, s = self.world, self.settings
+    local n_groups, n_gimmicks = 0, 0
+    if world ~= nil then
+        if (m.what & P.WORLD.FLAGS) ~= 0 and s.sync_flags ~= false then
+            n_groups = self.flag_sync:send_full(m.sync_id, world)
+        end
+        if (m.what & P.WORLD.GIMMICKS) ~= 0 and s.sync_gimmicks ~= false then
+            n_gimmicks = self.gimmick_sync:send_full(m.sync_id, world)
+        end
+        if (m.what & P.WORLD.OBJECTS) ~= 0 and s.sync_objects ~= false then
+            self.object_sync:send_history()
+        end
+    end
+    -- Enemies need nothing extra: deaths the client did not see are re-advertised anyway.
+    self:send(P.encode_world_done(m.sync_id, m.what, n_groups, n_gimmicks), true)
+    self:add_message(("Sent the world state to %s (%d flag groups, %d gimmicks)")
+        :format(self.partner_name or "partner", n_groups, n_gimmicks), "info")
 end
 
 function Session:handle_message(data, now)
@@ -613,7 +815,7 @@ function Session:handle_message(data, now)
         else
             self.compatible = true
             local mine = self.game:area_name() or ""
-            if m.area ~= "" and mine ~= "" and m.area ~= mine then
+            if m.area ~= "" and mine ~= "" and m.area ~= mine and not self.join_travel_pending then
                 self:add_message(("Partner is in '%s', you are in '%s' - load the same chapter"):format(m.area, mine), "warn")
             end
         end
@@ -640,6 +842,23 @@ function Session:handle_message(data, now)
         if self.drop_sync and self.settings.sync_enemies then
             self.drop_sync:on_message(m, now, self.game, self.local_stage)
         end
+    elseif m.type == T.WORLD_REQUEST then
+        if self.role == "host" then self:on_world_request(m) end
+    elseif m.type == T.WORLD_DONE then
+        if self.role == "client" and m.sync_id == self.world_sync_pending then
+            self.world_sync_pending = nil
+            self:add_message(("World synchronised with the host (%d flag groups, %d gimmicks)")
+                :format(m.n_flag_groups, m.n_gimmicks), "good")
+            if self.travel then self.travel:sync_done() end
+        end
+    elseif m.type == T.FLAGS or m.type == T.FLAG_WORDS then
+        if self.flag_sync and self.world then self.flag_sync:on_message(m, now, self.world) end
+    elseif m.type == T.GIMMICKS then
+        if self.gimmick_sync and self.world then self.gimmick_sync:on_message(m, now) end
+    elseif m.type == T.OBJECTS then
+        if self.object_sync and self.world then self.object_sync:on_message(m, now, self.world) end
+    elseif m.type == T.CUTSCENE then
+        if self.cutscene_sync and self.world then self.cutscene_sync:on_message(m, now) end
     elseif self.avatar_rx:on_message(m, now) then
         return
     elseif self.enemy_sync and self.settings.sync_enemies then
@@ -649,7 +868,18 @@ end
 
 function Session:send_player_state(now)
     local st = self.game:read_player_state()
-    if st == nil then return end
+    if st == nil then
+        self.player_missing_since = self.player_missing_since or now
+        return
+    end
+    -- A new player context, or a long gap without one, means the game (re)loaded: a
+    -- checkpoint brought the enemies back.
+    local reloaded = (st.id ~= nil and self.player_id ~= nil and st.id ~= self.player_id)
+        or (self.player_missing_since ~= nil and now - self.player_missing_since >= RELOAD_GAP)
+    self.player_missing_since = nil
+    if st.id ~= nil then self.player_id = st.id end
+    if reloaded and self.enemy_sync then self.enemy_sync:on_local_reload() end
+
     self.last_local_pos = st.pos
     self.last_local_pos_time = now
     self.local_cutscene = st.cutscene and true or false
@@ -680,12 +910,95 @@ function Session:send_player_state(now)
     self.local_dead = st.dead and true or false
 end
 
+-- Both players' positions for enemy ownership (the partner only counts in the same region).
+function Session:players_info(now)
+    local local_pos = self:fresh_local_pos(now)
+    local remote = self.interp:sample(now)
+    local age = self.interp:age(now)
+    if local_pos == nil then return nil end
+    if remote == nil or age == nil or age > 2.0 then return { local_pos = local_pos } end
+    if remote.stage ~= nil and self.local_stage ~= nil and remote.stage // 1000 ~= self.local_stage // 1000 then
+        return { local_pos = local_pos } -- another region: the partner is not near our enemies
+    end
+    return { local_pos = local_pos, partner_pos = remote.pos }
+end
+
+-- No-pause: while hosting or connected, menus do not freeze the world (see game_pause.lua).
+function Session:update_pause()
+    if self.pause == nil or self.pause.set_active == nil then return end
+    local s = self.settings
+    local active = s.no_pause ~= false and self.role ~= "none" and self.net.state() ~= "idle"
+    self.pause:set_active(active, s.no_pause_mode or "menus", s.no_pause_aggressive == true, self.clock())
+end
+
+-- Where we are (chapter, stage, playable), refreshed a few times per second.
+function Session:refresh_location(now)
+    if self.world == nil or now - self.last_location < LOCATION_INTERVAL then return end
+    self.last_location = now
+    self.local_loc = self.world:location()
+end
+
+-- Shared world: flags, gimmicks, breakables, cutscenes; joining and following the host.
+function Session:update_world(now)
+    local world, s = self.world, self.settings
+    if world == nil or self.flag_sync == nil then return end
+
+    if world.update then world:update() end
+    self.flag_sync:tick(now, world)
+    self.gimmick_sync:tick(now, world)
+    self.object_sync:tick(now, world, self:fresh_local_pos(now))
+    self.cutscene_sync:tick(now, world, self.local_loc, self.travel)
+
+    local partner = self:partner_location()
+    if self.role == "client" and self.sync_on_join and partner ~= nil and self.local_loc ~= nil then
+        local same = partner.chapter == nil or self.local_loc.chapter == nil or self.local_loc.chapter == partner.chapter
+        if same then
+            self.sync_on_join = false
+            self:request_world_sync()
+        end
+    end
+    if self.role == "client" and partner ~= nil and not self.travel:busy() then
+        if self.join_travel_pending then
+            -- Joining: load the host's chapter if needed, take over its world, then warp to it.
+            if self.travel:request({ chapter = partner.chapter, stage = partner.stage, pos = partner.pos,
+                yaw = partner.yaw, reason = "join", sync = true, follow = true }) then
+                self.join_travel_pending = false
+                self:add_message("Joining your partner's game...", "info")
+            end
+        elseif s.follow_host_chapter ~= false and self.local_loc ~= nil and self.local_loc.playable
+            and partner.chapter ~= nil and self.local_chapter ~= nil and partner.chapter > self.local_chapter
+            and self.gate.holding == nil then
+            -- The host moved on to a later chapter and we did not get there ourselves: follow.
+            self.chapter_ahead_since = self.chapter_ahead_since or now
+            if now - self.chapter_ahead_since >= FOLLOW_CHAPTER_DELAY then
+                self.chapter_ahead_since = nil
+                self.travel:request({ chapter = partner.chapter, stage = partner.stage, pos = partner.pos,
+                    yaw = partner.yaw, reason = "join", sync = true, follow = true })
+                self:add_message("Your partner moved on to the next chapter - following", "warn")
+            end
+        else
+            self.chapter_ahead_since = nil
+        end
+    end
+    self.travel:tick(now, world, partner)
+end
+
 -- Network + game sync. Call once per game frame from a game-thread callback.
 function Session:update()
     local now = self.clock()
+    if #self.deferred > 0 then
+        local deferred = self.deferred
+        self.deferred = {}
+        for _, data in ipairs(deferred) do
+            self:handle_message(data, now)
+        end
+    end
+    self:refresh_location(now)
     for _, ev in ipairs(self.net.poll()) do
         self:handle_event(ev, now)
     end
+    self:update_pause()
+    if self.pause and self.pause.update then self.pause:update(now) end
     local active = self.partner_connected and self.compatible
     if self.game.set_capture then self.game:set_capture(active and self.settings.share_character ~= false) end
     if not active then
@@ -722,12 +1035,20 @@ function Session:update()
         self.game:set_drop_suppress(nil) -- enemy pairing is off: never skip our own rolls
     end
 
-    if self.enemy_sync and s.sync_enemies and now - self.last_enemy_tick >= 1.0 / (s.enemy_tick_hz or 20) then
-        self.last_enemy_tick = now
-        local enemies = self.game:list_enemies()
-        if enemies ~= nil then
-            self.enemy_sync:tick(now, enemies, self.game)
+    if self.enemy_sync and s.sync_enemies then
+        -- The animation is only read while enemies are mirrored with their animation.
+        self.game.read_motion = s.enemy_mirror ~= false and s.enemy_motion_sync ~= false
+        if now - self.last_enemy_tick >= 1.0 / (s.enemy_tick_hz or 20) then
+            self.last_enemy_tick = now
+            local enemies = self.game:list_enemies()
+            if enemies ~= nil then
+                self.enemy_sync:tick(now, enemies, self.game, self:players_info(now))
+            end
         end
+        -- Every frame: enemies the partner's game runs follow their copies smoothly.
+        self.enemy_sync:frame(now, self.game)
+    elseif self.enemy_sync then
+        self.enemy_sync:release_all(self.game) -- enemy sync switched off: our AI runs everything
     end
 
     if self.game.list_pickups and now - self.last_item_tick >= ITEM_TICK_INTERVAL then
@@ -750,18 +1071,11 @@ function Session:update()
         end
     end
 
+    self:update_world(now)
     self:update_gate(now)
     self:update_left_behind(now)
     self:handle_hotkeys(now)
 end
-
--- Messages that only update state (no game objects) and may be handled while the game
--- loop is not running (title screen, loading).
-local OFFLINE_SAFE = {
-    [P.T.CHAT] = true, [P.T.NOTIFY] = true, [P.T.HELLO] = true, [P.T.PLAYER] = true,
-    [P.T.ITEM_TAKEN] = true, -- only recorded here; the pickup is removed on the next game tick
-    [P.T.FRAG] = true, [P.T.AVATAR] = true, [P.T.GEAR] = true, [P.T.POSE] = true, [P.T.ACTIONS] = true,
-}
 
 -- Keeps connect/disconnect events flowing while the game thread callback is not running
 -- (title screen, loading). Never touches game objects, except to undo a transition-gate hold:
@@ -781,15 +1095,23 @@ function Session:update_network_only()
     end
     for _, ev in ipairs(self.net.poll()) do
         if ev.type == "message" then
-            -- Enemy messages are dropped here: they refer to objects that are being (un)loaded,
-            -- and the host re-sends its full enemy state continuously anyway.
             local t = type(ev.data) == "string" and ev.data:byte(1) or nil
             if t ~= nil and OFFLINE_SAFE[t] then
                 self:handle_message(ev.data, now)
+            elseif t ~= nil and DEFER[t] and #self.deferred < MAX_DEFERRED then
+                self.deferred[#self.deferred + 1] = ev.data
             end
+            -- Other enemy messages are dropped: they refer to objects that are being
+            -- (un)loaded, and the host re-sends its full enemy state continuously anyway.
         else
             self:handle_event(ev, now)
         end
+    end
+    -- Joining from the title screen: whatever save gets loaded next is redirected into the
+    -- host's chapter (only a variable is set here; the game applies it when it loads).
+    if self.role == "client" and self.join_travel_pending and self.world ~= nil and self.travel ~= nil
+        and self.partner_state ~= nil and self.partner_state.chapter ~= nil then
+        self.world:arm_chapter_switch(self.partner_state.chapter)
     end
 end
 

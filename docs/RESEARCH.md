@@ -364,6 +364,61 @@ What v0.5 builds on that:
 | Transition gate (RE5/6 style) | A cutscene longer than 1.5 s, or a chapter/part change, holds the player who got there first (scene time scale 0) until the partner arrives. The partner is offered F6 right away. **F8** continues alone | Released on disconnect, on "Reset Scripts", when switched off, and automatically if holding ever stops the mod's game loop |
 | Damage race fix | The host applied client damage to the HP from its last enemy scan, overwriting HP the enemy lost since (its own shots). It now reads the current HP | Regression test |
 
+### 3.6 Fifth round: the shared world (v0.6)
+
+v0.6 adds what the roadmap called *shared progression* and *enemies for both players*, plus
+two things players asked for directly: no pausing in co-op, and joining straight into the
+host's game. Sources for this round: the in-game Lua client of the RE4R Archipelago randomizer
+([LiterallyMetaphorical/RE4R-AP-Wizard](https://github.com/LiterallyMetaphorical/RE4R-AP-Wizard),
+whose code records what was verified live), the RE4 RSZ schema (§3.2), REFramework's binding
+source (`src/mods/bindings/Sdk.cpp`, `shared/sdk/SystemArray.cpp`), EMV Engine and this mod's
+own dumps (§3.3, §3.5). Status: **Live** = used in game by a published mod; **Dump** = the
+type/fields exist in the game's type database, method names are found at runtime by signature
+(*Diagnostics* lists each one).
+
+| Area | Type / member | Status | Used for |
+|---|---|---|---|
+| Scenario flags | `chainsaw.ScenarioFlagManager.requestSetFlag(System.Guid, System.Boolean)`, `checkFlag(System.Guid)`; GUIDs from `System.Guid.Parse(System.String)` | Live (AP Wizard re-fires pickup flags with it) | Applying the partner's flag changes through the game's own setter |
+| Scenario flags | Setters `(Guid[, Boolean])` on `ScenarioFlagManager` with an allow-listed name (`requestSetFlag`, `setFlag`, `...FlagOn/Off`, `resetFlag`...) | Dump + signature probe | Hooked to report local changes. Watchers, counters and locks are never hooked |
+| Scenario flags | `ScenarioFlagManager.SaveData {Datas: SaveGroup[] {GroupName, Flags: UInt32[]}}`, save/load methods returning/taking it | Dump + signature probe | Full flag copy for a joining client; 32-bit word diffs when no setter can be hooked |
+| Gimmicks | `chainsaw.GimmickManager.SaveData {Datas: List<SaveItem {ID: ContextID, SaveData}>}`, `GimmickContext.SaveData {Attr: Byte[], TriggerSave: TriggerDone[] {SaveID, Done}, IsDetected, AccDatas: AccessoryData{Float,Uint}[]}` | Dump + signature probe | Locks, keys used, levers, shutters, puzzles: diffed and replicated by ContextID (the save table is what goes into save files, so its IDs are level IDs) |
+| Gimmicks | `GimmickManager.pushDirtyList(context)` | This mod's dump (§3.5) | A gimmick announced a state change: its record is read and sent at once instead of at the next 2 s scan |
+| Breakables, animals | `chainsaw.GmWoodBox`, `GmOilDrum`, `GmBottle`, `GmSimpleBreak`, `GmShootObj`, `GmBlueCoin`, `GmWindowBreakable`, `GmCrow`, `GmChicken`, `GmFish`, `GmBat`… with a `_Routine` state enum | Dump | Watched by GameObject GUID; a terminal routine name (`Break`, `Dead`, …) is "destroyed". Applied by setting the same routine (the object plays its own break/death), else a break/kill method, else hiding it |
+| Scene | `via.SceneManager.get_CurrentScene` → `findComponents(System.Type)`; GameObject `ToString()` → `name@<guid>` | Live (AP Wizard) | Finding objects; a cross-PC object identity from the scene file |
+| Cutscenes | `chainsaw.TimelineEventManager` methods taking `chainsaw.TimelineEventDefine.ID`; `GuiManager.get_IsPlayingEvent` | Dump + signature probe (`get_IsPlayingEvent` confirmed) | Hooking local cutscene starts (play/start requests only; preloads, stops and queries excluded), replaying the partner's |
+| Pauses | `share.PauseManager` with `Dictionary<UInt32, PauseParameter {TargetUpdate, TargetDraw}>`, `PauseType` and `chainsaw.PauseManagerCustom.CustomPause` enums; `PauseLayer` = {Self 1, Inventory 2, Map 4, …} (§3.5) | Dump | Neutralising menu pauses (their targets set to 0 while in a session, restored afterwards), optionally refusing the requests |
+| Location | `PlayerContext.get_CurrentStageID()`, `CampaignManager.get_CurrentChapter()` (ChapterID 21100 = chapter 1 … 25400 = chapter 16) | Live (AP Wizard, this mod's dump) | Where each player is |
+| Warp | `Prefecture/Location/EnvSceneManager.requestToChangeStatus(id, Nullable<EnvSceneStatus> = 3, priority 1)` (prefecture = stage / 1000, location = prefecture × 1000), then `CharacterManager.requestWarp(ContextID, Nullable<vec3>, Nullable<Quaternion>, StageIdentifier.setup(location, stage, 0))` | Live (AP Wizard typewriter warps; technique by JumperDenfer, Nexus 5923) | Travelling to the partner in another stage |
+| Chapter switch | Hook `CampaignManager.loadGameSaveData(GameData)`: set `_InitialSettings._Chapter` and `_SpecialJumpSequence` (6 = chapter 1 … 21 = chapter 16) before the load runs | Live (AP Wizard chapter select) | Loading the host's chapter |
+| Reload | `GameOverManager.get_Mediator().requestGameOver(new GameOverRequest)` → *Continue* reloads through `loadGameSaveData` | Live (AP Wizard DeathLink) | Starting the chapter switch without the menu |
+| Enemy AI | `CharacterContext.get_HeadGameObject()` (the AI "head": think, targeting, `HateController`) vs the body (§3.5); `via.GameObject.set_UpdateSelf(bool)` | Engine + this mod's dump | Switching a mirrored enemy's AI off |
+| Enemy animation | `via.motion.Motion.getLayer(0)` → `get_MotionBankID/get_MotionID/get_Frame`, `changeMotion(UInt32, UInt32, Single, Single, InterpolationMode, InterpolationCurve)` | Confirmed (EMV Engine) | Mirroring the owner's animation |
+| REFramework | `SystemArray:get_element` returns boxed values for primitive arrays (`System.Array.GetValue`); `arr[i] = sdk.create_uint32(v)` writes through `SetValue`; `sdk.to_valuetype(ptr, "System.Guid")` reads a struct argument in a hook | Source | Reading/writing flag words and attribute bytes; GUID hook arguments |
+
+Two things the dumps ruled out:
+
+* **Spawn vetoes.** v0.2 (unreleased) refused spawns of enemies the host had killed at
+  `CharacterSpawnController.permitSpawn`, keyed by ContextID. Enemy `_ID`s are runtime IDs
+  (§3.3) and one spawner creates several enemies (waves), so a veto keyed by either would also
+  refuse the *next* enemy of a wave. v0.6 kills late arrivals on pairing instead (§4).
+* RE4 also contains a dormant `chainsaw.NetworkManager` / `ReNetUnit_*` family. Those are
+  RE.NET statistics uploads (kills, items, objects destroyed), not gameplay networking.
+  `GmCoopJump` and `CoopMediator` are Ashley's partner actions.
+
+What v0.6 builds on that:
+
+| Feature | How | Safety |
+|---|---|---|
+| Story progress, objectives, map, doors | Flag setter hooks report each change by GUID; the partner applies it with `requestSetFlag`, so whatever reacts to the flag reacts on both PCs | Echoes of our own applications are ignored; a flag that flips more than 6 times in 10 s (per-machine state) is muted for a minute; repeated sets of the same value are not resent |
+| Locks, levers, puzzles | Gimmick table diffs (on `pushDirtyList`, and every 2 s, read 60 records per frame), sent by ContextID; the host re-broadcasts what it applies | Conflicts converge to the host's version. A record that *appears* (a gimmick loaded for the first time) is only added where the partner has none, and an area load (more than 16 new records at once) is not sent at all, so a gimmick's initial state never overwrites the partner's progress |
+| Breakables and animals | Observed by GameObject GUID; destroyed objects are remembered and sent to a joining client | An area unload (objects vanishing far away or more than 4 at once) is not a break. Events for objects that are not loaded wait for them (30 min) |
+| Cutscenes for both | A cutscene request (hooked) is sent with chapter, stage and position; the partner's game plays the same timeline event, after travelling there if it is more than 30 m away or in another stage | Played once even if both trigger it; dropped if the partner is in another chapter. The transition gate (§3.5) holds the first player until the partner is in the same event |
+| No pauses | While hosting or connected, the parameters of menu pauses (inventory, map, files, pause menu, item pickup, typewriter, tutorials) freeze nothing; re-applied when the game rebuilds its table | Cutscene, movie and loading pauses are kept. Restored on leave and on "Reset Scripts". Mode *all* and a request-refusing mode are options |
+| Join the host's game | Client: arm the chapter switch to the host's chapter (also from the title screen) and start the reload; once there, WORLD_REQUEST → full flags, gimmicks and destroyed objects → stage preload + `requestWarp` next to the host | Each step has a timeout and reports what failed; without a stage, a plain teleport |
+| Follow the host | The client follows the host into a *later* chapter after 15 s (or at once with F6 when the host waits for it at the gate) | Never pulled back to an earlier chapter; the transition gate keeps the host waiting meanwhile |
+| Enemies fight both players | Ownership: the host gives an enemy to the client when the client's player is closer by 2 m for 0.6 s (and back); the owner's AI runs it, the other game mirrors position, facing and animation from a 150 ms buffer and switches that enemy's AI head off | Only enemies the client reported having (ENEMY_CLIENT) are handed over; AI is switched back on before any kill, on hand-back, on disconnect and on "Reset Scripts"; every part has an option |
+| Late arrivals, both ways | Host deaths the client did not witness are re-advertised for 10 min and kill the client's copy when its level spawns it; client kills of enemies the host had not loaded are remembered by the host and applied when they spawn there | Deaths the client saw are never re-advertised, and living host enemies pair first, so a wave enemy spawning where another died is not killed. A host checkpoint reload clears all death records on both sides |
+
 ## 4. Sync architecture
 
 ```
@@ -372,47 +427,55 @@ What v0.5 builds on that:
  ┌────────────────────────┐   UDP 33040 (direct IP)   ┌────────────────────────┐
  │ re4coop.lua            │ ◄───────────────────────► │ re4coop.lua            │
  │  session ─ enemy_sync  │   PLAYER (20 Hz, unrel.)  │  session ─ enemy_sync  │
- │          ─ items_sync  │   ITEM_TAKEN (rel.)       │          ─ items_sync  │
- │  avatar (character)    │   POSE (30 Hz, unrel.)    │  avatar (character)    │
- │  game.lua (sdk)        │   AVATAR/GEAR/ACTIONS     │  game.lua (sdk)        │
- │  puppet (partner model)│   ENEMY_SNAPSHOT (10 Hz)  │  puppet (partner model)│
- │  overlay (name, HUD)   │   ENEMY_DAMAGE/DEAD (rel.)│  overlay (name, HUD)   │
- │ re4coop_net.dll        │   CHAT/NOTIFY/HELLO (rel.)│ re4coop_net.dll        │
+ │   items, drops, gate   │   POSE / AVATAR / ACTIONS │   items, drops, gate   │
+ │   flag/gimmick/object/ │   ENEMY_SNAPSHOT (15 Hz)  │   flag/gimmick/object/ │
+ │   cutscene sync        │   ENEMY_CLIENT (20 Hz)    │   cutscene sync        │
+ │   travel               │   ENEMY_DAMAGE/DEAD/HIT   │   travel               │
+ │  game / game_world /   │   FLAGS, FLAG_WORDS,      │  game / game_world /   │
+ │  game_pause (sdk)      │   GIMMICKS, OBJECTS,      │  game_pause (sdk)      │
+ │  puppet (partner model)│   CUTSCENE, WORLD_*       │  puppet (partner model)│
+ │ re4coop_net.dll        │   CHAT/NOTIFY/HELLO       │ re4coop_net.dll        │
  └────────────────────────┘                           └────────────────────────┘
 ```
 
-* **Two full game instances.** Each player runs their own RE4 with their own Leon, camera and
-  inputs. Both load the **same chapter** from a save.
+* **Two full game instances, one world.** Each player runs their own RE4 with their own Leon,
+  camera and inputs. The client joins the **host's world**: it is brought to the host's
+  chapter (a reload with the chapter switch if needed), receives the host's flag and gimmick
+  tables and the list of destroyed objects, and is warped next to the host. From then on
+  every change on either side is replicated (§3.6).
 * **Partner presence: their real character.** Each side describes its character once (AVATAR:
   character id, costume parts, skeleton joint list) and then streams its final pose ~30 times a
   second (POSE). The receiver spawns the partner's body prefab, dresses it and poses it, 100 ms in
   the past for smooth interpolation. Details in §4.1. Name tag, distance and HP bar are drawn on
   top.
-* **Enemies: host-authoritative outcomes.** The level spawns the same enemies on both machines,
-  and each machine runs its own AI.
-  * The host numbers its enemies. Every 100 ms it broadcasts `{id, kind, ContextID, position,
-    spawn position, HP, alive}`, plus recently killed enemies every 0.5 s for up to 3 min.
-  * The client pairs each host enemy with its own copy by **kind + spawn point**
-    (deterministic level spawns), or by the enemy's **spawner ContextID** once spawner IDs have
-    proven reliable (§3.3). It never pairs by current position, because the two copies chase
-    different players.
-  * Damage the client deals is detected by HP polling (`expected HP − current HP`). It is sent
-    as `ENEMY_DAMAGE`, which the host applies. The client never *raises* HP to the host's value
-    (that would undo damage still in flight). It only lowers HP and applies deaths. Deaths are
-    sent reliably and re-advertised, so a partner who arrives late finds the room already
-    cleared.
-  * Optional position snapping (off by default) pulls the client's copies to the host's
-    positions.
+* **Enemies: one shared set.**
+  * Identity: the host numbers its enemies. The client pairs each with its own copy by **kind +
+    spawn point** (deterministic level spawns), or by the enemy's **spawner ContextID** once
+    spawner IDs have proven reliable (§3.3). Living host enemies are paired first.
+  * Health and death: the host is authoritative. Client damage is detected by HP polling and
+    sent as `ENEMY_DAMAGE`; the client only ever lowers HP and applies deaths. Deaths the client
+    did not witness are re-advertised, and kills the host could not match wait for the enemy to
+    spawn on the host (§3.6).
+  * Movement and AI: each enemy is **owned** by the machine whose player is closer (2 m
+    hysteresis, 0.6 s hold). The owner's AI runs it; the other machine **mirrors** it every
+    frame (position, facing, animation) with its AI head switched off. So an enemy near the
+    client attacks the client for real, and both see it in the same place doing the same thing.
+  * Hits each player lands are replayed (cosmetically) on the other side's copy, and the host's
+    random roll decides enemy drops for both (§3.5).
+* **World: event + state replication** (§3.6): scenario flags by GUID through the game's own
+  setter, gimmick records by ContextID, breakables and animals by GameObject GUID, cutscenes by
+  timeline event ID.
+* **No pauses in co-op** (§3.6): menu pauses freeze nothing while hosting or connected.
 * **Key items exist once** (§3.2, §3.3): whoever picks one up keeps it, and the partner's copy
-  is removed. Pickups are confirmed by the game's own pickup callback.
-* **Left-behind prompt** (§3.2, §3.3): offers a teleport (F6) when the partner has been far
-  away, or in another stage, for a while, so the player without the key item is never stuck.
+  is removed.
+* **Left-behind prompt** (§3.2, §3.3): F6 when the partner has been far away or in another
+  stage for a while; across stages the game's own warp is used, across chapters (client) the
+  chapter switch.
 * **Transition gate** (§3.5): the player who reaches a cutscene or a new chapter part first is
-  held there (scene time scale 0) until the partner arrives; F8 continues alone.
-* **Partner hits and drops** (§3.5): hits each player lands are replayed (cosmetically) on the
-  other side's copy of the enemy, and the host's random roll decides enemy drops for both.
-* **Utilities**: teleport to partner (transform + `CharacterController.warp`), chat, notices
-  ("partner is down", "teleported to you"), and a diagnostics panel with the research dump.
+  held there (scene time scale 0) until the partner arrives; F8 continues alone. With cutscene
+  replay the partner arrives *in* the same cutscene.
+* **Utilities**: teleport/travel to partner, chat, notices ("partner is down", "teleported to
+  you"), and a diagnostics panel with the research dump.
 
 ### 4.1 The partner's character
 
@@ -479,25 +542,24 @@ joint.
 different chapters, and when no pose arrived for 3 s. If the game unloads the copy with an area,
 it is rebuilt.
 
-### 4.2 Known limitations (v0.5)
+### 4.2 Known limitations (v0.6)
 
-* Nothing here has been verified in the running game yet. The riskiest assumption is that the
-  body prefab can be spawned outside the game's character spawner without side effects once its
-  logic is disabled; *Build partner from meshes only* is the escape hatch.
-* The copy is visual only: no collision, enemies don't see it, bullets pass through it.
-* Sounds the engine plays without going through the reflected `trigger` methods (for example
-  animation-driven ones, if they bypass it) are not replayed. *Diagnostics* counts what is.
-* Thrown grenades, projectiles, bullet impacts and blood happen only in the thrower's game.
-* Enemies only target the local player, so each machine's copy of an enemy fights its own
-  player: you see the partner's character shoot and your copy of the enemy flinches from their
-  hits, but enemies don't choose between the two players, and your partner cannot draw aggro
-  on your machine. Positions are not synced except by optional snapping. The next step is the
-  AI head (§3.5).
-* Wooden boxes and other breakables are not synced. Only enemy drops are identical.
-* Story flags, doors and cutscenes are not synced. Key items are shared once, and the
-  left-behind prompt brings the other player along.
-* Pausing or opening the inventory pauses only your game. The connection survives because the
-  network thread keeps running.
+* Nothing here has been verified in the running game yet. The riskiest assumptions are that the
+  body prefab can be spawned outside the game's character spawner once its logic is disabled
+  (*Build partner from meshes only* is the escape hatch), that switching an enemy's AI head off
+  leaves its body and HitController working (*...with their AI switched off* is the switch),
+  and that the probed flag/gimmick/cutscene methods are the ones named in §3.6 (*Diagnostics*).
+* The copy is visual only: no collision, enemies don't see it, bullets pass through it. An
+  enemy chasing the partner is run by the partner's game (ownership), so it does not target the
+  copy on yours.
+* Sounds the engine plays without going through the reflected `trigger` methods are not
+  replayed. Thrown grenades, projectiles, bullet impacts and blood happen only in the thrower's
+  game.
+* Cutscenes that start without a hooked timeline request (movies) are not replayed; the
+  transition gate and the flags still bring both players through them.
+* A checkpoint reload (death, Retry) happens only in that player's game.
+* Joining from another chapter, and following the host into the next one, go through the game
+  over screen (*Continue*).
 * Damage dealt to an enemy before your game has observed it once (the first ~50 ms after it
   spawns) is not reported.
 * Both players need the same game version, REFramework build and mod version. A protocol
@@ -505,21 +567,16 @@ it is rebuilt.
 
 ## 5. Roadmap
 
-1. **In-game validation of v0.5** with the checklist in [TESTING.md](TESTING.md), collecting
-   `re4coop_typedump.json` + **`re4coop_research_log.json`** from several areas (the dump also
-   lists the local character's objects, components, meshes and joints) and fixing any probed
-   names with them.
-2. Enemies for both players: enemy ownership (each enemy's AI runs on the machine of the player
-   it targets; the other machine switches the enemy's AI head off and mirrors position,
-   rotation and motion, which also shows enemies attacking the partner), or the partner's model
-   from §4.1 registered as a target (`HateController.find/addHate`).
-3. Breakables and doors through the gimmick state-change log (`pushDirtyList`), then stage-aware
-   teleports via `CharacterManager.requestWarp`.
+1. **In-game validation of v0.6** with the checklist in [TESTING.md](TESTING.md), collecting
+   `re4coop_typedump.json` + `re4coop_research_log.json` from several areas, and fixing any
+   probed names with them.
+2. Shared checkpoints: when one player dies, both reload (RE5/RE6 style), or the other revives
+   them.
 3. Event-driven damage via `chainsaw.EnemyManager.notifyHitDamage` hooks, to remove polling
    latency.
 4. Replicate thrown objects (grenades, eggs, bolts) and hit effects on enemies.
-5. Shared progression: sync door/gimmick interactions and story flags; host-driven chapter
-   transitions.
+5. The partner's model as an enemy target (`HateController.find/addHate`), so enemies run by
+   your game can also turn on the partner standing next to you.
 6. Optional Steam networking transport for NAT traversal.
 
 ## Sources
@@ -528,6 +585,8 @@ it is rebuilt.
 * [REFramework discussion #1112: creating a prefab instance in RE4](https://github.com/praydog/REFramework/discussions/1112)
 * [resyst/re4r `srt-overlay.lua`](https://github.com/resyst/re4r/blob/master/srt-overlay.lua) and [Joydurn/re4r-SRT](https://github.com/Joydurn/re4r-SRT/blob/master/srt-overlay.lua)
 * [GreenComfyTea/RE4-Health-Bars](https://github.com/GreenComfyTea/RE4-Health-Bars)
+* [LiterallyMetaphorical/RE4R-AP-Wizard](https://github.com/LiterallyMetaphorical/RE4R-AP-Wizard) (scenario flags by GUID, typewriter warps with `requestWarp`, chapter select through `loadGameSaveData`, DeathLink game over, scene components and GameObject GUIDs, `permitSpawn` gates)
+* REFramework [`shared/sdk/SystemArray.cpp`](https://github.com/praydog/REFramework/blob/master/shared/sdk/SystemArray.cpp) (boxed elements of primitive arrays, `SetValue` on write)
 * [alphazolam/EMV-Engine](https://github.com/alphazolam/EMV-Engine) (RE4 resource lists; `create_gameobj`, `create_resource`, `via.Prefab.get_Exist`, the poser writing joints at `PrepareRendering`, Wwise/EPV calls, `findComponents`, `get_Components`)
 * [alphazolam/RE_RSZ `rszre4.json`](https://github.com/alphazolam/RE_RSZ) (RE4 type names and serialized fields)
 * [resyst/re4r `re4r.asl`](https://github.com/resyst/re4r/blob/master/re4r.asl) (key item IDs)

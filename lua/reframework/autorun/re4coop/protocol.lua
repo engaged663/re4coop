@@ -3,8 +3,8 @@
 
 local P = {}
 
-P.VERSION = 5            -- bump on any incompatible change to the layouts below
-P.MOD_VERSION = "0.5.0"
+P.VERSION = 6            -- bump on any incompatible change to the layouts below
+P.MOD_VERSION = "0.6.0"
 P.MAX_PAYLOAD = 1388     -- re4coop_net.max_payload(): biggest message one datagram carries
 
 P.T = {
@@ -24,6 +24,14 @@ P.T = {
     ACTIONS = 14,       -- reliable, sounds/effects/shots to replay on the partner's model
     ENEMY_HIT = 15,     -- unreliable, both directions: a hit the sender's player landed on an enemy
     ITEM_DROPPED = 16,  -- reliable, host -> client: an enemy's random drop on the host
+    ENEMY_CLIENT = 17,  -- unreliable, ~20 Hz, client -> host: the enemies the client runs + its copies
+    FLAGS = 18,         -- reliable, both directions: scenario flags that changed, by GUID
+    FLAG_WORDS = 19,    -- reliable, both directions: scenario flag bits per group (full copy or masks)
+    GIMMICKS = 20,      -- reliable, both directions: gimmick save states (doors, locks, levers...)
+    OBJECTS = 21,       -- reliable, both directions: breakables/animals destroyed, by GameObject GUID
+    CUTSCENE = 22,      -- reliable, both directions: a cutscene (timeline event) started
+    WORLD_REQUEST = 23, -- reliable, client -> host: send me your whole world state
+    WORLD_DONE = 24,    -- reliable, host -> client: end of a full world state transfer
 }
 
 P.PLAYER_FLAGS = {
@@ -37,7 +45,40 @@ P.PLAYER_FLAGS = {
 
 P.ENEMY_FLAGS = {
     ALIVE = 1,
-    HAS_CTX = 2, -- entry carries the enemy's chainsaw.ContextID
+    HAS_CTX = 2,      -- entry carries the enemy's chainsaw.ContextID
+    CLIENT_OWNED = 4, -- the client runs this enemy's AI; the host mirrors the client's copy
+    HAS_MOTION = 8,   -- entry carries the enemy's animation (motion bank, motion id, frame)
+}
+
+P.CLIENT_ENEMY_FLAGS = {
+    HAS_MOTION = 1,
+}
+
+P.FLAG_WORDS_MODE = {
+    FULL = 1,  -- the sender's complete words for those groups (replace)
+    DELTA = 2, -- pairs of masks: bits that turned on, bits that turned off
+}
+
+P.GIMMICK_MODE = {
+    FULL = 1,  -- the sender's whole table (a joining client)
+    DELTA = 2, -- records that changed
+    ADDED = 3, -- records that appeared: apply only where the receiver has none for that gimmick
+}
+
+P.OBJECT_EVENT = {
+    DESTROYED = 1, -- broken / killed / removed from the scene
+    ROUTINE = 2,   -- the object's state machine (_Routine) moved to `value`
+}
+
+P.WORLD = {
+    FLAGS = 1,
+    GIMMICKS = 2,
+    ENEMIES = 4,
+    OBJECTS = 8,
+}
+
+P.CUTSCENE_FLAGS = {
+    LOCAL_TRIGGER = 1, -- started by the sender's own game (not a replay of ours)
 }
 
 P.DAMAGE_FLAGS = {
@@ -50,6 +91,10 @@ P.ITEM_FLAGS = {
     ONLY_INSTANCE = 2, -- the sender's scene had no other copy of this key item
     HAS_STAGE = 4,
 }
+
+-- ENEMY_DEAD with this net id: the host's enemies were reset (checkpoint reload), forget
+-- every death it reported. Real net ids start at 1.
+P.ENEMY_DEAD_RESET = 0
 
 P.HIT_FLAGS = {
     CRITICAL = 1,
@@ -103,10 +148,17 @@ P.MAX_WEAPONS = 4
 P.MAX_WEAPON_JOINTS = 32
 P.MAX_TRANSLATIONS = 32
 P.MAX_EVENT_ARGS = 16
-P.ENEMIES_PER_SNAPSHOT = 25 -- 12 B header + 25 * 53 B entries stays under the 1388 B payload limit
+P.ENEMIES_PER_SNAPSHOT = 20 -- 12 B header + 20 * 65 B entries stays under the 1388 B payload limit
+P.MAX_CLIENT_ENEMY_STATES = 30
+P.MAX_CLIENT_PAIRED = 200
+P.FLAGS_PER_MESSAGE = 64
+P.OBJECTS_PER_MESSAGE = 60
 
--- net id, kind hash, position, spawn position, yaw, hp, max hp, flags, ContextID (group, index, kind, category)
-local ENEMY_ENTRY = "<I2I4fffffffffBi4i4BB"
+-- net id, kind hash, position, spawn position, yaw, hp, max hp, flags, ContextID (group, index,
+-- kind, category), motion bank, motion id, motion frame
+local ENEMY_ENTRY = "<I2I4fffffffffBi4i4BBI4I4f"
+-- net id, position, yaw, motion bank, motion id, motion frame, flags
+local CLIENT_STATE = "<I2ffffI4I4fB"
 
 local function clamp_i16(v)
     v = math.floor(v + 0.5)
@@ -124,6 +176,65 @@ end
 
 local function ctx_from(group, index, kind, category)
     return { group = group, index = index, kind = kind, category = category }
+end
+
+local function clamp_i32(v)
+    v = math.floor(tonumber(v) or 0)
+    if v > 0x7FFFFFFF then return 0x7FFFFFFF end
+    if v < -0x80000000 then return -0x80000000 end
+    return v
+end
+
+local function clamp_u32(v)
+    v = math.floor(tonumber(v) or 0)
+    if v < 0 then return 0 end
+    if v > 0xFFFFFFFF then return 0xFFFFFFFF end
+    return v
+end
+
+-- ContextID as group, index, kind, category (the field order ENEMY_ENTRY uses too).
+local CTX = "<i4i4BB"
+
+local function pack_ctx(ctx)
+    local g, idx, k, c = ctx_fields(ctx)
+    return string.pack(CTX, clamp_i32(g), clamp_i32(idx), k, c)
+end
+
+local function unpack_ctx(data, off)
+    local g, idx, k, c
+    g, idx, k, c, off = string.unpack(CTX, data, off)
+    return ctx_from(g, idx, k, c), off
+end
+
+-- Parses a ctx_key() string back into a ContextID table.
+function P.ctx_from_key(key)
+    local c, k, g, i = tostring(key):match("^(%-?%d+):(%-?%d+):(%-?%d+):(%-?%d+)$")
+    if c == nil then return nil end
+    return ctx_from(tonumber(g), tonumber(i), tonumber(k), tonumber(c))
+end
+
+-------------------------------------------------------------------------------
+-- GUIDs (scenario flags, scene objects) travel as 16 raw bytes: the 32 hex digits of the
+-- canonical string, in order.
+-------------------------------------------------------------------------------
+
+function P.guid_to_bytes(s)
+    if type(s) ~= "string" then return nil end
+    local hex = s:lower():gsub("[{}%-]", "")
+    if #hex ~= 32 or hex:find("[^0-9a-f]") then return nil end
+    return (hex:gsub("..", function(h) return string.char(tonumber(h, 16)) end))
+end
+
+function P.guid_from_bytes(b)
+    if type(b) ~= "string" or #b ~= 16 then return nil end
+    local hex = b:gsub(".", function(ch) return ("%02x"):format(ch:byte()) end)
+    return ("%s-%s-%s-%s-%s"):format(hex:sub(1, 8), hex:sub(9, 12), hex:sub(13, 16), hex:sub(17, 20), hex:sub(21, 32))
+end
+
+-- Lower-case "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx", or nil if `s` is not a GUID.
+function P.normalize_guid(s)
+    local b = P.guid_to_bytes(s)
+    return b and P.guid_from_bytes(b) or nil
 end
 
 -- ContextIDs in this group are handed out at runtime, in load order: the research dump showed
@@ -256,13 +367,16 @@ function P.encode_player(m)
 end
 
 -- Splits the enemy list into as many messages as needed. Returns an array of strings.
--- entry = { net_id, kind_hash, pos={x,y,z}, spawn={x,y,z}, yaw, hp, max_hp, flags, ctx }
+-- entry = { net_id, kind_hash, pos={x,y,z}, spawn={x,y,z}, yaw, hp, max_hp, flags, ctx,
+--           motion={bank, id, frame}|nil }
 -- `ctx` is the enemy's chainsaw.ContextID (nil if unreadable). `spawn` is where the host
 -- first saw the enemy; (kind, spawn position) is the fallback identity when IDs differ.
+-- `motion` is the animation playing on the enemy (for mirroring it on the client).
 function P.encode_enemy_snapshots(time, entries)
     local out = {}
     local per = P.ENEMIES_PER_SNAPSHOT
     local chunks = math.max(1, math.ceil(#entries / per))
+    local F = P.ENEMY_FLAGS
     for c = 1, chunks do
         local first = (c - 1) * per + 1
         local last = math.min(#entries, c * per)
@@ -271,16 +385,195 @@ function P.encode_enemy_snapshots(time, entries)
         for i = first, last do
             local e = entries[i]
             local spawn = e.spawn or e.pos
-            local flags = (e.flags or 0) & ~P.ENEMY_FLAGS.HAS_CTX
-            if e.ctx ~= nil then flags = flags | P.ENEMY_FLAGS.HAS_CTX end
-            local g, idx, k, c = ctx_fields(e.ctx)
+            local flags = (e.flags or 0) & ~(F.HAS_CTX | F.HAS_MOTION)
+            if e.ctx ~= nil then flags = flags | F.HAS_CTX end
+            local motion = e.motion or {}
+            if e.motion ~= nil then flags = flags | F.HAS_MOTION end
+            local g, idx, k, cat = ctx_fields(e.ctx)
             parts[#parts + 1] = string.pack(ENEMY_ENTRY, e.net_id, e.kind_hash,
                 e.pos.x, e.pos.y, e.pos.z, spawn.x, spawn.y, spawn.z,
-                e.yaw or 0, e.hp or 0, e.max_hp or 0, flags, g, idx, k, c)
+                e.yaw or 0, e.hp or 0, e.max_hp or 0, flags, g, idx, k, cat,
+                clamp_u32(motion.bank), clamp_u32(motion.id), motion.frame or 0)
         end
         out[#out + 1] = table.concat(parts)
     end
     return out
+end
+
+-- Client -> host, every ~50 ms. states = { {net_id, pos, yaw, motion={bank,id,frame}|nil} ... }:
+-- the enemies the client runs (the host mirrors them); paired = { net_id ... }: every other
+-- host enemy the client has a copy of (the host only hands over enemies the client has).
+function P.encode_enemy_client(time, states, paired)
+    local ns = math.min(#states, P.MAX_CLIENT_ENEMY_STATES)
+    local np = math.min(#paired, P.MAX_CLIENT_PAIRED)
+    local parts = { string.pack("<BdBB", P.T.ENEMY_CLIENT, time, ns, np) }
+    for i = 1, ns do
+        local s = states[i]
+        local motion = s.motion or {}
+        parts[#parts + 1] = string.pack(CLIENT_STATE, s.net_id, s.pos.x, s.pos.y, s.pos.z, s.yaw or 0,
+            clamp_u32(motion.bank), clamp_u32(motion.id), motion.frame or 0,
+            s.motion ~= nil and P.CLIENT_ENEMY_FLAGS.HAS_MOTION or 0)
+    end
+    for i = 1, np do
+        parts[#parts + 1] = string.pack("<I2", paired[i])
+    end
+    return table.concat(parts)
+end
+
+-- flags = { {guid="xxxxxxxx-....", value=bool}, ... } -> array of messages
+function P.encode_flags(flags)
+    local out = {}
+    local i = 1
+    repeat
+        local last = math.min(#flags, i + P.FLAGS_PER_MESSAGE - 1)
+        local parts = { "" }
+        local n = 0
+        for k = i, last do
+            local b = P.guid_to_bytes(flags[k].guid)
+            if b ~= nil then
+                parts[#parts + 1] = b .. string.pack("<B", flags[k].value and 1 or 0)
+                n = n + 1
+            end
+        end
+        parts[1] = string.pack("<BB", P.T.FLAGS, n)
+        out[#out + 1] = table.concat(parts)
+        i = last + 1
+    until i > #flags
+    return out
+end
+
+-- Packs variable-size items into as few messages as fit the payload limit.
+-- make_header(chunk, chunks, count) -> string; items are already-packed strings.
+local function chunk_items(items, header_size, make_header)
+    local groups, cur, size = {}, {}, header_size
+    for _, it in ipairs(items) do
+        if #cur > 0 and (size + #it > P.MAX_PAYLOAD or #cur >= 255) then
+            groups[#groups + 1] = cur
+            cur, size = {}, header_size
+        end
+        cur[#cur + 1] = it
+        size = size + #it
+    end
+    groups[#groups + 1] = cur
+    local out = {}
+    for c, g in ipairs(groups) do
+        out[c] = make_header(c, #groups, #g) .. table.concat(g)
+    end
+    return out
+end
+
+-- Full mode: groups = { {name, words={u32,...}}, ... }
+-- Delta mode: groups = { {name, changes={ {word=i (0-based), set=mask, clear=mask}, ... }}, ... }
+function P.encode_flag_words(sync_id, mode, groups)
+    local items = {}
+    for _, g in ipairs(groups) do
+        local name = tostring(g.name):sub(1, 255)
+        -- Bytes one item may use: payload - message header - name - first/count.
+        local room = P.MAX_PAYLOAD - 7 - (1 + #name) - 4
+        if mode == P.FLAG_WORDS_MODE.FULL then
+            local words = g.words or {}
+            local first = 0
+            repeat
+                local n = math.min(#words - first, room // 4)
+                local parts = { string.pack("<s1I2I2", name, first, n) }
+                for k = first + 1, first + n do
+                    parts[#parts + 1] = string.pack("<I4", clamp_u32(words[k]))
+                end
+                items[#items + 1] = table.concat(parts)
+                first = first + n
+            until first >= #words
+        else
+            local changes = g.changes or {}
+            local first = 1
+            repeat
+                local n = math.min(#changes - first + 1, room // 10)
+                local parts = { string.pack("<s1I2I2", name, 0, n) }
+                for k = first, first + n - 1 do
+                    local c = changes[k]
+                    parts[#parts + 1] = string.pack("<I2I4I4", c.word, clamp_u32(c.set), clamp_u32(c.clear))
+                end
+                items[#items + 1] = table.concat(parts)
+                first = first + n
+            until first > #changes
+        end
+    end
+    return chunk_items(items, 7, function(c, n, count)
+        return string.pack("<BI2BBBB", P.T.FLAG_WORDS, (sync_id or 0) & 0xFFFF, mode, c, n, count)
+    end)
+end
+
+-- item = { ctx, attr="<raw bytes>", triggers={ {id, done}, ... }, detected=bool,
+--          acc={ {kind=1|2, value=n}, ... } }   (accessory kind 1 = float, 2 = uint32)
+local function pack_gimmick(item)
+    local attr = item.attr or ""
+    if #attr > 255 then attr = attr:sub(1, 255) end
+    local parts = { pack_ctx(item.ctx), string.pack("<s1", attr) }
+    local triggers = item.triggers or {}
+    local nt = math.min(#triggers, 64)
+    parts[#parts + 1] = string.pack("<B", nt)
+    for i = 1, nt do
+        parts[#parts + 1] = string.pack("<I4I4", clamp_u32(triggers[i].id), clamp_u32(triggers[i].done))
+    end
+    parts[#parts + 1] = string.pack("<B", item.detected and 1 or 0)
+    local acc = item.acc or {}
+    local na = math.min(#acc, 64)
+    parts[#parts + 1] = string.pack("<B", na)
+    for i = 1, na do
+        local a = acc[i]
+        if a.kind == 1 then
+            parts[#parts + 1] = string.pack("<Bf", 1, a.value or 0)
+        else
+            parts[#parts + 1] = string.pack("<BI4", 2, clamp_u32(a.value))
+        end
+    end
+    return table.concat(parts)
+end
+
+function P.encode_gimmicks(sync_id, mode, items)
+    local packed = {}
+    for i, it in ipairs(items) do packed[i] = pack_gimmick(it) end
+    return chunk_items(packed, 7, function(c, n, count)
+        return string.pack("<BI2BBBB", P.T.GIMMICKS, (sync_id or 0) & 0xFFFF, mode, c, n, count)
+    end)
+end
+
+-- events = { {guid, event=P.OBJECT_EVENT.*, value=int}, ... } -> array of messages
+function P.encode_objects(events)
+    local out = {}
+    local i = 1
+    repeat
+        local last = math.min(#events, i + P.OBJECTS_PER_MESSAGE - 1)
+        local parts = { "" }
+        local n = 0
+        for k = i, last do
+            local e = events[k]
+            local b = P.guid_to_bytes(e.guid)
+            if b ~= nil then
+                parts[#parts + 1] = b .. string.pack("<Bi4", e.event or 0, clamp_i32(e.value or 0))
+                n = n + 1
+            end
+        end
+        parts[1] = string.pack("<BB", P.T.OBJECTS, n)
+        out[#out + 1] = table.concat(parts)
+        i = last + 1
+    until i > #events
+    return out
+end
+
+-- m = { id (chainsaw.TimelineEventDefine.ID), method, chapter, stage, pos={x,y,z}|nil, flags }
+function P.encode_cutscene(m)
+    local pos = m.pos or { x = 0, y = 0, z = 0 }
+    return string.pack("<Bi4s1i4i4fffB", P.T.CUTSCENE, clamp_i32(m.id), (m.method or ""):sub(1, 255),
+        clamp_i32(m.chapter or -1), clamp_i32(m.stage or -1), pos.x, pos.y, pos.z, m.flags or 0)
+end
+
+function P.encode_world_request(sync_id, what)
+    return string.pack("<BI2B", P.T.WORLD_REQUEST, (sync_id or 0) & 0xFFFF, what or 0)
+end
+
+function P.encode_world_done(sync_id, what, n_flag_groups, n_gimmicks)
+    return string.pack("<BI2BI4I4", P.T.WORLD_DONE, (sync_id or 0) & 0xFFFF, what or 0,
+        clamp_u32(n_flag_groups), clamp_u32(n_gimmicks))
 end
 
 -- m = { net_id (0 if unknown), kind_hash, pos={x,y,z}, amount, flags, ctx }
@@ -558,18 +851,140 @@ end
 decoders[P.T.ENEMY_SNAPSHOT] = function(data)
     local _, time, chunk, chunks, count, off = string.unpack("<BdBBB", data)
     local m = { time = time, chunk = chunk, chunks = chunks, enemies = {} }
+    local F = P.ENEMY_FLAGS
     for i = 1, count do
-        local net_id, kind_hash, x, y, z, sx, sy, sz, yaw, hp, max_hp, flags, g, idx, k, c
-        net_id, kind_hash, x, y, z, sx, sy, sz, yaw, hp, max_hp, flags, g, idx, k, c, off =
+        local net_id, kind_hash, x, y, z, sx, sy, sz, yaw, hp, max_hp, flags, g, idx, k, c, bank, mid, frame
+        net_id, kind_hash, x, y, z, sx, sy, sz, yaw, hp, max_hp, flags, g, idx, k, c, bank, mid, frame, off =
             string.unpack(ENEMY_ENTRY, data, off)
         m.enemies[i] = {
             net_id = net_id, kind_hash = kind_hash,
             pos = { x = x, y = y, z = z }, spawn = { x = sx, y = sy, z = sz },
             yaw = yaw, hp = hp, max_hp = max_hp, flags = flags,
-            ctx = (flags & P.ENEMY_FLAGS.HAS_CTX) ~= 0 and ctx_from(g, idx, k, c) or nil,
+            ctx = (flags & F.HAS_CTX) ~= 0 and ctx_from(g, idx, k, c) or nil,
+            motion = (flags & F.HAS_MOTION) ~= 0 and { bank = bank, id = mid, frame = frame } or nil,
         }
     end
     return m
+end
+
+decoders[P.T.ENEMY_CLIENT] = function(data)
+    local _, time, ns, np, off = string.unpack("<BdBB", data)
+    local m = { time = time, states = {}, paired = {} }
+    for i = 1, ns do
+        local net_id, x, y, z, yaw, bank, mid, frame, flags
+        net_id, x, y, z, yaw, bank, mid, frame, flags, off = string.unpack(CLIENT_STATE, data, off)
+        local s = { net_id = net_id, pos = { x = x, y = y, z = z }, yaw = yaw }
+        if (flags & P.CLIENT_ENEMY_FLAGS.HAS_MOTION) ~= 0 then
+            s.motion = { bank = bank, id = mid, frame = frame }
+        end
+        m.states[i] = s
+    end
+    for i = 1, np do
+        m.paired[i], off = string.unpack("<I2", data, off)
+    end
+    return m
+end
+
+decoders[P.T.FLAGS] = function(data)
+    local _, n, off = string.unpack("<BB", data)
+    local flags = {}
+    for i = 1, n do
+        if off + 16 > #data then error("truncated") end
+        local guid = P.guid_from_bytes(data:sub(off, off + 15))
+        local value = string.unpack("<B", data, off + 16)
+        off = off + 17
+        flags[i] = { guid = guid, value = value ~= 0 }
+    end
+    return { flags = flags }
+end
+
+decoders[P.T.FLAG_WORDS] = function(data)
+    local _, sync_id, mode, chunk, chunks, count, off = string.unpack("<BI2BBBB", data)
+    if chunk < 1 or chunk > chunks then error("bad chunk") end
+    local m = { sync_id = sync_id, mode = mode, chunk = chunk, chunks = chunks, groups = {} }
+    for i = 1, count do
+        local name, first, n
+        name, first, n, off = string.unpack("<s1I2I2", data, off)
+        local g = { name = name, first = first }
+        if mode == P.FLAG_WORDS_MODE.FULL then
+            g.words = {}
+            for k = 1, n do
+                g.words[k], off = string.unpack("<I4", data, off)
+            end
+        else
+            g.changes = {}
+            for k = 1, n do
+                local word, set, clear
+                word, set, clear, off = string.unpack("<I2I4I4", data, off)
+                g.changes[k] = { word = word, set = set, clear = clear }
+            end
+        end
+        m.groups[i] = g
+    end
+    return m
+end
+
+decoders[P.T.GIMMICKS] = function(data)
+    local _, sync_id, mode, chunk, chunks, count, off = string.unpack("<BI2BBBB", data)
+    if chunk < 1 or chunk > chunks then error("bad chunk") end
+    local m = { sync_id = sync_id, mode = mode, chunk = chunk, chunks = chunks, items = {} }
+    for i = 1, count do
+        local item = {}
+        item.ctx, off = unpack_ctx(data, off)
+        item.attr, off = string.unpack("<s1", data, off)
+        local nt
+        nt, off = string.unpack("<B", data, off)
+        item.triggers = {}
+        for k = 1, nt do
+            local id, done
+            id, done, off = string.unpack("<I4I4", data, off)
+            item.triggers[k] = { id = id, done = done }
+        end
+        local detected, na
+        detected, na, off = string.unpack("<BB", data, off)
+        item.detected = detected ~= 0
+        item.acc = {}
+        for k = 1, na do
+            local kind, value
+            kind, off = string.unpack("<B", data, off)
+            if kind == 1 then
+                value, off = string.unpack("<f", data, off)
+            else
+                value, off = string.unpack("<I4", data, off)
+            end
+            item.acc[k] = { kind = kind, value = value }
+        end
+        m.items[i] = item
+    end
+    return m
+end
+
+decoders[P.T.OBJECTS] = function(data)
+    local _, n, off = string.unpack("<BB", data)
+    local events = {}
+    for i = 1, n do
+        if off + 20 > #data then error("truncated") end
+        local guid = P.guid_from_bytes(data:sub(off, off + 15))
+        local event, value = string.unpack("<Bi4", data, off + 16)
+        off = off + 21
+        events[i] = { guid = guid, event = event, value = value }
+    end
+    return { events = events }
+end
+
+decoders[P.T.CUTSCENE] = function(data)
+    local _, id, method, chapter, stage, x, y, z, flags = string.unpack("<Bi4s1i4i4fffB", data)
+    return { id = id, method = method, chapter = chapter, stage = stage, pos = { x = x, y = y, z = z }, flags = flags }
+end
+
+decoders[P.T.WORLD_REQUEST] = function(data)
+    local _, sync_id, what = string.unpack("<BI2B", data)
+    return { sync_id = sync_id, what = what }
+end
+
+decoders[P.T.WORLD_DONE] = function(data)
+    local _, sync_id, what, n_flag_groups, n_gimmicks = string.unpack("<BI2BI4I4", data)
+    return { sync_id = sync_id, what = what, n_flag_groups = n_flag_groups, n_gimmicks = n_gimmicks }
 end
 
 decoders[P.T.ENEMY_DAMAGE] = function(data)

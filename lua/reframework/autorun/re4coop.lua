@@ -27,6 +27,8 @@ end
 
 local Config = require("re4coop.config")
 local Game = require("re4coop.game")
+local World = require("re4coop.game_world")
+local Pause = require("re4coop.game_pause")
 local Session = require("re4coop.session")
 local Puppet = require("re4coop.puppet")
 local Overlay = require("re4coop.overlay")
@@ -35,9 +37,25 @@ local P = require("re4coop.protocol")
 
 local settings = Config.load(json)
 local game = Game.new(log_info, re4coop_net.time)
+game:add_dump_types(World.DUMP_TYPES)
+
+-- The world and pause adapters are optional: if either fails to start (a game patch), the
+-- rest of the mod keeps working and Diagnostics shows what is missing.
+local function try_new(class, name)
+    local ok, obj = pcall(class.new, game, log_info)
+    if ok then return obj end
+    log_info(("%s adapter disabled: %s"):format(name, tostring(obj)))
+    game:cap(name, false, tostring(obj))
+    return nil
+end
+local world = try_new(World, "world")
+local pause = try_new(Pause, "pause")
+
 local session = Session.new({
     net = re4coop_net,
     game = game,
+    world = world,
+    pause = pause,
     clock = re4coop_net.time,
     settings = settings,
     log = log_info,
@@ -76,8 +94,8 @@ local function update_partner(now)
     })
 end
 
--- Game thread: networking, reading the player, enemy sync, the partner's model. Runs after
--- behaviours have updated this frame so positions/HP are settled.
+-- Game thread: networking, reading the player, enemy and world sync, the partner's model.
+-- Runs after behaviours have updated this frame so positions/HP are settled.
 re.on_application_entry("LateUpdateBehavior", function()
     local now = re4coop_net.time()
     last_game_tick = now
@@ -141,9 +159,10 @@ end)
 
 re.on_script_reset(function()
     -- Keep the network session alive across script reloads (the plugin owns it); just
-    -- remove anything we spawned into the world.
+    -- remove anything we spawned into the world and undo what we changed: the transition
+    -- gate's freeze, the neutralised menu pauses, switched-off enemy AI.
     pcall(puppet.shutdown, puppet)
-    pcall(session.shutdown, session) -- never leave the game frozen by the transition gate
+    pcall(session.shutdown, session)
     Config.save(json, settings)
 end)
 

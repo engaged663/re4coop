@@ -32,6 +32,29 @@ T.run("explains_missing_plugin", function()
     T.check(found, "tells the user what to install")
 end)
 
+T.run("broken_world_adapter_does_not_stop_the_mod", function()
+    local world = mock.install()
+    world.player = mock.make_player({ x = 0, y = 0, z = 0 })
+    for name in pairs(package.loaded) do
+        if name:find("^re4coop") then package.loaded[name] = nil end
+    end
+    -- A game patch that breaks the world adapter's constructor.
+    local World = require("re4coop.game_world")
+    World.new = function() error("type layout changed") end
+    local ok, err = pcall(dofile, TEST_ROOT .. "/lua/reframework/autorun/re4coop.lua")
+    T.check(ok, "entry script still loads: " .. tostring(err))
+    T.check(#mock.callbacks.entry > 0 and #mock.callbacks.ui > 0, "game loop and UI registered")
+    mock.press["Host game"] = true
+    mock.run_frame()
+    T.eq(re4coop_net.state(), "listening", "hosting works without the shared world")
+    re4coop_net.stop()
+    local logged = false
+    for _, l in ipairs(mock.logs) do
+        if l:find("world adapter disabled") then logged = true end
+    end
+    T.check(logged, "the reason is logged")
+end)
+
 T.run("partner_with_other_protocol_version_is_flagged", function()
     local P = require("re4coop.protocol")
     local Session = require("re4coop.session")

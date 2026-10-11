@@ -52,10 +52,10 @@ Session rules:
 | `stats()` | Table: `rtt_ms, peer, peer_name, bytes_sent, bytes_recv, resends, reliable_in_flight, …` |
 | `local_addresses()` | Array of this PC's LAN IPv4 addresses |
 | `time()` | Monotonic seconds (`os.clock` is CPU time, so don't use it for networking) |
-| `max_payload()`, `version()` | `1388`; `"0.5.0", 1` |
+| `max_payload()`, `version()` | `1388`; `"0.6.0", 1` |
 | `new_session()` | An independent session object with the same methods (tests/tools) |
 
-## Game messages (game protocol version 5)
+## Game messages (game protocol version 6)
 
 The first byte is the message type. Formats use Lua `string.pack` notation.
 
@@ -64,9 +64,9 @@ The first byte is the message type. Formats use Lua `string.pack` notation.
 | 1 | HELLO | reliable | both, on connect | `<B I2 s1 s1 s1 B`: type, game protocol version, mod version, player name, chapter/area, flags (1 = reply requested) |
 | 2 | PLAYER | unreliable, 20 Hz | both | `<B d fff ffff ff B I4 i4 i4`: time, position, rotation quaternion (x,y,z,w), HP, max HP, flags (1 dead, 2 cutscene, 4 aiming, 8 has stage, 16 has chapter, 32 waiting at a transition), area hash, `chainsaw.StageID` (valid with flag 8), `chainsaw.ChapterID` (valid with flag 16) |
 | 3 | *(retired)* | | | SKELETON in protocols 1–3 (the stick-figure ghost) |
-| 4 | ENEMY_SNAPSHOT | unreliable, 10 Hz | host → client | `<B d B B B` + n × `<I2 I4 fff fff f f f B i4 i4 B B`: time, chunk, chunks, count; then net id, kind hash (FNV-1a of context type name), position, spawn position, yaw, HP, max HP, flags (1 alive, 2 has ContextID), the enemy's **spawner** `chainsaw.ContextID` (`CharacterContext.get_SpawnerID()`) as group, index, kind, category. 25 entries per chunk |
+| 4 | ENEMY_SNAPSHOT | unreliable, 15 Hz | host → client | `<B d B B B` + n × `<I2 I4 fff fff f f f B i4 i4 B B I4 I4 f>` (65 B): time, chunk, chunks, count; then net id, kind hash (FNV-1a of context type name), position, spawn position, yaw, HP, max HP, flags (1 alive, 2 has ContextID, 4 run by the client, 8 has animation), the enemy's **spawner** `chainsaw.ContextID` (`CharacterContext.get_SpawnerID()`) as group, index, kind, category, then motion bank, motion ID and frame of its motion layer 0. 20 entries per chunk. Every 5th snapshot also lists recent deaths the client did not witness (flags without 1) |
 | 5 | ENEMY_DAMAGE | reliable | client → host | `<B I2 I4 fff f B i4 i4 B B`: net id (0 = unpaired), kind hash, spawn position, amount, flags (1 lethal, 2 has ContextID), spawner ContextID (sent only once spawner IDs are trusted, see below) |
-| 6 | ENEMY_DEAD | reliable | host → client | `<B I2`: net id |
+| 6 | ENEMY_DEAD | reliable | host → client | `<B I2`: net id. Net id 0: the host reloaded a checkpoint, forget every death it reported |
 | 7 | CHAT | reliable | both | `<B s2`: text (≤ 512 bytes) |
 | 8 | NOTIFY | reliable | both | `<B B s1`: code (1 died, 2 revived, 3 teleported, 4 info), text |
 | 9 | ITEM_TAKEN | reliable | both | `<B I4 fff B i4 i4 B B i4`: item ID, position, flags (1 has ContextID, 2 it was the only copy in the sender's scene, 4 has stage), ContextID of the `chainsaw.DropItem` (level IDs only), its `chainsaw.StageID`. The receiver removes its copy of that key item |
@@ -77,6 +77,22 @@ The first byte is the message type. Formats use Lua `string.pack` notation.
 | 14 | ACTIONS | reliable | both | see below: sound/effect calls and shots to replay |
 | 15 | ENEMY_HIT | unreliable | both | `<B I2 I4 fff i4 fff fff i4 B`: net id (host numbering; 0 = unpaired), kind hash, enemy spawn position, damage, wince, break, stopping, damage direction, weapon ID, flags (1 critical). A hit the sender's player landed (`HitController.callbackDamageHit`); the receiver replays it on its copy (cosmetic: 1 damage, HP restored) |
 | 16 | ITEM_DROPPED | reliable | host → client | `<B I2 I4 i4 fff i4 B`: net id of the enemy, item ID, count, position, stage, flags (1 has stage). The item the host's random roll dropped; the client spawns it where its copy of that enemy is |
+| 17 | ENEMY_CLIENT | unreliable, 20 Hz | client → host | `<B d B B` + n × `<I2 fff f I4 I4 f B>` + m × `<I2>`: time, state count (≤ 30), copy count (≤ 200); the enemies the client runs (net id, position, yaw, motion bank/ID/frame, flags: 1 has animation), then the net ids of every other host enemy the client has a copy of. The host mirrors the first list and hands over only enemies the client has |
+| 18 | FLAGS | reliable | both | `<B B` + n × (`guid` + `<B`): scenario flags that changed (≤ 64 per message), with their new value |
+| 19 | FLAG_WORDS | reliable | both | `<B I2 B B B B` (sync id, mode, chunk, chunks, item count) + per item `<s1 I2 I2` (group name, first word, count) + words. Mode 1 = full copy: `<I4` words. Mode 2 = changes: `<I2 I4 I4` (word index, bits set, bits cleared) |
+| 20 | GIMMICKS | reliable | both | `<B I2 B B B B` (sync id, mode, chunk, chunks, count) + per gimmick: `ctx` (`<i4 i4 B B>`: group, index, kind, category), `<s1` attribute bytes, `<B` + n × `<I4 I4` (trigger save ID, done), `<B` detected, `<B` + n × (`<B` kind, `<f` or `<I4` value) accessory values. Mode 1 = the whole table, 2 = records that changed, 3 = records that appeared (applied only where the receiver has no record of that gimmick) |
+| 21 | OBJECTS | reliable | both | `<B B` + n × (`guid` + `<B i4`): scene object (GameObject GUID), event (1 destroyed, 2 state changed), value (the `_Routine` it ended in, or -1) |
+| 22 | CUTSCENE | reliable | both | `<B i4 s1 i4 i4 fff B`: timeline event ID (`chainsaw.TimelineEventDefine.ID`), request method name, chapter, stage, position where it started, flags (1 = triggered by the sender's game) |
+| 23 | WORLD_REQUEST | reliable | client → host | `<B I2 B`: sync id, what (1 flags, 2 gimmicks, 4 enemies, 8 objects) |
+| 24 | WORLD_DONE | reliable | host → client | `<B I2 B I4 I4`: sync id, what, flag groups sent, gimmicks sent. Follows the FLAG_WORDS / GIMMICKS / OBJECTS of a full transfer (the reliable channel is ordered) |
+
+`guid` is 16 raw bytes: the 32 hex digits of the canonical GUID string, in order. Scenario
+flags are addressed by GUID in the game itself; scene objects by their GameObject GUID, which
+comes from the scene file and is the same on both machines.
+
+Joining: once the client is in the host's chapter it sends WORLD_REQUEST; the host answers
+with full FLAG_WORDS and GIMMICKS, the OBJECTS destroyed so far and WORLD_DONE; the client
+applies them and then warps next to the host.
 
 Compatibility: only the `version` field of HELLO is guaranteed across game protocol versions.
 A peer with a different version gets an "update both" message, and its game messages are

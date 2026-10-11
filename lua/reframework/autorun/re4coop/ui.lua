@@ -102,6 +102,21 @@ local function draw_status(session, status)
             if imgui.button("Teleport to partner") then
                 session:teleport_to_partner()
             end
+            if session:can_travel() then
+                imgui.same_line()
+                if imgui.button("Travel to partner (loads their area or chapter)") then
+                    session:travel_to_partner()
+                end
+            end
+            local tr = status.travel
+            if tr ~= nil and tr.state ~= "idle" then
+                imgui.text_colored(("Travelling to partner (%s): %s"):format(tr.reason or "?", tr.state), COLOR_WARN)
+            elseif tr ~= nil and tr.result ~= nil and tr.result ~= "arrived" then
+                imgui.text_colored("Last travel: " .. tostring(tr.result), COLOR_DIM)
+            end
+            if status.world_sync_pending then
+                imgui.text_colored("Receiving the host's world state...", COLOR_WARN)
+            end
         else
             imgui.text_colored("Waiting for partner position (are they in game?)", COLOR_WARN)
         end
@@ -117,8 +132,12 @@ local function draw_status(session, status)
         end
         if status.enemies then
             local e = status.enemies
-            imgui.text(("Enemies: %d local, %d paired%s"):format(e.local_count, e.paired,
-                e.role == "client" and (", %d from host"):format(e.remote_count) or ""))
+            imgui.text(("Enemies: %d local, %d paired%s, %d run by the client, %d following the partner's copy"):format(
+                e.local_count, e.paired, e.role == "client" and (", %d from host"):format(e.remote_count) or "",
+                e.client_owned or 0, e.mirrored_now or 0))
+        end
+        if status.pause and status.pause.active then
+            imgui.text_colored(("No-pause on: %d menu pauses keep the world running"):format(status.pause.patched or 0), COLOR_DIM)
         end
         if status.items and status.items.taken > 0 then
             local c = status.items.counters
@@ -170,10 +189,41 @@ local function draw_options(settings)
         checkbox(settings, "sync_enemies", "Sync enemies")
         checkbox(settings, "sync_hp", "Sync enemy HP / damage")
         checkbox(settings, "sync_deaths", "Sync enemy deaths")
+        checkbox(settings, "enemy_mirror", "Same enemy positions on both screens")
+        checkbox(settings, "enemy_ownership", "Enemies near your partner are run by their game (they attack them)")
+        checkbox(settings, "enemy_motion_sync", "...and play the same animation on both screens")
+        checkbox(settings, "enemy_puppet_ai", "...with their AI switched off where they are only shown")
         slider_float(settings, "match_radius", "Pairing radius (m)", 0.5, 10.0)
-        slider_float(settings, "snap_distance", "Client: snap enemies further than (m, 0 = off)", 0.0, 20.0)
+        slider_float(settings, "snap_distance", "Client without mirroring: snap enemies further than (m, 0 = off)", 0.0, 20.0)
         checkbox(settings, "replay_partner_hits", "Enemies react to your partner's hits")
         checkbox(settings, "sync_drops", "Enemies drop the same item for both players")
+
+        imgui.separator()
+        imgui.text_colored("Shared world", COLOR_DIM)
+        checkbox(settings, "sync_flags", "Story progress: objectives, map, doors, items taken, events")
+        checkbox(settings, "sync_gimmicks", "Doors, locks, levers, puzzles")
+        checkbox(settings, "sync_objects", "Breakables and animals (crates, barrels, crows...)")
+        checkbox(settings, "sync_object_states", "Experimental: other state changes of those objects")
+        checkbox(settings, "sync_cutscenes", "Cutscenes play for both players")
+        checkbox(settings, "cutscene_travel", "...bringing the partner over first")
+
+        imgui.separator()
+        imgui.text_colored("Joining and travelling", COLOR_DIM)
+        checkbox(settings, "auto_travel", "Client: on joining, go to the host's chapter and area")
+        checkbox(settings, "travel_reload", "Load another chapter automatically (game over -> Continue)")
+        checkbox(settings, "follow_host_chapter", "Client: follow the host into the next chapter")
+        checkbox(settings, "stage_travel", "Teleports to another area load it first (game's own warp)")
+
+        imgui.separator()
+        imgui.text_colored("Pauses", COLOR_DIM)
+        checkbox(settings, "no_pause", "While hosting or connected, menus and the inventory do not pause the game")
+        if imgui.button("Mode: " .. tostring(settings.no_pause_mode)) then
+            local order = { menus = "all", all = "off", off = "menus" }
+            settings.no_pause_mode = order[settings.no_pause_mode] or "menus"
+        end
+        imgui.same_line()
+        imgui.text_colored("menus = cutscenes and loading still pause, all = nothing pauses", COLOR_DIM)
+        checkbox(settings, "no_pause_aggressive", "Also refuse pause requests (if a menu still pauses)")
 
         imgui.separator()
         imgui.text_colored("Progression", COLOR_DIM)
@@ -252,6 +302,37 @@ local function draw_diagnostics(game, session_status, puppet)
                     session_status.enemies.spawner_trusted and "trusted" or "not trusted yet", tr.agree, tr.disagree))
             end
         end
+        if session_status and session_status.enemies then
+            local c = session_status.enemies.counters
+            imgui.text(("enemy ownership: changes %d | mirrored moves %d, animations %d, AI switched %d | late kills %d, pending %d"):format(
+                c.ownership_changes, c.mirrored, c.motions, c.ai_switched, c.late_kills, c.pending_kills))
+        end
+        local function sync_line(label, summary)
+            if summary == nil then return end
+            local text = label .. ": " .. counters_text(summary.counters)
+            if summary.muted_now and summary.muted_now > 0 then text = text .. (" | muted %d"):format(summary.muted_now) end
+            if summary.queued and summary.queued > 0 then text = text .. (" | queued %d"):format(summary.queued) end
+            if summary.destroyed_known then text = text .. (" | known destroyed %d"):format(summary.destroyed_known) end
+            if summary.pending then text = text .. (" | waiting for cutscene %s"):format(tostring(summary.pending)) end
+            imgui.text(text)
+        end
+        if session_status then
+            sync_line("flags", session_status.flags)
+            sync_line("gimmicks", session_status.gimmicks)
+            sync_line("objects", session_status.objects)
+            sync_line("cutscenes", session_status.cutscenes)
+            if session_status.travel then
+                imgui.text(("travel: %s (%s)"):format(session_status.travel.state, tostring(session_status.travel.result or "-")))
+            end
+            if session_status.pause then
+                local pz = session_status.pause
+                imgui.text(("no-pause: %s, mode %s, %d pause types neutralised, %d requests refused"):format(
+                    pz.active and "on" or "off", tostring(pz.mode), pz.patched or 0, pz.blocked or 0))
+                if pz.names and #pz.names > 0 then
+                    imgui.text_colored("  " .. table.concat(pz.names, ", "), COLOR_DIM)
+                end
+            end
+        end
         if session_status and session_status.items then
             local c = session_status.items.counters
             imgui.text(("key items: tracked %d | taken by me %d, by partner %d | removed %d, remove failed %d"):format(
@@ -280,6 +361,8 @@ local function draw_diagnostics(game, session_status, puppet)
             local extra = session_status and {
                 role = session_status.role, enemies = session_status.enemies, items = session_status.items,
                 drops = session_status.drops, gate = session_status.gate,
+                flags = session_status.flags, gimmicks = session_status.gimmicks, objects = session_status.objects,
+                cutscenes = session_status.cutscenes, travel = session_status.travel, pause = session_status.pause,
                 local_stage = session_status.local_stage, partner_stage = session_status.partner_stage,
                 character_sent = session_status.avatar_tx, character_received = session_status.avatar_rx,
                 partner_model = puppet and puppet:status() or nil,

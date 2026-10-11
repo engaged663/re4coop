@@ -14,17 +14,41 @@ Config.DEFAULTS = {
     player_hz = 20,
     pose_hz = 30,         -- partner model pose updates per second
     enemy_tick_hz = 20,
-    snapshot_hz = 10,
+    snapshot_hz = 15,
+    client_enemy_hz = 20, -- client: reports of the enemies it runs per second
     interp_delay = 0.10,
 
     -- enemy sync
     sync_enemies = true,
     sync_hp = true,
     sync_deaths = true,
+    enemy_mirror = true,      -- both screens show each enemy in the same place (the other PC's copy follows)
+    enemy_ownership = true,   -- each enemy is run by the PC whose player is closer (it attacks that player)
+    enemy_motion_sync = true, -- mirrored enemies also play the owner's animation
+    enemy_puppet_ai = true,   -- a mirrored enemy's own AI is switched off (it only follows the owner's copy)
     match_radius = 3.0,   -- metres between spawn points to treat two enemies as the same one
-    snap_distance = 0.0,  -- client: teleport enemies further than this from the host's copy (0 = off)
+    snap_distance = 0.0,  -- client, without mirroring: teleport enemies further than this from the host's copy (0 = off)
     replay_partner_hits = true, -- enemies visibly react to the partner's hits (cosmetic replay)
     sync_drops = true,    -- enemies drop the same item for both players (the host's roll)
+
+    -- shared world
+    sync_flags = true,        -- story/scenario flags: objectives, map, doors, items taken, events seen
+    sync_gimmicks = true,     -- gimmick states: locks, keys used, levers, shutters, puzzles
+    sync_objects = true,      -- breakables and animals: crates, barrels, pots, crows, chickens...
+    sync_object_states = false, -- experimental: also mirror other state changes of those objects
+    sync_cutscenes = true,    -- a cutscene one player triggers plays for both
+    cutscene_travel = true,   -- bring the partner next to you before their game plays your cutscene
+
+    -- joining and travelling
+    auto_travel = true,         -- client: on joining, load the host's chapter and appear next to them
+    travel_reload = true,       -- chapter change: trigger the reload (game over -> Continue) automatically
+    follow_host_chapter = true, -- client: follow the host into the next chapter if you do not get there yourself
+    stage_travel = true,        -- teleports to another stage use the game's warp (loads the stage first)
+
+    -- pauses
+    no_pause = true,             -- while hosting or connected, menus and the inventory do not pause the game
+    no_pause_mode = "menus",     -- "menus" (cutscenes and loading still pause), "all", "off"
+    no_pause_aggressive = false, -- also refuse the pause requests themselves (if a menu still pauses)
 
     -- progression
     share_key_items = true,       -- a key item exists once: the partner's copy disappears when you take it
@@ -81,6 +105,10 @@ function Config.sanitize(cfg)
     cfg.player_hz = math.max(5, math.min(60, cfg.player_hz))
     cfg.pose_hz = math.max(10, math.min(60, cfg.pose_hz))
     cfg.enemy_tick_hz = math.max(5, math.min(60, cfg.enemy_tick_hz))
+    cfg.client_enemy_hz = math.max(5, math.min(60, cfg.client_enemy_hz))
+    if cfg.no_pause_mode ~= "menus" and cfg.no_pause_mode ~= "all" and cfg.no_pause_mode ~= "off" then
+        cfg.no_pause_mode = Config.DEFAULTS.no_pause_mode
+    end
     cfg.snapshot_hz = math.max(2, math.min(30, cfg.snapshot_hz))
     cfg.interp_delay = math.max(0.0, math.min(0.5, cfg.interp_delay))
     cfg.match_radius = math.max(0.5, math.min(20.0, cfg.match_radius))

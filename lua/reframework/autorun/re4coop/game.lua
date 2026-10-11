@@ -1,5 +1,7 @@
--- RE4 (2023) adapter: the only module that touches REFramework's `sdk`, `draw` and game
--- objects. Everything else talks to the game through the methods below.
+-- RE4 (2023) adapter: player, enemies, pickups, the partner's model, drawing. Together with
+-- game_world.lua (story/world state) and game_pause.lua (menu pauses) it is the only code
+-- that touches REFramework's `sdk`, `draw` and game objects; everything else talks to the
+-- game through the methods below.
 --
 -- Type and method names come from REFramework's own RE4 helper (scripts/utility/RE4.lua),
 -- published RE4R mods and the game's PAK file list (see docs/RESEARCH.md). Names that
@@ -142,6 +144,13 @@ local function dist(a, b)
     return math.sqrt(dx * dx + dy * dy + dz * dz)
 end
 
+-- Heading (rotation about the vertical axis) of a quaternion, in radians.
+local function yaw_of(q)
+    if q == nil then return 0 end
+    local x, y, z, w = q.x or 0, q.y or 0, q.z or 0, q.w or 1
+    return math.atan(2 * (w * y + x * z), 1 - 2 * (x * x + y * y))
+end
+
 local function starts_with_any(s, prefixes)
     for _, p in ipairs(prefixes) do
         if s:sub(1, #p) == p then return true end
@@ -183,6 +192,10 @@ function Game.new(log, clock)
     self.enemy_by_body = {} -- body GameObject address -> enemy id
     self.hp_guard = {}      -- enemy id -> {hp, ticks}: undo HP changes a cosmetic hit replay made
     self.player_objects = {} -- addresses of the local player's body/head GameObjects
+    self.enemy_parts_cache = {} -- enemy id -> {body, transform, cc, layer}
+    self.enemy_ai_off = {}  -- enemy id -> true while its AI head is switched off (mirrored)
+    self.read_motion = false -- list_enemies() also reads each enemy's animation (enemy mirroring)
+    self.extra_dump_types = {} -- types other adapters want in the research dump
     self:probe()
     self:install_pickup_hooks()
     self:install_hit_hook()
@@ -861,8 +874,9 @@ function Game:is_cutscene()
     return gui ~= nil and self:call(gui, "get_IsPlayingEvent") == true
 end
 
--- Returns { pos, rot, hp, max_hp, dead, cutscene, aiming, stage } or nil when there is no
--- controllable player (title screen, loading).
+-- Returns { pos, rot, hp, max_hp, dead, cutscene, aiming, stage, chapter, id } or nil when
+-- there is no controllable player (title screen, loading). `id` identifies the player
+-- context object: a new one means the game (re)loaded.
 function Game:read_player_state()
     local ctx = self:player_context()
     if ctx == nil then
@@ -876,7 +890,7 @@ function Game:read_player_state()
     end
     self:cap("player", true, type_name_of(ctx) or "?")
 
-    local st = { pos = pos }
+    local st = { pos = pos, id = address_of(ctx) }
     local body = self:call(ctx, "get_BodyGameObject")
     self:remember_player_objects(body, self:call(ctx, "get_HeadGameObject"))
     local transform = body and self:call(body, "get_Transform")
@@ -1628,9 +1642,10 @@ function Game:list_enemies()
     local count = tonumber(self:call(list, "get_Count")) or 0
     self:cap("enemy_list", true, ("%d enemy contexts"):format(count))
 
-    local out, ctx_by_id, ids, bodies, by_body = {}, {}, {}, {}, {}
+    local out, ctx_by_id, ids, bodies, by_body, parts = {}, {}, {}, {}, {}, {}
     local old_ids = self.enemy_context_ids or {}
     local old_bodies = self.enemy_body or {}
+    local old_parts = self.enemy_parts_cache or {}
     local with_id = 0
     for i = 0, count - 1 do
         local ctx = self:call(list, "get_Item", i)
@@ -1658,7 +1673,7 @@ function Game:list_enemies()
                 end
                 local cur = tonumber(self:call(hp, "get_CurrentHitPoint")) or 0
                 cur = self:apply_hp_guard(id, hp, cur)
-                out[#out + 1] = {
+                local e = {
                     id = id,
                     kind = type_name_of(ctx) or "unknown",
                     ctx = cid or nil,
@@ -1668,6 +1683,14 @@ function Game:list_enemies()
                     max_hp = tonumber(self:call(hp, "get_DefaultHitPoint")) or 0,
                     alive = self:call(hp, "get_IsLive") ~= false,
                 }
+                -- Facing and (for mirroring) the animation playing, from the body.
+                local p = old_parts[id] or { body = body }
+                parts[id] = p
+                if p.transform == nil and body ~= nil then p.transform = self:call(body, "get_Transform") or false end
+                local q = p.transform and self:call(p.transform, "get_Rotation")
+                if q ~= nil then e.yaw = yaw_of(q) end
+                if self.read_motion then e.motion = self:enemy_motion_state(p) end
+                out[#out + 1] = e
             end
         end
     end
@@ -1675,6 +1698,10 @@ function Game:list_enemies()
     self.enemy_context_ids = ids
     self.enemy_body = bodies
     self.enemy_by_body = by_body
+    self.enemy_parts_cache = parts
+    for id in pairs(self.enemy_ai_off) do
+        if ctx_by_id[id] == nil then self.enemy_ai_off[id] = nil end
+    end
     for id in pairs(self.hp_guard) do
         if ctx_by_id[id] == nil then self.hp_guard[id] = nil end
     end
@@ -1762,6 +1789,8 @@ function Game:enemy_kill(id)
     local hp = ctx and self:call(ctx, "get_HitPoint")
     if hp == nil then return false end
     self.hp_guard[id] = nil
+    -- A mirrored enemy's AI is off; its death (animation, ragdoll, drop) needs it running.
+    if self.enemy_ai_off[id] then self:enemy_set_ai(id, true) end
     if self.kill_method ~= nil then
         local m = self:method(hp, self.kill_method)
         if m ~= nil and pcall(m.call, m, hp) then return true end
@@ -1774,6 +1803,103 @@ function Game:enemy_set_position(id, pos)
     local body = ctx and self:call(ctx, "get_BodyGameObject")
     if body == nil then return false end
     return (self:warp_game_object(body, pos))
+end
+
+-- Cached per-enemy engine objects: { body, transform, cc, layer } (false = looked up, missing).
+function Game:enemy_parts(id)
+    local p = self.enemy_parts_cache[id]
+    if p == nil then
+        local ctx = self.enemy_ctx[id]
+        local body = ctx and self:call(ctx, "get_BodyGameObject")
+        if body == nil then return nil end
+        p = { body = body }
+        self.enemy_parts_cache[id] = p
+    end
+    if p.transform == nil then p.transform = (p.body and self:call(p.body, "get_Transform")) or false end
+    return p
+end
+
+-- Layer 0 of the body's via.motion.Motion: what the enemy is animating now.
+function Game:enemy_motion_layer(p)
+    if p.layer == nil then
+        local motion = p.body and self:get_component(p.body, "via.motion.Motion")
+        p.layer = (motion and self:call(motion, "getLayer", 0)) or false
+    end
+    return p.layer or nil
+end
+
+function Game:enemy_motion_state(p)
+    local layer = self:enemy_motion_layer(p)
+    if layer == nil then return nil end
+    local bank = tonumber(self:call(layer, "get_MotionBankID"))
+    local mid = tonumber(self:call(layer, "get_MotionID"))
+    if bank == nil or mid == nil then return nil end
+    return { bank = bank, id = mid, frame = tonumber(self:call(layer, "get_Frame")) or 0 }
+end
+
+-- Mirrors an enemy the partner's game runs: position and facing, with the
+-- CharacterController warped so physics does not pull it back.
+function Game:enemy_set_transform(id, pos, yaw)
+    local p = self:enemy_parts(id)
+    local tf = p and p.transform
+    if not tf then return false end
+    local ok = pcall(function()
+        tf:call("set_Position", Vector3f.new(pos.x, pos.y, pos.z))
+        if yaw ~= nil then
+            local h = yaw * 0.5
+            tf:call("set_Rotation", Quaternion.new(math.cos(h), 0.0, math.sin(h), 0.0))
+        end
+    end)
+    if not ok then
+        self:cap("enemy_mirror", false, "set_Position/set_Rotation failed")
+        return false
+    end
+    if p.cc == nil then
+        p.cc = self:get_component(p.body, "via.physics.CharacterController") or false
+    end
+    if p.cc then self:call(p.cc, "warp") end
+    self:cap("enemy_mirror", true, "transform + CharacterController.warp")
+    return true
+end
+
+-- Plays the owner's animation on a mirrored enemy: TreeLayer.changeMotion(bank, motion,
+-- start frame, interpolation frames, mode, curve), the call EMV Engine uses.
+function Game:enemy_set_motion(id, motion)
+    local p = self:enemy_parts(id)
+    local layer = p and self:enemy_motion_layer(p)
+    if layer == nil then return false end
+    local ok = pcall(function()
+        layer:call("changeMotion(System.UInt32, System.UInt32, System.Single, System.Single, via.motion.InterpolationMode, via.motion.InterpolationCurve)",
+            motion.bank, motion.id, motion.frame or 0.0, 8.0, 2, 0)
+    end)
+    self:cap("enemy_motion", ok, ok and "TreeLayer.changeMotion" or "changeMotion failed")
+    return ok
+end
+
+-- Switches an enemy's AI on or off. Every character has a separate AI "head" GameObject
+-- (CharacterContext.get_HeadGameObject: think, targeting, HateController) and the body that
+-- carries out its commands; a mirrored enemy's head stops updating, so it no longer chases
+-- or attacks the local player while its body follows the partner's copy.
+function Game:enemy_set_ai(id, on)
+    local ctx = self.enemy_ctx[id]
+    if ctx == nil then return false end -- gone with its area
+    local head = self:call(ctx, "get_HeadGameObject")
+    if head == nil then
+        self:cap("enemy_ai_switch", false, "no head GameObject")
+        return false
+    end
+    local ok = pcall(function() head:call("set_UpdateSelf", on and true or false) end)
+    self:cap("enemy_ai_switch", ok, ok and "head GameObject set_UpdateSelf" or "set_UpdateSelf failed")
+    if ok then self.enemy_ai_off[id] = (not on) or nil end
+    return ok
+end
+
+-- Switches every enemy's AI back on (session ended, script reset).
+function Game:restore_enemy_ai()
+    for id in pairs(self.enemy_ai_off) do
+        self:enemy_set_ai(id, true)
+    end
+    self.enemy_ai_off = {}
 end
 
 -------------------------------------------------------------------------------
@@ -2724,6 +2850,11 @@ function Game:describe_player()
     return out
 end
 
+-- Types the world and pause adapters want described in the research dump too.
+function Game:add_dump_types(list)
+    for _, n in ipairs(list or {}) do self.extra_dump_types[#self.extra_dump_types + 1] = n end
+end
+
 -- Writes reframework/data/re4coop_typedump.json (signatures, enum values, capabilities, the
 -- latest live sample, the local character's objects, meshes and joints) and appends to
 -- reframework/data/re4coop_research_log.json. `extra` is the session's sync state (and the
@@ -2737,6 +2868,7 @@ function Game:dump_types(extra)
         end
     end
     for _, n in ipairs(DUMP_TYPES) do want(n) end
+    for _, n in ipairs(self.extra_dump_types) do want(n) end
 
     local live = { singletons = {}, hp_writers = {} }
     for _, n in ipairs(SINGLETONS_TO_CHECK) do

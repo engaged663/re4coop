@@ -37,7 +37,7 @@ local function make_world(id_base)
         local out = {}
         for _, e in ipairs(self.enemies) do
             out[#out + 1] = { id = e.id, kind = e.kind, pos = { x = e.pos.x, y = e.pos.y, z = e.pos.z },
-                yaw = e.yaw, hp = e.hp, max_hp = e.max_hp, alive = e.alive, ctx = e.ctx }
+                yaw = e.yaw, hp = e.hp, max_hp = e.max_hp, alive = e.alive, ctx = e.ctx, motion = e.motion }
         end
         return out
     end
@@ -461,8 +461,277 @@ T.run("snapshots_stay_compact", function()
         pair.host_world:spawn("chainsaw.Ch1c0z0Context", i * 5, 0, 0)
     end
     pair:step(20) -- 1 second
-    -- 10 Hz x ceil(120/25) chunks = ~50 messages per second.
-    T.check(pair.traffic.host <= 60, "host sends about 50 snapshot messages/s, got " .. pair.traffic.host)
+    -- 10 Hz x ceil(120/20) chunks = ~60 messages per second.
+    T.check(pair.traffic.host <= 66, "host sends about 60 snapshot messages/s, got " .. pair.traffic.host)
+    T.check(pair.traffic.client <= 22, "client sends about 20 reports/s, got " .. pair.traffic.client)
+end)
+
+-------------------------------------------------------------------------------
+-- Ownership and mirroring: each enemy is run by the machine whose player is closer; the
+-- other machine's copy follows it (position, facing, animation) with its own AI off.
+-------------------------------------------------------------------------------
+
+-- The transform, animation and AI writers game.lua provides.
+local function with_mirroring(w)
+    w.calls.transform, w.calls.motion, w.calls.ai = 0, 0, 0
+    w.ai_off = {}
+    function w:enemy_set_transform(id, pos, yaw)
+        local e = self:get(id)
+        if not e then return false end
+        self.calls.transform = self.calls.transform + 1
+        e.pos = { x = pos.x, y = pos.y, z = pos.z }
+        e.yaw = yaw
+        return true
+    end
+    function w:enemy_set_motion(id, motion)
+        local e = self:get(id)
+        if not e then return false end
+        self.calls.motion = self.calls.motion + 1
+        e.motion = { bank = motion.bank, id = motion.id, frame = motion.frame }
+        return true
+    end
+    function w:enemy_set_ai(id, on)
+        self.calls.ai = self.calls.ai + 1
+        self.ai_off[id] = (not on) or nil
+        return true
+    end
+    local kill = w.enemy_kill
+    function w:enemy_kill(id)
+        self.killed_with_ai_off = self.killed_with_ai_off or (self.ai_off[id] == true)
+        return kill(self, id)
+    end
+    return w
+end
+
+local function make_mirror_pair(settings)
+    local pair = make_pair(settings)
+    with_mirroring(pair.host_world)
+    with_mirroring(pair.client_world)
+    pair.host_player = { x = 0, y = 0, z = -30 }
+    pair.client_player = { x = 0, y = 0, z = -30 }
+    function pair:step(n)
+        for _ = 1, n or 1 do
+            self.now = self.now + 0.05
+            local players = { local_pos = self.host_player, partner_pos = self.client_player }
+            self.host:tick(self.now, self.host_world:list(), self.host_world, players)
+            self.host:frame(self.now, self.host_world)
+            for _, bytes in ipairs(self.to_client) do
+                self.client:on_message(assert(P.decode(bytes)), self.now, self.client_world)
+            end
+            self.to_client = {}
+            self.client:tick(self.now, self.client_world:list(), self.client_world)
+            self.client:frame(self.now, self.client_world)
+            for _, bytes in ipairs(self.to_host) do
+                self.host:on_message(assert(P.decode(bytes)), self.now, self.host_world)
+            end
+            self.to_host = {}
+        end
+    end
+    return pair
+end
+
+T.run("client_mirrors_host_enemy_movement", function()
+    local pair = make_mirror_pair()
+    local h, c = standard_level(pair)
+    pair:step(5)
+    -- The host's enemy walks 6 m over 0.5 s; the client's copy follows smoothly.
+    for i = 1, 10 do
+        h.b.pos = { x = 10 + i * 0.6, y = 0, z = 0 }
+        h.b.yaw = 0.1 * i
+        pair:step(1)
+    end
+    pair:step(8) -- let the interpolation buffer drain
+    T.near(c.b.pos.x, 16, 0.05, "client copy reached the host's position")
+    T.near(c.b.yaw, 1.0, 0.02, "and its facing")
+    T.check(pair.client_world.calls.transform > 5, "moved over several frames, not one snap")
+    T.eq(pair.client_world.ai_off[c.b.id], true, "the client copy's own AI is off")
+    T.eq(pair.host_world.ai_off[h.b.id], nil, "the host's runs")
+end)
+
+T.run("facing_blends_the_short_way_round", function()
+    local pair = make_mirror_pair()
+    local h, c = standard_level(pair)
+    h.a.yaw = 3.0
+    pair:step(10)
+    h.a.yaw = -3.0 -- 0.28 rad further, across +-pi
+    pair:step(2)
+    local seen_far = false
+    for _ = 1, 8 do
+        pair:step(1)
+        if math.abs(c.a.yaw) < 2.5 then seen_far = true end
+    end
+    T.check(not seen_far, "never turns the long way through 0")
+    T.near(math.abs(c.a.yaw), 3.0, 0.05, "ends facing the same way")
+end)
+
+T.run("ownership_moves_to_the_closer_player", function()
+    local pair = make_mirror_pair()
+    local h, c = standard_level(pair)
+    pair.host_player = { x = 0, y = 0, z = 5 }    -- between A and C
+    pair.client_player = { x = 11, y = 0, z = 1 } -- right next to B
+    pair:step(30)
+    local net_b = pair.host.net_of[h.b.id]
+    T.eq(pair.host.owner[net_b], "client", "B is run by the client")
+    T.eq(pair.host:summary().client_owned, 1, "only B")
+    T.eq(pair.client:summary().client_owned, 1, "the client knows")
+    T.eq(pair.client_world.ai_off[c.b.id], nil, "B's AI runs on the client (it attacks the client)")
+    -- The client's AI moves B; the host mirrors it.
+    for i = 1, 10 do
+        c.b.pos = { x = 10, y = 0, z = 1 + i * 0.5 }
+        pair:step(1)
+    end
+    pair:step(8)
+    T.near(h.b.pos.z, 6, 0.05, "host copy follows the client's AI")
+    T.near(c.b.pos.z, 6, 1e-6, "client copy is not mirrored back")
+    T.eq(pair.host_world.ai_off[h.b.id], true, "the host copy's AI is off")
+    T.eq(pair.host_world.ai_off[h.a.id], nil, "A still runs on the host")
+    -- Host walks up to B, client leaves: B goes back to the host.
+    pair.host_player = { x = 10, y = 0, z = 6 }
+    pair.client_player = { x = 60, y = 0, z = 60 }
+    pair:step(30)
+    T.check(pair.host.owner[net_b] == nil, "back to the host")
+    T.eq(pair.host_world.ai_off[h.b.id], nil, "its AI runs on the host again")
+    T.eq(pair.client_world.ai_off[c.b.id], true, "and is off on the client")
+    T.check(pair.host.counters.ownership_changes >= 2, "two hand-overs")
+end)
+
+T.run("ownership_needs_the_client_to_have_the_enemy", function()
+    local pair = make_mirror_pair()
+    local only_host = pair.host_world:spawn("chainsaw.Ch1c0z0Context", 5, 0, 5)
+    pair.host_player = { x = 0, y = 0, z = -40 }
+    pair.client_player = { x = 5, y = 0, z = 6 }
+    pair:step(30)
+    T.check(pair.host.owner[pair.host.net_of[only_host.id]] == nil, "host keeps enemies the client lacks")
+end)
+
+T.run("ownership_off_without_the_partner_nearby", function()
+    local pair = make_mirror_pair()
+    local h = standard_level(pair)
+    pair.client_player = { x = 11, y = 0, z = 1 }
+    pair.host_player = { x = 0, y = 0, z = 5 }
+    pair:step(30)
+    T.eq(pair.host:summary().client_owned, 1, "B handed over")
+    -- The client is in another region now (no partner position for ownership).
+    function pair:step_alone(n)
+        for _ = 1, n do
+            self.now = self.now + 0.05
+            self.host:tick(self.now, self.host_world:list(), self.host_world, { local_pos = self.host_player })
+            self.host:frame(self.now, self.host_world)
+            self.to_client, self.to_host = {}, {}
+        end
+    end
+    pair:step_alone(5)
+    T.eq(pair.host:summary().client_owned, 0, "everything back to the host")
+    T.eq(pair.host_world.ai_off[h.b.id], nil, "with its AI on")
+end)
+
+T.run("animation_is_mirrored", function()
+    local pair = make_mirror_pair()
+    local h, c = standard_level(pair)
+    h.a.motion = { bank = 100, id = 2003, frame = 4 }
+    pair:step(10)
+    T.eq(c.a.motion and c.a.motion.id, 2003, "client plays the host's animation")
+    local changes = pair.client_world.calls.motion
+    pair:step(10)
+    T.eq(pair.client_world.calls.motion, changes, "the same animation is not restarted every frame")
+    h.a.motion = { bank = 100, id = 2010, frame = 0 }
+    pair:step(8)
+    T.eq(c.a.motion.id, 2010, "the next one follows")
+end)
+
+T.run("mirroring_off_keeps_every_copy_local", function()
+    local pair = make_mirror_pair({ enemy_mirror = false, snap_distance = 2.0 })
+    local h, c = standard_level(pair)
+    pair.client_player = { x = 11, y = 0, z = 1 }
+    pair:step(10)
+    h.b.pos = { x = 20, y = 0, z = 0 }
+    pair:step(5)
+    T.eq(pair.client_world.calls.transform, 0, "no mirroring")
+    T.near(c.b.pos.x, 20, 1e-4, "snapping still works")
+    T.eq(pair.host:summary().client_owned, 0, "no hand-over")
+    T.eq(pair.client_world.calls.ai, 0, "AI never touched")
+end)
+
+T.run("switching_options_off_gives_the_ai_back", function()
+    local pair = make_mirror_pair()
+    local h, c = standard_level(pair)
+    pair:step(10)
+    T.eq(pair.client_world.ai_off[c.a.id], true, "A mirrored with its AI off")
+    pair.client.settings.enemy_puppet_ai = false
+    pair:step(2)
+    T.eq(pair.client_world.ai_off[c.a.id], nil, "AI back on, still mirrored")
+    T.check(pair.client_world.calls.transform > 0, "position still follows")
+    pair.client.settings.enemy_puppet_ai = true
+    pair:step(2)
+    T.eq(pair.client_world.ai_off[c.a.id], true, "off again")
+    pair.client.settings.enemy_mirror = false
+    pair:step(2)
+    T.eq(next(pair.client_world.ai_off), nil, "mirroring off: every AI back on")
+    pair.client.settings.enemy_mirror = true
+end)
+
+T.run("mirrored_enemy_dies_with_its_ai_on", function()
+    local pair = make_mirror_pair()
+    local h, c = standard_level(pair)
+    pair:step(10)
+    T.eq(pair.client_world.ai_off[c.c.id], true, "C mirrored on the client")
+    pair.host_world:damage(h.c, 1000)
+    pair:step(5)
+    T.eq(c.c.alive, false, "client copy died")
+    T.eq(pair.client_world.ai_off[c.c.id], nil, "AI back on for the death")
+    T.eq(pair.client_world.killed_with_ai_off, false, "never killed while its AI was off")
+end)
+
+T.run("wave_enemy_at_a_witnessed_death_spot_is_not_killed", function()
+    local pair = make_mirror_pair()
+    local h, c = standard_level(pair)
+    pair:step(10)
+    pair.host_world:damage(h.a, 1000) -- killed with the client watching (its copy dies too)
+    pair:step(10)
+    T.eq(c.a.alive, false, "client copy died with it")
+    pair.host_world:remove(h.a)
+    pair.client_world:remove(c.a)
+    pair:step(10)
+    -- The next wave spawns at the same door: first on the client, a moment later on the host.
+    local c2 = pair.client_world:spawn("chainsaw.Ch1c0z0Context", -0.2, 0, 0.1)
+    pair:step(30)
+    T.eq(c2.alive, true, "the new enemy is not mistaken for the dead one")
+    local h2 = pair.host_world:spawn("chainsaw.Ch1c0z0Context", 0.1, 0, -0.1)
+    pair:step(10)
+    T.eq(pair.client.net_of[c2.id], pair.host.net_of[h2.id], "and pairs with the host's new enemy")
+end)
+
+T.run("client_kill_where_the_host_had_no_enemy_applies_later", function()
+    local pair = make_mirror_pair()
+    standard_level(pair)
+    pair:step(5)
+    -- The client clears a room the host has not loaded.
+    local far = pair.client_world:spawn("chainsaw.Ch1c0z0Context", 200, 0, 0)
+    pair:step(5)
+    pair.client_world:damage(far, 500)
+    pair:step(5)
+    T.eq(pair.host.counters.pending_kills, 1, "the host remembers the kill")
+    -- The host arrives: its level spawns that enemy, which dies at once.
+    local hf = pair.host_world:spawn("chainsaw.Ch1c0z0Context", 200.4, 0, 0.3)
+    pair:step(5)
+    T.eq(hf.alive, false, "host's copy killed on arrival")
+    T.eq(pair.host.counters.late_kills, 1, "counted")
+    local other = pair.host_world:spawn("chainsaw.Ch1c0z0Context", 200.2, 0, 0)
+    pair:step(5)
+    T.eq(other.alive, true, "each remembered kill is used once")
+end)
+
+T.run("host_reload_forgets_old_deaths", function()
+    local pair = make_mirror_pair()
+    local hd = pair.host_world:spawn("chainsaw.Ch1c0z0Context", 50, 0, 50)
+    pair:step(5)
+    pair.host_world:damage(hd, 500) -- host kills it alone
+    pair:step(5)
+    pair.host:on_local_reload()      -- the host died and reloaded the checkpoint
+    pair:step(10)
+    local cd = pair.client_world:spawn("chainsaw.Ch1c0z0Context", 50.5, 0, 49.8)
+    pair:step(12)
+    T.eq(cd.alive, true, "the reloaded host's world has it alive again: not killed")
 end)
 
 T.finish()

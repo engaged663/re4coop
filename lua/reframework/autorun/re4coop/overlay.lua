@@ -93,7 +93,14 @@ function Overlay.draw_hud(game, status, messages, now, model)
 
     local prompt = nil
     local gate = status.gate
-    if gate ~= nil and gate.holding ~= nil then
+    local travel = status.travel
+    if travel ~= nil and travel.state ~= "idle" then
+        local what = {
+            start = "starting", chapter = "loading their chapter", sync_wait = "receiving the shared world",
+            preload = "loading their area", warp = "warping", verify = "arriving",
+        }
+        prompt = ("Travelling to %s: %s..."):format(status.partner_name or "partner", what[travel.state] or travel.state)
+    elseif gate ~= nil and gate.holding ~= nil then
         if gate.holding == "chapter" then
             prompt = ("Waiting for %s to reach this chapter (%.0f s) - press %s to continue alone"):format(
                 status.partner_name or "partner", gate.waited or 0, status.continue_key_name or "F8")
@@ -103,7 +110,10 @@ function Overlay.draw_hud(game, status, messages, now, model)
         end
     elseif status.left_behind ~= nil then
         local lb = status.left_behind
-        if lb.partner_waiting == "chapter" then
+        if lb.partner_waiting == "chapter" and lb.can_follow then
+            prompt = ("Partner is waiting for you in the next chapter - finish this one or press %s to load it"):format(
+                status.teleport_key_name or "F6")
+        elseif lb.partner_waiting == "chapter" then
             prompt = "Partner is waiting for you in the next chapter - finish this one to join them"
         elseif lb.partner_waiting == "here" then
             prompt = ("Partner is waiting for you at a transition (%.0f m) - press %s to teleport to them"):format(
