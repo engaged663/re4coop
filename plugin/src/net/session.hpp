@@ -15,6 +15,7 @@
 #include <map>
 #include <mutex>
 #include <random>
+#include <set>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -51,6 +52,7 @@ struct Stats {
     uint64_t bytes_recv{0};
     uint64_t resends{0};
     uint64_t unreliable_out_of_order{0};
+    uint64_t unordered_duplicates{0};
     uint64_t events_dropped{0};
     size_t reliable_in_flight{0};
 };
@@ -85,7 +87,9 @@ public:
 
     // Queues one message for the peer. Reliable messages are delivered exactly once, in order.
     // Unreliable messages may be dropped or reordered; use them for state that is resent anyway.
-    bool send(std::string_view payload, bool reliable, std::string& err);
+    // unordered (reliable only): delivered exactly once as soon as it arrives, on a lane of its
+    // own, so a lost packet there never holds back the ordered messages (and vice versa).
+    bool send(std::string_view payload, bool reliable, std::string& err, bool unordered = false);
 
     std::vector<Event> poll(size_t max_events = SIZE_MAX);
     Stats stats() const;
@@ -100,6 +104,7 @@ private:
         uint16_t seq{0};
         std::vector<uint8_t> packet;
         Clock::time_point last_sent{};
+        double rto_s{0.0}; // doubles with every resend of this packet (backoff)
     };
 
     bool start_thread(std::string& err);
@@ -109,6 +114,9 @@ private:
     void handle_connect_request_locked(const Address& from, const Header& h, Reader& r, Clock::time_point now);
     void handle_peer_packet_locked(const Header& h, Reader& r, Clock::time_point now);
     void deliver_reliable_locked(uint16_t seq, const uint8_t* data, size_t len);
+    void deliver_unordered_locked(uint16_t seq, const uint8_t* data, size_t len);
+    void resend_locked(std::deque<PendingReliable>& queue, Clock::time_point now);
+    void send_acks_locked(PacketType type, std::vector<uint16_t>& acks);
     void send_raw_locked(const Address& to, const std::vector<uint8_t>& bytes);
     void send_simple_locked(PacketType type);
     void flush_acks_locked();
@@ -148,6 +156,12 @@ private:
     uint16_t m_next_expected_seq{0};
     std::map<uint16_t, std::string> m_reorder; // out-of-order reliable payloads, keyed by absolute seq
     std::vector<uint16_t> m_pending_acks;
+
+    uint16_t m_next_unordered_seq{0};
+    std::deque<PendingReliable> m_unacked_unordered;
+    uint16_t m_unordered_base{0};             // lowest unordered seq not delivered yet
+    std::set<uint16_t> m_unordered_seen;      // delivered seqs ahead of m_unordered_base
+    std::vector<uint16_t> m_pending_unordered_acks;
 
     uint16_t m_next_unreliable_seq{0};
     uint16_t m_last_unreliable_seq{0};

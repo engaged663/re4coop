@@ -55,6 +55,38 @@ T.run("save_roundtrip", function()
     T.eq(again.port, 40000, "port persisted")
 end)
 
+T.run("unsafe_defaults_of_older_versions_are_reset_once", function()
+    -- A 0.6 config saved every setting, including the old defaults that are now experimental.
+    local files = { [Config.FILE] = { player_name = "Leon", replay_partner_hits = true, sync_cutscenes = true,
+        travel_reload = true, stage_travel = true, interp_delay = 0.1, snapshot_hz = 15, sync_flags = false } }
+    local json = fake_json(files)
+    local cfg = Config.load(json)
+    T.eq(cfg.replay_partner_hits, false, "hit replay back to off")
+    T.eq(cfg.sync_cutscenes, false, "cutscene replay back to off")
+    T.eq(cfg.travel_reload, false, "automatic reload back to off")
+    T.eq(cfg.stage_travel, false, "stage warp back to off")
+    T.near(cfg.interp_delay, 0.066, 1e-9, "new interpolation delay")
+    T.eq(cfg.snapshot_hz, 20, "new snapshot rate")
+    T.eq(cfg.sync_flags, false, "other choices kept")
+    T.eq(cfg.player_name, "Leon", "name kept")
+    T.eq(cfg.config_version, Config.VERSION, "upgraded")
+    -- Switched back on by the player and saved: kept from then on.
+    cfg.replay_partner_hits = true
+    Config.save(json, cfg)
+    T.eq(Config.load(json).replay_partner_hits, true, "the player's own choice sticks")
+end)
+
+T.run("experimental_features_are_off_by_default", function()
+    local cfg = Config.load(fake_json({}))
+    for _, k in ipairs({ "replay_partner_hits", "sync_cutscenes", "travel_reload", "stage_travel", "exp_table_reload",
+        "exp_force_routine" }) do
+        T.eq(cfg[k], false, k)
+    end
+    T.eq(cfg.hit_ownership, true, "fight-based enemy ownership on")
+    T.eq(cfg.sync_drops, true, "per-player loot on")
+    T.eq(cfg.profiler, true, "profiler on")
+end)
+
 T.run("broken_json_falls_back_to_defaults", function()
     local cfg = Config.load({ load_file = function() error("corrupt file") end })
     T.eq(cfg.port, Config.DEFAULTS.port, "defaults")

@@ -4,11 +4,13 @@ An open-source [REFramework](https://github.com/praydog/REFramework) mod that co
 copies of **Resident Evil 4 (2023)** directly by IP address over UDP, so two players can go
 through the campaign together on a LAN, or over the internet with a forwarded port or a VPN.
 
-> **Status: v0.6, experimental.** The networking, sync logic and scripts are covered by
-> automated tests, including end-to-end runs against a mock of REFramework. They have **not yet
-> been verified inside the running game.** Some RE4 method names are probed at runtime (see
-> [docs/RESEARCH.md](docs/RESEARCH.md)). Please run the
-> [in-game checklist](docs/TESTING.md#in-game-acceptance-checklist) and report what you find.
+> **Status: v0.7, experimental.** v0.7 is a stability and performance release after the first
+> in-game tests of v0.6 (crashes, stutter, lag, drops not syncing). The networking, sync logic
+> and scripts are covered by automated tests, including end-to-end runs against a mock of
+> REFramework, but most of it has **not yet been verified inside the running game.** Some RE4
+> method names are probed at runtime (see [docs/RESEARCH.md](docs/RESEARCH.md)). Please run the
+> [in-game checklist](docs/TESTING.md#in-game-acceptance-checklist) and, after any crash, send
+> `reframework/data/re4coop_breadcrumb.json` (what the mod did last) and `re2_framework_log.txt`.
 
 ## What it does
 
@@ -19,40 +21,44 @@ through the campaign together on a LAN, or over the internet with a forwarded po
 | **Their weapons, shots and sounds** | Their weapon is spawned from its prefab (`wp4000.pfb`…) and held by the same hand joint, slide and all. Gunshots, reloads, footsteps and voice are replayed on the model's own sound containers, and shots get a muzzle flash |
 | **Shared enemies** | The host is authoritative. Damage you deal is applied to the host's copy, and HP and kills sync back during the fight. Enemies are paired by spawn point and, once proven reliable, by their level spawner's ID. Rooms the host already cleared stay cleared for a partner who arrives later, and enemies the partner killed where the host was not yet stay dead when the host gets there |
 | **Enemies fight both players** | Each enemy is run by the game of the player closest to it: enemies near your partner chase and attack your partner for real, enemies near you attack you. The other game shows the same enemy in the same place, facing the same way and playing the same animation, with its own AI switched off. Ownership hands over smoothly as you move |
-| **See your partner's hits** | When your partner shoots an enemy, your copy of it flinches and staggers, and a tracer line shows the shot |
-| **Identical enemy drops** | The host's roll decides what an enemy drops, for both players (switches itself off if spawning the item doesn't work) |
+| **See your partner's hits** | An enemy your partner is shooting is handed to your partner's game, so it reacts to their shots with its own logic (flinch, stagger) and both screens show it; a tracer line shows the shot. Replaying the hit on your copy as well is an experimental switch |
+| **Your own loot from every enemy** | Every enemy that dies gives each player their own loot roll, tailored to that player's inventory like in the normal game, also the enemies your partner killed. You see your loot, your partner sees theirs |
 | **Key items exist once** | Whoever picks up a key item keeps it, and it disappears from the partner's world. Pickups are confirmed by the game's own "item obtained" flag |
 | **One shared world** | The story progress lives in the game's scenario flags (objectives, map reveals, doors unlocked, items taken, events seen) and its gimmick table (locks, keys used, levers, shutters, puzzles). Every change on one side is applied on the other through the game's own setters, within a fraction of a second, both ways |
 | **Breakables and animals** | Break a crate, a barrel or a pot, shoot a crow: it breaks or dies in your partner's game too, and stays that way for an area they only reach later |
-| **Cutscenes for both** | When one player triggers a cutscene, the other player's game plays the same cutscene (bringing them over first if they are elsewhere), so both see it and both games carry out what it does |
-| **No pauses in co-op** | While you host or are connected, the inventory, map, files and pause menu no longer freeze the world (the partner keeps playing). Cutscenes and loading screens still pause. Back to normal when you leave |
-| **Join where the host is** | Joining loads the host's chapter if you are in another one (or on the title screen), takes over the host's world state (flags, doors, broken objects) and puts you next to the host. Later, if the host moves on to the next chapter, the client follows |
+| **No pauses in co-op** | While you host or are connected, the inventory, map, files and pause menu no longer freeze the world (the partner keeps playing). Cutscenes, loading screens, saving at a typewriter and the merchant still pause. Back to normal when you leave |
+| **Join where the host is** | Joining takes over the host's world state (flags, doors, broken objects) and puts you next to the host. If you are in another chapter, load any save (or *Continue*) and the game goes into the host's chapter |
 | **Wait for each other (RE5/6 style)** | Reach a cutscene or the next chapter part first and the game holds you there until your partner arrives (they get an instant teleport prompt). **F8** continues alone |
 | **Never stuck** | When your partner has been far away, or in another stage, for a few seconds (e.g. they opened a door that needs their key item), press **F6** to teleport to them, or **F7** to hide the prompt |
-| **Teleport / travel to partner** | One click. In another stage the game's own warp loads it first; in another chapter, *Travel to partner* loads it |
+| **Teleport to partner** | One click, or F6 when the prompt shows |
 | **Chat & notices** | In the REFramework menu. "Partner is down", "teleported to you"… |
-| **Survives hiccups** | Reliable channel with retransmits. Pauses and loading screens don't drop you. Rejoin after a disconnect or game restart. "Reset Scripts" keeps the session |
-| **Diagnostics** | A capability list and a one-click research dump that collects game internals across runs, for fixing things after game patches and building the next features |
+| **Survives hiccups** | Reliable delivery with retransmits (sounds and effects on a lane of their own, so a lost packet never holds back the world). 1200-byte datagrams that pass through VPN tunnels unsplit. Pauses and loading screens don't drop you. Rejoin after a disconnect or game restart. "Reset Scripts" keeps the session |
+| **Diagnostics** | *Performance*: what the mod costs per frame, its worst frame and its busiest parts (also written to `re4coop_perf.json`). A crash breadcrumb file. A capability list and a one-click research dump that collects game internals across runs |
+| **Experimental** (off by default) | Features that change the game in ways not yet proven safe, each with its own switch in *Options → Experimental*: replaying the partner's hits on your enemies, starting the partner's cutscenes in your game, cross-stage warps, loading the partner's chapter automatically through game over, live flag-table reloads, forcing breakable objects' state machines |
 
 How it works and why: [docs/RESEARCH.md](docs/RESEARCH.md). Wire format: [docs/PROTOCOL.md](docs/PROTOCOL.md).
 
 ### Current limitations
 
-* None of the v0.6 world features has been seen in the running game yet: the names of the game
+* Most world features have not been seen working in the running game yet: the names of the game
   methods they use come from the game's type database and from another published RE4 mod, and
   are checked at runtime (*Diagnostics* lists each one as `[ok]` or `[--]`, and every feature
   has its own switch in *Options*). See [what is verified and what is probed](docs/RESEARCH.md#36-fifth-round-the-shared-world-v06).
+* v0.6 crashed in game. v0.7 removes every cause we could find (see
+  [the crash analysis](docs/RESEARCH.md#37-v07-crashes-stutter-lag-and-loot)) and puts the riskiest
+  features behind *Experimental* switches, but it is not proven crash-free yet: the breadcrumb
+  file names the last thing the mod did before a crash.
 * The partner's model is a visual copy: it does not collide, enemies on your machine target
   only your own character (an enemy chasing your partner is run by your partner's game), and
   your bullets pass through it.
 * Thrown grenades, bullet impacts and blood on enemies happen only in the thrower's/shooter's
   game. Sounds the engine plays internally (outside the reflected `trigger` calls) may not be
   replayed; *Diagnostics* counts what gets through.
-* Joining from another chapter, or following the host into the next one, reloads through the
-  game over screen: pick *Continue* when it appears.
-* Cutscenes are replayed from their timeline event ID. A cutscene started in a way the hooks do
-  not see (for example a movie file) is not replayed, but the transition gate still waits for
-  the partner and the story flags still sync.
+* Joining from another chapter, or following the host into the next one, needs a save load:
+  load any save (or pick *Continue* after a game over) and it goes into the host's chapter.
+  With *Experimental → Load the partner's chapter automatically* the mod triggers it.
+* Cutscenes are not started in the partner's game by default (experimental): each player
+  watches a cutscene when they reach it, and the transition gate makes both arrive together.
 * If one player dies and reloads a checkpoint, only that player's game goes back.
 
 ## Install
@@ -79,8 +85,8 @@ Both players do this, with the **same game version and the same re4coop version*
    them. From now on your menus and inventory no longer pause the game.
 2. **Partner**: from the title screen or any save, type that address into *Host IP* and click
    **Join game**. Your game goes to the host:
-   * in another chapter, the game over screen appears: pick *Continue* and you load into the
-     host's chapter (on the title screen, just load any save);
+   * in another chapter (or on the title screen), load any save and it loads into the host's
+     chapter;
    * then the host's world state (doors, objectives, map, broken objects...) is applied and you
      appear next to the host. The HUD says what it is doing at each step.
 3. The HUD in the top-left shows the connection, ping and distance. Your partner's character
@@ -120,21 +126,22 @@ cmake -S . -B build-win -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-w64.cmake && cmake --
 
 **Releasing:** bump the version in `lua/reframework/autorun/re4coop/protocol.lua`
 (`MOD_VERSION`), `plugin/src/lua_api.hpp` (`kVersion`) and `CMakeLists.txt`, then push a
-matching tag (`git tag v0.6.0 && git push origin v0.6.0`). CI builds the MSVC zip, checks the
-versions and attaches `re4coop-v0.6.0.zip` + `.sha256` to a draft GitHub Release for you to
+matching tag (`git tag v0.7.0 && git push origin v0.7.0`). CI builds the MSVC zip, checks the
+versions and attaches `re4coop-v0.7.0.zip` + `.sha256` to a draft GitHub Release for you to
 publish.
 
 ## Repository layout
 
 ```
-plugin/src/net/        UDP transport: handshake, reliable + unreliable channels, timeouts
+plugin/src/net/        UDP transport: handshake, ordered + unordered reliable lanes, unreliable, timeouts
 plugin/src/lua_api.*   `re4coop_net` Lua bindings (plain Lua C API)
 plugin/src/plugin_main.cpp  REFramework plugin entry points
 plugin/tests/          native transport tests + Lua test runner
 lua/reframework/autorun/re4coop.lua   entry script (REFramework autoloads it)
 lua/reframework/autorun/re4coop/      protocol, session, enemy_sync, items_sync, drop_sync, gate,
                                       flag_sync, gimmick_sync, object_sync, cutscene_sync, travel,
-                                      pause_policy, interp, config, ui, overlay,
+                                      pause_policy, interp, config, ui, overlay, perf (profiler,
+                                      crash breadcrumbs),
                                       game (RE4 adapter: player, enemies, prefabs, sound mirror,
                                       HP, pickups), game_world (flags, gimmicks, breakables,
                                       cutscenes, warps, chapters), game_pause (menu pauses),
@@ -148,6 +155,8 @@ docs/                  research, protocol, testing
 
 | Symptom | Fix |
 |---|---|
+| The game crashed | Send `reframework/data/re4coop_breadcrumb.json` (the last things the mod did, with the frame number), `re2_framework_log.txt` and the crash dump, and say what was happening. Then switch off the feature the breadcrumb names (every feature has a switch in *Options*) |
+| Stutter or low frame rate in co-op | *Diagnostics → Performance* shows the mod's cost per frame and its busiest part; send `reframework/data/re4coop_perf.json`. *Options*: lower *Character pose updates per second*, or untick *Same enemy positions on both screens* |
 | Panel says `re4coop_net.dll is not loaded` | The DLL isn't in `reframework/plugins/`, or REFramework is too old. Check `re2_framework_log.txt` in the game folder |
 | "could not reach host" | Wrong IP or port, the host didn't click *Host game*, or a firewall is blocking it (see above). Both must be on the same network or VPN |
 | "Partner runs re4coop X…" | Install the same release on both PCs |
@@ -158,7 +167,8 @@ docs/                  research, protocol, testing
 | A menu still pauses the game in co-op | *Options → Pauses*: tick *Also refuse pause requests*. *Diagnostics* lists which pause types were neutralised |
 | Something in the shared world misbehaves (a door, a flag that keeps flipping, a cutscene) | Switch that part off in *Options → Shared world* and keep playing. *Diagnostics* shows the counters for flags, gimmicks, objects and cutscenes; flags that flip back and forth are muted automatically |
 | Enemies jitter or stand still on one screen | *Options → Enemy sync*: untick *...play the same animation* first, then *...with their AI switched off*, then *Same enemy positions on both screens* |
-| Joining does not go to the host's chapter | *Diagnostics*: `chapter_switch` and `warp` must be `[ok]`. Without them, load the host's chapter yourself and use *Travel to partner* |
+| Joining does not go to the host's chapter | *Diagnostics*: `chapter_switch` must be `[ok]`; then load any save while the HUD says it is joining. Without it, load the host's chapter yourself and use *Teleport to partner* |
+| No loot from enemies your partner killed | *Diagnostics*: `drop_hook` and `drop_request` must be `[ok]` and the *loot* line must not say "waiting for the first enemy drop" (kill an enemy yourself first: that proves the game's own rolls are seen) |
 
 ## Credits
 

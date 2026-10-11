@@ -2,6 +2,7 @@
 #include "net/session.hpp"
 #include "net/wire.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -185,6 +186,83 @@ void test_reliable_under_loss() {
     }, 5000ms));
 }
 
+// The unordered reliable lane: every message exactly once under loss, without waiting for
+// earlier ones, and independent of the ordered lane.
+void test_unordered_lane_under_loss() {
+    Session host, client;
+    std::vector<Event> he, ce;
+    const uint16_t port = host_any(host, "Host");
+    std::string err;
+    CHECK(client.join("127.0.0.1", port, "Client", "", err));
+    CHECK(pump_until({&host, &client}, {&he, &ce}, [&] { return client.state() == State::Connected; }));
+    he.clear();
+
+    host.set_simulated_loss(0.3f);
+    client.set_simulated_loss(0.3f);
+    constexpr int kCount = 800;
+    for (int i = 0; i < kCount; ++i) {
+        CHECK(client.send("u" + std::to_string(i), true, err, true));
+        CHECK(client.send("o" + std::to_string(i), true, err));
+    }
+    const bool done = pump_until({&host, &client}, {&he, &ce}, [&] {
+        return count_type(he, Event::Type::Message) >= 2 * kCount;
+    }, 20000ms);
+    CHECK(done);
+    std::vector<int> seen(kCount, 0);
+    int ordered = 0;
+    bool overtook = false; // an unordered message delivered before an earlier one
+    int last_u = -1;
+    for (const auto& e : he) {
+        if (e.type != Event::Type::Message) continue;
+        CHECK(e.reliable);
+        if (e.data[0] == 'u') {
+            const int i = std::stoi(e.data.substr(1));
+            CHECK(i >= 0 && i < kCount);
+            if (i >= 0 && i < kCount) ++seen[i];
+            if (i < last_u) overtook = true;
+            last_u = std::max(last_u, i);
+        } else {
+            CHECK(e.data == "o" + std::to_string(ordered)); // the ordered lane keeps its order
+            ++ordered;
+        }
+    }
+    for (int i = 0; i < kCount; ++i) CHECK(seen[i] == 1);
+    CHECK(ordered == kCount);
+    CHECK(overtook); // with 30% loss, later messages arrive before resent earlier ones
+    host.set_simulated_loss(0.0f);
+    client.set_simulated_loss(0.0f);
+    CHECK(pump_until({&host, &client}, {&he, &ce}, [&] { return client.stats().reliable_in_flight == 0; }, 5000ms));
+    CHECK(host.stats().unordered_duplicates > 0); // resends of delivered messages were recognised
+}
+
+// A partner that stops acknowledging (100% loss) gets fewer and fewer resends, not a flood.
+void test_resend_backoff() {
+    Config cfg;
+    cfg.timeout_s = 30.0;
+    Session host(cfg), client(cfg);
+    std::vector<Event> he, ce;
+    const uint16_t port = host_any(host, "Host");
+    std::string err;
+    CHECK(client.join("127.0.0.1", port, "Client", "", err));
+    CHECK(pump_until({&host, &client}, {&he, &ce}, [&] { return client.state() == State::Connected; }));
+    host.set_simulated_loss(1.0f); // nothing gets through any more: no acks for the client's packets
+    client.set_simulated_loss(1.0f);
+    for (int i = 0; i < 20; ++i) CHECK(client.send("lost" + std::to_string(i), true, err));
+    std::this_thread::sleep_for(1500ms);
+    const uint64_t resends = client.stats().resends;
+    // Without backoff: 20 packets every 50 ms (the minimum timeout on loopback) = ~600 in 1.5 s.
+    // With it, each packet's timeout doubles up to 1 s: 50+100+200+400+800 ms -> ~5-6 resends each.
+    CHECK(resends > 20);
+    CHECK(resends < 20 * 9);
+    std::printf("  resends of 20 unacknowledged packets in 1.5 s: %llu\n", static_cast<unsigned long long>(resends));
+}
+
+void test_datagram_limit() {
+    // 1200-byte datagrams: below the MTU of VPN tunnels, so nothing is split into IP fragments.
+    CHECK(kMaxDatagram == 1200);
+    CHECK(kMaxPayload == 1188);
+}
+
 void test_rejections_and_rejoin() {
     Session host, a, b, wrong;
     std::vector<Event> he, ae, be, we;
@@ -363,6 +441,9 @@ int main() {
         {"wire_roundtrip", test_wire_roundtrip},
         {"connect_and_exchange", test_connect_and_exchange},
         {"reliable_under_loss", test_reliable_under_loss},
+        {"unordered_lane_under_loss", test_unordered_lane_under_loss},
+        {"resend_backoff", test_resend_backoff},
+        {"datagram_limit", test_datagram_limit},
         {"rejections_and_rejoin", test_rejections_and_rejoin},
         {"version_mismatch_reject", test_version_mismatch_reject},
         {"session_full", test_session_full},

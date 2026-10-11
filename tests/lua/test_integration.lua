@@ -11,7 +11,8 @@ world.player = mock.make_player({ x = 0, y = 0, z = 0 })
 local host_e1 = mock.make_character("chainsaw.Ch1c0z0Context", { x = 5, y = 0, z = 0 }, 100)
 local host_e2 = mock.make_character("chainsaw.Ch1d0z0Context", { x = 0, y = 0, z = 8 }, 300)
 world.enemies = { host_e1, host_e2 }
-mock.files["re4coop.json"] = { player_name = "HostLeon", port = PORT, left_behind_distance = 30, left_behind_seconds = 1 }
+mock.files["re4coop.json"] = { player_name = "HostLeon", port = PORT, left_behind_distance = 30, left_behind_seconds = 1,
+    config_version = 7, replay_partner_hits = true } -- experimental hit replay covered here
 
 local function run_entry_script()
     for name in pairs(package.loaded) do
@@ -146,15 +147,16 @@ function client_game:take_drop_events()
     self.drop_queue = {}
     return q
 end
-function client_game:set_drop_suppress(set) self.suppress = set end
-function client_game:spawn_drop(item_id, count, pos, stage)
-    self.spawned[#self.spawned + 1] = { item_id = item_id, count = count, pos = pos }
+function client_game:request_enemy_drop(id)
+    self.spawned[#self.spawned + 1] = { enemy = id }
+    self.drop_queue[#self.drop_queue + 1] = { enemy_id = id, via = "generate" }
     return true
 end
 
 local client_settings = Config.load(nil)
 client_settings.player_name = "ClientLeon"
 client_settings.port = PORT
+client_settings.replay_partner_hits = true
 local client_net_obj = re4coop_net.new_session()
 local client = Session.new({ net = wrap(client_net_obj), game = client_game, clock = re4coop_net.time,
     settings = client_settings })
@@ -188,7 +190,8 @@ end
 
 T.run("host_via_ui_button", function()
     mock.press["Host game"] = true
-    mock.run_frame()
+    mock.run_frame() -- the UI queues the action...
+    mock.run_frame() -- ...the next game frame carries it out
     T.eq(re4coop_net.state(), "listening", "host listening after clicking Host game")
     T.check(host_messages_contain("Hosting on UDP port " .. PORT), "host log mentions port")
 end)
@@ -332,14 +335,23 @@ T.run("hits_and_drops_end_to_end", function()
     T.eq(r[#r].damage, 1, "cosmetic replay")
     T.eq(host_e1.hp, hp_after_host_hit, "replay did not change the host's HP")
 
-    -- Enemy 2 (killed by the host earlier) drops ammo: the client gets the same item.
-    client_game.drop_queue = { { enemy_id = 2, droptype = 65536 } } -- the client's own drop hook works
-    run_for(0.6)
-    T.eq(client_game.suppress and client_game.suppress[1], true, "client skips its own rolls for paired enemies")
+    -- Loot: each player rolls their own, also for the partner's kills. The host's game rolls
+    -- loot for enemy 2 (killed earlier): that proves the host's drop hooks.
     mock.enemy_drop(host_e2, 112806400)
-    ok = T.wait_until(function() return #client_game.spawned > 0 end, step, 5)
-    T.check(ok, "client spawned the host's drop")
-    T.eq(client_game.spawned[1] and client_game.spawned[1].item_id, 112806400, "same item")
+    -- The client kills enemy 1: the host's copy dies through enemy sync, and since the mocked
+    -- death runs no loot code, the host rolls that enemy's loot for its own player.
+    local before = #(world.generated or {})
+    client_game.enemies[1].hp = 0
+    client_game.enemies[1].alive = false
+    ok = T.wait_until(function() return host_e1.hp == 0 end, step, 5)
+    T.check(ok, "host's copy died from the client's kill")
+    ok = T.wait_until(function() return #(world.generated or {}) > before end, step, 6)
+    T.check(ok, "the host rolled loot for the client's kill")
+    local g = world.generated[#world.generated]
+    T.eq(g and g.order, host_e1, "from that enemy")
+    T.eq(g and g.cc, world.player, "for the host's own player")
+    for _ = 1, 50 do step() end
+    T.eq(#world.generated, before + 1, "exactly once")
 end)
 
 T.run("key_items_exist_once", function()
@@ -384,7 +396,9 @@ end)
 
 T.run("research_dump_button_while_connected", function()
     mock.press["Write research dump (adds a run to reframework/data/)"] = true
-    mock.run_frame()
+    mock.run_frame() -- queued from the UI...
+    mock.run_frame() -- ...written on the game thread
+    mock.run_frame() -- (and the UI shows the result)
     local log = mock.files["re4coop_research_log.json"]
     T.check(log ~= nil and #log.runs == 1, "research log written from the UI")
     T.eq(log.runs[1].session.role, "host", "session state included")
@@ -405,6 +419,7 @@ T.run("chat_and_teleport", function()
     T.check(ok, "host received chat")
 
     mock.press["Teleport to partner"] = true
+    step()
     step()
     T.check(world.player.pos.x > 5, "host teleported towards client (x=" .. world.player.pos.x .. ")")
     T.eq(world.player.warped, 1, "CharacterController.warp used")
@@ -464,6 +479,7 @@ T.run("client_leaves_host_keeps_listening", function()
     T.check(partner_model() == nil, "partner model removed")
     T.eq(#mock.find("re4coop_wp4000"), 0, "and their weapon")
     mock.press["Stop hosting"] = true
+    mock.run_frame()
     mock.run_frame()
     T.eq(re4coop_net.state(), "idle", "stop hosting")
     for _, cb in ipairs(mock.callbacks.config_save) do cb() end

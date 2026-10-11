@@ -10,9 +10,11 @@
 namespace re4coop::net {
 
 constexpr uint32_t kMagic = 0x50433452;  // "R4CP" when read as little-endian bytes
-constexpr uint8_t kProtocolVersion = 1;
+constexpr uint8_t kProtocolVersion = 2;  // 2: unordered reliable lane, 1200 B datagrams
 constexpr size_t kHeaderSize = 10;        // magic(4) + version(1) + type(1) + token(4)
-constexpr size_t kMaxDatagram = 1400;     // stays under a typical 1500 MTU with IP/UDP headers
+// Stays under the MTU of VPN tunnels (ZeroTier, Tailscale, Hamachi: ~1280-1420 B) with the
+// IP/UDP headers, so a datagram is never split into IP fragments (one lost fragment loses it all).
+constexpr size_t kMaxDatagram = 1200;
 constexpr size_t kMaxReliableOverhead = 2;
 constexpr size_t kMaxPayload = kMaxDatagram - kHeaderSize - kMaxReliableOverhead; // per message
 
@@ -26,6 +28,8 @@ enum class PacketType : uint8_t {
     Unreliable = 7,     // seq u16, payload...
     Reliable = 8,       // seq u16, payload...
     Ack = 9,            // count u8, seq u16 * count
+    ReliableUnordered = 10, // seq u16, payload... (delivered as soon as it arrives, exactly once)
+    AckUnordered = 11,      // count u8, seq u16 * count
 };
 
 enum class RejectReason : uint8_t {

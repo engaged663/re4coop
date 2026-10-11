@@ -24,6 +24,7 @@ local function fresh(opts)
     local World = require("re4coop.game_world")
     local w = World.new(game, function() end)
     w:set_active(true) -- a partner is connected
+    game:set_active(true)
     return w, game, world
 end
 
@@ -95,6 +96,12 @@ T.run("flag_words_snapshot_and_full_apply", function()
         "full apply")
     T.eq(world.flag_groups[1].words[3], 0xFFFFFFFF, "word written back through loadGameSaveData")
     T.eq(world.flag_groups[1].words[1], 1, "first word")
+    -- Live word changes reload the whole flag table: experimental, off by default.
+    w:flag_words_apply("Chapter", 0, 0x10, 0)
+    w:update()
+    T.eq(world.flag_groups[2].words[1], 0, "not applied while the experimental switch is off")
+    T.eq(w.table_reloads_skipped, 1, "counted")
+    w.game.settings.exp_table_reload = true
     w:flag_words_apply("Chapter", 0, 0x10, 0)
     w:flag_words_apply("Main", 1, 0, 0x2)
     w:update()
@@ -140,10 +147,17 @@ T.run("large_gimmick_tables_are_read_over_several_frames", function()
         calls = calls + 1
         snap = w:gimmicks_snapshot()
     until snap ~= nil or calls > 10
-    T.eq(calls, 3, "60 records per call")
+    T.eq(calls, 4, "40 records per call")
     local n = 0
     for _ in pairs(snap) do n = n + 1 end
     T.eq(n, 150, "all records")
+    -- Only the gimmicks that announced a change: their IDs are checked, only they are read.
+    local keys = { ["1:0:1007:0"] = true, ["1:0:1120:0"] = true }
+    local targeted = w:gimmicks_snapshot(false, keys)
+    n = 0
+    for _ in pairs(targeted or {}) do n = n + 1 end
+    T.eq(n, 2, "two records, in one call (150 IDs per call)")
+    T.eq(targeted["1:0:1120:0"].attr, string.char(120), "the right one")
 end)
 
 T.run("gimmick_changes_are_announced", function()
@@ -152,6 +166,9 @@ T.run("gimmick_changes_are_announced", function()
     mock.set_gimmick({ category = 1, kind = 0, group = 5, index = 1 }, { 1 }, nil, true) -- the game: pushDirtyList
     T.eq(w:gimmicks_dirty(), true, "announced through the pushDirtyList hook")
     T.eq(w:gimmicks_dirty(), false, "once")
+    local keys = w:gimmick_dirty_keys()
+    T.eq(keys["1:0:5:1"], true, "which gimmick")
+    T.eq(next(w:gimmick_dirty_keys()), nil, "taken once")
 end)
 
 T.run("objects_scan_detect_and_apply", function()
@@ -177,7 +194,16 @@ T.run("objects_scan_detect_and_apply", function()
     box.__fields._Routine = 0
     w:objects_scan()
     T.eq(w:object_apply("aaaaaaaa-0000-0000-0000-000000000001", P.OBJECT_EVENT.DESTROYED, 2), "done", "box")
-    T.eq(box.__fields._Routine, 2, "box enters the partner's terminal routine (plays its own break)")
+    T.eq(box.__fields._Routine, 0, "its state machine is not forced (experimental switch off)")
+    T.eq(box.owner.draw_self, false, "hidden instead")
+    box.owner.draw_self = true
+    w.game.settings.exp_force_routine = true
+    T.eq(w:object_apply("aaaaaaaa-0000-0000-0000-000000000001", P.OBJECT_EVENT.DESTROYED, 2), "done", "box")
+    T.eq(box.__fields._Routine, 2, "experimental: box enters the partner's terminal routine (plays its own break)")
+    -- A scanned object that the game destroyed since is not touched.
+    mock.destroy(crow.owner)
+    T.eq(w:object_apply("aaaaaaaa-0000-0000-0000-000000000002", P.OBJECT_EVENT.DESTROYED, -1), "missing",
+        "destroyed since the scan: left alone")
 end)
 
 T.run("cutscene_hooks_play_and_current_id", function()
@@ -201,6 +227,8 @@ end)
 
 T.run("location_preload_warp_and_fallback", function()
     local w, _, world = fresh()
+    T.eq(w:preload_stage(43310), false, "cross-stage warps are experimental: off by default")
+    w.game.settings.stage_travel = true
     local loc = w:location()
     T.eq(loc.chapter, 21100, "chapter")
     T.eq(loc.stage, 40200, "stage")
@@ -213,18 +241,21 @@ T.run("location_preload_warp_and_fallback", function()
     T.eq(by["chainsaw.PrefectureSceneManager"].id, 43, "prefecture id")
     T.eq(by["chainsaw.LocationSceneManager"].id, 43000, "location id")
     T.eq(by["chainsaw.EnvSceneManager"].id, 43310, "stage id")
-    T.eq(by["chainsaw.EnvSceneManager"].status, 3, "status 3 (boxed Int32)")
+    T.eq(by["chainsaw.EnvSceneManager"].status, 3, "status 3 in a real Nullable struct")
+    T.eq(world.bad_nullable, nil, "never a boxed value where the game expects a Nullable")
     T.check(w:warp(43310, { x = 65, y = 6, z = -78 }, 0.5), "warp requested")
     T.eq(#world.warps, 1, "through CharacterManager.requestWarp")
     T.eq(world.warps[1].stage, 43310, "with a StageIdentifier for the target stage")
     T.near(world.warps[1].rot.y, math.sin(0.25), 1e-6, "facing")
     T.near(world.player.pos.x, 65, 1e-6, "player moved")
+    T.eq(world.bad_nullable, nil, "position and rotation passed as Nullable structs")
     T.eq(w:location().stage, 43310, "and is in the new stage")
     T.check(w:warp(nil, { x = 1, y = 1, z = 1 }), "stage unknown: direct move")
     T.near(world.player.pos.x, 1, 1e-6, "moved exactly there")
     T.eq(#world.warps, 1, "no stage warp")
     world.player = nil
     world.chapter = 22100
+    w.game:begin_frame() -- the player context is read once per game frame
     local loading = w:location()
     T.eq(loading.loading, true, "no player: loading")
     T.eq(loading.chapter, 22100, "chapter still known")
@@ -242,6 +273,8 @@ T.run("chapter_switch_rewrites_the_next_load", function()
     T.check(w:arm_chapter_switch(21300), "armed for the chapter the save is in")
     mock.load_save(21300)
     T.eq(world.jump_sequence, 0, "a save already in that chapter keeps its own checkpoint")
+    T.eq(w:trigger_reload(), false, "the automatic reload is experimental: off by default")
+    w.game.settings.travel_reload = true
     T.check(w:trigger_reload(), "reload")
     T.eq(world.game_over_requests, 1, "game over requested")
 end)
@@ -274,13 +307,13 @@ T.run("no_pause_neutralises_menu_pauses_only", function()
     T.eq(game:capabilities().no_pause.ok, true, "pause table found")
     T.eq(mock.pause_freezes(1), true, "the inventory pause freezes before")
     pause:set_active(true, "menus", false, 0)
-    for _, t in ipairs({ 1, 2, 3, 4, 100 }) do
+    for _, t in ipairs({ 1, 2, 3, 4 }) do
         T.eq(mock.pause_freezes(t), false, "pause " .. t .. " neutralised")
     end
-    for _, t in ipairs({ 5, 6, 101 }) do
-        T.eq(mock.pause_freezes(t), true, "pause " .. t .. " (event/loading/movie) kept")
+    for _, t in ipairs({ 5, 6, 100, 101 }) do
+        T.eq(mock.pause_freezes(t), true, "pause " .. t .. " (event/loading/typewriter/movie) kept")
     end
-    T.eq(pause:status().patched, 5, "five pause types neutralised")
+    T.eq(pause:status().patched, 4, "four pause types neutralised")
     -- The game rebuilds its table (area load): applied again.
     world.pause_params[2] = mock.new("share.PauseManager.PauseParameter", { __fields = { TargetUpdate = 0xFF, TargetDraw = 1 } })
     pause:update(10)

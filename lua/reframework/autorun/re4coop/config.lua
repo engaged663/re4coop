@@ -4,7 +4,12 @@ local Config = {}
 
 Config.FILE = "re4coop.json"
 
+-- Bumped when defaults change for safety: settings saved by an older version take the new
+-- default for the keys listed in Config.RESET_ON_UPGRADE.
+Config.VERSION = 7
+
 Config.DEFAULTS = {
+    config_version = Config.VERSION,
     player_name = "Player",
     last_address = "192.168.1.",
     port = 33040,
@@ -14,9 +19,9 @@ Config.DEFAULTS = {
     player_hz = 20,
     pose_hz = 30,         -- partner model pose updates per second
     enemy_tick_hz = 20,
-    snapshot_hz = 15,
+    snapshot_hz = 20,
     client_enemy_hz = 20, -- client: reports of the enemies it runs per second
-    interp_delay = 0.10,
+    interp_delay = 0.066, -- seconds the partner is shown in the past (smooths network jitter)
 
     -- enemy sync
     sync_enemies = true,
@@ -28,22 +33,19 @@ Config.DEFAULTS = {
     enemy_puppet_ai = true,   -- a mirrored enemy's own AI is switched off (it only follows the owner's copy)
     match_radius = 3.0,   -- metres between spawn points to treat two enemies as the same one
     snap_distance = 0.0,  -- client, without mirroring: teleport enemies further than this from the host's copy (0 = off)
-    replay_partner_hits = true, -- enemies visibly react to the partner's hits (cosmetic replay)
-    sync_drops = true,    -- enemies drop the same item for both players (the host's roll)
+    hit_ownership = true, -- an enemy the partner is shooting is run by their game (it reacts to their hits)
+    sync_drops = true,    -- every enemy that dies gives each player their own loot roll, also the partner's kills
 
     -- shared world
     sync_flags = true,        -- story/scenario flags: objectives, map, doors, items taken, events seen
     sync_gimmicks = true,     -- gimmick states: locks, keys used, levers, shutters, puzzles
     sync_objects = true,      -- breakables and animals: crates, barrels, pots, crows, chickens...
     sync_object_states = false, -- experimental: also mirror other state changes of those objects
-    sync_cutscenes = true,    -- a cutscene one player triggers plays for both
     cutscene_travel = true,   -- bring the partner next to you before their game plays your cutscene
 
     -- joining and travelling
     auto_travel = true,         -- client: on joining, load the host's chapter and appear next to them
-    travel_reload = true,       -- chapter change: trigger the reload (game over -> Continue) automatically
     follow_host_chapter = true, -- client: follow the host into the next chapter if you do not get there yourself
-    stage_travel = true,        -- teleports to another stage use the game's warp (loads the stage first)
 
     -- pauses
     no_pause = true,             -- while hosting or connected, menus and the inventory do not pause the game
@@ -71,7 +73,23 @@ Config.DEFAULTS = {
     share_character = true,            -- send our character (prefab, costume, pose) to the partner
     show_nametag = true,
     show_hud = true,
+
+    -- diagnostics
+    profiler = true,   -- time the mod's work (Diagnostics > Performance)
+    perf_file = true,  -- write the measurements to reframework/data/re4coop_perf.json every 10 s
+
+    -- experimental: features that change the game in ways not proven safe yet (off by default)
+    replay_partner_hits = false, -- replay the partner's hits on enemies your game runs (flinch)
+    sync_cutscenes = false,      -- a cutscene one player triggers is started in the partner's game
+    travel_reload = false,       -- load the partner's chapter by triggering game over -> Continue
+    stage_travel = false,        -- teleports to another stage preload it and use the game's warp
+    exp_table_reload = false,    -- apply the partner's flag words by reloading the flag table
+    exp_force_routine = false,   -- break objects by forcing their state machine into a "broken" state
 }
+
+-- Keys whose default changed in Config.VERSION for stability (crashes or stutter in 0.6).
+Config.RESET_ON_UPGRADE = { "interp_delay", "snapshot_hz", "replay_partner_hits", "sync_cutscenes", "travel_reload",
+    "stage_travel" }
 
 local function copy(t)
     local out = {}
@@ -85,12 +103,17 @@ function Config.load(json)
     if json ~= nil then
         local ok, saved = pcall(json.load_file, Config.FILE)
         if ok and type(saved) == "table" then
+            local reset = {}
+            if (tonumber(saved.config_version) or 0) < Config.VERSION then
+                for _, k in ipairs(Config.RESET_ON_UPGRADE) do reset[k] = true end
+            end
             for k, default in pairs(Config.DEFAULTS) do
                 local v = saved[k]
-                if v ~= nil and type(v) == type(default) then
+                if v ~= nil and type(v) == type(default) and not reset[k] then
                     cfg[k] = v
                 end
             end
+            cfg.config_version = Config.VERSION
         end
     end
     Config.sanitize(cfg)

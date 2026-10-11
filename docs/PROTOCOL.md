@@ -4,14 +4,14 @@ Two layers: the **transport** (C++, `plugin/src/net`) moves datagrams between ex
 peers. The **game messages** (Lua, `re4coop/protocol.lua`) ride inside transport payloads.
 All integers are little-endian.
 
-## Transport (network protocol version 1)
+## Transport (network protocol version 2)
 
 Every datagram starts with a 10-byte header:
 
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 4 | magic `0x50433452` (`"R4CP"`) |
-| 4 | 1 | protocol version (`1`) |
+| 4 | 1 | protocol version (`2`) |
 | 5 | 1 | packet type |
 | 6 | 4 | session token (0 until accepted) |
 
@@ -27,11 +27,15 @@ address or with the wrong token are ignored too.
 | 5 | Ping | `u32 id, u64 time_us` | Every 0.5 s |
 | 6 | Pong | `u32 id, u64 time_us` | Echo, used for RTT |
 | 7 | Unreliable | `u16 seq, payload` | Delivered as is. `seq` is only used to count reordering |
-| 8 | Reliable | `u16 seq, payload` | Acked. Retransmitted every `clamp(2·RTT, 50 ms, 1 s)`. Delivered once, in order (4096-entry reorder window) |
-| 9 | Ack | `u8 count, u16 seq × count` | Selective acks, batched per network tick |
+| 8 | Reliable | `u16 seq, payload` | The ordered lane. Acked. First retransmit after `clamp(2·RTT + 10 ms, 50 ms, 1 s)`, then each packet's own timeout doubles with every resend (up to 1 s). Delivered once, in order (4096-entry reorder window) |
+| 9 | Ack | `u8 count, u16 seq × count` | Selective acks for the ordered lane, batched per network tick |
+| 10 | ReliableUnordered | `u16 seq, payload` | The unordered lane (own sequence numbers): acked and retransmitted like Reliable, delivered once as soon as it arrives, never waiting for earlier packets. Used for ACTIONS |
+| 11 | AckUnordered | `u8 count, u16 seq × count` | Acks for the unordered lane |
 
-`str` = `u8 length` + bytes (≤ 255). Maximum datagram: 1400 bytes. Maximum message payload:
-**1388 bytes** (`re4coop_net.max_payload()`).
+`str` = `u8 length` + bytes (≤ 255). Maximum datagram: **1200 bytes** (below the MTU of VPN
+tunnels such as ZeroTier, Tailscale or Hamachi, so no datagram is split into IP fragments).
+Maximum message payload: **1188 bytes** (`re4coop_net.max_payload()`). Version 1 used 1400 /
+1388 bytes and had no unordered lane.
 
 Session rules:
 
@@ -46,16 +50,21 @@ Session rules:
 | `host(port, name, password)` | `true` or `nil, err` |
 | `join(address, port, name, password)` | `true` or `nil, err` (the result arrives later through `poll`) |
 | `stop()` | Disconnects politely and stops the thread |
-| `send(bytes, reliable)` | `true` or `nil, err` |
+| `send(bytes, reliable[, unordered])` | `true` or `nil, err`. `unordered` (with `reliable`): the unordered lane |
 | `poll([max])` | Array of `{type="connected"\|"disconnected"\|"rejected"\|"message", data, reliable, peer, name}` |
 | `state()` / `role()` | `"idle"\|"listening"\|"connecting"\|"connected"` / `"none"\|"host"\|"client"` |
-| `stats()` | Table: `rtt_ms, peer, peer_name, bytes_sent, bytes_recv, resends, reliable_in_flight, …` |
+| `stats()` | Table: `rtt_ms, peer, peer_name, bytes_sent, bytes_recv, resends, reliable_in_flight, out_of_order, unordered_duplicates, …` |
 | `local_addresses()` | Array of this PC's LAN IPv4 addresses |
 | `time()` | Monotonic seconds (`os.clock` is CPU time, so don't use it for networking) |
-| `max_payload()`, `version()` | `1388`; `"0.6.0", 1` |
+| `max_payload()`, `version()` | `1188`; `"0.7.0", 2` |
 | `new_session()` | An independent session object with the same methods (tests/tools) |
 
-## Game messages (game protocol version 6)
+## Game messages (game protocol version 7)
+
+Version 7 (mod 0.7.0): ENEMY_SNAPSHOT carries 17 entries per chunk, ENEMY_CLIENT up to 24
+states, OBJECTS up to 50 events (everything fits the 1188-byte payload), deaths the client did
+not witness are re-advertised 30 at a time on every 10th snapshot, ACTIONS travel on the
+unordered lane, and ITEM_DROPPED is retired (each player rolls their own loot).
 
 The first byte is the message type. Formats use Lua `string.pack` notation.
 
@@ -64,7 +73,7 @@ The first byte is the message type. Formats use Lua `string.pack` notation.
 | 1 | HELLO | reliable | both, on connect | `<B I2 s1 s1 s1 B`: type, game protocol version, mod version, player name, chapter/area, flags (1 = reply requested) |
 | 2 | PLAYER | unreliable, 20 Hz | both | `<B d fff ffff ff B I4 i4 i4`: time, position, rotation quaternion (x,y,z,w), HP, max HP, flags (1 dead, 2 cutscene, 4 aiming, 8 has stage, 16 has chapter, 32 waiting at a transition), area hash, `chainsaw.StageID` (valid with flag 8), `chainsaw.ChapterID` (valid with flag 16) |
 | 3 | *(retired)* | | | SKELETON in protocols 1–3 (the stick-figure ghost) |
-| 4 | ENEMY_SNAPSHOT | unreliable, 15 Hz | host → client | `<B d B B B` + n × `<I2 I4 fff fff f f f B i4 i4 B B I4 I4 f>` (65 B): time, chunk, chunks, count; then net id, kind hash (FNV-1a of context type name), position, spawn position, yaw, HP, max HP, flags (1 alive, 2 has ContextID, 4 run by the client, 8 has animation), the enemy's **spawner** `chainsaw.ContextID` (`CharacterContext.get_SpawnerID()`) as group, index, kind, category, then motion bank, motion ID and frame of its motion layer 0. 20 entries per chunk. Every 5th snapshot also lists recent deaths the client did not witness (flags without 1) |
+| 4 | ENEMY_SNAPSHOT | unreliable, 20 Hz | host → client | `<B d B B B` + n × `<I2 I4 fff fff f f f B i4 i4 B B I4 I4 f>` (65 B): time, chunk, chunks, count; then net id, kind hash (FNV-1a of context type name), position, spawn position, yaw, HP, max HP, flags (1 alive, 2 has ContextID, 4 run by the client, 8 has animation), the enemy's **spawner** `chainsaw.ContextID` (`CharacterContext.get_SpawnerID()`) as group, index, kind, category, then motion bank, motion ID and frame of its motion layer 0 (read only for enemies the client mirrors). 17 entries per chunk. Every 10th snapshot also lists up to 30 deaths the client did not witness, in turn (flags without 1) |
 | 5 | ENEMY_DAMAGE | reliable | client → host | `<B I2 I4 fff f B i4 i4 B B`: net id (0 = unpaired), kind hash, spawn position, amount, flags (1 lethal, 2 has ContextID), spawner ContextID (sent only once spawner IDs are trusted, see below) |
 | 6 | ENEMY_DEAD | reliable | host → client | `<B I2`: net id. Net id 0: the host reloaded a checkpoint, forget every death it reported |
 | 7 | CHAT | reliable | both | `<B s2`: text (≤ 512 bytes) |
@@ -74,17 +83,17 @@ The first byte is the message type. Formats use Lua `string.pack` notation.
 | 11 | AVATAR | reliable (fragmented) | both | see below: how the sender's character is built |
 | 12 | GEAR | reliable | both | see below: the weapons the character carries |
 | 13 | POSE | unreliable, 30 Hz | both | see below: root placement, every joint's local rotation, weapon placement |
-| 14 | ACTIONS | reliable | both | see below: sound/effect calls and shots to replay |
-| 15 | ENEMY_HIT | unreliable | both | `<B I2 I4 fff i4 fff fff i4 B`: net id (host numbering; 0 = unpaired), kind hash, enemy spawn position, damage, wince, break, stopping, damage direction, weapon ID, flags (1 critical). A hit the sender's player landed (`HitController.callbackDamageHit`); the receiver replays it on its copy (cosmetic: 1 damage, HP restored) |
-| 16 | ITEM_DROPPED | reliable | host → client | `<B I2 I4 i4 fff i4 B`: net id of the enemy, item ID, count, position, stage, flags (1 has stage). The item the host's random roll dropped; the client spawns it where its copy of that enemy is |
-| 17 | ENEMY_CLIENT | unreliable, 20 Hz | client → host | `<B d B B` + n × `<I2 fff f I4 I4 f B>` + m × `<I2>`: time, state count (≤ 30), copy count (≤ 200); the enemies the client runs (net id, position, yaw, motion bank/ID/frame, flags: 1 has animation), then the net ids of every other host enemy the client has a copy of. The host mirrors the first list and hands over only enemies the client has |
+| 14 | ACTIONS | reliable, unordered lane | both | see below: sound/effect calls and shots to replay |
+| 15 | ENEMY_HIT | unreliable | both | `<B I2 I4 fff i4 fff fff i4 B`: net id (host numbering; 0 = unpaired), kind hash, enemy spawn position, damage, wince, break, stopping, damage direction, weapon ID, flags (1 critical). A hit the sender's player landed (`HitController.callbackDamageHit`). The host hands an enemy the client is fighting to the client's game (and back); with the experimental replay switch the receiver also replays it on its copy (cosmetic: 1 damage, HP restored) |
+| 16 | *(retired)* | | | ITEM_DROPPED in protocols 4–6 (the host's roll spawned on the client); still decoded, ignored |
+| 17 | ENEMY_CLIENT | unreliable, 20 Hz | client → host | `<B d B B` + n × `<I2 fff f I4 I4 f B>` + m × `<I2>`: time, state count (≤ 24), copy count (≤ 200); the enemies the client runs (net id, position, yaw, motion bank/ID/frame, flags: 1 has animation), then the net ids of every other host enemy the client has a copy of. The host mirrors the first list and hands over only enemies the client has |
 | 18 | FLAGS | reliable | both | `<B B` + n × (`guid` + `<B`): scenario flags that changed (≤ 64 per message), with their new value |
 | 19 | FLAG_WORDS | reliable | both | `<B I2 B B B B` (sync id, mode, chunk, chunks, item count) + per item `<s1 I2 I2` (group name, first word, count) + words. Mode 1 = full copy: `<I4` words. Mode 2 = changes: `<I2 I4 I4` (word index, bits set, bits cleared) |
 | 20 | GIMMICKS | reliable | both | `<B I2 B B B B` (sync id, mode, chunk, chunks, count) + per gimmick: `ctx` (`<i4 i4 B B>`: group, index, kind, category), `<s1` attribute bytes, `<B` + n × `<I4 I4` (trigger save ID, done), `<B` detected, `<B` + n × (`<B` kind, `<f` or `<I4` value) accessory values. Mode 1 = the whole table, 2 = records that changed, 3 = records that appeared (applied only where the receiver has no record of that gimmick) |
 | 21 | OBJECTS | reliable | both | `<B B` + n × (`guid` + `<B i4`): scene object (GameObject GUID), event (1 destroyed, 2 state changed), value (the `_Routine` it ended in, or -1) |
 | 22 | CUTSCENE | reliable | both | `<B i4 s1 i4 i4 fff B`: timeline event ID (`chainsaw.TimelineEventDefine.ID`), request method name, chapter, stage, position where it started, flags (1 = triggered by the sender's game) |
 | 23 | WORLD_REQUEST | reliable | client → host | `<B I2 B`: sync id, what (1 flags, 2 gimmicks, 4 enemies, 8 objects) |
-| 24 | WORLD_DONE | reliable | host → client | `<B I2 B I4 I4`: sync id, what, flag groups sent, gimmicks sent. Follows the FLAG_WORDS / GIMMICKS / OBJECTS of a full transfer (the reliable channel is ordered) |
+| 24 | WORLD_DONE | reliable | host → client | `<B I2 B I4 I4`: sync id, what, flag groups sent, gimmicks sent. Follows the FLAG_WORDS / GIMMICKS / OBJECTS of a full transfer (the ordered lane keeps them in order) |
 
 `guid` is 16 raw bytes: the 32 hex digits of the canonical GUID string, in order. Scenario
 flags are addressed by GUID in the game itself; scene objects by their GameObject GUID, which
@@ -172,4 +181,16 @@ time, then:
 * kind 2, SHOT: `<B>` weapon slot.
 
 The receiver replays events when its delayed animation timeline reaches them (same
-interpolation delay as the pose), and drops events more than a second late.
+interpolation delay as the pose), and drops events more than a second late. ACTIONS travel on
+the unordered lane: each message carries its own timestamps, so arrival order does not matter.
+
+### Timing
+
+Senders keep exact rates (the next send is due one interval after the last *due* time, not
+after the frame that sent it), so 30 poses per second stay 30 at any frame rate. The pose is
+sent at the end of the frame it was captured in (PrepareRendering). The receiver shows the
+partner `interp_delay` (default 66 ms) in the past, more when packets arrive with more jitter
+than that covers (one send interval plus twice the measured jitter, at most 250 ms), samples
+every POSE chunk at the same instant, and lets joints move on for one more pose interval when
+a pose is late instead of freezing them. The pose rate drops to half beyond 40 m and to 5 per
+second while the partner is in another chapter.

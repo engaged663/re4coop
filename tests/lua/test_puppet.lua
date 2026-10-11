@@ -42,6 +42,7 @@ local function setup(opts)
     function env.frame(hidden)
         now = now + 1 / 60
         env.opts = env.opts or {}
+        game:begin_frame() -- what the entry script does at the start of every game frame
         tx:tick(now, game)
         for _, bytes in ipairs(queue) do
             local m = assert(P.decode(bytes))
@@ -168,7 +169,7 @@ T.run("holds_the_partners_weapon", function()
     T.eq(mock.component(go, "via.physics.Colliders").enabled, false, "no collision")
     -- Weapon joints (slide) follow too.
     mock.joint(env.world.player.weapon.transform, "Slide").lrot = mock.quat(0.2588190, 0, 0, 0.9659258)
-    env.frames(2)
+    env.frames(3)
     T.check(angle(mock.joint(go.transform, "Slide").lrot, mock.quat(0.2588190, 0, 0, 0.9659258)) < 0.3, "slide")
     -- Held by a joint only one part has (here the face's Jaw): it hangs from that part.
     local face_src = mock.find("cha000_10")[1]
@@ -233,10 +234,13 @@ T.run("replays_sounds_effects_and_shots", function()
     T.eq(world.effects[#world.effects].comp, mock.component(w.go, "via.effect.script.EPVStandard"), "effect on the copy's gun")
     now = now + 0.05
     ctx.gun:call("shoot")
-    env.frames(2)
+    env.frames(3)
     T.eq(world.flashes, 1, "no fallback flash while the gun's own effects replay")
-    -- Flashes are cleaned up.
+    -- Flashes are cleaned up once their effect has surely finished.
     now = now + 1
+    env.frames(1)
+    T.check(#env.puppet.flashes > 0, "a flash is not destroyed while its effect may still play")
+    now = now + 2.5
     env.frames(1)
     T.eq(#env.puppet.flashes, 0, "flashes expire")
 

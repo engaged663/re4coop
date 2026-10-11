@@ -155,9 +155,11 @@ T.run("receiver_interpolates_joints_and_root", function()
     T.eq(#st.pose.weapons, 1, "weapon placement")
     T.eq(st.pose.weapons[1].attach, 1, "attached to joint 1")
     T.near(st.pose.tpos[1].y, 1.0, 1e-3, "translation")
-    -- Long after the last pose: joints hold (no extrapolation), root extrapolates a bit.
+    -- Long after the last pose: joints move on for at most one pose interval and then hold,
+    -- the root extrapolates a bit.
     local late = rx:state(5.0)
-    T.near(math.abs(2 * math.asin(late.pose.q[1])), 1.0, 0.01, "joints hold the last pose")
+    local a = math.abs(2 * math.asin(late.pose.q[1]))
+    T.check(a > 1.0 and a < 1.06, ("joints extrapolate at most one pose interval, then hold (%.4f)"):format(a))
     T.check(late.pose.root_pos.x <= 1.0 + 0.25 + 1e-6, "root extrapolation capped")
     T.near(rx:age(5.0), 5.0 - 1.01, 1e-6, "age since the last pose")
 end)

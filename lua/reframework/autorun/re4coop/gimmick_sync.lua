@@ -5,27 +5,29 @@
 -- come from the level data and are the same on both PCs): an attribute byte array, the
 -- triggers that already fired (a key was used, a switch was pulled) and a few accessory
 -- values. This module keeps those records equal on both machines:
---   * each side diffs its records when a gimmick announces a change (pushDirtyList) and
---     every couple of seconds anyway, and sends the ones that changed;
+--   * each side compares the records of gimmicks that announced a change (pushDirtyList) a
+--     moment later, plus all records every 30 seconds, and sends the ones that changed;
 --   * the host is the referee: it applies the client's changes and re-broadcasts the result,
 --     so if both changed the same gimmick at once, both end up with the host's version;
 --   * a joining client gets the host's complete table.
 --
 -- Adapter contract (world):
---   world:gimmicks_snapshot(force) -> { [ctx_key] = item } | nil
+--   world:gimmicks_snapshot(force, keys) -> { [ctx_key] = item } | nil
 --       (nil = not available, or still reading a large table over several frames; force =
---       read everything now)
+--       read everything now; keys = { [ctx_key] = true }: only those gimmicks)
 --       item = { ctx={category,kind,group,index}, attr="<bytes>", triggers={{id,done},...},
 --                detected=bool, acc={{kind=1|2, value},...} }
---   world:gimmicks_apply(items) -> bool   (items = array of item)
+--   world:gimmicks_apply(items) -> bool | nil   (items = array of item; nil = not now, try later)
 --   world:gimmicks_dirty() -> bool         (optional: a gimmick changed state since the last call)
+--   world:gimmick_dirty_keys() -> { [ctx_key] = true } | nil (optional: which ones)
 
 local GimmickSync = {}
 GimmickSync.__index = GimmickSync
 
-local INTERVAL = 2.0
+local INTERVAL = 30.0       -- full comparison of every record
 local DIRTY_DELAY = 0.2     -- after a pushDirtyList, let the gimmick finish updating its save state
-local MIN_INTERVAL = 0.3
+local MIN_INTERVAL = 1.0    -- between targeted reads
+local DIRTY_FULL_INTERVAL = 1.0 -- announced changes without keys: full reads at most this often
 local FULL_TIMEOUT = 20.0
 local APPLY_INTERVAL = 0.5
 local MAX_ADDED = 16        -- more new records than this in one scan = an area loaded, not a change
@@ -55,7 +57,10 @@ function GimmickSync:reset()
     self.announced = false    -- a change was announced since the last scan
     self.has_signal = false   -- the game adapter reports announced changes (pushDirtyList hook)
     self.pending_added = {}   -- partner's new records received before our first scan
-    self.counters = { sent = 0, received = 0, applied = 0, full_applied = 0, full_sent = 0, scans = 0 }
+    self.dirty_keys = {}      -- gimmicks that announced a change, read at the next targeted scan
+    self.scan_keys = nil      -- the keys of the targeted scan in progress
+    self.counters = { sent = 0, received = 0, applied = 0, full_applied = 0, full_sent = 0, scans = 0,
+        targeted = 0, deferred = 0 }
 end
 
 function GimmickSync:enabled()
@@ -82,14 +87,16 @@ local function by_key(P)
     return function(a, b) return P.ctx_key(a.ctx) < P.ctx_key(b.ctx) end
 end
 
-function GimmickSync:scan(now, world)
-    local snap = world:gimmicks_snapshot()
+-- keys = nil: compare every record (and replace the baseline); keys = set: only those.
+function GimmickSync:scan(now, world, keys)
+    local snap = world:gimmicks_snapshot(false, keys)
     if snap == nil then return false end
-    local hashes, changed, added = {}, {}, {}
+    local hashes, changed, added = keys and self.baseline or {}, {}, {}
+    if keys ~= nil and hashes == nil then return true end -- no baseline yet: the full scan comes first
     for key, item in pairs(snap) do
         local h = GimmickSync.hash(item)
-        hashes[key] = h
         local before = self.baseline and self.baseline[key]
+        hashes[key] = h
         if self.expect[key] == h then
             self.expect[key] = nil -- the state we applied for the partner
         elseif before ~= nil and before ~= h then
@@ -99,7 +106,11 @@ function GimmickSync:scan(now, world)
         end
     end
     self.baseline = hashes
-    self.items = snap
+    if keys == nil then
+        self.items = snap
+    else
+        for key, item in pairs(snap) do self.items[key] = item end
+    end
     if #changed > 0 then
         table.sort(changed, by_key(self.P))
         for _, msg in ipairs(self.P.encode_gimmicks(0, self.P.GIMMICK_MODE.DELTA, changed)) do
@@ -226,7 +237,12 @@ function GimmickSync:apply_queue(now, world)
     local items = {}
     for _, item in pairs(self.queue) do items[#items + 1] = item end
     table.sort(items, function(a, b) return self.P.ctx_key(a.ctx) < self.P.ctx_key(b.ctx) end)
-    if world:gimmicks_apply(items) then
+    local ok = world:gimmicks_apply(items)
+    if ok == nil then
+        self.counters.deferred = self.counters.deferred + 1
+        return -- not now (loading, cutscene): keep the queue
+    end
+    if ok then
         self.counters.applied = self.counters.applied + #items
     else
         -- Not applicable right now (loading?). Drop our expectations so nothing is lost.
@@ -239,20 +255,44 @@ end
 function GimmickSync:tick(now, world)
     if not self:enabled() then return end
     self:apply_queue(now, world)
-    -- A gimmick announced a state change (GimmickManager.pushDirtyList): read the table soon
-    -- instead of waiting for the next periodic scan.
+    -- A gimmick announced a state change (GimmickManager.pushDirtyList): read it soon instead
+    -- of waiting for the next periodic scan - only that gimmick when the adapter can say which.
     self.has_signal = world.gimmicks_dirty ~= nil
+    local keyed = world.gimmick_dirty_keys ~= nil
     if self.has_signal and world:gimmicks_dirty() then
         self.dirty_at = self.dirty_at or now
         self.announced = true
     end
-    local due = now - self.last_scan >= (self.settings.gimmick_interval or INTERVAL)
-    if self.dirty_at ~= nil and now - self.dirty_at >= DIRTY_DELAY and now - self.last_scan >= MIN_INTERVAL then
-        due = true
+    if keyed then
+        for key in pairs(world:gimmick_dirty_keys() or {}) do self.dirty_keys[key] = true end
     end
-    if due and self:scan(now, world) then
+
+    -- A targeted read in progress continues until it is done.
+    if self.scan_keys ~= nil then
+        if self:scan(now, world, self.scan_keys) then
+            self.scan_keys = nil
+            self.last_targeted = now
+            self.counters.targeted = self.counters.targeted + 1
+        end
+        return
+    end
+    local full_due = now - self.last_scan >= (self.settings.gimmick_interval or INTERVAL)
+    if not full_due and self.dirty_at ~= nil and now - self.dirty_at >= DIRTY_DELAY then
+        if keyed and next(self.dirty_keys) ~= nil and self.baseline ~= nil then
+            if now - (self.last_targeted or -math.huge) >= MIN_INTERVAL then
+                self.scan_keys = self.dirty_keys
+                self.dirty_keys = {}
+                self.dirty_at = nil
+                return self:tick(now, world)
+            end
+        elseif now - self.last_scan >= (keyed and MIN_INTERVAL or DIRTY_FULL_INTERVAL) then
+            full_due = true
+        end
+    end
+    if full_due and self:scan(now, world) then
         self.last_scan = now
         self.dirty_at = nil
+        self.dirty_keys = {}
         self.counters.scans = self.counters.scans + 1
     end
 end

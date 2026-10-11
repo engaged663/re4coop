@@ -34,9 +34,16 @@ local Puppet = require("re4coop.puppet")
 local Overlay = require("re4coop.overlay")
 local UI = require("re4coop.ui")
 local P = require("re4coop.protocol")
+local Perf = require("re4coop.perf")
 
 local settings = Config.load(json)
 local game = Game.new(log_info, re4coop_net.time)
+local perf = Perf.new({
+    clock = re4coop_net.time, json = json, version = P.MOD_VERSION, settings = settings,
+    calls = function() return game.n_calls end,
+})
+game.perf = perf
+game.settings = settings
 game:add_dump_types(World.DUMP_TYPES)
 
 -- The world and pause adapters are optional: if either fails to start (a game patch), the
@@ -59,6 +66,7 @@ local session = Session.new({
     clock = re4coop_net.time,
     settings = settings,
     log = log_info,
+    perf = perf,
 })
 local puppet = Puppet.new(game, log_info)
 
@@ -88,7 +96,8 @@ local function update_partner(now)
         local cut = P.POSE_FLAGS.CUTSCENE
         hidden = (st ~= nil and st.pose ~= nil and (st.pose.flags & cut) ~= 0) or game:is_cutscene()
     end
-    puppet:update(now, st, { hidden = hidden, meshes_only = settings.partner_meshes_only })
+    puppet:update(now, st, { hidden = hidden, meshes_only = settings.partner_meshes_only,
+        viewer = session:fresh_local_pos(now) })
     puppet:replay(session:take_partner_events(now), {
         audio = settings.partner_audio, effects = settings.partner_effects,
     })
@@ -99,25 +108,31 @@ end
 re.on_application_entry("LateUpdateBehavior", function()
     local now = re4coop_net.time()
     last_game_tick = now
-    local ok, err = pcall(session.update, session)
+    perf:end_frame(now)
+    game:begin_frame()
+    local ok, err = perf:pcall("update", session.update, session)
     if not ok then report_once("update", err) end
 
-    local ok2, err2 = pcall(update_partner, now)
+    local ok2, err2 = perf:pcall("partner", update_partner, now)
     if not ok2 then report_once("partner model", err2) end
 end)
 
 -- End of the game frame, after animation, IK and physics: read our final pose for the
 -- partner, and make sure the partner's model shows the pose we gave it.
 re.on_application_entry("PrepareRendering", function()
-    local ok, err = pcall(game.capture_pose_late, game, re4coop_net.time())
+    local now = re4coop_net.time()
+    local ok, err = perf:pcall("capture", game.capture_pose_late, game, now)
     if not ok then report_once("pose capture", err) end
-    local ok2, err2 = pcall(puppet.late_update, puppet)
+    local okF, errF = perf:pcall("capture.send", session.flush_pose, session, now)
+    if not okF then report_once("pose send", errF) end
+    local ok2, err2 = perf:pcall("partner_late", puppet.late_update, puppet)
     if not ok2 then report_once("partner pose", err2) end
 end)
 
 -- Render thread: only drawing, plus network service while the game loop is not ticking.
 re.on_frame(function()
     local now = re4coop_net.time()
+    local t0 = perf:start()
     if now - last_game_tick > 0.5 then
         local ok, err = pcall(session.update_network_only, session)
         if not ok then report_once("network", err) end
@@ -125,7 +140,7 @@ re.on_frame(function()
 
     local state = session:partner_render_state()
     if state ~= nil then
-        local status = session:status()
+        local status = session:status_cached()
         if status.partner_hits ~= nil and #status.partner_hits > 0 then
             local okT, errT = pcall(Overlay.draw_tracers, game, state, status.partner_hits)
             if not okT then report_once("tracers", errT) end
@@ -141,15 +156,16 @@ re.on_frame(function()
         end
     end
 
-    if settings.show_hud then
-        local ok, err = pcall(Overlay.draw_hud, game, session:status(), session.messages, now,
+    if settings.show_hud and session.role ~= "none" then
+        local ok, err = pcall(Overlay.draw_hud, game, session:status_cached(), session.messages, now,
             settings.show_partner and puppet:status() or nil)
         if not ok then report_once("hud", err) end
     end
+    perf:stop("render", t0)
 end)
 
 re.on_draw_ui(function()
-    local ok, err = pcall(UI.draw, session, game, settings, json, puppet)
+    local ok, err = pcall(UI.draw, session, game, settings, json, puppet, perf)
     if not ok then report_once("ui", err) end
 end)
 

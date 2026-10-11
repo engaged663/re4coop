@@ -16,8 +16,10 @@
 --     off - so enemies near the client chase and attack the client for real, and both
 --     screens show them in the same place doing the same thing.
 --   * Hits: each side sends the hits its own player lands (ENEMY_HIT, from the game's damage
---     callback) and the other side replays them on its copy, so you see the partner's shots
---     land. Replays are cosmetic: HP still flows through the damage/HP sync above.
+--     callback). An enemy the partner is shooting moves to the partner's game (ownership
+--     follows the fight), so it reacts to their shots there with its own logic, and both
+--     screens show that reaction. Optionally (experimental) the other side also replays the
+--     hit on its copy. HP still flows through the damage/HP sync above.
 --
 -- Game access goes through an adapter (see game.lua) so this file is pure Lua and is
 -- tested offline against fake worlds (tests/lua/test_enemy_sync.lua).
@@ -45,8 +47,6 @@ local HP_EPS = 0.01
 local FORGET_AFTER = 5.0          -- seconds an enemy may be missing from the list before we forget it
 local DEAD_REPORT_WINDOW = 600.0  -- host keeps advertising deaths the client did not witness
 local DEAD_STALE = 3.0            -- client: a death not advertised again for this long is over
-local DEAD_EVERY_N_SNAPSHOTS = 5  -- ...but only on every Nth snapshot to save bandwidth
-local MAX_DEAD_ENTRIES = 90
 local PENDING_KILL_WINDOW = 600.0 -- host: client kills of enemies the host had not loaded yet
 local MAX_PENDING_KILLS = 64
 local CREDIT_SECONDS = 2.0        -- HP a replay could not put back is not reported as our damage
@@ -54,7 +54,11 @@ local MAX_RECENT_HITS = 16        -- partner hits kept for drawing shot tracers
 local PAIRED_TIMEOUT = 1.5        -- host: a client report older than this no longer counts
 local OWNER_HYSTERESIS = 2.0      -- metres the other player must be closer by to take an enemy over
 local OWNER_HOLD = 0.6            -- seconds that must stay true before ownership moves
-local MIRROR_DELAY = 0.15         -- interpolation delay for mirrored enemies
+local HIT_WINDOW = 3.0            -- the player who hit an enemy this recently runs it
+local HIT_HOLD = 0.2              -- ...after this much hold (the fight decides quickly)
+local DEAD_EVERY_N = 10           -- deaths the client did not witness: re-advertised every Nth snapshot...
+local DEAD_PER_SNAPSHOT = 30      -- ...this many at a time, in turn
+local MIRROR_DELAY = 0.1          -- interpolation delay for mirrored enemies
 local MIRROR_STALE = 1.0          -- stop mirroring when the owner's data is older than this
 local MIRROR_MIN_MOVE = 0.01      -- metres; smaller corrections are not written
 
@@ -87,7 +91,8 @@ local function new_buffer()
 end
 
 -- opts: { role="host"|"client", protocol=<protocol module>, send=function(bytes, reliable),
---         settings=<table read live>, log=function(fmt, ...) }
+--         settings=<table read live>, log=function(fmt, ...),
+--         on_kill=function(local_id, now) (optional: we killed an enemy because the partner's game did) }
 -- settings: sync_hp, sync_deaths, snapshot_hz, match_radius, snap_distance, replay_partner_hits,
 --           enemy_mirror, enemy_ownership, enemy_motion_sync, enemy_puppet_ai, client_enemy_hz
 function EnemySync.new(opts)
@@ -97,6 +102,7 @@ function EnemySync.new(opts)
     self.send = opts.send
     self.settings = opts.settings or {}
     self.log = opts.log or function() end
+    self.on_kill = opts.on_kill or function() end
     self:reset()
     return self
 end
@@ -120,6 +126,8 @@ function EnemySync:reset()
     self.client_paired = {} -- net id -> time the client last reported having a copy
     self.client_interp = {} -- net id -> interpolation buffer of the client's copy
     self.pending_kills = {} -- client kills the host could not match yet: {kind_hash, pos, time}
+    self.last_hit = {}      -- net id -> {who = "host"|"client", time}
+    self.dead_cursor = 0
 
     -- client
     self.remote = {}        -- net id -> latest host entry (+ .updated, .interp, .client_owned)
@@ -253,6 +261,20 @@ function EnemySync:mirroring(game)
     return self.settings.enemy_mirror ~= false and game ~= nil and game.enemy_set_transform ~= nil
 end
 
+-- Whether the partner's game mirrors this local enemy from ours (so its animation must be
+-- read and sent): host - the client has a copy and does not run it itself; client - the host
+-- handed it to us. Decided from the previous tick's state.
+function EnemySync:wants_motion(id)
+    local net_id = self.net_of[id]
+    if net_id == nil then return false end
+    if self.role == "host" then
+        local t = self.client_paired[net_id]
+        return t ~= nil and self.owner[net_id] ~= "client" and (self.last_tick or 0) - t <= PAIRED_TIMEOUT
+    end
+    local r = self.remote[net_id]
+    return r ~= nil and r.client_owned == true
+end
+
 -- Switches a local enemy's own AI off while it is mirrored, and back on when it is not.
 function EnemySync:set_ai(game, id, on)
     if game == nil or game.enemy_set_ai == nil then return end
@@ -332,6 +354,9 @@ function EnemySync:on_local_hits(events, now)
     for _, ev in ipairs(events or {}) do
         local e = self.by_id[ev.id]
         local net_id = self.net_of[ev.id]
+        if net_id ~= nil and self.role == "host" then
+            self.last_hit[net_id] = { who = "host", time = now }
+        end
         if e ~= nil and (net_id ~= nil or self.role == "client") then
             self.send(self.P.encode_enemy_hit({
                 net_id = net_id or 0, kind_hash = e.kind_hash, pos = self.spawn[ev.id] or e.pos,
@@ -357,10 +382,13 @@ function EnemySync:on_partner_hit(m, now, game)
         return
     end
     self.counters.hits_received = self.counters.hits_received + 1
+    if self.role == "host" and self.net_of[id] ~= nil then
+        self.last_hit[self.net_of[id]] = { who = "client", time = now }
+    end
     local hits = self.recent_hits
     hits[#hits + 1] = { pos = copy3(e.pos), time = now }
     if #hits > MAX_RECENT_HITS then table.remove(hits, 1) end
-    if self.settings.replay_partner_hits ~= false and e.alive and game ~= nil and game.enemy_replay_hit ~= nil then
+    if self.settings.replay_partner_hits == true and e.alive and game ~= nil and game.enemy_replay_hit ~= nil then
         local ok, kept = game:enemy_replay_hit(id, m)
         if ok then
             self.counters.hits_replayed = self.counters.hits_replayed + 1
@@ -416,13 +444,20 @@ function EnemySync:update_owner(net_id, e, players, now)
         if cur ~= "host" then self:set_owner(net_id, "host") end
         return
     end
-    local dh = dist(e.pos, players.local_pos)
-    local dc = dist(e.pos, players.partner_pos)
-    local want
-    if cur == "host" then
-        want = (dc + OWNER_HYSTERESIS < dh) and "client" or "host"
+    local want, hold
+    local hit = self.last_hit[net_id]
+    if self.settings.hit_ownership ~= false and hit ~= nil and now - hit.time <= HIT_WINDOW then
+        -- Whoever is fighting it runs it: their shots hit an enemy their own game controls.
+        want, hold = hit.who, HIT_HOLD
     else
-        want = (dh + OWNER_HYSTERESIS < dc) and "host" or "client"
+        local dh = dist(e.pos, players.local_pos)
+        local dc = dist(e.pos, players.partner_pos)
+        if cur == "host" then
+            want = (dc + OWNER_HYSTERESIS < dh) and "client" or "host"
+        else
+            want = (dh + OWNER_HYSTERESIS < dc) and "host" or "client"
+        end
+        hold = OWNER_HOLD
     end
     if want == cur then
         self.owner_pending[net_id] = nil
@@ -431,7 +466,9 @@ function EnemySync:update_owner(net_id, e, players, now)
     local p = self.owner_pending[net_id]
     if p == nil or p.want ~= want then
         self.owner_pending[net_id] = { want = want, since = now }
-    elseif now - p.since >= OWNER_HOLD then
+        p = self.owner_pending[net_id]
+    end
+    if now - p.since >= hold then
         self:set_owner(net_id, want)
     end
 end
@@ -453,6 +490,7 @@ function EnemySync:apply_pending_kills(now, game)
                 if self.settings.sync_deaths ~= false and game:enemy_kill(id) then
                     self.by_id[id].hp = 0
                     self.counters.late_kills = self.counters.late_kills + 1
+                    self.on_kill(id, now)
                 end
             end
         end
@@ -498,6 +536,9 @@ function EnemySync:host_tick(now, enemies, game, players)
     for net_id, t in pairs(self.client_paired) do
         if now - t > 30 then self.client_paired[net_id] = nil end
     end
+    for net_id, h in pairs(self.last_hit) do
+        if now - h.time > HIT_WINDOW then self.last_hit[net_id] = nil end
+    end
     self:apply_pending_kills(now, game)
 
     -- Ownership: who runs each enemy's AI.
@@ -518,11 +559,13 @@ function EnemySync:host_tick(now, enemies, game, players)
         if self.local_of[net_id] == nil then self.owner[net_id] = nil end
     end
 
-    local hz = self.settings.snapshot_hz or 15
-    if now - self.last_snapshot < 1.0 / hz then
+    local hz = self.settings.snapshot_hz or 20
+    local interval = 1.0 / hz
+    if now - self.last_snapshot < interval then
         return
     end
-    self.last_snapshot = now
+    -- Keep the rate exact (not slowed down by the frame rate), without bursts after a gap.
+    self.last_snapshot = (now - self.last_snapshot >= 2 * interval) and now or (self.last_snapshot + interval)
     self.snapshot_count = self.snapshot_count + 1
 
     local F = self.P.ENEMY_FLAGS
@@ -538,16 +581,22 @@ function EnemySync:host_tick(now, enemies, game, players)
             }
         end
     end
-    if self.snapshot_count % DEAD_EVERY_N_SNAPSHOTS == 0 then
+    if self.snapshot_count % DEAD_EVERY_N == 0 then
+        -- Deaths the client did not witness (it had no copy then), a few at a time in turn:
+        -- its level may spawn those enemies later, and they must arrive dead.
         local dead_list = {}
         for net_id, d in pairs(self.dead) do
             if not d.client_had then
                 dead_list[#dead_list + 1] = { net_id = net_id, d = d }
             end
         end
-        table.sort(dead_list, function(a, b) return a.d.time > b.d.time end)
-        for i = 1, math.min(#dead_list, MAX_DEAD_ENTRIES) do
-            local x = dead_list[i]
+        table.sort(dead_list, function(a, b) return a.net_id < b.net_id end)
+        local n = #dead_list
+        local first = n > 0 and (self.dead_cursor % n) or 0
+        local count = math.min(n, DEAD_PER_SNAPSHOT)
+        self.dead_cursor = first + count
+        for k = 0, count - 1 do
+            local x = dead_list[(first + k) % n + 1]
             entries[#entries + 1] = {
                 net_id = x.net_id, kind_hash = x.d.kind_hash, pos = x.d.pos, spawn = x.d.spawn,
                 yaw = 0, hp = 0, max_hp = x.d.max_hp, flags = 0, ctx = x.d.ctx,
@@ -615,6 +664,7 @@ function EnemySync:host_on_damage(m, game, now)
         if self.settings.sync_deaths ~= false and game:enemy_kill(e.id) then
             e.hp = 0
             self.counters.kills_applied = self.counters.kills_applied + 1
+            self.on_kill(e.id, now or 0)
             return true
         end
     elseif self.settings.sync_hp ~= false then
@@ -710,12 +760,13 @@ function EnemySync:client_on_dead(m, now)
     end
 end
 
-function EnemySync:client_kill(game, id)
+function EnemySync:client_kill(game, id, now)
     if self.settings.sync_deaths == false or self.self_killed[id] then return false end
     if game:enemy_kill(id) then
         self.self_killed[id] = true
         self.expected_hp[id] = 0
         self.counters.kills_applied = self.counters.kills_applied + 1
+        self.on_kill(id, now or 0)
         return true
     end
     return false
@@ -814,7 +865,7 @@ function EnemySync:client_tick(now, enemies, game)
         if e.alive then
             if not r.alive then
                 self:release_mirror(game, id) -- the death plays out with its own logic
-                self:client_kill(game, id)
+                self:client_kill(game, id, now)
             else
                 if self.settings.sync_hp ~= false and r.hp < e.hp - HP_EPS then
                     if game:enemy_set_hp(id, r.hp) then
@@ -834,8 +885,9 @@ function EnemySync:client_tick(now, enemies, game)
 
     -- 4) Tell the host which enemies we have, and where the ones we run are.
     local hz = self.settings.client_enemy_hz or 20
-    if now - self.last_client_send >= 1.0 / hz then
-        self.last_client_send = now
+    local interval = 1.0 / hz
+    if now - self.last_client_send >= interval then
+        self.last_client_send = (now - self.last_client_send >= 2 * interval) and now or (self.last_client_send + interval)
         local share = self.settings.enemy_mirror ~= false
         local states, paired = {}, {}
         for net_id, id in pairs(self.local_of) do
@@ -873,6 +925,7 @@ end
 
 -- players = { local_pos={x,y,z}|nil, partner_pos={x,y,z}|nil } (the host uses them for ownership)
 function EnemySync:tick(now, enemies, game, players)
+    self.last_tick = now
     if self.role == "host" then
         self:host_tick(now, enemies, game, players)
     else

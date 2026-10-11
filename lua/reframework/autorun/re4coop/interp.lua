@@ -32,6 +32,8 @@ Interp.nlerp_quat = nlerp_quat
 
 -- opts.blend(state_a, state_b, t) -> state replaces the default blend (position, rotation,
 -- joint positions). t runs past 1 while extrapolating.
+-- opts.adaptive: the delay grows above opts.delay when packets arrive with more jitter than it
+-- covers (one send interval plus twice the measured jitter), up to opts.max_delay.
 function Interp.new(opts)
     opts = opts or {}
     return setmetatable({
@@ -39,9 +41,13 @@ function Interp.new(opts)
         max_extrapolate = opts.max_extrapolate or 0.25,
         capacity = opts.capacity or 32,
         blend = opts.blend or Interp.blend,
+        adaptive = opts.adaptive or false,
+        max_delay = opts.max_delay or 0.25,
         snapshots = {},                     -- sorted by remote time
         offset = nil,                       -- estimate of (local clock - remote clock)
         last_push_local = nil,
+        gap = nil,                          -- average remote time between snapshots
+        jitter = 0,                         -- average deviation of arrivals from the offset
     }, Interp)
 end
 
@@ -49,6 +55,16 @@ function Interp:clear()
     self.snapshots = {}
     self.offset = nil
     self.last_push_local = nil
+    self.gap = nil
+    self.jitter = 0
+    self.last_sample = nil
+end
+
+-- Seconds in the past that samples are taken from.
+function Interp:effective_delay()
+    if not self.adaptive then return self.delay end
+    local need = (self.gap or 0) + 2 * self.jitter
+    return math.min(self.max_delay, math.max(self.delay, need))
 end
 
 -- remote_time: sender's clock when the snapshot was taken; local_time: our clock on arrival.
@@ -64,9 +80,21 @@ function Interp:push(remote_time, local_time, state)
         self.offset = lerp(self.offset, sample, 0.02)
     end
     self.last_push_local = local_time
+    -- Interarrival jitter (RFC 3550): how much the transit time changes from one snapshot
+    -- to the next.
+    if self.last_sample ~= nil then
+        self.jitter = self.jitter + (math.abs(sample - self.last_sample) - self.jitter) / 16
+    end
+    self.last_sample = sample
 
     local snaps = self.snapshots
     local n = #snaps
+    if n > 0 then
+        local gap = remote_time - snaps[n].time
+        if gap > 0 and gap < 1.0 then
+            self.gap = self.gap and (self.gap + (gap - self.gap) * 0.1) or gap
+        end
+    end
     if n > 0 and remote_time <= snaps[n].time then
         if remote_time == snaps[n].time then return end
         -- Out of order: insert in place (rare on LAN).
@@ -107,14 +135,26 @@ function Interp.blend(sa, sb, t)
     return out
 end
 
+-- The remote time that "now" shows (nil before the first snapshot).
+function Interp:target(local_now)
+    if self.offset == nil then return nil end
+    return local_now - self.offset - self:effective_delay()
+end
+
 -- Returns the interpolated state for "now", or nil before the first snapshot.
 function Interp:sample(local_now)
+    if #self.snapshots == 0 then return nil end
+    return self:sample_remote(self:target(local_now))
+end
+
+-- The state at remote time `target` (several buffers fed by the same sender can be sampled
+-- at the same instant this way).
+function Interp:sample_remote(target)
     local snaps = self.snapshots
     local n = #snaps
-    if n == 0 then return nil end
+    if n == 0 or target == nil then return nil end
     if n == 1 then return snaps[1].state end
 
-    local target = local_now - self.offset - self.delay
     if target <= snaps[1].time then
         return snaps[1].state
     end

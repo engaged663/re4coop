@@ -29,6 +29,8 @@ end
 -- Runs sdk.hook pre/post functions around a method call, like REFramework does: args[1] is
 -- the VM context, then `this` (instance methods only), then the parameters.
 local function invoke(m, obj, ...)
+    M.calls = (M.calls or 0) + 1 -- every engine call the mod makes (call budget tests)
+    if M.call_names then M.call_names[m.key] = (M.call_names[m.key] or 0) + 1 end
     if m.hooks then
         local args = { 0 }
         if not m.static then args[2] = raw_arg(obj) end
@@ -197,13 +199,19 @@ function Managed:call(name, ...)
     if m == nil then error("mock: no method " .. name .. " on " .. self.__type) end
     return invoke(m, self, ...)
 end
-function Managed:get_field(name) return self.__fields[name] end
+function Managed:get_field(name)
+    M.calls = (M.calls or 0) + 1
+    if M.call_names then M.call_names["field " .. name] = (M.call_names["field " .. name] or 0) + 1 end
+    return self.__fields[name]
+end
 function Managed:set_field(name, v)
     if classes[self.__type]:get_field(name) == nil then error("mock: no field " .. name) end
     self.__fields[name] = v
 end
 -- Components keep their owner GameObject at 0x10; the game clears it on destroy.
 function Managed:read_qword(offset)
+    M.calls = (M.calls or 0) + 1
+    if M.call_names then M.call_names.read_qword = (M.call_names.read_qword or 0) + 1 end
     if offset == 0x10 and self.owner and self.owner.__type == "via.GameObject" then
         return self.owner.destroyed and 0 or self.owner.__addr
     end
@@ -562,7 +570,8 @@ function M.install(opts)
 
     -- Hits: HitController.callbackDamageHit(DamageInfo) applies damage to its character.
     local info_fields = { "Damage", "Wince", "Break", "Stopping", "DamageDir", "AttackOwnerObject", "WeaponID",
-        "IsCritical", "IsKill" }
+        "IsCritical", "IsKill", "WeaponGameObject", "AttackGameObject", "DamageGameObject", "ChildHitController",
+        "AttackCollidable", "DamageCollidable" }
     local info_methods = {
         copy = { 1, function(self, src)
             for _, f in ipairs(info_fields) do self.data[f] = src.data[f] end
@@ -595,14 +604,43 @@ function M.install(opts)
     })
     class("chainsaw.DropItemManager.GenerateItemOption", "System.Object", {},
         { Falldown = "System.Boolean", Effect = "System.Boolean", NeedColCheck = "System.Boolean" })
+    -- Random drops: requestGenerateRandomDrop queues a roll (RandomDropStack), updateRandomDropStack
+    -- runs generateRandomDrop for each. cc is the player who gets the loot, order the enemy/box.
+    class("chainsaw.RandomDrop.Option", "System.Object", {})
+    local GEN = { "chainsaw.RandomDrop.DropType", "chainsaw.CharacterContext", "via.vec3", "chainsaw.StageID",
+        "chainsaw.Context", "chainsaw.DropItemManager.GenerateItemOption" }
     class("chainsaw.DropItemManager", "System.Object", {
-        -- The original rolls `next_item` and drops it next to the character (or at `drop_pos`).
-        generateRandomDrop = { 6, function(self, droptype, cc)
-            local base = cc and cc.pos or self.drop_pos or vec(0, 0, 0)
+        ["requestGenerateRandomDrop(chainsaw.RandomDrop.Option, chainsaw.CharacterContext, via.vec3, chainsaw.StageID, chainsaw.Context, chainsaw.DropItemManager.GenerateItemOption)"] = {
+            6, function(self, rnd, cc, pos, stage, order, opt)
+                self.stack = self.stack or {}
+                self.stack[#self.stack + 1] = { droptype = rnd and rnd.droptype or 65536, cc = cc, pos = pos, stage = stage,
+                    order = order, opt = opt }
+            end, { "chainsaw.RandomDrop.Option", "chainsaw.CharacterContext", "via.vec3", "chainsaw.StageID",
+                "chainsaw.Context", "chainsaw.DropItemManager.GenerateItemOption" } },
+        ["requestGenerateRandomDrop(chainsaw.RandomDrop.Option, chainsaw.CharacterContext, via.GameObject, chainsaw.DropItemManager.GenerateItemOption)"] = {
+            4, function(self, rnd, cc, go, opt)
+                self.stack = self.stack or {}
+                local p = go and go.transform and M.world_pos(go.transform) or vec(0, 0, 0)
+                self.stack[#self.stack + 1] = { droptype = rnd and rnd.droptype or 65536, cc = cc, pos = p, stage = 40100,
+                    opt = opt }
+            end, { "chainsaw.RandomDrop.Option", "chainsaw.CharacterContext", "via.GameObject",
+                "chainsaw.DropItemManager.GenerateItemOption" } },
+        updateRandomDropStack = { 0, function(self)
+            local stack = self.stack or {}
+            self.stack = {}
+            for _, e in ipairs(stack) do
+                self:call("generateRandomDrop", e.droptype, e.cc, e.pos, e.stage, e.order, e.opt)
+            end
+        end },
+        -- Rolls `next_item` and drops it next to the dropper (`order`) or at `pos`.
+        generateRandomDrop = { 6, function(self, droptype, cc, pos, stage, order, opt)
+            world.generated = world.generated or {}
+            world.generated[#world.generated + 1] = { droptype = droptype, cc = cc, order = order, pos = pos,
+                stage = stage, opt = opt }
+            local base = (order and order.pos) or pos or self.drop_pos or vec(0, 0, 0)
             self.last_drop = M.make_drop_item(self.next_item or 112800000, { x = base.x + 0.5, y = base.y, z = base.z },
                 nil, 1)
-        end, { "chainsaw.RandomDrop.DropType", "chainsaw.CharacterContext", "via.vec3", "chainsaw.StageID",
-            "chainsaw.Context", "chainsaw.DropItemManager.GenerateItemOption" } },
+        end, GEN },
         ["requestGenerateLostItem(chainsaw.Item, via.vec3, chainsaw.StageID, chainsaw.DropItemManager.GenerateItemOption)"] = {
             4, function(_, item, pos, stage, opt)
                 world.spawned[#world.spawned + 1] = { item_id = item.item_id, count = item.count, pos = pos, stage = stage,
@@ -838,6 +876,7 @@ function M.install(opts)
     M.hooks = {}
     if opts.no_hook then _G.sdk.hook = nil end
     _G.Vector3f = { new = function(x, y, z) return vec(x, y, z) end }
+    _G.ValueType = { new = function(td) return new(td.name) end }
     _G.Quaternion = { new = function(w, x, y, z) return quat(x, y, z, w) end }
 
     local callbacks = { entry = {}, frame = {}, ui = {}, config_save = {}, reset = {} }
@@ -1214,12 +1253,18 @@ function M.hit(enemy, damage, wince, attacker)
     return info
 end
 
--- The game rolls a random drop for `enemy` (or a wooden box when enemy is nil). Returns the
--- dropped item, or nil if a hook skipped the roll.
+-- The game rolls a random drop for `enemy` (or a wooden box when enemy is nil) the way RE4
+-- does: requestGenerateRandomDrop(option, player, pos, stage, dropper, option), processed by
+-- the next updateRandomDropStack. Returns the dropped item.
 function M.enemy_drop(enemy, item_id, droptype)
     local mgr = M.world.singletons["chainsaw.DropItemManager"]
     mgr.next_item, mgr.last_drop = item_id, nil
-    mgr:call("generateRandomDrop", droptype or (enemy and 65536 or 1), enemy, vec(0, 0, 0), 40100, nil, nil)
+    local order = enemy or new("chainsaw.GmContextBox")
+    local pos = enemy and enemy.pos or vec(0, 0, 0)
+    mgr:call("requestGenerateRandomDrop(chainsaw.RandomDrop.Option, chainsaw.CharacterContext, via.vec3, chainsaw.StageID, chainsaw.Context, chainsaw.DropItemManager.GenerateItemOption)",
+        new("chainsaw.RandomDrop.Option", { droptype = droptype or (enemy and 65536 or 1) }), M.world.player,
+        vec(pos.x, pos.y, pos.z), 40100, order, new("chainsaw.DropItemManager.GenerateItemOption"))
+    mgr:call("updateRandomDropStack")
     return mgr.last_drop
 end
 
@@ -1310,6 +1355,12 @@ function M.install_world(world, opts)
         _Kind = "System.Byte", _Group = "System.Int32", _Index = "System.Int32" })
     class("via.vec3", "System.Object", {})
     class("via.Quaternion", "System.Object", {})
+    -- System.Nullable`1<T>: a struct { _HasValue, _Value } built with REFramework's ValueType.new.
+    for _, inner in ipairs({ "via.vec3", "via.Quaternion", "chainsaw.EnvSceneStatus" }) do
+        local name = "System.Nullable`1<" .. inner .. ">"
+        class(name, "System.Object", {}, { _HasValue = "System.Boolean", _Value = inner })
+        M.value_types[name] = true
+    end
 
     -- Scenario flags: GUID -> (group, bit). requestSetFlag applies at once and runs hooks.
     local function flag_bit(text)
@@ -1508,8 +1559,11 @@ function M.install_world(world, opts)
         local mgr = name
         class(mgr, "System.Object", {
             [("requestToChangeStatus(%s, %s, %s)"):format(id_type, STATUS, PRIO)] = { 3, function(_, id, status, prio)
+                -- Only a real Nullable struct carries a value; anything else is garbage to the game.
+                local ok = type(status) == "table" and status.__type == STATUS and status.__fields._HasValue == true
+                if not ok then world.bad_nullable = (world.bad_nullable or 0) + 1 return end
                 world.scene_requests[#world.scene_requests + 1] = { mgr = mgr, id = id,
-                    status = type(status) == "table" and status.mValue or status, prio = prio }
+                    status = status.__fields._Value, prio = prio }
             end, { id_type, STATUS, PRIO } },
         })
         world.singletons[mgr] = new(mgr)
@@ -1525,7 +1579,18 @@ function M.install_world(world, opts)
         getPartnerContextRef = { 0, function() return world.partner end },
         get_EnemyContextList = { 0, function() return world.enemy_list end },
         isActive = { 1, function(_, stage) return world.active_stages ~= nil and world.active_stages[stage] == true end },
-        [WARP] = { 4, function(_, id, pos, rot, sid)
+        [WARP] = { 4, function(_, id, npos, nrot, sid)
+            local function value(n, t)
+                if type(n) ~= "table" or n.__type ~= "System.Nullable`1<" .. t .. ">" or n.__fields._HasValue ~= true then
+                    return nil
+                end
+                return n.__fields._Value
+            end
+            local pos, rot = value(npos, "via.vec3"), value(nrot, "via.Quaternion")
+            if pos == nil or rot == nil then
+                world.bad_nullable = (world.bad_nullable or 0) + 1
+                return
+            end
             world.warps[#world.warps + 1] = { pos = { x = pos.x, y = pos.y, z = pos.z }, rot = rot, stage = sid.stage, id = id }
             if world.refuse_warp or world.player == nil then return end
             local p = world.player.pos

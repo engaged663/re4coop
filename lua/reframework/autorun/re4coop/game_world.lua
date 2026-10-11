@@ -22,6 +22,7 @@
 
 local R = require("re4coop.reflect")
 local P = require("re4coop.protocol")
+local Perf = require("re4coop.perf")
 
 local World = {}
 World.__index = World
@@ -126,6 +127,30 @@ function World:set_field_any(obj, type_name, field, value)
     if R.set(obj, field, value) and R.number(R.get(obj, field)) == value then return true end
     local td = self.r:type(type_name)
     return td ~= nil and (pcall(sdk.set_native_field, obj, td, field, value))
+end
+
+-- Live config (experimental switches live in the core adapter's settings).
+function World:setting(key)
+    local s = self.game and self.game.settings
+    return s and s[key]
+end
+
+function World:perf()
+    return (self.game and self.game.perf) or Perf.NULL
+end
+
+function World:crumb(step, detail, urgent)
+    self:perf():crumb(step, detail, urgent)
+end
+
+-- The game reloaded: scanned components and half-read tables belong to the old scene.
+function World:on_reload()
+    self.object_index = {}
+    self.comp_guid = {}
+    self.comp_guid_n = 0
+    self.gim_scan = nil
+    self.object_scan = nil
+    self.word_queue = {}
 end
 
 function World:cap(name, ok, detail)
@@ -322,6 +347,7 @@ function World:flag_set(guid, value)
     if m == nil or mgr == nil then return false end
     local g = self.r:guid_value(guid)
     if g == nil then return false end
+    self:crumb("world.flag_set", guid)
     self.applying = true
     local ok = pcall(m.method.call, m.method, mgr, g, value and true or false)
     self.applying = false
@@ -400,7 +426,13 @@ end
 
 -- Rewrites groups in a fresh save object and loads it back. changes(name, words_array, current)
 -- returns true if it modified the array.
-function World:flag_rewrite(edit)
+-- Reloading the whole flag table while playing is experimental (exp_table_reload); the
+-- complete copy a joining client takes over (full = true) is always allowed.
+function World:flag_rewrite(edit, full)
+    if not full and self:setting("exp_table_reload") ~= true then
+        self.table_reloads_skipped = (self.table_reloads_skipped or 0) + 1
+        return false
+    end
     local sd = self:flag_save_data()
     if sd == nil then return false end
     local changed = false
@@ -410,6 +442,7 @@ function World:flag_rewrite(edit)
         if name ~= nil and arr ~= nil and edit(name, arr, R.numbers(arr)) then changed = true end
     end)
     if not changed then return true end
+    self:crumb("world.flag_table_reload", full and "full" or "delta", true)
     self.applying = true
     local ok = pcall(self.flag_load_m.method.call, self.flag_load_m.method, self:flag_mgr(), sd)
     self.applying = false
@@ -429,7 +462,7 @@ function World:flag_words_apply_full(groups)
             end
         end
         return changed
-    end)
+    end, true)
 end
 
 -- Queued; applied together by World:update().
@@ -510,25 +543,41 @@ function World:read_gimmick(item)
     return out
 end
 
-local GIMMICKS_PER_CALL = 60
+local GIMMICKS_PER_CALL = 40   -- items fully read per call
+local GIMMICK_IDS_PER_CALL = 150 -- items whose ID is checked per call (targeted reads)
 
--- The table can hold hundreds of gimmicks; reading it all in one frame would hitch, so
--- periodic scans read GIMMICKS_PER_CALL items per call and return the table when done
--- (nil until then). force = read everything now (one-off full copies).
-function World:gimmicks_snapshot(force)
+-- The table can hold hundreds of gimmicks; reading it all in one frame would hitch, so scans
+-- run over several calls and return the table when done (nil until then).
+--   force = read everything now (one-off full copies);
+--   keys  = { [ctx_key] = true }: read only those gimmicks (the ones that announced a change).
+-- The table itself comes from GimmickManager's save method, which builds a fresh copy: that
+-- is done once per scan, not per call.
+function World:gimmicks_snapshot(force, keys)
     local scan = self.gim_scan
+    if scan ~= nil and scan.keys ~= keys then scan = nil end -- a different kind of scan was running
     if scan == nil then
         local sd = self:gim_save_data()
         if sd == nil then return nil end
         local items = {}
         R.each(R.get(sd, "Datas"), function(item) items[#items + 1] = item end)
-        scan = { sd = sd, items = items, next = 1, out = {} }
+        scan = { sd = sd, items = items, next = 1, out = {}, keys = keys }
         self.gim_scan = scan
+        self:perf():crumb("world.gimmick_scan", keys and "targeted" or "full")
     end
-    local last = force and #scan.items or math.min(#scan.items, scan.next + GIMMICKS_PER_CALL - 1)
+    local per_call = keys and GIMMICK_IDS_PER_CALL or GIMMICKS_PER_CALL
+    local last = force and #scan.items or math.min(#scan.items, scan.next + per_call - 1)
     for i = scan.next, last do
-        local g = self:read_gimmick(scan.items[i])
-        if g ~= nil then scan.out[P.ctx_key(g.ctx)] = g end
+        local item = scan.items[i]
+        if keys ~= nil then
+            local key = P.ctx_key(self:read_ctx(R.get(item, "ID")))
+            if key ~= nil and keys[key] then
+                local g = self:read_gimmick(item)
+                if g ~= nil then scan.out[key] = g end
+            end
+        else
+            local g = self:read_gimmick(item)
+            if g ~= nil then scan.out[P.ctx_key(g.ctx)] = g end
+        end
     end
     scan.next = last + 1
     if scan.next <= #scan.items then return nil end
@@ -590,6 +639,9 @@ end
 
 function World:gimmicks_apply(items)
     self.gim_scan = nil -- a scan in progress would read the old states
+    -- Not while the game is loading or playing a cutscene: the table is being rebuilt then.
+    local loc = self:location()
+    if loc == nil or loc.loading or loc.cutscene then return nil end -- not now: keep the queue
     local sd, mgr = self:gim_save_data()
     if sd == nil then return false end
     local list = R.get(sd, "Datas")
@@ -619,6 +671,7 @@ function World:gimmicks_apply(items)
         local data = item and R.get(item, "SaveData")
         if data ~= nil then self:write_gimmick(data, it) end
     end
+    self:crumb("world.gimmick_table_reload", ("%d items"):format(#items), true)
     self.applying = true
     local ok = pcall(self.gim_load_m.method.call, self.gim_load_m.method, mgr, sd)
     self.applying = false
@@ -634,6 +687,13 @@ function World:gimmicks_dirty()
         return true
     end
     return false
+end
+
+-- The gimmicks that announced a change since the last call ({ [ctx_key] = true }), or nil when
+-- the hook cannot tell which ones.
+function World:gimmick_dirty_keys()
+    if self.game == nil or self.game.take_gimmick_dirty_keys == nil then return nil end
+    return self.game:take_gimmick_dirty_keys()
 end
 
 -------------------------------------------------------------------------------
@@ -672,30 +732,48 @@ local function is_terminal(name)
     return name ~= nil and starts_any(name, TERMINAL)
 end
 
+-- One scene-wide search per object type is not free, and there are ~30 types: each call
+-- refreshes OBJECT_TYPES_PER_SCAN types and keeps the others from their last search, so a
+-- full round takes a few scans. Returns the merged snapshot.
+local OBJECT_TYPES_PER_SCAN = 4
+
 function World:objects_scan()
     local scene = self:scene()
     if scene == nil or #self.object_types == 0 then return nil end
     self.comp_guid_n = (self.comp_guid_n or 0) + 1
-    if self.comp_guid_n > 600 then
+    if self.comp_guid_n > 2000 then
         -- Components come and go with areas; addresses can be reused. Start afresh now and then.
         self.comp_guid = {}
         self.comp_guid_n = 0
     end
-    local objects, index = {}, {}
-    for _, tname in ipairs(self.object_types) do
+    local scan = self.object_scan
+    if scan == nil then
+        scan = { next = 1, by_type = {} } -- type name -> { objects = {guid -> obj}, index = {guid -> entry} }
+        self.object_scan = scan
+    end
+    local n = #self.object_types
+    local count = scan.complete and math.min(OBJECT_TYPES_PER_SCAN, n) or n -- the first round reads all
+    for _ = 1, count do
+        local tname = self.object_types[scan.next]
+        scan.next = scan.next % n + 1
+        if scan.next == 1 then scan.complete = true end
+        local objects, index = {}, {}
         local t = self.r:typeof(tname)
         local comps = t and (R.call(scene, "findComponents(System.Type)", t) or R.call(scene, "findComponents", t))
         R.each(comps, function(comp)
             local okaddr, addr = pcall(function() return comp:get_address() end)
-            local guid = okaddr and self.comp_guid[addr] or nil
-            local go
-            if guid == nil then
-                go = R.call(comp, "get_GameObject")
+            local cached = okaddr and self.comp_guid[addr] or nil
+            local go = R.call(comp, "get_GameObject")
+            local okg, go_addr = pcall(function() return go:get_address() end)
+            go_addr = okg and go_addr or nil
+            local guid
+            if cached ~= nil and go_addr ~= nil and cached.go_addr == go_addr then
+                guid = cached.guid -- the same object as before (the address was not reused)
+            else
                 guid = R.game_object_guid(go)
-                if okaddr and guid then self.comp_guid[addr] = guid end
+                if okaddr and guid then self.comp_guid[addr] = { guid = guid, go_addr = go_addr } end
             end
             if guid ~= nil and objects[guid] == nil then
-                go = go or R.call(comp, "get_GameObject")
                 local info = self:routine_info(R.type_name(comp) or tname)
                 local routine = info.field and R.number(R.get(comp, "_Routine")) or nil
                 local rname = routine and info.enum and info.enum.values[routine] or nil
@@ -703,23 +781,39 @@ function World:objects_scan()
                 index[guid] = { comp = comp, go = go, info = info }
             end
         end)
+        scan.by_type[tname] = { objects = objects, index = index }
+    end
+    local objects, index = {}, {}
+    for _, t in pairs(scan.by_type) do
+        for guid, o in pairs(t.objects) do objects[guid] = o end
+        for guid, e in pairs(t.index) do index[guid] = e end
     end
     self.object_index = index
     local loc = self:location()
     return { stage = loc and loc.stage or nil, objects = objects }
 end
 
+-- A scanned component is used again only while its GameObject still exists.
+function World:object_alive(o)
+    if o == nil or o.go == nil then return false end
+    if self.game ~= nil and self.game.go_alive ~= nil then return self.game:go_alive(o.go) end
+    return true
+end
+
 function World:object_apply(guid, event, value)
     local o = self.object_index[guid]
-    if o == nil then return "missing" end
+    if o == nil or not self:object_alive(o) then return "missing" end
     local E = P.OBJECT_EVENT
+    self:crumb("world.object_apply", o.info and R.type_name(o.comp) or guid, true)
     self.applying = true
     local result = "failed"
+    -- Forcing an object's state machine into another state is experimental (exp_force_routine).
+    local force_routine = self:setting("exp_force_routine") == true
     if event == E.ROUTINE then
-        if o.info.field and R.set(o.comp, "_Routine", value) then result = "done" end
+        if force_routine and o.info.field and R.set(o.comp, "_Routine", value) then result = "done" end
     elseif event == E.DESTROYED then
         -- 1) The same terminal state the partner's copy reached (plays its own break/death).
-        if value ~= nil and value >= 0 and o.info.field and R.set(o.comp, "_Routine", value) then
+        if force_routine and value ~= nil and value >= 0 and o.info.field and R.set(o.comp, "_Routine", value) then
             result = "done"
         end
         -- 2) A break / kill method of the object.
@@ -768,6 +862,7 @@ end
 function World:cutscene_play(id, method)
     local mgr = self.r:singleton(TEM)
     if mgr == nil or #self.cs_play_ms == 0 then return false end
+    self:crumb("world.cutscene_play", tostring(id), true)
     local candidates = {}
     for _, i in ipairs(self.cs_play_ms) do
         if i.name == method then table.insert(candidates, 1, i) else candidates[#candidates + 1] = i end
@@ -818,14 +913,46 @@ local function split_stage(stage)
     return pref, pref * 1000
 end
 
+-- A System.Nullable`1<inner> value with a value, as a real struct (REFramework ValueType):
+-- passing a boxed object where the game expects a Nullable hands it garbage. set(vt, field)
+-- writes the value into the struct's value field. nil if the type or its fields are unknown.
+function World:make_nullable(inner, set)
+    if ValueType == nil or ValueType.new == nil then return nil end
+    local tname = "System.Nullable`1<" .. inner .. ">"
+    local td = self.r:type(tname)
+    if td == nil then return nil end
+    local has_f, val_f
+    for _, f in ipairs(self.r:fields(tname, 0)) do
+        if not f.static then
+            if f.type == "System.Boolean" then has_f = f.name elseif f.type == inner then val_f = f.name end
+        end
+    end
+    if has_f == nil or val_f == nil then return nil end
+    local ok, vt = pcall(ValueType.new, td)
+    if not ok or vt == nil then return nil end
+    if not pcall(vt.set_field, vt, has_f, true) or not pcall(set, vt, val_f) then return nil end
+    return vt
+end
+
+-- Cross-stage warps (preloading the partner's stage and CharacterManager.requestWarp) are
+-- experimental (stage_travel): without them, travelling moves the player directly.
+function World:stage_warp_enabled()
+    return self:setting("stage_travel") == true and self.warp_m ~= nil
+end
+
 -- Keeps the stage's scenes requested so the warp lands in a loaded area.
 function World:preload_stage(stage)
-    if stage == nil or stage < 0 then return false end
+    if stage == nil or stage < 0 or not self:stage_warp_enabled() then return false end
     local pref, loc = split_stage(stage)
     local pm, lm, em = self.r:singleton(PREF_SCENE), self.r:singleton(LOC_SCENE), self.r:singleton(ENV_SCENE)
     if pm == nil or lm == nil or em == nil then return false end
+    local status = self:make_nullable("chainsaw.EnvSceneStatus", function(vt, f) vt:set_field(f, 3) end)
+    if status == nil then
+        self:cap("warp", false, "cannot build Nullable<EnvSceneStatus>: stage preload off")
+        return false
+    end
+    self:crumb("world.preload_stage", tostring(stage), true)
     local ok = pcall(function()
-        local status = sdk.create_int32(3)
         pm:call("requestToChangeStatus(chainsaw.PrefectureID, System.Nullable`1<chainsaw.EnvSceneStatus>, chainsaw.EnvSceneStatusRequestPriority)", pref, status, 1)
         lm:call("requestToChangeStatus(chainsaw.LocID, System.Nullable`1<chainsaw.EnvSceneStatus>, chainsaw.EnvSceneStatusRequestPriority)", loc, status, 1)
         em:call("requestToChangeStatus(chainsaw.StageID, System.Nullable`1<chainsaw.EnvSceneStatus>, chainsaw.EnvSceneStatusRequestPriority)", stage, status, 1)
@@ -834,34 +961,28 @@ function World:preload_stage(stage)
 end
 
 function World:warp(stage, pos, yaw)
-    if stage ~= nil and stage >= 0 and self.warp_m ~= nil then
+    if stage ~= nil and stage >= 0 and self:stage_warp_enabled() then
         local cm = self.r:singleton(CHARACTER_MANAGER)
         local ctx = self.game:player_context()
-        if cm ~= nil and ctx ~= nil then
+        local npos = self:make_nullable("via.vec3", function(vt, f) vt:set_field(f, Vector3f.new(pos.x, pos.y, pos.z)) end)
+        local h = (yaw or 0) * 0.5
+        local nrot = self:make_nullable("via.Quaternion", function(vt, f)
+            vt:set_field(f, Quaternion.new(math.cos(h), 0.0, math.sin(h), 0.0))
+        end)
+        if cm ~= nil and ctx ~= nil and npos ~= nil and nrot ~= nil then
             local pref, loc = split_stage(stage)
+            self:crumb("world.warp", tostring(stage), true)
             local ok = pcall(function()
-                local v = sdk.create_instance("via.vec3")
-                local vt = sdk.find_type_definition("via.vec3")
-                local q = sdk.create_instance("via.Quaternion")
-                local qt = sdk.find_type_definition("via.Quaternion")
                 local sid = sdk.create_instance("chainsaw.StageIdentifier")
-                sdk.set_native_field(v, vt, "x", pos.x)
-                sdk.set_native_field(v, vt, "y", pos.y)
-                sdk.set_native_field(v, vt, "z", pos.z)
-                local h = (yaw or 0) * 0.5
-                sdk.set_native_field(q, qt, "x", 0.0)
-                sdk.set_native_field(q, qt, "y", math.sin(h))
-                sdk.set_native_field(q, qt, "z", 0.0)
-                sdk.set_native_field(q, qt, "w", math.cos(h))
                 sid:call("setup(chainsaw.LocID, chainsaw.StageID, chainsaw.AreaID)", loc, stage, 0)
                 cm:call("requestWarp(chainsaw.ContextID, System.Nullable`1<via.vec3>, System.Nullable`1<via.Quaternion>, chainsaw.StageIdentifier)",
-                    ctx:get_field("_ID"), v, q, sid)
+                    ctx:get_field("_ID"), npos, nrot, sid)
             end)
             if ok then return true end
         end
     end
-    -- Same area or no stage information: move the player directly (pos is already the
-    -- landing spot next to the partner).
+    -- Same area, no stage information or no stage warp: move the player directly (pos is
+    -- already the landing spot next to the partner).
     local ctx = self.game:player_context()
     local body = ctx and R.call(ctx, "get_BodyGameObject")
     if body == nil then return false end
@@ -881,9 +1002,11 @@ end
 -- Game over -> the player picks Continue -> the checkpoint load runs through
 -- CampaignManager.loadGameSaveData, which the armed chapter switch redirects.
 function World:trigger_reload()
+    if self:setting("travel_reload") ~= true then return false end
     local gom = self.r:singleton(GAME_OVER)
     local mediator = gom and R.call(gom, "get_Mediator")
     if mediator == nil then return false end
+    self:crumb("world.trigger_reload", nil, true)
     local ok = pcall(function()
         local req = sdk.create_instance("chainsaw.GameOverRequest")
         mediator:call("requestGameOver", req)

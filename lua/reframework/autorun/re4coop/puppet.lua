@@ -21,8 +21,18 @@ Puppet.__index = Puppet
 
 local LOAD_TIMEOUT = 15.0   -- seconds to wait for a prefab before falling back
 local RETRY_AFTER = 3.0     -- seconds before rebuilding a model the game unloaded
-local ROT_EPS = 1e-5        -- joint writes that would change less than this are skipped
-local FLASH_LIFETIME = 0.4
+-- Joint writes that would change a rotation by less than this (sum of the quaternion
+-- components' differences, ~0.01 degrees) are skipped: idle joints cost nothing.
+local ROT_EPS = 2e-4
+-- A muzzle flash prefab is destroyed only after its effect has surely finished: destroying
+-- an effect's GameObject while the effect system still updates it is not safe.
+local FLASH_LIFETIME = 3.0
+local MAX_FLASHES = 6
+-- Writing ~350 joints is the biggest cost of the partner's model, and detail is lost with
+-- distance anyway: a partner further than NEAR_DISTANCE is posed every 2nd frame, further
+-- than FAR_DISTANCE every 4th (their pose still arrives and is interpolated as before).
+local NEAR_DISTANCE = 8.0
+local FAR_DISTANCE = 40.0
 local FAILED_RETRY = 10.0   -- seconds before trying again after a model could not be built
 local EFFECT_MEMORY = 2.0   -- a weapon whose own effects replayed this recently needs no fallback flash
 
@@ -75,10 +85,12 @@ end
 -------------------------------------------------------------------------------
 
 -- st: the receiver's render state { avatar, gear, pose } (or nil when there is no partner)
--- opts: { hidden = bool, meshes_only = bool (skip the body prefab) }
+-- opts: { hidden = bool, meshes_only = bool (skip the body prefab), viewer = {x,y,z} (the
+--         local player: a far partner is posed less often) }
 function Puppet:update(now, st, opts)
     opts = opts or {}
     self.now = now
+    self.frame = (self.frame or 0) + 1
     self:expire_flashes(now)
     if st == nil or st.avatar == nil then
         if self.state ~= "idle" then self:destroy() end
@@ -110,7 +122,15 @@ function Puppet:update(now, st, opts)
     self:update_weapons(now, st)
     if visible then
         self.last_pose = st.pose
-        if not self.late_writes then self:apply_pose(st.pose, false) end
+        local every = 1
+        local v, rp = opts.viewer, st.pose.root_pos
+        if v ~= nil and rp ~= nil then
+            local dx, dy, dz = rp.x - v.x, rp.y - v.y, rp.z - v.z
+            local d2 = dx * dx + dy * dy + dz * dz
+            every = d2 > FAR_DISTANCE * FAR_DISTANCE and 4 or (d2 > NEAR_DISTANCE * NEAR_DISTANCE and 2 or 1)
+        end
+        self.pose_due = self.frame % every == 0
+        if not self.late_writes and self.pose_due then self:apply_pose(st.pose, false) end
     end
 end
 
@@ -118,7 +138,9 @@ end
 -- pose (a prefab whose animation could not be switched off), write it again here, and from
 -- then on every frame.
 function Puppet:late_update()
-    if self.state ~= "ready" or not self.visible or self.last_pose == nil then return end
+    if self.state ~= "ready" or not self.visible or self.last_pose == nil or not self.pose_due then return end
+    -- Between the game-thread update and now the game may have unloaded the area.
+    if not self.game:alive(self.root_tf) then return end
     if not self.late_writes then
         local e = self.probe
         if e ~= nil and e.x ~= nil then
@@ -669,6 +691,7 @@ function Puppet:muzzle_flash(slot)
     local g = self.game
     self:preload_flash()
     if not self.flash_prefab or not g:prefab_ready(self.flash_prefab) then return end
+    if #self.flashes >= MAX_FLASHES then return end
     local pos = (w.muzzle and g:joint_world_position(w.muzzle)) or (g:world_transform(w.tf))
     if pos == nil then return end
     local go = g:instantiate(self.flash_prefab, pos)

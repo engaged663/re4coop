@@ -61,11 +61,13 @@ local function make_world(name)
         self.gimmicks[P.ctx_key(ctx)] = { ctx = ctx, attr = attr, triggers = { { id = i, done = done or 0 } },
             detected = false, acc = {} }
     end
-    function w:gimmicks_snapshot()
+    function w:gimmicks_snapshot(_, keys)
         local out = {}
+        self.snapshots = (self.snapshots or 0) + 1
         for k, g in pairs(self.gimmicks) do
-            out[k] = { ctx = g.ctx, attr = g.attr, triggers = { table.unpack(g.triggers) }, detected = g.detected,
-                acc = { table.unpack(g.acc) } }
+            if keys == nil or keys[k] then out[k] = {
+                ctx = g.ctx, attr = g.attr, triggers = { table.unpack(g.triggers) }, detected = g.detected,
+                acc = { table.unpack(g.acc) } } end
         end
         return out
     end
@@ -300,13 +302,39 @@ T.run("gimmick_change_announced_by_the_game_is_sent_at_once", function()
         dirty = false
         return d
     end
-    pair.host_world:set_gimmick(5, "\5\0", 1) -- the host opens a door...
-    dirty = true                                  -- ...and the game calls GimmickManager.pushDirtyList
-    pair:step(16, pair.tick)                      -- 0.8 s: long before the next periodic scan
     local k5 = P.ctx_key({ category = 1, kind = 0, group = 5, index = 0 })
+    local announced = {}
+    function pair.host_world:gimmick_dirty_keys()
+        local k = announced
+        announced = {}
+        return k
+    end
+    pair.host_world:set_gimmick(5, "\5\0", 1) -- the host opens a door...
+    dirty, announced = true, { [k5] = true }      -- ...and the game calls GimmickManager.pushDirtyList
+    pair:step(16, pair.tick)                      -- 0.8 s: long before the next periodic scan
     T.check(pair.client_world.gimmicks[k5] ~= nil and pair.client_world.gimmicks[k5].attr == "\5\0",
         "client's door opened within a second")
-    T.eq(pair.host.counters.scans, scans + 1, "one extra scan, triggered by the announcement")
+    T.eq(pair.host.counters.scans, scans, "no full scan")
+    T.eq(pair.host.counters.targeted, 1, "only the announced gimmick was read")
+end)
+
+T.run("announced_change_without_keys_triggers_a_full_scan", function()
+    local pair = gimmick_pair()
+    pair.host.settings.gimmick_interval = 10
+    pair:step(5, pair.tick)
+    local scans = pair.host.counters.scans
+    local dirty = false
+    function pair.host_world:gimmicks_dirty()
+        local d = dirty
+        dirty = false
+        return d
+    end
+    pair.host_world:set_gimmick(6, "\6\0", 1)
+    dirty = true
+    pair:step(30, pair.tick)
+    local k6 = P.ctx_key({ category = 1, kind = 0, group = 6, index = 0 })
+    T.eq(pair.client_world.gimmicks[k6] and pair.client_world.gimmicks[k6].attr, "\6\0", "sent within 1.5 s")
+    T.eq(pair.host.counters.scans, scans + 1, "one extra full scan")
 end)
 
 T.run("new_gimmick_records_never_overwrite_the_partners", function()

@@ -21,7 +21,9 @@ world.enemies = { ganado }
 local crow = mock.make_object("chainsaw.GmCrow", CROW, { x = 3, y = 0, z = 0 }, 0)
 local crate = mock.make_object("chainsaw.GmWoodBox", CRATE, { x = 4, y = 0, z = 0 }, 0)
 mock.set_gimmick({ category = 1, kind = 0, group = 40200, index = 5 }, { 0, 0 }, { { id = 1, done = 0 } })
-mock.files["re4coop.json"] = { player_name = "HostLeon", port = PORT }
+-- Experimental features this test covers are switched on (config_version 7: a current config).
+mock.files["re4coop.json"] = { player_name = "HostLeon", port = PORT, config_version = 7, sync_cutscenes = true,
+    exp_force_routine = true }
 
 local function run_entry_script()
     for name in pairs(package.loaded) do
@@ -140,6 +142,7 @@ client_world.objects[CRATE] = { kind = "chainsaw.GmWoodBox", pos = { x = 4, y = 
 local client_settings = Config.load(nil)
 client_settings.player_name = "ClientLeon"
 client_settings.port = PORT
+client_settings.sync_cutscenes = true
 local client_net_obj = re4coop_net.new_session()
 local client = Session.new({ net = wrap(client_net_obj), game = client_game, world = client_world,
     clock = re4coop_net.time, settings = client_settings })
@@ -159,7 +162,8 @@ end
 T.run("hosting_stops_menus_pausing", function()
     T.eq(mock.pause_freezes(1), true, "the inventory pauses before")
     mock.press["Host game"] = true
-    mock.run_frame()
+    mock.run_frame() -- the UI queues it...
+    mock.run_frame() -- ...the game thread hosts and switches the menu pauses off
     T.eq(re4coop_net.state(), "listening", "hosting")
     T.eq(mock.pause_freezes(1), false, "inventory no longer pauses the world")
     T.eq(mock.pause_freezes(2), false, "nor the map")
@@ -283,6 +287,7 @@ T.run("stop_hosting_restores_pauses", function()
     client:leave()
     T.wait_until(function() return host_messages_contain("ClientLeon disconnected") end, step, 5)
     mock.press["Stop hosting"] = true
+    mock.run_frame()
     mock.run_frame()
     T.eq(re4coop_net.state(), "idle", "stopped")
     T.eq(mock.pause_freezes(1), true, "the inventory pauses again")

@@ -419,6 +419,101 @@ What v0.6 builds on that:
 | Enemies fight both players | Ownership: the host gives an enemy to the client when the client's player is closer by 2 m for 0.6 s (and back); the owner's AI runs it, the other game mirrors position, facing and animation from a 150 ms buffer and switches that enemy's AI head off | Only enemies the client reported having (ENEMY_CLIENT) are handed over; AI is switched back on before any kill, on hand-back, on disconnect and on "Reset Scripts"; every part has an option |
 | Late arrivals, both ways | Host deaths the client did not witness are re-advertised for 10 min and kill the client's copy when its level spawns it; client kills of enemies the host had not loaded are remembered by the host and applied when they spawn there | Deaths the client saw are never re-advertised, and living host enemies pair first, so a wave enemy spawning where another died is not killed. A host checkpoint reload clears all death records on both sides |
 
+### 3.7 v0.7: crashes, stutter, lag and loot
+
+The first in-game tests of v0.6 reported lag, low frame rate, stutter, crashes and enemy drops
+that never synced. v0.7 is the answer to that report; it adds no new feature.
+
+**The crash dump.** One `reframework_crash.dmp` (v0.6): an access violation reading address
+`0x24` at `re4.exe+0x193f995`, on a game worker thread, about 20 game frames above
+REFramework's update hook (so in the game's own update, not inside a Lua call). The code there
+is compiled managed code:
+
+```
+mov  rax, [r8]            ; arg's type info
+call is_instance_of(T)     ; if (arg is T t)
+mov  rax, [r14+0x18]       ; t.field_18      -> null
+mov  ecx, [rax+0x24]       ; field_18.enum   -> crash (0x0 + 0x24)
+...
+lea  r8, [r14+0x90]        ; an inline UTF-16 name inside the object -> new System.String
+```
+
+The heap is not in the dump, so the type cannot be named. A null at `+0x18` is what a
+destroyed `via.GameObject` looks like (its Transform pointer is cleared), and the work runs
+later on a worker thread. That fits the mod handing the game objects that no longer exist:
+the permanent hit-replay template (a copied `DamageInfo` whose attacker, weapon, collider and
+victim objects could be long gone), enemy mirroring writing to cached transforms of despawned
+enemies every frame, world messages queued during a load and applied to the new scene, game
+state changed from the render thread (UI buttons, the network fallback), and boxed values
+passed where the game expects `System.Nullable` structs (stage preload, warps).
+
+**What v0.7 changes** (each with a test against the mock):
+
+| Area | Change |
+|---|---|
+| Stale objects | Every cached engine object is checked before use (`Game:alive`: the component's owner GameObject at `+0x10` is still a managed object; `Game:go_alive` for GameObjects). Enemy data is cached per context and dropped when its body changes. A reload (new player context) drops every cache in the game and world adapters |
+| Hit replay | No permanent template. Off by default (*Experimental*). When on, the template is the latest hit of this scene, every object field is checked or replaced (our live body as attacker, the target's body as damaged object, dead objects cleared) |
+| Loads | Messages queued while the game loop was not running are applied only after the game has been playable for a second, right after a fresh enemy list |
+| Threads | UI buttons and the render-thread network fallback only queue actions; `Session:update` (LateUpdateBehavior) carries them out. Disconnects restore enemy AI on the game thread |
+| Hooks | Hit, drop and gimmick hooks are installed when a partner connects and do nothing while none is (REFramework cannot remove hooks) |
+| Risky features | Off by default, each with a switch in *Options → Experimental*: hit replay, cutscene replay (zero-argument timeline requests), cross-stage warps (the `Nullable` arguments are now built as real structs, but untested in game), the automatic game-over reload, live flag-table reloads, forcing a breakable's `_Routine`. Gimmick table reloads wait while loading or in a cutscene. Saving, the merchant and game over keep pausing in co-op. Old configs get the new defaults once (`config_version`) |
+| Puppet | No second `.ctor` on created objects; a liveness check before the late pose write; muzzle flashes destroyed after 3 s instead of 0.4 s (an effect's GameObject must outlive the effect) |
+| Breadcrumbs | `reframework/data/re4coop_breadcrumb.json`: the last ~48 things the mod did, with frame numbers; rare risky calls (kills, warps, table reloads, spawns, replays) are written before they happen |
+
+**Performance.** v0.6 made roughly 90,000 engine calls per second in game, with bursts. The
+biggest items and what replaced them:
+
+* `Game:call` resolved the method through the object's type name on every call (three engine
+  calls plus a closure and a string); now one `obj:call`.
+* The avatar was rescanned every second (thousands of calls in one frame); now a cheap check
+  (body, skeleton size, children, part meshes) runs once a second and a scan only on change.
+  Gear every second instead of four times; the scene search for loose weapons ten names at a
+  time instead of seventy.
+* Pickups: what never changes for an item is read once per component (4 calls per item per
+  scan instead of ~12).
+* Objects: 4 of the ~30 breakable/animal types are searched per scan instead of all of them.
+* Gimmicks: only the records whose gimmick announced a change (`pushDirtyList`) are read, a
+  full comparison every 30 s instead of every 2 s; flag words every 5 s. Boxed array elements
+  read with one engine call instead of up to five.
+* Enemies further than 50 m are read in full every 4th tick; animation only for enemies the
+  partner mirrors.
+* The partner's model writes joints only when they move, every frame within 8 m, every 2nd
+  frame up to 40 m, every 4th beyond; the pose is sent at half rate beyond 40 m and at 5 Hz
+  while the partner is in another chapter.
+* The HUD's status is computed once per frame (it was computed up to three times).
+
+*Diagnostics → Performance* shows the mod's cost per frame, its worst frame, frames over 4 ms
+and the busiest parts, and writes them to `re4coop_perf.json` every 10 s. The call-budget test
+(`tests/lua/test_call_budget.lua`) measures ~6,500 engine calls per second against the mock (10
+enemies, 90 pickups, a connected partner; the mock's skeleton has 34 joints where Leon has
+~350) and fails above 12,000 or a frame above 1,500.
+
+**Lag.** Built-in delay was ~150–200 ms: 100 ms interpolation, a pose captured at the end of one
+frame and sent in the next, timers that drifted with the frame rate, and joints that froze
+when a pose was late. Now: 66 ms interpolation (adaptive: more only when jitter needs it),
+the pose is sent at the end of the frame it was captured in, rates are exact, all pose chunks
+are sampled at the same instant, joints move on for one pose interval when a pose is late,
+enemy snapshots go at 20 Hz with a 100 ms mirror buffer. Transport: 1200-byte datagrams (VPN
+tunnels never split them), a second, unordered reliable lane for sounds and effects (a lost
+packet no longer holds back flags and deaths), and per-packet resend backoff.
+
+**Loot.** v0.6's drop hook only reported a drop when `cc` was a known enemy, but `cc` is the
+*player*: the roll is tailored to that player's inventory (`RandomDrop.calcRandom(droptype, cc,
+inventory, order)`, `calcPointInInventory(..., cc, inventory)`, `calcPointAround(id, cc)`).
+The dropper is `order` (a `chainsaw.Context`: enemy or box). So the hook never fired and the
+host-roll design never started. You asked for each player to get their own roll from every
+enemy, including the partner's kills, so v0.7 drops the host roll entirely:
+
+* `requestGenerateRandomDrop` (both overloads) and `generateRandomDrop` are hooked; a call whose
+  `order` (or `cc`, or GameObject) is one of our enemies means that enemy rolled its loot here.
+  The research log records the argument types of every call (`drop_calls`), to confirm this.
+* An enemy that dies in our world because the partner's game killed it (enemy sync's kill) and
+  shows no roll within `wait` seconds is rolled by us: `generateRandomDrop(droptype, our player,
+  its position, stage, the enemy, option)`, exactly once. `wait` is learned from our own kills
+  (how long the game takes to roll after a death); a kind that dies by our hand without a roll
+  is never rolled for the partner's kills either. Nothing is rolled until the hooks have seen
+  one roll of the game's own (otherwise a missed hook would double the loot).
+
 ## 4. Sync architecture
 
 ```
@@ -542,9 +637,11 @@ joint.
 different chapters, and when no pose arrived for 3 s. If the game unloads the copy with an area,
 it is rebuilt.
 
-### 4.2 Known limitations (v0.6)
+### 4.2 Known limitations (v0.7)
 
-* Nothing here has been verified in the running game yet. The riskiest assumptions are that the
+* v0.6 crashed in game; v0.7 removes the causes we found (§3.7), but has not been run in game
+  yet. After a crash, `re4coop_breadcrumb.json` names the last thing the mod did.
+* Most of this has not been verified in the running game yet. The riskiest assumptions are that the
   body prefab can be spawned outside the game's character spawner once its logic is disabled
   (*Build partner from meshes only* is the escape hatch), that switching an enemy's AI head off
   leaves its body and HitController working (*...with their AI switched off* is the switch),
@@ -555,11 +652,14 @@ it is rebuilt.
 * Sounds the engine plays without going through the reflected `trigger` methods are not
   replayed. Thrown grenades, projectiles, bullet impacts and blood happen only in the thrower's
   game.
-* Cutscenes that start without a hooked timeline request (movies) are not replayed; the
-  transition gate and the flags still bring both players through them.
+* Cutscenes are not started in the partner's game unless the experimental switch is on; the
+  transition gate and the flags bring both players through them.
 * A checkpoint reload (death, Retry) happens only in that player's game.
-* Joining from another chapter, and following the host into the next one, go through the game
-  over screen (*Continue*).
+* Joining from another chapter, and following the host into the next one, need a save load
+  (any save, or *Continue*); the automatic game-over reload is experimental.
+* The partner's loot rolls are confirmed only by the research log so far: if `drop_calls`
+  shows another argument layout than §3.7 describes, the *loot* line in *Diagnostics* stays at
+  "waiting for the first enemy drop" and nobody gets extra loot.
 * Damage dealt to an enemy before your game has observed it once (the first ~50 ms after it
   spawns) is not reported.
 * Both players need the same game version, REFramework build and mod version. A protocol
@@ -567,9 +667,9 @@ it is rebuilt.
 
 ## 5. Roadmap
 
-1. **In-game validation of v0.6** with the checklist in [TESTING.md](TESTING.md), collecting
-   `re4coop_typedump.json` + `re4coop_research_log.json` from several areas, and fixing any
-   probed names with them.
+1. **In-game validation of v0.7** with the checklist in [TESTING.md](TESTING.md): the
+   profiler's numbers, the breadcrumb file after any crash, `drop_calls` in the research log,
+   then switching the experimental features on one at a time.
 2. Shared checkpoints: when one player dies, both reload (RE5/RE6 style), or the other revives
    them.
 3. Event-driven damage via `chainsaw.EnemyManager.notifyHitDamage` hooks, to remove polling

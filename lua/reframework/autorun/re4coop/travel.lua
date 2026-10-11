@@ -19,6 +19,7 @@ Travel.__index = Travel
 
 local ARRIVED = 6.0          -- metres from the target that count as "there"
 local PRELOAD_TIME = 1.5     -- seconds to keep preloading another stage before warping
+local PRELOAD_REPEAT = 0.5   -- seconds between repeated preload requests
 local VERIFY_TIME = 6.0
 local SETTLE_TIME = 2.0      -- after a load, wait this long before syncing/warping
 local SYNC_TIMEOUT = 15.0
@@ -195,7 +196,7 @@ function Travel:tick(now, world, partner)
             return self:finish(now)
         end
         if not same_stage then
-            if (self.last_preload or -math.huge) + 0.1 <= now then
+            if (self.last_preload or -math.huge) + PRELOAD_REPEAT <= now then
                 self.last_preload = now
                 world:preload_stage(t.stage)
             end

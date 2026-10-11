@@ -10,6 +10,11 @@
 --   pause    : adapter from game_pause.lua (or a fake). Optional: menus keep pausing.
 --   clock    : function() -> seconds
 --   settings : live config table (see config.lua)
+--   perf     : profiler / breadcrumbs (perf.lua). Optional.
+--
+-- Threading: update() runs on the game thread (LateUpdateBehavior) and is the only place that
+-- changes the game. The UI and the render-thread fallback (update_network_only) only queue
+-- actions (Session:queue) and update Lua state.
 
 local P = require("re4coop.protocol")
 local Interp = require("re4coop.interp")
@@ -23,6 +28,7 @@ local GimmickSync = require("re4coop.gimmick_sync")
 local ObjectSync = require("re4coop.object_sync")
 local CutsceneSync = require("re4coop.cutscene_sync")
 local Travel = require("re4coop.travel")
+local Perf = require("re4coop.perf")
 
 local Session = {}
 Session.__index = Session
@@ -52,6 +58,8 @@ local LOCATION_INTERVAL = 0.5   -- seconds between reads of where we are (chapte
 local FOLLOW_CHAPTER_DELAY = 15.0 -- client: the host has been in a later chapter this long -> follow
 local RELOAD_GAP = 2.0          -- seconds without a player that mean the game (re)loaded
 local MAX_DEFERRED = 4000
+local SETTLE_AFTER_LOAD = 1.0   -- seconds in game before queued world/enemy messages are applied
+local STATUS_MAX_AGE = 0.1      -- status_cached(): seconds a computed status is reused
 
 local function dist3(a, b)
     local dx, dy, dz = a.x - b.x, a.y - b.y, a.z - b.z
@@ -91,7 +99,9 @@ function Session.new(opts)
     self.pause = opts.pause
     self.clock = opts.clock
     self.settings = opts.settings
+    self.perf = opts.perf or Perf.NULL
     self.log_sink = opts.log or function() end
+    self.actions = {}        -- UI requests, carried out on the game thread (see Session:queue)
     self.messages = {}       -- chat + notices shown in the UI/HUD: {time, text, kind}
     self.deferred = {}       -- reliable messages received while the game loop was not running
     self.frag_id = 0
@@ -99,7 +109,7 @@ function Session.new(opts)
     self.avatar_tx = Avatar.new_sender({
         protocol = P,
         settings = self.settings,
-        send = function(bytes, reliable) return self:send(bytes, reliable) end,
+        send = function(bytes, reliable, unordered) return self:send(bytes, reliable, unordered) end,
         send_large = function(bytes) return self:send_large(bytes) end,
     })
     self.avatar_rx = Avatar.new_receiver({ protocol = P, settings = self.settings })
@@ -182,7 +192,7 @@ function Session:reset_peer()
     self.partner_hello = nil
     self.partner_state = nil     -- last decoded PLAYER message
     self.compatible = true
-    self.interp = Interp.new({ delay = (self.settings and self.settings.interp_delay) or 0.1 })
+    self.interp = Interp.new({ delay = (self.settings and self.settings.interp_delay) or 0.066, adaptive = true })
     self.reassembler = P.new_reassembler()
     self.avatar_tx:reset()
     self.avatar_rx:reset()
@@ -212,16 +222,11 @@ function Session:make_syncs()
         log = function(...) self:log(...) end,
         notify = function(text, kind) self:add_message(text, kind) end,
     }
-    self.enemy_sync = EnemySync.new(base)
-    self.drop_sync = DropSync.new({
-        role = self.role,
-        protocol = P,
-        settings = self.settings,
-        enemy_sync = self.enemy_sync,
-        is_key_item = function(id) return self.game.is_key_item ~= nil and self.game.is_key_item(id) end,
-        send = base.send,
-        log = base.log,
-    })
+    self.drop_sync = DropSync.new({ settings = self.settings, log = base.log })
+    local enemy_opts = {}
+    for k, v in pairs(base) do enemy_opts[k] = v end
+    enemy_opts.on_kill = function(id, now) self.drop_sync:on_remote_kill(id, now) end
+    self.enemy_sync = EnemySync.new(enemy_opts)
     self.flag_sync = FlagSync.new(base)
     self.gimmick_sync = GimmickSync.new(base)
     self.object_sync = ObjectSync.new(base)
@@ -252,6 +257,41 @@ end
 -- Commands from the UI
 -------------------------------------------------------------------------------
 
+-- UI buttons run on the render thread; anything that touches the game is queued here and
+-- carried out by update() on the game thread. name: "host" | "join" | "leave" | "teleport" |
+-- "travel" | "dump"; arg: join address / dump extra.
+function Session:queue(name, arg)
+    if #self.actions < 16 then self.actions[#self.actions + 1] = { name = name, arg = arg } end
+end
+
+-- in_game = false: from the render thread (only network actions run; the rest wait).
+function Session:run_actions(in_game)
+    if #self.actions == 0 then return end
+    local keep = {}
+    for _, a in ipairs(self.actions) do
+        if a.name == "host" then
+            self:host()
+        elseif a.name == "join" then
+            self:join(a.arg)
+        elseif a.name == "leave" then
+            self:leave()
+        elseif not in_game then
+            keep[#keep + 1] = a
+        elseif a.name == "teleport" then
+            self:teleport_to_partner()
+        elseif a.name == "travel" then
+            self:travel_to_partner()
+        elseif a.name == "dump" then
+            if self.game.dump_types then
+                local ok, runs = self.game:dump_types(a.arg)
+                self.dump_result = ok and ("run %d saved - send re4coop_typedump.json and re4coop_research_log.json"):format(runs)
+                    or "failed (see REFramework log)"
+            end
+        end
+    end
+    self.actions = keep
+end
+
 function Session:host()
     local s = self.settings
     local ok, err = self.net.host(s.port, s.player_name, s.password)
@@ -266,8 +306,7 @@ function Session:host()
     self:make_syncs()
     self.item_sync:reset()
     self:add_message(("Hosting on UDP port %d - waiting for partner"):format(s.port), "info")
-    self:update_pause()
-    return true
+    return true -- no-pause starts with the next game-thread update
 end
 
 function Session:join(address)
@@ -288,7 +327,6 @@ function Session:join(address)
     self:make_syncs()
     self.item_sync:reset()
     self:add_message(("Connecting to %s:%d ..."):format(host, port), "info")
-    self:update_pause()
     return true
 end
 
@@ -312,17 +350,24 @@ function Session:leave()
     self:reset_peer()
     self:make_syncs()
     self.gate:reset()
-    self:restore_game()
+    self.restore_pending = true -- the game side is restored by the next game-thread update
 end
 
 -- Undo anything that must not outlive the script (called on "Reset Scripts").
 function Session:shutdown()
+    self.perf:closing("script reset")
     self:restore_game()
 end
 
-function Session:send(bytes, reliable)
+-- unordered (reliable only): its own lane, delivered as soon as it arrives (see the plugin).
+function Session:send(bytes, reliable, unordered)
     if not self.partner_connected then return false end
-    local ok, err = self.net.send(bytes, reliable)
+    local ok, err
+    if unordered then
+        ok, err = self.net.send(bytes, reliable, true)
+    else
+        ok, err = self.net.send(bytes, reliable)
+    end
     if not ok then
         self:log("send failed: %s", tostring(err))
     end
@@ -752,11 +797,10 @@ function Session:handle_event(ev, now)
             self.last_error = ev.data
             self:add_message(tostring(ev.data), "error")
         end
-        if self.game.restore_enemy_ai then self.game:restore_enemy_ai() end
+        self.ai_restore_pending = true -- on the game thread (this may run on the render thread)
         if self.role == "client" then
             self.role = "none"
             self:make_syncs()
-            self:update_pause()
         end
     elseif ev.type == "message" then
         self:handle_message(ev.data, now)
@@ -838,10 +882,7 @@ function Session:handle_message(data, now)
     elseif m.type == T.ITEM_TAKEN then
         self.item_sync:on_message(m, now)
     elseif m.type == T.ITEM_DROPPED then
-        -- Without enemy sync our own rolls are not skipped, so the host's item would be extra.
-        if self.drop_sync and self.settings.sync_enemies then
-            self.drop_sync:on_message(m, now, self.game, self.local_stage)
-        end
+        return -- 0.5/0.6 host-rolled drops: each player rolls their own loot now
     elseif m.type == T.WORLD_REQUEST then
         if self.role == "host" then self:on_world_request(m) end
     elseif m.type == T.WORLD_DONE then
@@ -878,7 +919,7 @@ function Session:send_player_state(now)
         or (self.player_missing_since ~= nil and now - self.player_missing_since >= RELOAD_GAP)
     self.player_missing_since = nil
     if st.id ~= nil then self.player_id = st.id end
-    if reloaded and self.enemy_sync then self.enemy_sync:on_local_reload() end
+    if reloaded then self:on_reload(now) end
 
     self.last_local_pos = st.pos
     self.last_local_pos_time = now
@@ -908,6 +949,33 @@ function Session:send_player_state(now)
         self:send(P.encode_notify(NOTIFY.DIED, self.settings.player_name .. " is down!"), true)
     end
     self.local_dead = st.dead and true or false
+end
+
+-- Poses per second to send: the full rate while the partner can see us up close, half
+-- beyond POSE_FAR metres, and a trickle while they are in another chapter (reading ~350
+-- joints is the biggest cost of sharing our character).
+local POSE_FAR = 40.0
+local POSE_ELSEWHERE_HZ = 5
+
+function Session:pose_rate(now)
+    local full = self.settings.pose_hz or 30
+    if self:partner_elsewhere() then return POSE_ELSEWHERE_HZ end
+    local partner = self.interp:sample(now)
+    local mine = self:fresh_local_pos(now)
+    if partner ~= nil and mine ~= nil and dist3(partner.pos, mine) > POSE_FAR then
+        return math.max(10, full / 2)
+    end
+    return full
+end
+
+-- The game (re)loaded: cached engine objects and half-done work belong to the old scene.
+function Session:on_reload(now)
+    self.perf:crumb("session.reload", nil, true)
+    if self.game.on_reload then self.game:on_reload() end
+    if self.world and self.world.on_reload then self.world:on_reload() end
+    if self.enemy_sync then self.enemy_sync:on_local_reload() end
+    if self.drop_sync then self.drop_sync:forget_enemies() end
+    self.in_game_since = now
 end
 
 -- Both players' positions for enemy ownership (the partner only counts in the same region).
@@ -983,105 +1051,175 @@ function Session:update_world(now)
     self.travel:tick(now, world, partner)
 end
 
+-- What the game side must undo once the session ended or the partner left (queued by
+-- leave() / the disconnect event, which may run off the game thread).
+function Session:apply_pending_restores()
+    if self.restore_pending then
+        self.restore_pending = false
+        self.ai_restore_pending = false
+        self:restore_game()
+    elseif self.ai_restore_pending then
+        self.ai_restore_pending = false
+        if self.game.restore_enemy_ai then self.game:restore_enemy_ai() end
+    end
+end
+
+-- Reliable world/enemy messages received while the game loop was not running. They are
+-- applied once the game has been playable for SETTLE_AFTER_LOAD seconds, right after a fresh
+-- enemy list, so nothing they touch comes from before the load.
+function Session:apply_deferred(now)
+    if #self.deferred == 0 then return end
+    if self:fresh_local_pos(now) == nil or now - (self.in_game_since or now) < SETTLE_AFTER_LOAD then return end
+    local deferred = self.deferred
+    self.deferred = {}
+    self.perf:crumb("session.deferred", ("%d messages"):format(#deferred))
+    for _, data in ipairs(deferred) do
+        self:handle_message(data, now)
+    end
+end
+
 -- Network + game sync. Call once per game frame from a game-thread callback.
 function Session:update()
     local now = self.clock()
-    if #self.deferred > 0 then
-        local deferred = self.deferred
-        self.deferred = {}
-        for _, data in ipairs(deferred) do
-            self:handle_message(data, now)
-        end
-    end
+    local perf = self.perf
+    self.frame = (self.frame or 0) + 1
+    local t0 = perf:start()
+    self:run_actions(true)
     self:refresh_location(now)
     for _, ev in ipairs(self.net.poll()) do
         self:handle_event(ev, now)
     end
+    self:apply_pending_restores()
     self:update_pause()
     if self.pause and self.pause.update then self.pause:update(now) end
     local active = self.partner_connected and self.compatible
-    if self.game.set_capture then self.game:set_capture(active and self.settings.share_character ~= false) end
+    local s = self.settings
+    if self.game.set_capture then self.game:set_capture(active and s.share_character ~= false) end
+    if self.game.set_active then
+        self.game:set_active(active, { hits = s.sync_enemies ~= false,
+            drops = s.sync_enemies ~= false and s.sync_drops ~= false, gimmicks = s.sync_gimmicks ~= false })
+    end
     if self.world and self.world.set_active then self.world:set_active(active) end
+    perf:stop("update.net", t0)
     if not active then
         -- Game events from before the partner joined are stale by the time we sync.
         if self.game.take_pickup_events then self.game:take_pickup_events() end
         if self.game.take_hit_events then self.game:take_hit_events() end
         if self.game.take_drop_events then self.game:take_drop_events() end
-        if self.game.set_drop_suppress then self.game:set_drop_suppress(nil) end
         self:update_gate(now) -- releases a hold
         return
     end
 
-    local s = self.settings
-    if now - self.last_player_send >= 1.0 / (s.player_hz or 20) then
-        self.last_player_send = now
+    t0 = perf:start()
+    local player_interval = 1.0 / (s.player_hz or 20)
+    if now - self.last_player_send >= player_interval then
+        self.last_player_send = (now - self.last_player_send >= 2 * player_interval) and now or (self.last_player_send + player_interval)
         self:send_player_state(now)
     end
+    if self:fresh_local_pos(now) ~= nil then
+        self.in_game_since = self.in_game_since or now
+    else
+        self.in_game_since = nil
+    end
+    perf:stop("update.player", t0)
 
     if s.share_character ~= false and self.game.avatar_descriptor then
+        t0 = perf:start()
+        self.avatar_tx.rate = self:pose_rate(now)
         self.avatar_tx:tick(now, self.game)
+        perf:stop("update.avatar", t0)
     end
 
-    -- Hits our player landed, and enemy drops, since the last frame (hooks in game.lua).
+    -- Hits our player landed and enemy loot rolls since the last frame (hooks in game.lua).
+    t0 = perf:start()
     local hits = self.game.take_hit_events and self.game:take_hit_events() or nil
-    if self.enemy_sync and s.sync_enemies and hits ~= nil then
+    if self.enemy_sync and s.sync_enemies and hits ~= nil and #hits > 0 then
         self.enemy_sync:on_local_hits(hits, now)
     end
     local drops = self.game.take_drop_events and self.game:take_drop_events() or nil
-    local drops_on = self.drop_sync ~= nil and self.drop_sync:enabled() and s.sync_enemies
-    if drops_on then
-        self.drop_sync:on_drop_events(now, drops)
-        self.drop_sync:update_pairs(now, self.game)
-    elseif self.game.set_drop_suppress then
-        self.game:set_drop_suppress(nil) -- enemy pairing is off: never skip our own rolls
-    end
 
-    if self.enemy_sync and s.sync_enemies then
+    local enemies, ticked = nil, false
+    local in_game = self:fresh_local_pos(now) ~= nil
+    if self.enemy_sync and s.sync_enemies and in_game then
         -- The animation is only read while enemies are mirrored with their animation.
         self.game.read_motion = s.enemy_mirror ~= false and s.enemy_motion_sync ~= false
-        if now - self.last_enemy_tick >= 1.0 / (s.enemy_tick_hz or 20) then
-            self.last_enemy_tick = now
-            local enemies = self.game:list_enemies()
+        local interval = 1.0 / (s.enemy_tick_hz or 20)
+        if now - self.last_enemy_tick >= interval then
+            self.last_enemy_tick = (now - self.last_enemy_tick >= 2 * interval) and now or (self.last_enemy_tick + interval)
+            local es = self.enemy_sync
+            enemies = self.game:list_enemies(self:fresh_local_pos(now), function(id) return es:wants_motion(id) end)
             if enemies ~= nil then
+                ticked = true
                 self.enemy_sync:tick(now, enemies, self.game, self:players_info(now))
             end
         end
-        -- Every frame: enemies the partner's game runs follow their copies smoothly.
-        self.enemy_sync:frame(now, self.game)
-    elseif self.enemy_sync then
+    elseif self.enemy_sync and not s.sync_enemies then
         self.enemy_sync:release_all(self.game) -- enemy sync switched off: our AI runs everything
     end
+    if self.drop_sync and s.sync_enemies then
+        self.drop_sync:update(now, enemies, drops, self.game)
+    end
+    perf:stop("update.enemies", t0)
 
-    if self.game.list_pickups and now - self.last_item_tick >= ITEM_TICK_INTERVAL then
-        self.last_item_tick = now
-        local accepted = self.game.take_pickup_events and self.game:take_pickup_events() or nil
-        if s.share_key_items or drops_on then
-            local pickups = self.game:list_pickups()
-            if s.share_key_items then
-                local pos = self:fresh_local_pos(now)
-                local flags = nil
-                if self.game.item_get_flags then
-                    flags = self.game:item_get_flags(self.item_sync:watched_item_ids())
-                end
-                self.item_sync:tick(now, pickups, pos, self.game, pos ~= nil and not self.local_cutscene,
-                    accepted, flags)
-            end
-            if drops_on then
-                self.drop_sync:on_pickups(now, pickups, self.local_stage)
-            end
-        end
+    -- Every frame: enemies the partner's game runs follow their copies smoothly.
+    if self.enemy_sync and s.sync_enemies and in_game then
+        t0 = perf:start()
+        self.enemy_sync:frame(now, self.game)
+        perf:stop("update.mirror", t0)
     end
 
+    if ticked or not s.sync_enemies then self:apply_deferred(now) end
+
+    if self.game.list_pickups and now - self.last_item_tick >= ITEM_TICK_INTERVAL and in_game then
+        t0 = perf:start()
+        self.last_item_tick = now
+        local accepted = self.game.take_pickup_events and self.game:take_pickup_events() or nil
+        if s.share_key_items then
+            local pickups = self.game:list_pickups()
+            local pos = self:fresh_local_pos(now)
+            local flags = nil
+            if self.game.item_get_flags then
+                flags = self.game:item_get_flags(self.item_sync:watched_item_ids())
+            end
+            self.item_sync:tick(now, pickups, pos, self.game, pos ~= nil and not self.local_cutscene,
+                accepted, flags)
+        end
+        perf:stop("update.pickups", t0)
+    end
+
+    t0 = perf:start()
     self:update_world(now)
+    perf:stop("update.world", t0)
+    t0 = perf:start()
     self:update_gate(now)
     self:update_left_behind(now)
     self:handle_hotkeys(now)
+    perf:stop("update.gate", t0)
+end
+
+-- End of the game frame (PrepareRendering), right after the pose capture: send it now.
+function Session:flush_pose(now)
+    if not (self.partner_connected and self.compatible) or self.settings.share_character == false then return end
+    self.avatar_tx:flush_pose(now, self.game)
+end
+
+-- status() for the HUD and the overlay, which ask several times per frame.
+function Session:status_cached()
+    local now = self.clock()
+    local c = self.status_cache
+    if c ~= nil and self.status_cache_frame == self.frame and now - self.status_cache_time < STATUS_MAX_AGE then
+        return c
+    end
+    c = self:status()
+    self.status_cache, self.status_cache_frame, self.status_cache_time = c, self.frame, now
+    return c
 end
 
 -- Keeps connect/disconnect events flowing while the game thread callback is not running
--- (title screen, loading). Never touches game objects, except to undo a transition-gate hold:
--- if holding stopped the game thread callback, the gate could never release, so it is
--- released here and switched off for this session instead.
+-- (title screen, loading). Runs on the render thread: never touches game objects, except to
+-- undo a transition-gate hold: if holding stopped the game thread callback, the gate could
+-- never release, so it is released here (one time-scale write) and switched off for this
+-- session instead.
 function Session:update_network_only()
     local now = self.clock()
     if self.held_scale ~= nil then
@@ -1094,6 +1232,7 @@ function Session:update_network_only()
         end
         self.gate_fallback_time = now
     end
+    self:run_actions(false)
     for _, ev in ipairs(self.net.poll()) do
         if ev.type == "message" then
             local t = type(ev.data) == "string" and ev.data:byte(1) or nil
@@ -1108,6 +1247,7 @@ function Session:update_network_only()
             self:handle_event(ev, now)
         end
     end
+    self.in_game_since = nil -- the game loop stopped: queued messages wait until it settles again
     -- Joining from the title screen: whatever save gets loaded next is redirected into the
     -- host's chapter (only a variable is set here; the game applies it when it loads).
     if self.role == "client" and self.join_travel_pending and self.world ~= nil and self.travel ~= nil

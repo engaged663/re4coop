@@ -40,6 +40,8 @@ T.run("reads_player_state", function()
     world.player.hp = 0
     T.eq(game:read_player_state().dead, true, "dead when HitPoint.get_IsLive is false")
     world.player = nil
+    T.check(game:read_player_state() ~= nil, "the player context is read once per frame")
+    game:begin_frame()
     T.check(game:read_player_state() == nil, "nil without a player (menus/loading)")
 end)
 
@@ -70,6 +72,7 @@ T.run("describes_the_local_character", function()
     local changed = game:avatar_descriptor(4)
     T.check(changed ~= desc and changed.sig ~= desc.sig, "new description after a costume change")
     world.player = nil
+    game:begin_frame()
     T.check(game:avatar_descriptor(6) == nil, "no player, no avatar")
 end)
 
@@ -414,6 +417,8 @@ end)
 
 T.run("hit_hook_captures_player_hits", function()
     local game, world = fresh_game()
+    T.eq(game:capabilities().hit_hook, nil, "hooks wait until a partner connects")
+    game:set_active(true)
     T.check(game:capabilities().hit_hook.ok, "hit hook installed")
     game:read_player_state() -- learns the player's body/head objects
     game:list_enemies()      -- learns the enemies' bodies
@@ -436,15 +441,21 @@ T.run("hit_hook_captures_player_hits", function()
     mock.hit(other, 5, 1)
     T.eq(#game:take_hit_events(), 0, "player hits on non-enemies are not sent")
     T.eq(game.hit_stats.not_enemy, 1, "counted")
+    game:set_active(false)
+    mock.hit(e1, 5, 1)
+    T.eq(#game:take_hit_events(), 0, "the hook does nothing while no partner is connected")
 end)
 
 T.run("hit_replay_is_cosmetic", function()
     local game, world = fresh_game()
+    game:set_active(true)
     game:read_player_state()
     game:list_enemies()
     local e2 = world.enemies[2]
     local id = e2:get_address()
     local hit = { damage = 50, wince = 30, break_ = 1, stopping = 2, dir = { x = 1, y = 0, z = 0 }, critical = true }
+    T.eq(game:enemy_replay_hit(id, hit), false, "experimental: off unless switched on")
+    game.settings.replay_partner_hits = true
     local ok = game:enemy_replay_hit(id, hit)
     T.eq(ok, false, "no replay before our player landed a hit (no template yet)")
 
@@ -458,7 +469,7 @@ T.run("hit_replay_is_cosmetic", function()
     T.eq(r.wince, 30, "the partner's wince")
     T.eq(r.damage, 1, "cosmetic damage only")
     T.eq(r.critical, true, "critical flag")
-    T.eq(r.attacker, world.player.body, "template objects come from this game")
+    T.eq(r.attacker, world.player.body, "the attacker is our live player body")
     T.eq(e2.hp, 300, "HP unchanged")
     T.eq(#game:take_hit_events(), 0, "our replay is not reported as our own hit")
 
@@ -483,37 +494,68 @@ T.run("hit_replay_is_cosmetic", function()
     e2.hp = 15
     T.eq(game:enemy_replay_hit(id, hit), false, "nearly dead enemies are not replayed")
     T.eq(e2.hp, 15, "untouched")
+    e2.hp = 300
+
+    -- The template's objects may be gone by the time a replay happens: dead ones are not
+    -- handed to the game (the weapon here), and the attacker is always our live body.
+    local hc = mock.component(e2.body, "chainsaw.HitController")
+    local weapon = mock.make_go("wp4000_old")
+    game.hit_template.data.WeaponGameObject = weapon
+    mock.destroy(weapon)
+    T.check(game:enemy_replay_hit(id, hit), "replayed")
+    local last = hc.received[#hc.received]
+    T.eq(last.attacker, world.player.body, "live attacker")
+    T.eq(game.hit_stats.stale_owner, 1, "the dead weapon object was cleared")
+    -- After a reload nothing from the old scene is reused.
+    game:on_reload()
+    T.eq(game:enemy_replay_hit(id, hit), false, "template dropped with the old scene")
 end)
 
-T.run("drop_hook_reports_and_suppresses", function()
+T.run("drop_hooks_see_the_games_rolls_and_roll_for_partner_kills", function()
     local game, world = fresh_game()
-    T.check(game:capabilities().drop_hook.ok, "drop hook installed")
+    game:set_active(true)
+    T.check(game:capabilities().drop_hook.ok, "drop hooks installed")
+    T.check(game:capabilities().drop_request.ok, "generateRandomDrop available for our own rolls")
+    game:begin_frame()
+    game:read_player_state()
     game:list_enemies()
-    local e1 = world.enemies[1]
-    T.check(mock.enemy_drop(e1, 112800000) ~= nil, "not skipped by default")
+    local e1, e2 = world.enemies[1], world.enemies[2]
+    T.check(mock.enemy_drop(e1, 112800000) ~= nil, "the game's roll is never skipped")
     local ev = game:take_drop_events()
-    T.eq(#ev, 1, "reported")
-    T.eq(ev[1].enemy_id, e1:get_address(), "which enemy")
-    T.eq(ev[1].droptype, 65536, "drop type")
-    game:set_drop_suppress({ [e1:get_address()] = true })
-    T.eq(mock.enemy_drop(e1, 112800000), nil, "suppressed roll skipped")
-    T.eq(game.drop_stats.suppressed, 1, "counted")
-    T.eq(mock.enemy_drop(world.enemies[2], 112800000) ~= nil, true, "other enemies roll normally")
-    T.check(mock.enemy_drop(nil, 112800000) ~= nil, "wooden box drops are never skipped")
-    T.eq(#game:take_drop_events(), 2, "box drops not reported")
+    T.eq(#ev, 2, "request + the stack's generate")
+    T.eq(ev[1].enemy_id, e1:get_address(), "the enemy is the roll's `order`")
+    T.eq(ev[1].via, "request", "seen when requested")
+    T.eq(ev[2].via, "generate", "and when rolled")
+    T.eq(ev[2].droptype, 65536, "drop type")
+    local research = game.drop_research[#game.drop_research]
+    T.eq(research.cc_is_player, true, "research: cc is our player")
+    T.eq(research.order, "chainsaw.Ch1c0z0Context", "research: order is the enemy")
+    mock.enemy_drop(nil, 112800000) -- a wooden box
+    T.eq(#game:take_drop_events(), 0, "box drops are not enemy drops")
 
-    local ok = game:spawn_drop(124000000, 300, { x = 1, y = 2, z = 3 }, 43400)
-    T.check(ok, "spawn requested")
-    local sp = world.spawned[1]
-    T.eq(sp.item_id, 124000000, "item")
-    T.eq(sp.count, 300, "count")
-    T.eq(sp.stage, 43400, "stage")
-    T.eq(sp.falldown, true, "falls to the ground like a drop")
+    -- The partner killed e2: we roll its loot for our player.
+    local before = #world.generated
+    local ok = game:request_enemy_drop(e2:get_address())
+    T.check(ok, "rolled")
+    local g = world.generated[#world.generated]
+    T.eq(#world.generated, before + 1, "one roll")
+    T.eq(g.cc, world.player, "for our player (their inventory decides)")
+    T.eq(g.order, e2, "from that enemy")
+    T.eq(g.droptype, 65536, "with the enemy drop type")
+    T.eq(g.opt.__fields.Falldown, true, "falls to the ground like a drop")
+    local evs = game:take_drop_events()
+    T.eq(#evs, 1, "our own roll is seen by the hook too")
+    T.eq(evs[1].via, "generate", "as a generate call")
     local found = false
     for _, p in ipairs(game:list_pickups()) do
-        if p.item_id == 124000000 then found = true end
+        if math.abs(p.pos.x - (e2.pos.x + 0.5)) < 1e-6 then found = true end
     end
-    T.check(found, "spawned item lies in the scene")
+    T.check(found, "the loot lies next to the enemy")
+    mock.destroy(e2.body)
+    T.eq(select(2, game:request_enemy_drop(e2:get_address())), "enemy gone", "never on an enemy whose body is gone")
+    game:set_active(false)
+    mock.enemy_drop(e1, 112800000)
+    T.eq(#game:take_drop_events(), 0, "hooks idle while no partner is connected")
 end)
 
 T.run("item_flags_and_time_scale", function()
@@ -532,6 +574,7 @@ end)
 
 T.run("hooks_absent_without_sdk_hook", function()
     local game = fresh_game({ no_hook = true })
+    game:set_active(true)
     T.eq(game:take_hit_events(), nil, "no hit events")
     T.eq(game:take_drop_events(), nil, "no drop events")
     T.check(not game:capabilities().hit_hook.ok, "hit hook reported missing")
@@ -565,6 +608,7 @@ T.run("research_dump", function()
     mock.make_hate_controller("ch1c0z0_hate", { x = 5, y = 0, z = 0 }, world.player.body)
     local cog = mock.make_drop_item(119235200, { x = 3, y = 0, z = 1 }, { category = 3, kind = 0, group = 40200, index = 2 })
     game:avatar_descriptor(0)
+    game:set_active(true)
     mock.gimmick_dirty("chainsaw.GmContextBox", { group = 43400, index = 7 })
     local ok, runs = game:dump_types({ role = "host", items = { hook = "confirmed" }, partner_model = { state = "idle" } })
     T.check(ok, "dump written")

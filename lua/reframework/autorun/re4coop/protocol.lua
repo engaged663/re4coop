@@ -3,9 +3,9 @@
 
 local P = {}
 
-P.VERSION = 6            -- bump on any incompatible change to the layouts below
-P.MOD_VERSION = "0.6.0"
-P.MAX_PAYLOAD = 1388     -- re4coop_net.max_payload(): biggest message one datagram carries
+P.VERSION = 7            -- bump on any incompatible change to the layouts below
+P.MOD_VERSION = "0.7.0"
+P.MAX_PAYLOAD = 1188     -- re4coop_net.max_payload(): biggest message one datagram carries
 
 P.T = {
     HELLO = 1,          -- reliable, both directions, right after connecting
@@ -23,7 +23,7 @@ P.T = {
     POSE = 13,          -- unreliable, ~30 Hz, the full skeleton pose + weapon placement
     ACTIONS = 14,       -- reliable, sounds/effects/shots to replay on the partner's model
     ENEMY_HIT = 15,     -- unreliable, both directions: a hit the sender's player landed on an enemy
-    ITEM_DROPPED = 16,  -- reliable, host -> client: an enemy's random drop on the host
+    ITEM_DROPPED = 16,  -- retired in 0.7 (each player rolls their own loot); still decoded, ignored
     ENEMY_CLIENT = 17,  -- unreliable, ~20 Hz, client -> host: the enemies the client runs + its copies
     FLAGS = 18,         -- reliable, both directions: scenario flags that changed, by GUID
     FLAG_WORDS = 19,    -- reliable, both directions: scenario flag bits per group (full copy or masks)
@@ -148,11 +148,11 @@ P.MAX_WEAPONS = 4
 P.MAX_WEAPON_JOINTS = 32
 P.MAX_TRANSLATIONS = 32
 P.MAX_EVENT_ARGS = 16
-P.ENEMIES_PER_SNAPSHOT = 20 -- 12 B header + 20 * 65 B entries stays under the 1388 B payload limit
-P.MAX_CLIENT_ENEMY_STATES = 30
+P.ENEMIES_PER_SNAPSHOT = 17 -- 12 B header + 17 * 65 B entries stays under the 1188 B payload limit
+P.MAX_CLIENT_ENEMY_STATES = 24 -- 11 B + 24 * 31 B states + 200 * 2 B paired ids < 1188 B
 P.MAX_CLIENT_PAIRED = 200
 P.FLAGS_PER_MESSAGE = 64
-P.OBJECTS_PER_MESSAGE = 60
+P.OBJECTS_PER_MESSAGE = 50 -- 2 B + 50 * 21 B
 
 -- net id, kind hash, position, spawn position, yaw, hp, max hp, flags, ContextID (group, index,
 -- kind, category), motion bank, motion id, motion frame

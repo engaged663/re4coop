@@ -224,14 +224,21 @@ function R.set(obj, name, value)
     return (pcall(function() obj:set_field(name, value) end))
 end
 
--- Lua number from a number, boolean, boxed primitive or enum object.
+local VALUE_FIELDS = { "m_value", "value__", "_value" }
+
+-- Lua number from a number, boolean, boxed primitive or enum object. Boxed primitives (what
+-- primitive arrays hand out) are the common case and take one engine call.
 function R.number(v)
     local t = type(v)
     if t == "number" then return v end
     if t == "boolean" then return v and 1 or 0 end
     if v == nil then return nil end
-    for _, f in ipairs({ "mValue", "m_value", "value__", "_value" }) do
-        local ok, x = pcall(function() return v:get_field(f) end)
+    local get = (t == "userdata" or t == "table") and v.get_field or nil
+    if get == nil then return nil end
+    local ok, x = pcall(get, v, "mValue")
+    if ok and type(x) == "number" then return x end
+    for _, f in ipairs(VALUE_FIELDS) do
+        ok, x = pcall(get, v, f)
         if ok and type(x) == "number" then return x end
     end
     local ok, s = pcall(function() return v:call("ToString()") end)

@@ -84,13 +84,14 @@ int do_stop(lua_State*, net::Session& s, int) {
     return 0;
 }
 
-// send(data, reliable) -> true | nil, err
+// send(data, reliable[, unordered]) -> true | nil, err
 int do_send(lua_State* L, net::Session& s, int b) {
     size_t len = 0;
     const char* data = luaL_checklstring(L, b, &len);
     const bool reliable = lua_toboolean(L, b + 1) != 0;
+    const bool unordered = lua_toboolean(L, b + 2) != 0;
     std::string err;
-    if (!s.send(std::string_view(data, len), reliable, err)) return push_fail(L, err);
+    if (!s.send(std::string_view(data, len), reliable, err, unordered)) return push_fail(L, err);
     lua_pushboolean(L, 1);
     return 1;
 }
@@ -146,6 +147,7 @@ int do_stats(lua_State* L, net::Session& session, int) {
     set_integer(L, "bytes_recv", static_cast<lua_Integer>(s.bytes_recv));
     set_integer(L, "resends", static_cast<lua_Integer>(s.resends));
     set_integer(L, "out_of_order", static_cast<lua_Integer>(s.unreliable_out_of_order));
+    set_integer(L, "unordered_duplicates", static_cast<lua_Integer>(s.unordered_duplicates));
     set_integer(L, "events_dropped", static_cast<lua_Integer>(s.events_dropped));
     set_integer(L, "reliable_in_flight", static_cast<lua_Integer>(s.reliable_in_flight));
     return 1;

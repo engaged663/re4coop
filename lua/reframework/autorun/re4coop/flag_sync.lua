@@ -29,7 +29,7 @@ local TOGGLE_WINDOW = 10.0
 local TOGGLE_LIMIT = 6         -- more changes than this inside the window mutes the flag
 local MUTE_TIME = 60.0
 local FLUSH_INTERVAL = 0.05
-local WORDS_INTERVAL = 2.0
+local WORDS_INTERVAL = 5.0     -- reading the whole flag table is not free: only now and then
 local FULL_TIMEOUT = 20.0
 
 -- opts: { role, protocol, settings, send(bytes, reliable), log(fmt, ...) }

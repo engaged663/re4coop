@@ -127,7 +127,12 @@ T.run("world_messages_wait_for_the_game_loop", function()
     T.eq(s.messages[#s.messages].text, "Host: still here", "chat handled right away")
     clock.t = 1
     s:update()
-    T.eq(world.flags[g], true, "applied on the next game tick")
+    T.check(world.flags[g] == nil, "not in the first frames after loading (the scene is still settling)")
+    for i = 1, 12 do
+        clock.t = 1 + i * 0.1
+        s:update()
+    end
+    T.eq(world.flags[g], true, "applied once the game has been running for a moment")
     T.eq(#s.deferred, 0, "queue drained")
 end)
 
@@ -154,7 +159,7 @@ T.run("joining_client_takes_the_hosts_world_then_warps", function()
 end)
 
 T.run("joining_from_another_chapter_loads_the_hosts", function()
-    local s, net, clock, game, world = make("client")
+    local s, net, clock, game, world = make("client", { settings = { travel_reload = true } })
     game.chapter = 23100
     s.join_travel_pending = true
     clock.t = 1
@@ -187,7 +192,7 @@ T.run("joining_from_the_title_screen_redirects_the_next_load", function()
 end)
 
 T.run("client_follows_the_host_into_the_next_chapter", function()
-    local s, net, clock, _, world = make("client")
+    local s, net, clock, _, world = make("client", { settings = { travel_reload = true } })
     for i = 1, 40 do
         clock.t = i * 0.5
         net.push(player_msg(clock.t, 21200, 44410, { x = 3, y = 0, z = 230 }))
@@ -211,7 +216,7 @@ T.run("client_never_follows_the_host_back", function()
 end)
 
 T.run("f6_loads_the_chapter_the_host_waits_in", function()
-    local s, net, clock, game, world = make("client")
+    local s, net, clock, game, world = make("client", { settings = { travel_reload = true, stage_travel = true } })
     game.keys = {}
     -- Host is held at the start of the next chapter (GATE_WAITING).
     for i = 1, 10 do
@@ -230,7 +235,7 @@ T.run("f6_loads_the_chapter_the_host_waits_in", function()
 end)
 
 T.run("cross_stage_teleport_uses_the_games_warp", function()
-    local s, net, clock, game = make("client")
+    local s, net, clock, game = make("client", { settings = { stage_travel = true } })
     for i = 1, 5 do
         clock.t = i * 0.1
         net.push(player_msg(clock.t, 21100, 43310, { x = 65, y = 6, z = -78 }))
@@ -248,7 +253,7 @@ T.run("cross_stage_teleport_uses_the_games_warp", function()
 end)
 
 T.run("partners_cutscene_plays_here_too", function()
-    local s, net, clock, _, world = make("client")
+    local s, net, clock, _, world = make("client", { settings = { sync_cutscenes = true } })
     net.push(player_msg(0.1, 21100, 40200, { x = 2, y = 0, z = 0 }))
     net.push(P.encode_cutscene({ id = 20130, method = "requestPlay", chapter = 21100, stage = 40200,
         pos = { x = 2, y = 0, z = 0 }, flags = P.CUTSCENE_FLAGS.LOCAL_TRIGGER }))
@@ -317,8 +322,37 @@ T.run("no_pause_follows_the_session", function()
     s:update()
     T.eq(pause.active, true, "and on again")
     s:leave()
-    T.eq(pause.active, false, "off after leaving")
+    T.eq(pause.active, true, "leave() may run on the render thread: nothing in the game changes yet")
+    s:update()
+    T.eq(pause.active, false, "off after leaving (next game frame)")
     T.eq(game.ai_restored, 1, "enemy AI restored")
+end)
+
+T.run("ui_actions_run_on_the_game_thread", function()
+    local s, net, clock, game = make("client", { settings = { stage_travel = false } })
+    net.push(player_msg(0.1, 21100, 40200, { x = 9, y = 0, z = 9 }))
+    s:update()
+    s:queue("teleport")
+    s:update_network_only() -- render thread: the teleport waits
+    T.eq(#game.teleports, 0, "nothing moved from the render thread")
+    clock.t = 0.2
+    s:update()
+    T.eq(#game.teleports, 1, "teleported on the game thread")
+    s:queue("leave")
+    s:update_network_only() -- network actions may run anywhere
+    T.eq(net.st, "idle", "left")
+    T.eq(game.ai_restored, 0, "but the game side waits for the game thread")
+    s:update()
+    T.eq(game.ai_restored, 1, "restored there")
+end)
+
+T.run("disconnect_restores_ai_on_the_game_thread", function()
+    local s, net, clock, game = make("host")
+    net.inbox[#net.inbox + 1] = { type = "disconnected", data = "timeout" }
+    s:update_network_only()
+    T.eq(game.ai_restored, 0, "not from the render thread")
+    s:update()
+    T.eq(game.ai_restored, 1, "on the next game frame")
 end)
 
 T.run("shutdown_restores_everything", function()

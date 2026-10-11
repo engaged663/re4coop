@@ -182,7 +182,7 @@ void Session::stop() {
     m_events.clear();
 }
 
-bool Session::send(std::string_view payload, bool reliable, std::string& err) {
+bool Session::send(std::string_view payload, bool reliable, std::string& err, bool unordered) {
     std::scoped_lock _{m_mutex};
     if (m_state != State::Connected) {
         err = "not connected";
@@ -195,19 +195,20 @@ bool Session::send(std::string_view payload, bool reliable, std::string& err) {
 
     Writer w;
     if (reliable) {
-        if (m_unacked.size() >= m_cfg.max_reliable_in_flight) {
+        if (m_unacked.size() + m_unacked_unordered.size() >= m_cfg.max_reliable_in_flight) {
             err = "reliable send queue is full (partner not acknowledging)";
             return false;
         }
         PendingReliable p;
-        p.seq = m_next_reliable_seq++;
-        w.header(PacketType::Reliable, m_token);
+        p.seq = unordered ? m_next_unordered_seq++ : m_next_reliable_seq++;
+        w.header(unordered ? PacketType::ReliableUnordered : PacketType::Reliable, m_token);
         w.u16(p.seq);
         w.bytes(payload.data(), payload.size());
         p.packet = w.data();
         p.last_sent = Clock::now();
+        p.rto_s = rto_s_locked();
         send_raw_locked(m_peer, p.packet);
-        m_unacked.push_back(std::move(p));
+        (unordered ? m_unacked_unordered : m_unacked).push_back(std::move(p));
     } else {
         w.header(PacketType::Unreliable, m_token);
         w.u16(m_next_unreliable_seq++);
@@ -239,7 +240,7 @@ Stats Session::stats() const {
     s.peer_name = m_state == State::Connected ? m_peer_name : std::string{};
     s.rtt_ms = m_have_rtt ? m_srtt_s * 1000.0 : 0.0;
     s.since_last_recv_s = m_state == State::Connected ? seconds(Clock::now() - m_last_recv) : 0.0;
-    s.reliable_in_flight = m_unacked.size();
+    s.reliable_in_flight = m_unacked.size() + m_unacked_unordered.size();
     return s;
 }
 
@@ -317,20 +318,27 @@ void Session::tick_locked(Clock::time_point now) {
             send_raw_locked(m_peer, w.data());
             m_last_ping = now;
         }
-        const double rto = rto_s_locked();
-        for (auto& p : m_unacked) {
-            if (seconds(now - p.last_sent) >= rto) {
-                send_raw_locked(m_peer, p.packet);
-                p.last_sent = now;
-                ++m_stats.resends;
-            }
-        }
+        resend_locked(m_unacked, now);
+        resend_locked(m_unacked_unordered, now);
         break;
     }
 
     case State::Idle:
     case State::Listening:
         break;
+    }
+}
+
+// Resends every packet whose own timeout passed. Each resend doubles that packet's timeout
+// (up to max_rto), so a burst of loss or a stalled partner does not turn into a resend flood.
+void Session::resend_locked(std::deque<PendingReliable>& queue, Clock::time_point now) {
+    for (auto& p : queue) {
+        if (seconds(now - p.last_sent) >= p.rto_s) {
+            send_raw_locked(m_peer, p.packet);
+            p.last_sent = now;
+            p.rto_s = std::min(std::max(p.rto_s, rto_s_locked()) * 2.0, m_cfg.max_rto_s);
+            ++m_stats.resends;
+        }
     }
 }
 
@@ -485,6 +493,13 @@ void Session::handle_peer_packet_locked(const Header& h, Reader& r, Clock::time_
         deliver_reliable_locked(seq, r.cursor(), r.remaining());
         break;
     }
+    case PacketType::ReliableUnordered: {
+        const uint16_t seq = r.u16();
+        if (!r.ok()) return;
+        m_pending_unordered_acks.push_back(seq);
+        deliver_unordered_locked(seq, r.cursor(), r.remaining());
+        break;
+    }
     case PacketType::Unreliable: {
         const uint16_t seq = r.u16();
         if (!r.ok()) return;
@@ -501,14 +516,16 @@ void Session::handle_peer_packet_locked(const Header& h, Reader& r, Clock::time_
         push_event_locked(std::move(e));
         break;
     }
-    case PacketType::Ack: {
+    case PacketType::Ack:
+    case PacketType::AckUnordered: {
+        auto& queue = h.type == PacketType::Ack ? m_unacked : m_unacked_unordered;
         const uint8_t count = r.u8();
         for (uint8_t i = 0; i < count; ++i) {
             const uint16_t seq = r.u16();
             if (!r.ok()) return;
-            auto it = std::find_if(m_unacked.begin(), m_unacked.end(), [seq](const PendingReliable& p) { return p.seq == seq; });
-            if (it != m_unacked.end()) {
-                m_unacked.erase(it);
+            auto it = std::find_if(queue.begin(), queue.end(), [seq](const PendingReliable& p) { return p.seq == seq; });
+            if (it != queue.end()) {
+                queue.erase(it);
             }
         }
         break;
@@ -554,24 +571,50 @@ void Session::deliver_reliable_locked(uint16_t seq, const uint8_t* data, size_t 
     }
 }
 
-void Session::flush_acks_locked() {
-    if (m_pending_acks.empty() || m_state != State::Connected) {
-        m_pending_acks.clear();
+void Session::deliver_unordered_locked(uint16_t seq, const uint8_t* data, size_t len) {
+    const uint16_t ahead = static_cast<uint16_t>(seq - m_unordered_base);
+    if (ahead >= kReorderWindow || !m_unordered_seen.insert(seq).second) {
+        ++m_stats.unordered_duplicates; // a resend of something already delivered
         return;
     }
+    Event e;
+    e.type = Event::Type::Message;
+    e.reliable = true;
+    e.data.assign(reinterpret_cast<const char*>(data), len);
+    push_event_locked(std::move(e));
+    while (true) {
+        auto it = m_unordered_seen.find(m_unordered_base);
+        if (it == m_unordered_seen.end()) break;
+        m_unordered_seen.erase(it);
+        ++m_unordered_base;
+    }
+}
+
+void Session::send_acks_locked(PacketType type, std::vector<uint16_t>& acks) {
     size_t i = 0;
-    while (i < m_pending_acks.size()) {
-        const size_t n = std::min<size_t>(255, m_pending_acks.size() - i);
+    while (i < acks.size()) {
+        // Up to 255 acks per packet, and never more than one datagram (kMaxDatagram).
+        const size_t n = std::min<size_t>({255, acks.size() - i, (kMaxDatagram - kHeaderSize - 1) / 2});
         Writer w;
-        w.header(PacketType::Ack, m_token);
+        w.header(type, m_token);
         w.u8(static_cast<uint8_t>(n));
         for (size_t k = 0; k < n; ++k) {
-            w.u16(m_pending_acks[i + k]);
+            w.u16(acks[i + k]);
         }
         send_raw_locked(m_peer, w.data());
         i += n;
     }
-    m_pending_acks.clear();
+    acks.clear();
+}
+
+void Session::flush_acks_locked() {
+    if (m_state != State::Connected) {
+        m_pending_acks.clear();
+        m_pending_unordered_acks.clear();
+        return;
+    }
+    if (!m_pending_acks.empty()) send_acks_locked(PacketType::Ack, m_pending_acks);
+    if (!m_pending_unordered_acks.empty()) send_acks_locked(PacketType::AckUnordered, m_pending_unordered_acks);
 }
 
 void Session::send_raw_locked(const Address& to, const std::vector<uint8_t>& bytes) {
@@ -605,6 +648,11 @@ void Session::reset_link_locked() {
     m_next_expected_seq = 0;
     m_reorder.clear();
     m_pending_acks.clear();
+    m_next_unordered_seq = 0;
+    m_unacked_unordered.clear();
+    m_unordered_base = 0;
+    m_unordered_seen.clear();
+    m_pending_unordered_acks.clear();
     m_next_unreliable_seq = 0;
     m_last_unreliable_seq = 0;
     m_have_unreliable = false;

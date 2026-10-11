@@ -45,7 +45,8 @@ T.run("broken_world_adapter_does_not_stop_the_mod", function()
     T.check(ok, "entry script still loads: " .. tostring(err))
     T.check(#mock.callbacks.entry > 0 and #mock.callbacks.ui > 0, "game loop and UI registered")
     mock.press["Host game"] = true
-    mock.run_frame()
+    mock.run_frame() -- the UI queues the action...
+    mock.run_frame() -- ...and the next game frame carries it out
     T.eq(re4coop_net.state(), "listening", "hosting works without the shared world")
     re4coop_net.stop()
     local logged = false

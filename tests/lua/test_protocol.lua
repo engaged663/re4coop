@@ -302,14 +302,14 @@ T.run("enemy_snapshot_chunking", function()
     entries[12].flags = P.ENEMY_FLAGS.ALIVE | P.ENEMY_FLAGS.CLIENT_OWNED
     local msgs = P.encode_enemy_snapshots(9.5, entries)
     local per = P.ENEMIES_PER_SNAPSHOT
-    T.eq(per, 20, "20 enemies per snapshot")
-    T.eq(#msgs, 4, "75 enemies -> 4 chunks")
+    T.eq(per, 17, "17 enemies per snapshot")
+    T.eq(#msgs, 5, "75 enemies -> 5 chunks")
     local seen = 0
     for c, data in ipairs(msgs) do
         T.check(#data <= MAX, ("chunk %d fits in one datagram (%d bytes)"):format(c, #data))
         local m = assert(P.decode(data))
         T.eq(m.chunk, c, "chunk index")
-        T.eq(m.chunks, 4, "chunk count")
+        T.eq(m.chunks, 5, "chunk count")
         for _, e in ipairs(m.enemies) do
             seen = seen + 1
             T.eq(e.net_id, seen, "order preserved")

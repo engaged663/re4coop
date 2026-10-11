@@ -30,6 +30,9 @@ local STALE_EVENT = 1.0   -- seconds behind the animation after which an event i
 local MAX_QUEUED_EVENTS = 256
 local TELEPORT = 2.5      -- metres between two poses that mean a jump, not movement
 local MAX_EXTRAPOLATE = 0.1
+-- When a pose is late, joints keep moving for up to one more pose interval (blend t up to 2)
+-- instead of freezing; the root keeps moving for up to MAX_EXTRAPOLATE seconds.
+local JOINT_MAX_T = 2.0
 
 local function lerp(a, b, t)
     return a + (b - a) * t
@@ -65,7 +68,7 @@ end
 function Sender:reset()
     self.sent_avatar_sig = nil
     self.sent_gear_sig = nil
-    self.last_pose = -math.huge
+    self.last_request = -math.huge
 end
 
 function Sender:tick(now, game)
@@ -104,29 +107,46 @@ function Sender:tick(now, game)
             ev.dt = (ev.time or now) - now
             m.events[i] = ev
         end
+        -- Sounds and effects carry their own timestamps: the unordered reliable lane delivers
+        -- them as soon as they arrive, and a lost one never holds back the world messages.
         for _, bytes in ipairs(P.encode_actions(m)) do
-            self.send(bytes, true)
+            self.send(bytes, true, true)
         end
         self.counters.events = self.counters.events + #events
     end
 
-    if now - self.last_pose >= 1.0 / (self.settings.pose_hz or 30) then
-        local pose = game:take_pose(now)
-        -- Only a pose captured with the descriptors the partner has can be decoded by them.
-        if pose ~= nil and pose.sig == self.sent_avatar_sig and (pose.gear_sig or "") == self.sent_gear_sig then
-            self.last_pose = now
-            for _, bytes in ipairs(P.encode_pose({
-                time = pose.time or now, avatar_rev = self.avatar_rev, gear_rev = self.gear_rev,
-                flags = pose.flags, root_pos = pose.root_pos, root_rot = pose.root_rot,
-                q = pose.q, tpos = pose.tpos, weapons = pose.weapons,
-            })) do
-                self.send(bytes, false)
-                self.counters.pose_bytes = self.counters.pose_bytes + #bytes
-            end
-            self.counters.poses = self.counters.poses + 1
-        end
+    -- Poses: a capture is requested at pose_hz; the game adapter reads it at the end of the
+    -- frame (after animation) and flush_pose sends it right away. send_pose here covers a
+    -- pose that is still waiting, or an in-place read when the end-of-frame callback is not
+    -- running.
+    local interval = 1.0 / (self.rate or self.settings.pose_hz or 30)
+    if now - self.last_request >= interval then
+        self.last_request = (now - self.last_request >= 2 * interval) and now or (self.last_request + interval)
+        self:send_pose(now, game)
         game:request_pose()
     end
+end
+
+-- End of frame, right after the capture (see game:capture_pose_late).
+function Sender:flush_pose(now, game)
+    if self.sent_avatar_sig == nil then return end
+    self:send_pose(now, game)
+end
+
+function Sender:send_pose(now, game)
+    local pose = game:take_pose(now)
+    -- Only a pose captured with the descriptors the partner has can be decoded by them.
+    if pose == nil or pose.sig ~= self.sent_avatar_sig or (pose.gear_sig or "") ~= self.sent_gear_sig then return end
+    local P = self.P
+    for _, bytes in ipairs(P.encode_pose({
+        time = pose.time or now, avatar_rev = self.avatar_rev, gear_rev = self.gear_rev,
+        flags = pose.flags, root_pos = pose.root_pos, root_rot = pose.root_rot,
+        q = pose.q, tpos = pose.tpos, weapons = pose.weapons,
+    })) do
+        self.send(bytes, false)
+        self.counters.pose_bytes = self.counters.pose_bytes + #bytes
+    end
+    self.counters.poses = self.counters.poses + 1
 end
 
 -------------------------------------------------------------------------------
@@ -172,17 +192,19 @@ local function blend_weapons(wa, wb, t)
     return out
 end
 
--- Blends two decoded POSE chunks. Joints never extrapolate (t is clamped); the root
--- position may, which keeps a running partner moving smoothly through a lost packet.
+-- Blends two decoded POSE chunks. Joints extrapolate at most one pose interval (JOINT_MAX_T);
+-- the root position up to MAX_EXTRAPOLATE seconds, which keeps a running partner moving
+-- smoothly through a lost packet.
 local function make_chunk_blend()
     local qbuf = {}
     return function(sa, sb, t)
         if sa.first ~= sb.first or sa.count ~= sb.count then
             return t < 0.5 and sa or sb
         end
+        local tj = t < 0 and 0 or (t > JOINT_MAX_T and JOINT_MAX_T or t)
         local tq = t < 0 and 0 or (t > 1 and 1 or t)
         for k = 4, sa.count * 4, 4 do
-            nlerp_into(qbuf, k, sa.q, sb.q, tq)
+            nlerp_into(qbuf, k, sa.q, sb.q, tj)
         end
         local out = { first = sa.first, count = sa.count, q = qbuf, chunk = sa.chunk }
         if sa.root_pos and sb.root_pos then
@@ -233,8 +255,8 @@ end
 function Receiver:chunk_interp(c)
     local it = self.chunks[c]
     if it == nil then
-        it = Interp.new({ delay = self.settings.interp_delay or 0.1, max_extrapolate = MAX_EXTRAPOLATE,
-            blend = make_chunk_blend() })
+        it = Interp.new({ delay = self.settings.interp_delay or 0.066, max_extrapolate = MAX_EXTRAPOLATE,
+            blend = make_chunk_blend(), adaptive = true })
         self.chunks[c] = it
     end
     return it
@@ -289,13 +311,15 @@ function Receiver:state(now)
     if self.avatar == nil then return nil end
     local st = { avatar = self.avatar, gear = self.gear }
     local main = self.chunks[1]
-    local root = main and main:sample(now)
+    -- Every chunk is sampled at the instant chunk 1 shows: one body, one moment.
+    local target = main and main:target(now)
+    local root = main and main:sample_remote(target)
     if root == nil or root.root_pos == nil then
         return st
     end
     local q = self.q
     for c, it in pairs(self.chunks) do
-        local s = c == 1 and root or it:sample(now)
+        local s = c == 1 and root or it:sample_remote(target)
         if s ~= nil then
             local base = (s.first - 1) * 4
             local sq = s.q
@@ -322,7 +346,7 @@ function Receiver:take_events(now)
         self.events = {}
         return due
     end
-    local cutoff = now - main.offset - main.delay
+    local cutoff = now - main.offset - main:effective_delay()
     local due, keep = {}, {}
     for _, e in ipairs(self.events) do
         if e.t <= cutoff then

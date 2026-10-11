@@ -1,5 +1,6 @@
 -- Control panel inside the REFramework menu (press Insert in game): host/join, partner
--- status, chat, sync options and diagnostics.
+-- status, chat, sync options and diagnostics. This runs on the render thread: buttons that
+-- change the game only queue the action (Session:queue); the game thread carries it out.
 
 local Config = require("re4coop.config")
 local P = require("re4coop.protocol")
@@ -12,7 +13,6 @@ local COLOR_ERR = 0xFF6060FF
 local COLOR_DIM = 0xFFA0A0A0
 
 local chat_draft = ""
-local dump_result = nil
 
 local function text_input(label, value)
     local changed, v = imgui.input_text(label, value, 0)
@@ -51,7 +51,7 @@ local function draw_connection(session, settings, status)
 
         if imgui.button("Host game") then
             Config.sanitize(settings)
-            session:host()
+            session:queue("host")
         end
         imgui.same_line()
         imgui.text_colored("your partner joins with one of these addresses:", COLOR_DIM)
@@ -67,11 +67,11 @@ local function draw_connection(session, settings, status)
         changed, settings.last_address = text_input("Host IP (or IP:port)", settings.last_address)
         if imgui.button("Join game") then
             Config.sanitize(settings)
-            session:join(settings.last_address)
+            session:queue("join", settings.last_address)
         end
     else
         if imgui.button(status.role == "host" and "Stop hosting" or "Disconnect") then
-            session:leave()
+            session:queue("leave")
         end
     end
 
@@ -100,12 +100,12 @@ local function draw_status(session, status)
                     status.teleport_key_name or "F6"), COLOR_WARN)
             end
             if imgui.button("Teleport to partner") then
-                session:teleport_to_partner()
+                session:queue("teleport")
             end
             if session:can_travel() then
                 imgui.same_line()
                 if imgui.button("Travel to partner (loads their area or chapter)") then
-                    session:travel_to_partner()
+                    session:queue("travel")
                 end
             end
             local tr = status.travel
@@ -195,8 +195,8 @@ local function draw_options(settings)
         checkbox(settings, "enemy_puppet_ai", "...with their AI switched off where they are only shown")
         slider_float(settings, "match_radius", "Pairing radius (m)", 0.5, 10.0)
         slider_float(settings, "snap_distance", "Client without mirroring: snap enemies further than (m, 0 = off)", 0.0, 20.0)
-        checkbox(settings, "replay_partner_hits", "Enemies react to your partner's hits")
-        checkbox(settings, "sync_drops", "Enemies drop the same item for both players")
+        checkbox(settings, "hit_ownership", "An enemy your partner is shooting is run by their game (it reacts to their hits)")
+        checkbox(settings, "sync_drops", "Every enemy that dies gives each player their own loot (also your partner's kills)")
 
         imgui.separator()
         imgui.text_colored("Shared world", COLOR_DIM)
@@ -204,15 +204,11 @@ local function draw_options(settings)
         checkbox(settings, "sync_gimmicks", "Doors, locks, levers, puzzles")
         checkbox(settings, "sync_objects", "Breakables and animals (crates, barrels, crows...)")
         checkbox(settings, "sync_object_states", "Experimental: other state changes of those objects")
-        checkbox(settings, "sync_cutscenes", "Cutscenes play for both players")
-        checkbox(settings, "cutscene_travel", "...bringing the partner over first")
 
         imgui.separator()
         imgui.text_colored("Joining and travelling", COLOR_DIM)
         checkbox(settings, "auto_travel", "Client: on joining, go to the host's chapter and area")
-        checkbox(settings, "travel_reload", "Load another chapter automatically (game over -> Continue)")
         checkbox(settings, "follow_host_chapter", "Client: follow the host into the next chapter")
-        checkbox(settings, "stage_travel", "Teleports to another area load it first (game's own warp)")
 
         imgui.separator()
         imgui.text_colored("Pauses", COLOR_DIM)
@@ -241,6 +237,21 @@ local function draw_options(settings)
         slider_int(settings, "pose_hz", "Character pose updates per second", 10, 60)
         slider_int(settings, "snapshot_hz", "Enemy snapshots per second (host)", 2, 30)
         slider_float(settings, "interp_delay", "Interpolation delay (s)", 0.0, 0.5)
+
+        imgui.separator()
+        imgui.text_colored("Diagnostics", COLOR_DIM)
+        checkbox(settings, "profiler", "Measure the mod's cost per frame (Diagnostics > Performance)")
+        checkbox(settings, "perf_file", "...and write it to reframework/data/re4coop_perf.json")
+
+        imgui.separator()
+        imgui.text_colored("Experimental (may crash the game - off by default)", COLOR_WARN)
+        checkbox(settings, "replay_partner_hits", "Replay your partner's hits on enemies your game runs (flinch)")
+        checkbox(settings, "sync_cutscenes", "A cutscene one player triggers starts in the partner's game")
+        checkbox(settings, "cutscene_travel", "...bringing the partner over first")
+        checkbox(settings, "stage_travel", "Teleports to another area preload it and use the game's warp")
+        checkbox(settings, "travel_reload", "Load the partner's chapter automatically (game over -> Continue)")
+        checkbox(settings, "exp_table_reload", "Apply the partner's story flags by reloading the flag table")
+        checkbox(settings, "exp_force_routine", "Break objects by forcing their state machine")
         imgui.tree_pop()
     end
 end
@@ -278,8 +289,30 @@ local function draw_models(status, game, puppet)
     end
 end
 
-local function draw_diagnostics(game, session_status, puppet)
+local function draw_performance(perf, game)
+    local r = perf and perf:summary()
+    if r == nil then
+        imgui.text_colored("Performance: measuring... (enable it under Options > Diagnostics)", COLOR_DIM)
+        return
+    end
+    local color = (r.frame_avg_ms > 2.0 or r.frame_max_ms > 8.0) and COLOR_WARN or COLOR_OK
+    imgui.text_colored(("Performance: %.2f ms per frame on average, worst frame %.2f ms, %d frames over 4 ms in the last second, %.0f fps"):format(
+        r.frame_avg_ms, r.frame_max_ms, r.spikes, r.fps), color)
+    if r.game_calls_per_s then
+        imgui.text_colored(("  %.0f engine calls per second through the adapter"):format(r.game_calls_per_s), COLOR_DIM)
+    end
+    for i = 1, math.min(#r.spans, 10) do
+        local sp = r.spans[i]
+        imgui.text_colored(("  %-18s %6.3f ms avg  %6.3f ms max  %5.1f calls/frame"):format(sp.name, sp.avg_ms, sp.max_ms, sp.calls),
+            COLOR_DIM)
+    end
+    imgui.text_colored("  after a crash, send reframework/data/re4coop_breadcrumb.json (what the mod did last)", COLOR_DIM)
+end
+
+local function draw_diagnostics(session, game, session_status, puppet, perf)
     if imgui.tree_node("Diagnostics") then
+        draw_performance(perf, game)
+        imgui.separator()
         local version, proto = re4coop_net.version()
         imgui.text(("re4coop %s  |  plugin %s (net protocol %d)  |  game protocol %d"):format(
             P.MOD_VERSION, version, proto, P.VERSION))
@@ -346,8 +379,9 @@ local function draw_diagnostics(game, session_status, puppet)
         end
         if session_status and session_status.drops then
             local c = session_status.drops.counters
-            imgui.text(("drops: %s | seen %d, sent %d, received %d, spawned %d (verified %d, missing %d)"):format(
-                session_status.drops.state, c.drops_seen, c.sent, c.received, c.spawned, c.verified, c.unverified))
+            imgui.text(("loot: %s | game rolls %d (enemies %d), partner kills %d -> rolled by us %d, failed %d, gone %d, doubles %d, kinds without loot %d"):format(
+                session_status.drops.state, c.rolls_seen, c.natural, c.partner_kills, c.requested, c.request_failed,
+                c.gone, c.doubles, c.no_drop_kinds))
         end
         if session_status and session_status.gate then
             local g = session_status.gate
@@ -358,6 +392,7 @@ local function draw_diagnostics(game, session_status, puppet)
         imgui.separator()
         draw_models(session_status, game, puppet)
         if imgui.button("Write research dump (adds a run to reframework/data/)") then
+            -- Built here, written on the game thread (it reads enemies, pickups and objects).
             local extra = session_status and {
                 role = session_status.role, enemies = session_status.enemies, items = session_status.items,
                 drops = session_status.drops, gate = session_status.gate,
@@ -368,28 +403,27 @@ local function draw_diagnostics(game, session_status, puppet)
                 partner_model = puppet and puppet:status() or nil,
                 local_chapter = session_status.local_chapter, partner_chapter = session_status.partner_chapter,
             } or nil
-            local ok, runs = game:dump_types(extra)
-            dump_result = ok and ("run %d saved - send re4coop_typedump.json and re4coop_research_log.json"):format(runs)
-                or "failed (see REFramework log)"
+            session.dump_result = "writing on the next game frame..."
+            session:queue("dump", extra)
         end
-        if dump_result then
+        if session.dump_result then
             imgui.same_line()
-            imgui.text_colored(dump_result, COLOR_DIM)
+            imgui.text_colored(session.dump_result, COLOR_DIM)
         end
         imgui.tree_pop()
     end
 end
 
-function UI.draw(session, game, settings, json, puppet)
+function UI.draw(session, game, settings, json, puppet, perf)
     if not imgui.tree_node("RE4 Co-op (LAN)") then return end
-    local status = session:status()
+    local status = session.status_cached and session:status_cached() or session:status()
     draw_status(session, status)
     imgui.separator()
     draw_connection(session, settings, status)
     imgui.separator()
     draw_chat(session, status)
     draw_options(settings)
-    draw_diagnostics(game, status, puppet)
+    draw_diagnostics(session, game, status, puppet, perf)
     if imgui.button("Save settings") then
         Config.sanitize(settings)
         Config.save(json, settings)

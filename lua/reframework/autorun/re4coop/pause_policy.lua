@@ -5,14 +5,17 @@
 -- world it freezes. In co-op the partner keeps playing, so a menu must not freeze your
 -- world: those pauses are neutralised (they still "happen" for the menus, but freeze
 -- nothing). Only pauses that belong to shared or system moments are kept: cutscenes /
--- events and loading, which both players go through together anyway.
+-- events and loading, which both players go through together anyway, and screens where the
+-- game reads or writes its state as a whole (saving at a typewriter, the merchant, game over /
+-- retry): letting the world run under those is not worth the risk.
 -- Pure Lua, tested offline.
 
 local PausePolicy = {}
 
 -- Name fragments (lower case) of pauses that keep their normal effect.
 PausePolicy.KEEP = { "event", "movie", "demo", "timeline", "cutscene", "load", "fade", "title",
-    "ending", "warp", "boot", "system_reset" }
+    "ending", "warp", "boot", "system_reset", "save", "typewriter", "shop", "merchant", "trade",
+    "gameover", "game_over", "retry", "continue", "credit" }
 
 -- Returns true if a pause with this enum name should freeze nothing while in co-op.
 -- mode: "all" (also events), "menus" (default), "off".

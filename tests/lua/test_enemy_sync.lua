@@ -90,7 +90,8 @@ end
 
 local function make_pair(settings)
     settings = settings or {}
-    for k, v in pairs({ sync_hp = true, sync_deaths = true, snapshot_hz = 10, match_radius = 3.0, snap_distance = 0 }) do
+    for k, v in pairs({ sync_hp = true, sync_deaths = true, snapshot_hz = 10, match_radius = 3.0, snap_distance = 0,
+        replay_partner_hits = true }) do
         if settings[k] == nil then settings[k] = v end
     end
     local pair = { now = 0, host_world = make_world(1000), client_world = make_world(5000), to_host = {}, to_client = {},
@@ -336,8 +337,13 @@ T.run("unpaired_damage_found_by_context_id", function()
     pair.client:tick(pair.now, pair.client_world:list(), pair.client_world) -- baseline, no snapshot yet
     pair.client_world:damage(c, 40)
     pair.client:tick(pair.now + 0.05, pair.client_world:list(), pair.client_world)
-    T.eq(#pair.to_host, 1, "report sent before pairing")
-    local m = assert(P.decode(pair.to_host[1]))
+    local reports = {}
+    for _, bytes in ipairs(pair.to_host) do
+        local msg = assert(P.decode(bytes))
+        if msg.type == P.T.ENEMY_DAMAGE then reports[#reports + 1] = msg end
+    end
+    T.eq(#reports, 1, "report sent before pairing")
+    local m = reports[1]
     T.eq(m.net_id, 0, "no net id yet")
     T.eq(P.ctx_key(m.ctx), "2:1:7:7", "carries ContextID")
     pair.host:tick(pair.now, pair.host_world:list(), pair.host_world)
@@ -455,14 +461,46 @@ T.run("hits_on_unknown_enemies_are_counted", function()
     T.eq(pair.client.counters.hits_unmatched, 1, "unmatched")
 end)
 
+T.run("an_enemy_follows_the_fight", function()
+    local pair = make_pair({ enemy_mirror = true, enemy_ownership = true })
+    local function mirror_capable(w) w.enemy_set_transform = function() return true end end
+    mirror_capable(pair.host_world)
+    mirror_capable(pair.client_world)
+    local h, c = standard_level(pair)
+    pair:step(5)
+    local players = { local_pos = { x = 0, y = 0, z = -30 }, partner_pos = { x = 0, y = 0, z = -31 } } -- both far, host a bit closer
+    local function step_owned(n)
+        for _ = 1, n do
+            pair.now = pair.now + 0.05
+            pair.host:tick(pair.now, pair.host_world:list(), pair.host_world, players)
+            for _, b in ipairs(pair.to_client) do pair.client:on_message(assert(P.decode(b)), pair.now, pair.client_world) end
+            pair.to_client = {}
+            pair.client:tick(pair.now, pair.client_world:list(), pair.client_world)
+            for _, b in ipairs(pair.to_host) do pair.host:on_message(assert(P.decode(b)), pair.now, pair.host_world) end
+            pair.to_host = {}
+        end
+    end
+    step_owned(20)
+    local net_a = pair.host.net_of[h.a.id]
+    T.eq(pair.host.owner[net_a], nil, "the host runs it (closer)")
+    pair.client:on_local_hits({ hit_event(c.a, 20, 8) }, pair.now) -- the client shoots it
+    step_owned(8)
+    T.eq(pair.host.owner[net_a], "client", "moves to the client's game while the client fights it")
+    step_owned(70)
+    T.eq(pair.host.owner[net_a], "client", "after the fight, distance decides (with hysteresis: still the client)")
+    players.partner_pos = { x = 0, y = 0, z = -60 } -- the client walks away
+    step_owned(30)
+    T.eq(pair.host.owner[net_a], nil, "back to the closer player")
+end)
+
 T.run("snapshots_stay_compact", function()
     local pair = make_pair()
     for i = 1, 120 do
         pair.host_world:spawn("chainsaw.Ch1c0z0Context", i * 5, 0, 0)
     end
     pair:step(20) -- 1 second
-    -- 10 Hz x ceil(120/20) chunks = ~60 messages per second.
-    T.check(pair.traffic.host <= 66, "host sends about 60 snapshot messages/s, got " .. pair.traffic.host)
+    -- 10 Hz x ceil(120/17) chunks = ~80 messages per second.
+    T.check(pair.traffic.host <= 88, "host sends about 80 snapshot messages/s, got " .. pair.traffic.host)
     T.check(pair.traffic.client <= 22, "client sends about 20 reports/s, got " .. pair.traffic.client)
 end)
 
