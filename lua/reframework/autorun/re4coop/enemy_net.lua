@@ -34,6 +34,13 @@
 --     the owner acknowledged the hit. Damage our puppet takes from anything else (explosions,
 --     falls) is reported to the owner as well.
 --
+--   * Finishers. A stealth kill, grab, knife finish or stomp is asked of the enemy's own AI
+--     head (PlayerHeadUpdater.requestFatal & co.), which a puppet has switched off: the request
+--     would wait while the owner's game ran the enemy on (it chased the other player and died
+--     only when it changed hands). The game whose player starts one takes the enemy over at
+--     once - the host directly, the client with ENEMY_CLAIM (its game runs the enemy from that
+--     moment; the host hands it over) - and keeps it while the finisher plays out.
+--
 --   * Death. Only the owner decides a death and announces it (ENEMY_DEATH) with where it
 --     happened and the killing hit; the other game puts its copy there and kills it with that
 --     same hit (so the death reaction and the loot happen in both games). Deaths are final in
@@ -54,6 +61,7 @@
 --   game:enemy_get_hp(id) -> number|nil
 --   game:enemy_kill(id, fields|nil) -> bool         (dies with its own logic; with the killing hit if given)
 --   game:enemy_erase(id) -> bool                    (optional: removed without a death)
+--   game:enemy_restore_spawns(uid|nil) -> n          (optional: undo enemy_erase - alive again)
 --   game:enemy_apply_hit(id, hit) -> bool           (optional: runs a partner's hit through the game's hit code)
 --   game:enemy_last_hit(id) -> fields|nil           (optional: the values of the last hit it took)
 --   game:enemy_set_puppet(id, on) -> bool           (optional: AI head and animation driver off/on)
@@ -61,6 +69,8 @@
 --   game:enemy_set_anim(id, layers) -> bool         (optional)
 --   game:enemy_set_visible(id, on) -> bool          (optional)
 --   game:scan_eliminated(budget) -> done, uids      (optional, host: enemies dead in its save)
+--   on_local_fatal(ids): the enemies our player started a finisher on (game:take_fatal_events;
+--   the adapter switches such a puppet back on when may_fatal(id) allows it)
 
 local Interp = require("re4coop.interp")
 
@@ -93,6 +103,8 @@ local OWN_MIN = 2.5            -- seconds an enemy stays with its owner at least
 local HIT_BIAS = 4.0           -- metres of advantage for the player who hit it last...
 local HIT_BIAS_TIME = 3.0      -- ...within this many seconds
 local OWN_MAX_RANGE = 80.0     -- a player farther than this from the enemy never gets it
+local FATAL_HOLD = 10.0        -- seconds an enemy stays with the player finishing it (stealth kill, grab...)
+local CLAIM_WAIT = 1.5         -- client: seconds a claimed enemy runs here before the host's answer
 
 local function dist(a, b)
     local dx, dy, dz = a.x - b.x, a.y - b.y, a.z - b.z
@@ -185,7 +197,8 @@ function EnemyNet:reset()
         taken_over = 0, handed_over = 0, hits_sent = 0, hits_forwarded = 0, hits_received = 0, hits_applied = 0,
         hits_fallback = 0, hits_bounced = 0, hits_unmatched = 0, damage_reported = 0, hp_applied = 0, hp_failed = 0,
         deaths_sent = 0, deaths_received = 0, kills_applied = 0, erased = 0, late_kills = 0, buried = 0,
-        graves_sent = 0, graves_received = 0, moves = 0, anims = 0, puppet_switches = 0, held = 0, retired = 0 }
+        graves_sent = 0, graves_received = 0, moves = 0, anims = 0, puppet_switches = 0, held = 0, retired = 0,
+        fatals = 0, claims_sent = 0, claims_granted = 0, claims_refused = 0 }
 end
 
 function EnemyNet:kind_hash(kind)
@@ -351,8 +364,11 @@ function EnemyNet:take_over(net, game, now, hp)
     local id = net.local_id
     local e = id and self.by_id[id]
     local st = net.newest
+    local l = id and self.locals[id]
     if e ~= nil and e.alive and game ~= nil then
-        if st ~= nil and net.updated ~= nil and game.enemy_set_transform ~= nil then
+        -- (an enemy we claimed already runs here, in the middle of our player's finisher: it
+        -- stays where it is)
+        if st ~= nil and net.updated ~= nil and game.enemy_set_transform ~= nil and not self:claimed(l) then
             local age = math.min(SNAP_EXTRAPOLATE, math.max(0, now - net.updated))
             local v = st.vel or { x = 0, y = 0, z = 0 }
             local pos = { x = st.pos.x + v.x * age, y = st.pos.y + v.y * age, z = st.pos.z + v.z * age }
@@ -386,7 +402,11 @@ function EnemyNet:set_owner(net, owner, epoch, game, now, hp)
     local was_owner, was_epoch = net.owner, net.epoch
     net.owner, net.epoch = owner, epoch
     net.owner_since = now
-    if was_owner == owner and was_epoch ~= 0 then return end
+    local claimed_l = net.local_id and self.locals[net.local_id]
+    if was_owner == owner and was_epoch ~= 0 then
+        if claimed_l ~= nil then claimed_l.claim_until = nil end
+        return
+    end
     self.counters.owner_changes = self.counters.owner_changes + 1
     if owner == self.me then
         -- A copy our game already ran (an unassigned one) simply goes on; a puppet continues
@@ -400,6 +420,13 @@ function EnemyNet:set_owner(net, owner, epoch, game, now, hp)
                 self.locals[net.local_id].expected_hp = hp
             end
         end
+        -- Ours now, and already dead here without its death ever announced (it died while it
+        -- was the partner's - a report that crossed the change of hands): ours to announce.
+        local e = net.local_id and self.by_id[net.local_id]
+        if e ~= nil and not e.alive and claimed_l ~= nil and claimed_l.was_alive == false
+            and not claimed_l.death_sent and not claimed_l.self_killed then
+            self:announce_death(game, net.local_id, e, net, now)
+        end
     else
         -- Hits our player landed while our game still ran it, after the host's last look at
         -- it (`hp`: its HP when it decided), would be lost: they go to the new owner.
@@ -410,6 +437,7 @@ function EnemyNet:set_owner(net, owner, epoch, game, now, hp)
         end
         self:hand_over(net, game)
     end
+    if claimed_l ~= nil then claimed_l.claim_until = nil end -- the host answered our claim
 end
 
 -- Host: the next free net id.
@@ -474,6 +502,10 @@ function EnemyNet:decide_owners(now, game, players)
                     desired = (dh + OWN_MARGIN < dc) and P.OWNER.HOST or P.OWNER.CLIENT
                 end
             end
+            -- A finisher in progress keeps the enemy with the player doing it.
+            local f = net.fatal
+            if f ~= nil and now >= f.till then net.fatal, f = nil, nil end
+            if f ~= nil and (f.who == P.OWNER.HOST or has_copy) then desired = f.who end
             if net.epoch == 0 then
                 if has_copy then
                     -- First assignment, at once. The client's copy may have been fought already
@@ -570,7 +602,7 @@ function EnemyNet:control(game)
         elseif not mirror then
             if l.puppet or l.hidden then self:release(game, id) end
         elseif net ~= nil then
-            if self:runs_here(net) then
+            if self:runs_here(net) or self:claimed(l) then
                 self:release(game, id)
             else
                 self:set_puppet(game, id, true)
@@ -596,8 +628,8 @@ function EnemyNet:reconcile_hp(now, game)
         local id = net.local_id
         local e = id and self.by_id[id]
         local st = net.newest
-        if e ~= nil and e.alive and st ~= nil and st.alive and not self:runs_here(net) then
-            local l = self.locals[id]
+        local l = id and self.locals[id]
+        if e ~= nil and e.alive and st ~= nil and st.alive and not self:runs_here(net) and not self:claimed(l) then
             local p = net.pending
             if p ~= nil and (seq_reached(st.ack or 0, p.seq) or now - p.time > PENDING_TIMEOUT) then
                 net.pending, p = nil, nil
@@ -793,8 +825,10 @@ function EnemyNet:update_deaths(now, game, local_pos)
         local was_alive = l.was_alive
         if was_alive == true and not e.alive and not l.self_killed and not l.death_sent then
             -- It died in our world. Ours to decide: the owner's death, or (no owner yet) a death
-            -- in a game that ran it. A puppet's death is the owner's call: it is reported as damage.
-            if net == nil or self:authority_here(net) or (net.epoch == 0 and self:runs_here(net)) then
+            -- in a game that ran it, or one our player's finisher took over (claimed: the host's
+            -- answer may still be on its way). A puppet's death is the owner's call: it is
+            -- reported as damage.
+            if net == nil or self:authority_here(net) or (net.epoch == 0 and self:runs_here(net)) or self:claimed(l) then
                 if net ~= nil or e.uid ~= nil then self:announce_death(game, id, e, net, now) end
             elseif net ~= nil then
                 self:report_damage(net, e, l, now, l.expected_hp or e.max_hp, true)
@@ -851,7 +885,7 @@ function EnemyNet:on_local_hits(events, now)
         local e = self.by_id[ev.id]
         local net = l and l.net_id and self.nets[l.net_id]
         if l ~= nil and e ~= nil then
-            if net ~= nil and self:partner_owns(net) then
+            if net ~= nil and self:partner_owns(net) and not self:claimed(l) then
                 local seq = self:next_seq()
                 local flags = P.HIT_FLAGS.APPLY | (ev.lethal and P.HIT_FLAGS.LETHAL or 0)
                 self.send(P.encode_enemy_hit({
@@ -976,7 +1010,7 @@ function EnemyNet:check_puppet_damage(now)
         local l = self.locals[id]
         local net = l.net_id and self.nets[l.net_id]
         if e.alive then
-            if net ~= nil and not self:runs_here(net) and not l.self_killed then
+            if net ~= nil and not self:runs_here(net) and not l.self_killed and not self:claimed(l) then
                 local expected = l.expected_hp
                 if expected ~= nil and e.hp < expected - HP_EPS then
                     local unexplained = (expected - e.hp) - (l.hit_dropped or 0)
@@ -987,6 +1021,79 @@ function EnemyNet:check_puppet_damage(now)
             l.expected_hp = e.hp
         end
     end
+end
+
+-------------------------------------------------------------------------------
+-- Finishers
+-------------------------------------------------------------------------------
+
+-- Client: whether our game runs this enemy because our player started a finisher on it and the
+-- host has not answered yet.
+function EnemyNet:claimed(l)
+    return l ~= nil and l.claim_until ~= nil and (self.last_tick or 0) <= l.claim_until
+end
+
+-- Whether our game may take enemy `id` over for a finisher our player starts on it (the
+-- adapter switches a puppet back on right away when it may).
+function EnemyNet:may_fatal(id)
+    if self.role ~= "host" and not self:shared() then return false end -- host authority: never here
+    local e = self.by_id[id]
+    return e ~= nil and e.alive
+end
+
+-- Our player started a finisher on these local enemies: their game is ours now.
+function EnemyNet:on_local_fatal(ids, now, game)
+    local P = self.P
+    for _, id in ipairs(ids or {}) do
+        local l = self.locals[id]
+        local e = self.by_id[id]
+        local net = l and l.net_id and self.nets[l.net_id]
+        if net ~= nil and e ~= nil and e.alive and self:may_fatal(id) then
+            self.counters.fatals = self.counters.fatals + 1
+            if self.role == "host" then
+                net.fatal = { who = P.OWNER.HOST, till = now + FATAL_HOLD }
+                if net.owner ~= P.OWNER.HOST then
+                    self:assign(net, P.OWNER.HOST, now, e.hp)
+                    self:set_owner(net, P.OWNER.HOST, net.epoch, game, now)
+                end
+            else
+                if not self:runs_here(net) then
+                    l.claim_until = now + CLAIM_WAIT
+                    self:set_puppet(game, id, false)
+                end
+                -- (also when it is ours already: the host keeps it with us while it plays out)
+                self.send(P.encode_enemy_claim({ net_id = net.net_id, epoch = net.epoch }), true)
+                self.counters.claims_sent = self.counters.claims_sent + 1
+            end
+            self.log("enemy %s: finisher by our player - %s", tostring(net.net_id),
+                self.role == "host" and "taken over" or "claimed from the host")
+        end
+    end
+end
+
+-- Host: the client's player started a finisher on one of our enemies.
+function EnemyNet:host_on_claim(m, now, game)
+    local P = self.P
+    local net = self.nets[m.net_id]
+    local e = net and net.local_id and self.by_id[net.local_id]
+    local f = net and net.fatal
+    if net == nil or e == nil or not e.alive or not self:shared()
+        or (f ~= nil and f.who == P.OWNER.HOST and now < f.till) then
+        -- Gone, dead, host authority, or our own player is finishing it: it stays ours (the
+        -- client's claim runs out and its copy follows ours again).
+        self.counters.claims_refused = self.counters.claims_refused + 1
+        return
+    end
+    net.fatal = { who = P.OWNER.CLIENT, till = now + FATAL_HOLD }
+    if net.owner ~= P.OWNER.CLIENT then
+        self:assign(net, P.OWNER.CLIENT, now, e.hp)
+        self:set_owner(net, P.OWNER.CLIENT, net.epoch, game, now)
+    else
+        -- Already the client's: confirm it (the claim may have crossed our notice).
+        self.owner_changes[#self.owner_changes + 1] = { net_id = net.net_id, epoch = net.epoch,
+            owner = P.OWNER.CLIENT, uid = net.uid, hp = e.hp }
+    end
+    self.counters.claims_granted = self.counters.claims_granted + 1
 end
 
 -------------------------------------------------------------------------------
@@ -1061,7 +1168,10 @@ function EnemyNet:client_on_state(r, remote_time, now, game)
     end
     local dead_at = self:died_at(r.uid, r.net_id)
     if dead_at ~= nil and now - dead_at < REVIVE_GUARD then return end -- sent before the death notice
-    if r.uid ~= nil and dead_at ~= nil then self:unbury(r.uid) end   -- alive in the host's world again
+    if r.uid ~= nil and dead_at ~= nil then
+        self:unbury(r.uid) -- alive in the host's world again
+        if game ~= nil and game.enemy_restore_spawns ~= nil then game:enemy_restore_spawns(r.uid) end
+    end
     if net == nil then
         net = self:new_net(r.net_id, r.uid, r.kind_hash, r.spawn or r.pos)
     end
@@ -1206,6 +1316,8 @@ function EnemyNet:on_death(m, now, game)
     if m.reset then
         -- The host reloaded a checkpoint: its dead are alive again, and its enemies have new numbers.
         self.grave, self.grave_count, self.dead_net = {}, 0, {}
+        -- What we erased because it was dead there may spawn here again.
+        if game ~= nil and game.enemy_restore_spawns ~= nil then game:enemy_restore_spawns(nil) end
         for _, net in pairs(self.nets) do
             if net.local_id ~= nil then self:release(game, net.local_id) end
             self:unpair(net)
@@ -1330,6 +1442,8 @@ function EnemyNet:on_message(m, now, game)
         if self.role == "host" then self:host_on_roster(m, now) end
     elseif m.type == T.ENEMY_GRAVE then
         if self.role == "client" then self:client_on_grave(m, now) end
+    elseif m.type == T.ENEMY_CLAIM then
+        if self.role == "host" then self:host_on_claim(m, now, game) end
     else
         return false
     end

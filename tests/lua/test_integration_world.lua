@@ -8,6 +8,12 @@ local mock = require("mock_reframework")
 local PORT = 41000 + (os.time() % 2000) -- below the Windows dynamic port range, apart from the other UDP test
 local G_DOOR = "0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9"   -- a door the host opens
 local G_OBJ = "11111111-2222-3333-4444-555555555555"    -- an objective the client completes
+local G_GATE = "22222222-2222-3333-4444-555555555555"   -- a gate the host opens later
+local G_START = "33333333-2222-3333-4444-555555555555"  -- set when the church cutscene starts
+local G_HOOK = "44444444-2222-3333-4444-555555555555"   -- set after "Reset Scripts"
+local G_AREA = "dddddddd-0000-0000-0000-000000000001"   -- the GameObject of an event trigger the host walks into
+local G_AREA2 = "dddddddd-0000-0000-0000-000000000002"  -- ...and of one the client walks into
+local G_DOOR_GO = "d0d0d0d0-0000-0000-0000-000000000001" -- a door both games have
 local CROW = "c0c0c0c0-0000-0000-0000-000000000001"
 local CRATE = "c0c0c0c0-0000-0000-0000-000000000002"
 local CROW2 = "c0c0c0c0-0000-0000-0000-000000000003" -- a crow both players see fly around
@@ -17,6 +23,11 @@ world.player = mock.make_player({ x = 0, y = 0, z = 0 })
 world.stage, world.chapter = 40200, 21100
 mock.add_flag(G_DOOR, 1, 3)
 mock.add_flag(G_OBJ, 2, 7)
+mock.add_flag(G_GATE, 1, 4)
+mock.add_flag(G_START, 1, 5)
+mock.add_flag(G_HOOK, 1, 6)
+local area_runs = 0
+local area2 = mock.make_trigger(G_AREA2, "Area_ChurchSquare", { process = function() area_runs = area_runs + 1 end })
 local ganado = mock.make_character("chainsaw.Ch1c0z0Context", { x = 20, y = 0, z = 0 }, 100)
 -- Level enemies: a villager both games have (each placed it at another spawn point), and one
 -- the host killed in an earlier session (eliminated in its save; alive in the client's).
@@ -26,6 +37,7 @@ local villager = mock.make_character("chainsaw.Ch1c0z0Context", { x = 30, y = 0,
 world.enemies = { ganado, villager }
 mock.add_backup(KILLED_ID, true)
 local crow = mock.make_object("chainsaw.GmCrow", CROW, { x = 3, y = 0, z = 0 }, 0)
+local door = mock.make_door(G_DOOR_GO, { x = 2, y = 0, z = 2 })
 local crate = mock.make_object("chainsaw.GmWoodBox", CRATE, { x = 4, y = 0, z = 0 }, 0)
 local crow2 = mock.make_object("chainsaw.GmCrow", CROW2, { x = 5, y = 0, z = 5 }, 0)
 mock.set_gimmick({ category = 1, kind = 0, group = 40200, index = 5 }, { 0, 0 }, { { id = 1, done = 0 } })
@@ -100,9 +112,14 @@ end
 function client_game:enemy_set_puppet(id, on) self.puppet[id] = on or nil return true end
 function client_game:teleport_player(pos) self.player.pos = pos return true end
 function client_game:is_key_down() return false end
+client_game.case = {}
+function client_game:give_receive(id, count)
+    self.case[id] = (self.case[id] or 0) + count
+    return count
+end
 
 local client_world = { flags = {}, flag_sets = {}, full_groups = nil, gimmicks = {}, objects = {}, applied = {},
-    played = {}, warps = {}, playing = nil }
+    played = {}, warps = {}, playing = nil, done = {}, triggers_run = {} }
 client_game.world = client_world
 function client_world:install_hooks(cb) self.cb = cb end
 function client_world:update() end
@@ -111,6 +128,7 @@ function client_world:location()
     return { chapter = p.chapter, stage = p.stage, pos = p.pos, yaw = 0, playable = true, loading = false }
 end
 function client_world:flag_set(g, v) self.flags[g] = v self.flag_sets[#self.flag_sets + 1] = g return true end
+function client_world:flag_pulse() return true end
 function client_world:flag_check(g) return self.flags[g] or false end
 function client_world:flag_hooks_active() return true end
 function client_world:flag_words_snapshot() return { Main = { 0, 0, 0, 0 }, Chapter = { 0, 0 } } end
@@ -139,10 +157,26 @@ function client_world:object_apply(g, event, value)
     return "done"
 end
 function client_world:cutscene_playing() return self.playing end
-function client_world:cutscene_play(id, method)
-    self.played[#self.played + 1] = { id = id, method = method }
-    self.playing = id
+function client_world:cutscene_done(camera, id) return self.done[camera .. ":" .. id] == true end
+function client_world:cutscene_play(ev)
+    self.played[#self.played + 1] = ev
+    self.playing = true
+    self.done[ev.camera .. ":" .. ev.id] = true
     return true
+end
+function client_world:cutscene_skip(camera, id)
+    if not self.playing then return "missing" end
+    self.skipped = { camera = camera, id = id }
+    self.playing = nil
+    return "skipped"
+end
+client_world.door_states = {}
+function client_world:doors_near() return self.door_states end
+function client_world:door_apply(g, st) self.door_from_host = { guid = g, open = st.open, hold = st.hold } return "done" end
+function client_world:doors_release() end
+function client_world:trigger_run(ev)
+    self.triggers_run[#self.triggers_run + 1] = ev
+    return "run"
 end
 function client_world:preload_stage() return true end
 function client_world:warp(stage, pos)
@@ -177,7 +211,6 @@ function client_world:restore_animals() self.puppets = {} end
 local client_settings = Config.load(nil)
 client_settings.player_name = "ClientLeon"
 client_settings.port = PORT
-client_settings.sync_cutscenes = true
 local client_net_obj = re4coop_net.new_session()
 local client = Session.new({ net = wrap(client_net_obj), game = client_game, world = client_world,
     clock = re4coop_net.time, settings = client_settings })
@@ -264,13 +297,16 @@ T.run("a_client_reload_takes_the_hosts_world_again", function()
 end)
 
 T.run("flags_cross_both_ways", function()
-    client_world.flags[G_DOOR] = true -- what the full copy gave the client's game
-    mock.game_set_flag(G_DOOR, false)  -- the host's game closes the door again
-    local ok = T.wait_until(function() return client_world.flags[G_DOOR] == false end, step, 5)
+    mock.game_set_flag(G_GATE, true) -- game code in the host's game opens a gate (Variable.set_Bool)
+    local ok = T.wait_until(function() return client_world.flags[G_GATE] == true end, step, 5)
     T.check(ok, "the host's change reached the client's game")
+    client_world.flags[G_DOOR] = true -- what the full copy gave the client's game
+    mock.game_set_flag(G_DOOR, false)  -- the host's game goes back to an older state (a checkpoint)
+    T.wait_until(function() return false end, step, 0.5)
+    T.eq(client_world.flags[G_DOOR], true, "a flag going off never undoes the client's world")
     client_world.cb.on_flag(G_OBJ, true) -- the client's game completes an objective
     ok = T.wait_until(function() return mock.flag_value(G_OBJ) end, step, 5)
-    T.check(ok, "the client's objective is set in the host's game (requestSetFlag)")
+    T.check(ok, "the client's objective is set in the host's game (GlobalUserDataManager.trySetBool)")
 end)
 
 T.run("gimmicks_cross_as_soon_as_the_game_announces_them", function()
@@ -280,6 +316,30 @@ T.run("gimmicks_cross_as_soon_as_the_game_announces_them", function()
         return g ~= nil and g.triggers[1] and g.triggers[1].done == 1
     end, step, 5)
     T.check(ok, "the host's lever reached the client")
+    -- The client's game opens a shutter: the host's game takes it gimmick by gimmick.
+    client.settings.gimmick_interval = 0.5
+    T.wait_until(function() return false end, step, 1.5) -- the client's game has compared its table
+    client_world.gimmicks["1:0:40200:5"] = { ctx = { category = 1, kind = 0, group = 40200, index = 5 }, attr = "\2\0",
+        triggers = { { id = 1, done = 1 } }, detected = false, acc = {} }
+    ok = T.wait_until(function()
+        local g = world.gimmick_table["1:0:40200:5"]
+        return g ~= nil and g.attr[1] == 2
+    end, step, 5)
+    T.check(ok, "the client's change reached the host's game")
+    T.eq(world.gimmick_loads, nil, "without reloading the host's whole gimmick table")
+    client.settings.gimmick_interval = nil
+end)
+
+T.run("a_door_the_client_walks_through_opens_and_stays_open_for_the_host", function()
+    client_world.door_states[G_DOOR_GO] = { open = true, hold = true, attr = 1 }
+    local ok = T.wait_until(function() return door.__fields._Routine == 1 end, step, 5)
+    T.check(ok, "the host's door opened")
+    T.wait_until(function() return false end, step, 1)
+    T.eq(door.__fields._Routine, 1, "and stays open while the client is in it")
+    client_world.door_states[G_DOOR_GO] = { open = true, hold = false, attr = 1 }
+    ok = T.wait_until(function() return door.__fields._Routine == 0 end, step, 5)
+    T.check(ok, "it closes once the client walked on")
+    client_world.door_states = {}
 end)
 
 T.run("animals_near_both_players_follow_the_host", function()
@@ -320,20 +380,66 @@ T.run("cutscene_plays_for_both", function()
     -- having arrived (gate radius 10 m) unless it is in the cutscene too.
     client_game.player.pos = { x = 20, y = 0, z = 0 }
     T.wait_until(function() return false end, step, 0.3) -- the host sees the client there
-    mock.start_cutscene(20130) -- the host walks into a cutscene trigger
+    -- The host walks into the church: its game plays the cutscene "once" through a PayloadPlay
+    -- (start flag group 0 / bit 5, data owner and next scripted step).
+    mock.start_cutscene(20130, { screen = 3, start_flags = { { group = 0, index = 5 } }, owner = 0x4242,
+        end_portrayal = 0x99 })
+    T.eq(mock.flag_value(G_START), true, "the host's cutscene set its start flag")
     local ok = T.wait_until(function() return #client_world.played > 0 end, step, 5)
     T.check(ok, "the client's game played it")
-    T.eq(client_world.played[1] and client_world.played[1].id, 20130, "the same cutscene")
+    local ev = client_world.played[1] or {}
+    T.eq(ev.id, 20130, "the same cutscene")
+    T.eq(ev.screen, 3, "on the same screen")
+    T.eq(ev.owner_code, 0x4242, "continuing the same scripted sequence")
+    T.eq(ev.start_flags and ev.start_flags[1].index, 5, "with its start flags")
     -- Both are in it, so the transition gate does not hold the host once its grace period
     -- (1.5 s) is over.
     T.wait_until(function() return false end, step, 2.5)
     T.eq(world.time_scale, 1.0, "host not frozen while the client watches too")
     T.eq(client.partner_state and (client.partner_state.flags & P.PLAYER_FLAGS.CUTSCENE) ~= 0, true,
         "the client sees the host in the cutscene")
+    -- The host skips it: the client's copy is skipped too.
+    mock.press_skip()
+    ok = T.wait_until(function() return client_world.skipped ~= nil end, step, 5)
+    T.check(ok, "skipped in the client's game")
+    T.eq(client_world.skipped and client_world.skipped.id, 20130, "the same cutscene")
+    T.wait_until(function() return world.current_cutscene == nil end, step, 2)
+    T.eq(world.current_cutscene, nil, "and over in the host's")
     mock.end_cutscene()
     client_world.playing = nil
     client_game.player.pos = { x = 1, y = 0, z = 0 }
     for _ = 1, 10 do step() end
+end)
+
+T.run("event_triggers_run_in_both_games", function()
+    -- The host walks into a scripted event's area: the client's game (standing close) runs it too.
+    local t = mock.make_trigger(G_AREA, "Area_VillageAmbush")
+    T.check(mock.activate_trigger(t, world.player.body), "the host's game ran it")
+    local ok = T.wait_until(function() return #client_world.triggers_run > 0 end, step, 5)
+    T.check(ok, "the client's game ran the same trigger")
+    local ev = client_world.triggers_run[1] or {}
+    T.eq(ev.guid, G_AREA, "identified by its GameObject's GUID")
+    T.eq(ev.hash, mock.name_hash("Area_VillageAmbush"), "and its name hash")
+    -- The client walks into another one: the host's game finds it and runs it with its player.
+    client_world.cb.on_trigger({ guid = G_AREA2, hash = mock.name_hash("Area_ChurchSquare"), trigger_type = 1, once = true })
+    ok = T.wait_until(function() return area_runs > 0 end, step, 5)
+    T.check(ok, "the host's game ran the client's trigger")
+    T.eq(area2.trigger.__fields["<Done>k__BackingField"], 1, "marked done there")
+    for _ = 1, 10 do step() end
+    T.eq(area_runs, 1, "once")
+end)
+
+T.run("the_host_gives_the_client_an_item_from_its_case", function()
+    local herb = mock.case_item("case-herb", 114400000, 2)
+    local menu, labels = mock.open_item_commands(herb)
+    T.eq(menu.order[#menu.order], 13, "'give' is offered in the host's case")
+    T.eq(labels[13], "Give to ClientLeon", "named after the partner")
+    mock.choose_item_command(herb, 13)
+    T.eq(world.case["case-herb"], nil, "out of the host's case")
+    local ok = T.wait_until(function() return client_game.case[114400000] == 2 end, step, 5)
+    T.check(ok, "in the client's case")
+    ok = T.wait_until(function() return host_messages_contain("Gave") end, step, 2)
+    T.check(ok, "the host was told")
 end)
 
 T.run("an_enemy_next_to_the_client_is_run_by_the_clients_game", function()
@@ -364,8 +470,8 @@ T.run("reset_scripts_keeps_the_session_and_no_pause", function()
     for _ = 1, 20 do step() end
     T.eq(re4coop_net.state(), "connected", "still connected")
     T.eq(mock.pause_freezes(1), false, "no-pause back on")
-    mock.game_set_flag(G_DOOR, true)
-    local ok = T.wait_until(function() return client_world.flags[G_DOOR] == true end, step, 5)
+    mock.game_set_flag(G_HOOK, true)
+    local ok = T.wait_until(function() return client_world.flags[G_HOOK] == true end, step, 5)
     T.check(ok, "flag hooks reinstalled")
 end)
 

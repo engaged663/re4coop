@@ -283,11 +283,15 @@ end
 
 -- obj:call(name, ...) resolves the method on the object's runtime type inside REFramework
 -- (one engine call). Errors and missing methods give nil.
+local function call_method(obj, name, ...)
+    return obj:call(name, ...) -- inside the pcall: a userdata that is not an object fails here
+end
+
 function Game:call(obj, name, ...)
     local t = type(obj)
     if t ~= "userdata" and t ~= "table" then return nil end
     self.n_calls = self.n_calls + 1
-    local ok, r = pcall(obj.call, obj, name, ...)
+    local ok, r = pcall(call_method, obj, name, ...)
     if ok then return r end
     return nil
 end
@@ -2813,5 +2817,8 @@ require("re4coop.game_enemies").install(Game, {
     v3 = v3, q4 = q4, dist = dist, field_type_name = field_type_name, field_is_static = field_is_static,
     type_hierarchy = type_hierarchy, context_id_table = context_id_table, CHARACTER_MANAGER = CHARACTER_MANAGER,
 })
+
+require("re4coop.game_give").install(Game, { singleton = singleton, find_type = find_type })
+require("re4coop.game_save").install(Game, { singleton = singleton, find_type = find_type })
 
 return Game

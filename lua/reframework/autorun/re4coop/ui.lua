@@ -102,6 +102,8 @@ local function draw_status(session, status)
             if imgui.button("Teleport to partner") then
                 session:queue("teleport")
             end
+            imgui.same_line()
+            imgui.text_colored(("(or %s, any time)"):format(status.teleport_key_name or "F6"), COLOR_DIM)
             if session:can_travel() then
                 imgui.same_line()
                 if imgui.button("Travel to partner (loads their area or chapter)") then
@@ -113,6 +115,9 @@ local function draw_status(session, status)
                 imgui.text_colored(("Travelling to partner (%s): %s"):format(tr.reason or "?", tr.state), COLOR_WARN)
             elseif tr ~= nil and tr.result ~= nil and tr.result ~= "arrived" then
                 imgui.text_colored("Last travel: " .. tostring(tr.result), COLOR_DIM)
+            end
+            for _, w in ipairs(status.give_waiting or {}) do
+                imgui.text_colored("Item waiting for your case (close it to receive): " .. w, COLOR_WARN)
             end
             if status.world_sync_pending then
                 imgui.text_colored("Receiving the host's world state...", COLOR_WARN)
@@ -208,7 +213,13 @@ local function draw_options(settings)
         imgui.separator()
         imgui.text_colored("Shared world", COLOR_DIM)
         checkbox(settings, "sync_flags", "Story progress: objectives, map, doors, items taken, events")
+        checkbox(settings, "sync_cutscenes", "A cutscene one player's game starts plays for both")
+        checkbox(settings, "cutscene_travel", "...and a partner who watched it from far away joins you afterwards")
+        checkbox(settings, "sync_skips", "...and skipping it skips it for both")
+        checkbox(settings, "sync_triggers", "A scripted event one player walks into also runs for the partner")
         checkbox(settings, "sync_gimmicks", "Doors, locks, levers, puzzles")
+        checkbox(settings, "sync_doors", "Doors swing open and stay open in both games while either player is in them")
+        checkbox(settings, "give_items", "'Give to partner' in the attache case's item commands")
         checkbox(settings, "sync_objects", "Breakables and animal deaths (crates, barrels, crows...)")
         checkbox(settings, "sync_object_states", "Experimental: other state changes of those objects")
 
@@ -216,6 +227,12 @@ local function draw_options(settings)
         imgui.text_colored("Joining and travelling", COLOR_DIM)
         checkbox(settings, "auto_travel", "Client: on joining, go to the host's chapter and area")
         checkbox(settings, "follow_host_chapter", "Client: follow the host into the next chapter")
+        checkbox(settings, "auto_load_on_join", "Client: joining from the title screen loads your co-op save (or your latest) at once")
+
+        imgui.separator()
+        imgui.text_colored("Saving", COLOR_DIM)
+        checkbox(settings, "sync_saves", "When either game saves (autosave or typewriter), the partner's game saves too")
+        slider_int(settings, "coop_save_slot", "Client: co-op save slot (your autosaves go there too while connected)", 1, 20)
 
         imgui.separator()
         imgui.text_colored("Pauses", COLOR_DIM)
@@ -231,7 +248,7 @@ local function draw_options(settings)
         imgui.separator()
         imgui.text_colored("Progression", COLOR_DIM)
         checkbox(settings, "share_key_items", "Key items exist once (partner's copy disappears when you take one)")
-        checkbox(settings, "left_behind_prompt", "Offer a teleport when the partner is far away")
+        checkbox(settings, "left_behind_prompt", "Remind me of the teleport key when the partner is far away")
         slider_float(settings, "left_behind_distance", "Far-away distance (m)", 10.0, 200.0, "%.0f")
         slider_float(settings, "left_behind_seconds", "...for at least (s)", 1.0, 60.0, "%.0f")
         checkbox(settings, "transition_gate", "Wait for the partner at cutscenes and chapter changes (F8 skips)")
@@ -252,11 +269,8 @@ local function draw_options(settings)
 
         imgui.separator()
         imgui.text_colored("Experimental (may crash the game - off by default)", COLOR_WARN)
-        checkbox(settings, "sync_cutscenes", "A cutscene one player triggers starts in the partner's game")
-        checkbox(settings, "cutscene_travel", "...bringing the partner over first")
         checkbox(settings, "stage_travel", "Teleports to another area preload it and use the game's warp")
         checkbox(settings, "travel_reload", "Load the partner's chapter automatically (game over -> Continue)")
-        checkbox(settings, "exp_table_reload", "Apply the partner's story flags by reloading the flag table")
         checkbox(settings, "exp_force_routine", "Break objects by forcing their state machine")
         imgui.tree_pop()
     end
@@ -336,6 +350,8 @@ local function draw_diagnostics(session, game, session_status, puppet, perf)
                 en.authority or "?", en.with_uid or 0, en.local_count or 0, c.uid_pairs, c.spatial_pairs))
             imgui.text(("enemy owners: %d run here, %d by the partner | changes %d, taken over %d, handed over %d, retired %d"):format(
                 en.run_here or 0, en.run_by_partner or 0, c.owner_changes, c.taken_over, c.handed_over, c.retired))
+            imgui.text(("enemy finishers: ours %d | claims sent %d, granted %d, refused %d"):format(
+                c.fatals or 0, c.claims_sent or 0, c.claims_granted or 0, c.claims_refused or 0))
             imgui.text(("enemy states: sent %d, received %d | puppets %d, held %d | moves %d, animations %d, switches %d"):format(
                 c.states_sent, c.states_received, en.puppets or 0, en.held or 0, c.moves, c.anims, c.puppet_switches))
             imgui.text(("enemy hits: forwarded %d, shown %d, received %d, run %d, as HP %d, bounced %d, unmatched %d, other damage %d | HP set %d, failed %d"):format(
@@ -358,13 +374,35 @@ local function draw_diagnostics(session, game, session_status, puppet, perf)
             if summary.queued and summary.queued > 0 then text = text .. (" | queued %d"):format(summary.queued) end
             if summary.destroyed_known then text = text .. (" | known destroyed %d"):format(summary.destroyed_known) end
             if summary.pending then text = text .. (" | waiting for cutscene %s"):format(tostring(summary.pending)) end
+            if summary.replaying then text = text .. (" | playing partner's cutscene %s"):format(tostring(summary.replaying)) end
+            if summary.holding then text = text .. (" | %d partner flags wait for the cutscene"):format(summary.holding) end
+            if summary.skips_waiting then text = text .. (" | %d partner skips wait for their cutscene"):format(summary.skips_waiting) end
             imgui.text(text)
         end
         if session_status then
             sync_line("flags", session_status.flags)
-            sync_line("gimmicks", session_status.gimmicks)
-            sync_line("objects", session_status.objects)
             sync_line("cutscenes", session_status.cutscenes)
+            sync_line("event triggers", session_status.triggers)
+            if session_status.world_events then
+                local we = session_status.world_events
+                imgui.text(("seen in our game: flag changes %d, cutscenes %d, skips %d, event triggers %d (other triggers %d%s)"):format(
+                    we.flag_events or 0, we.cutscene_events or 0, we.skip_events or 0, we.trigger_events or 0,
+                    we.trigger_not_event or 0,
+                    session_status.world_last_not_event and (", last: " .. session_status.world_last_not_event) or ""))
+                imgui.text(("partner gimmick states applied here: %d (%d wait for their area)"):format(
+                    we.gimmicks_applied or 0, we.gimmicks_waiting or 0))
+            end
+            sync_line("gimmicks", session_status.gimmicks)
+            sync_line("doors", session_status.doors)
+            sync_line("items given", session_status.gives)
+            if session_status.saves then
+                local sv = session_status.saves
+                local c, g = sv.counters, sv.game or {}
+                imgui.text(("saves: ours %d (autosaves to slot %d: %d), sent %d | partner's %d -> saved here %d, already saved %d, gave up %d%s | join loads %d (co-op save used %d, menu asked %d)"):format(
+                    c.own, sv.coop_slot or 0, c.redirected, c.sent, c.received, c.mirrored, c.same, c.given_up,
+                    (sv.queued or 0) > 0 and " | 1 waiting" or "", c.join_loads, g.continue_swaps or 0, g.intents or 0))
+            end
+            sync_line("objects", session_status.objects)
             if session_status.travel then
                 imgui.text(("travel: %s (%s)"):format(session_status.travel.state, tostring(session_status.travel.result or "-")))
             end
@@ -408,7 +446,9 @@ local function draw_diagnostics(session, game, session_status, puppet, perf)
                 role = session_status.role, enemies = session_status.enemies, items = session_status.items,
                 drops = session_status.drops, gate = session_status.gate,
                 flags = session_status.flags, gimmicks = session_status.gimmicks, objects = session_status.objects,
-                cutscenes = session_status.cutscenes, travel = session_status.travel, pause = session_status.pause,
+                cutscenes = session_status.cutscenes, triggers = session_status.triggers,
+                world_events = session_status.world_events, world_last_not_event = session_status.world_last_not_event,
+                travel = session_status.travel, pause = session_status.pause,
                 local_stage = session_status.local_stage, partner_stage = session_status.partner_stage,
                 character_sent = session_status.avatar_tx, character_received = session_status.avatar_rx,
                 partner_model = puppet and puppet:status() or nil,

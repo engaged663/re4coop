@@ -607,6 +607,11 @@ T.run("flags_roundtrip_and_batching", function()
     T.eq(got[3].value, false, "value false")
     T.eq(got[150].guid, flags[150].guid, "last guid")
     T.eq(#P.encode_flags({}), 1, "empty batch is one (empty) message")
+    local pulse = assert(P.decode(P.encode_flags({ { guid = flags[1].guid, value = true, pulse = true },
+        { guid = flags[2].guid, value = true } })[1])).flags
+    T.eq(pulse[1].pulse, true, "a pulse travels as one")
+    T.eq(pulse[1].value, true, "and counts as on")
+    T.eq(pulse[2].pulse, false, "a plain flag is not a pulse")
 end)
 
 T.run("flag_words_full_and_delta", function()
@@ -701,14 +706,53 @@ T.run("objects_cutscene_world_roundtrip", function()
     T.eq(#msgs, 3, "130 events -> 3 messages")
     for _, data in ipairs(msgs) do T.check(#data <= MAX, "fits") end
 
-    local c = assert(P.decode(P.encode_cutscene({ id = 20130, method = "requestPlay", chapter = 21300, stage = 45200,
-        pos = { x = 1, y = 2, z = 3 }, flags = P.CUTSCENE_FLAGS.LOCAL_TRIGGER })))
+    -- A cutscene as the game's PayloadPlay describes it.
+    local starts, ends = {}, {}
+    for i = 1, 60 do starts[i] = { group = i % 7, index = i * 3 } end
+    ends[1] = { group = 12, index = -1 }
+    local c = assert(P.decode(P.encode_cutscene({ camera = P.CAMERA.TIMELINE, id = 20130, screen = 3,
+        owner_code = 0xF0000001, end_portrayal = 0xDEADBEEF, start_flags = starts, end_flags = ends,
+        chapter = 21300, stage = 45200, pos = { x = 1, y = 2, z = 3 }, flags = P.CUTSCENE_FLAGS.LOCAL_TRIGGER })))
+    T.eq(c.camera, P.CAMERA.TIMELINE, "camera type")
     T.eq(c.id, 20130, "cutscene id")
-    T.eq(c.method, "requestPlay", "method")
+    T.eq(c.screen, 3, "screen")
+    T.eq(c.owner_code, 0xF0000001, "data owner code (full u32)")
+    T.eq(c.end_portrayal, 0xDEADBEEF, "next scripted step")
+    T.eq(#c.start_flags, P.MAX_CUTSCENE_FLAGS, "start flags capped")
+    T.eq(c.start_flags[2].group, 2, "flag group")
+    T.eq(c.start_flags[2].index, 6, "flag index")
+    T.eq(c.end_flags[1].index, -1, "signed")
+    T.eq(#c.coords, 0, "no player placements for a timeline")
     T.eq(c.chapter, 21300, "chapter")
     T.eq(c.stage, 45200, "stage")
     T.near(c.pos.z, 3, 1e-6, "pos")
     T.eq(c.flags, P.CUTSCENE_FLAGS.LOCAL_TRIGGER, "flags")
+    local big = P.encode_cutscene({ camera = P.CAMERA.MOVIE, id = 7, start_flags = starts, end_flags = starts,
+        coords = { { kind = 1, pos = { x = 4, y = 5, z = 6 }, rot_y = 0.5, reset_camera = true, only_pc = true },
+            { kind = 2 }, { kind = 3 }, { kind = 4 }, { kind = 5 }, { kind = 6 }, { kind = 7 }, { kind = 8 }, { kind = 9 } } })
+    T.check(#big <= MAX, "the largest cutscene fits one datagram")
+    local mv = assert(P.decode(big))
+    T.eq(mv.camera, P.CAMERA.MOVIE, "movie")
+    T.eq(#mv.coords, P.MAX_CUTSCENE_COORDS, "placements capped")
+    T.eq(mv.coords[1].kind, 1, "player kind")
+    T.near(mv.coords[1].pos.y, 5, 1e-6, "placement")
+    T.near(mv.coords[1].rot_y, 0.5, 1e-6, "facing")
+    T.eq(mv.coords[1].reset_camera, true, "reset camera")
+    T.eq(mv.coords[1].only_pc, true, "only PC")
+    T.eq(mv.coords[1].only_npc, false, "not only NPC")
+    T.eq(mv.owner_code, 0xFFFFFFFF, "no data owner")
+
+    local tr = assert(P.decode(P.encode_trigger({ guid = G1, hash = 0xCAFEBABE, trigger_type = 1, once = true,
+        head = true, chapter = 21100, stage = 40200, pos = { x = 7, y = 8, z = 9 } })))
+    T.eq(tr.type, P.T.TRIGGER, "trigger")
+    T.eq(tr.guid, G1, "GameObject guid")
+    T.eq(tr.hash, 0xCAFEBABE, "name hash")
+    T.eq(tr.trigger_type, 1, "area hit")
+    T.eq(tr.once, true, "once")
+    T.eq(tr.head, true, "head")
+    T.eq(tr.stage, 40200, "stage")
+    T.near(tr.pos.y, 8, 1e-6, "where")
+    T.eq(P.encode_trigger({ guid = "nope", hash = 1 }), nil, "needs a guid")
 
     local r = assert(P.decode(P.encode_world_request(77, P.WORLD.FLAGS | P.WORLD.GIMMICKS)))
     T.eq(r.sync_id, 77, "request id")
@@ -754,7 +798,10 @@ T.run("malformed_input_never_raises", function()
         P.encode_gimmicks(1, P.GIMMICK_MODE.DELTA, { { ctx = { category = 1, kind = 0, group = 2, index = 3 }, attr = "ab",
             triggers = { { id = 1, done = 1 } }, detected = true, acc = { { kind = 1, value = 2 } } } })[1],
         P.encode_objects({ { guid = G1, event = 1, value = 2 } })[1],
-        P.encode_cutscene({ id = 1, method = "requestPlay", chapter = 2, stage = 3 }),
+        P.encode_cutscene({ id = 1, chapter = 2, stage = 3, start_flags = { { group = 1, index = 2 } } }),
+        P.encode_cutscene({ camera = 2, id = 1, coords = { { kind = 1 } } }),
+        P.encode_trigger({ guid = G1, hash = 5, trigger_type = 1, once = true }),
+        P.encode_flags({ { guid = G1, value = true, pulse = true } })[1],
         P.encode_world_request(1, 15),
         P.encode_world_done(1, 15, 2, 3),
     }
@@ -778,6 +825,53 @@ T.run("malformed_input_never_raises", function()
     end
     T.check(P.decode(string.pack("<BI2BB", P.T.FRAG, 1, 3, 2)) == nil, "fragment index beyond count")
     T.check(P.decode(string.pack("<BdB", P.T.ACTIONS, 0, 1) .. string.pack("<Bf", 99, 0)) == nil, "unknown event kind")
+end)
+
+T.run("doors_roundtrip", function()
+    local doors = {}
+    for i = 1, 70 do
+        doors[i] = { guid = ("%08x-0000-0000-0000-000000000000"):format(i), open = i % 2 == 0, hold = i % 3 == 0, attr = i }
+    end
+    local msgs = P.encode_doors(doors)
+    T.eq(#msgs, 2, "split at 60 per message")
+    local m = assert(P.decode(msgs[1]))
+    T.eq(m.type, P.T.DOORS, "type")
+    T.eq(#m.doors, 60, "first part")
+    T.eq(m.doors[2].guid, doors[2].guid, "guid")
+    T.eq(m.doors[2].open, true, "open")
+    T.eq(m.doors[3].hold, true, "hold")
+    T.eq(m.doors[5].attr, 5, "attr")
+    T.check(#msgs[1] <= P.MAX_PAYLOAD, "fits one datagram")
+    T.eq(P.decode(msgs[1]:sub(1, 20)), nil, "truncated")
+end)
+
+T.run("item_give_roundtrip", function()
+    local m = assert(P.decode(P.encode_item_give({ seq = 7, item_id = 114400000, count = 3, durability = -1 })))
+    T.eq(m.type, P.T.ITEM_GIVE, "type")
+    T.eq(m.seq, 7, "seq")
+    T.eq(m.item_id, 114400000, "item")
+    T.eq(m.count, 3, "count")
+    T.eq(m.durability, -1, "durability")
+    local r = assert(P.decode(P.encode_item_give_result({ seq = 7, returned = 2 })))
+    T.eq(r.type, P.T.ITEM_GIVE_RESULT, "result type")
+    T.eq(r.returned, 2, "returned")
+end)
+
+T.run("enemy_claim_roundtrip", function()
+    local bytes = P.encode_enemy_claim({ net_id = 513, epoch = 7 })
+    T.eq(#bytes, 4, "4 bytes")
+    local m = assert(P.decode(bytes))
+    T.eq(m.type, P.T.ENEMY_CLAIM, "type")
+    T.eq(m.net_id, 513, "net id")
+    T.eq(m.epoch, 7, "epoch")
+end)
+
+T.run("cutscene_skip_roundtrip", function()
+    local m = assert(P.decode(P.encode_cutscene_skip({ camera = 2, id = 1234 })))
+    T.eq(m.type, P.T.CUTSCENE_SKIP, "type")
+    T.eq(m.camera, 2, "camera")
+    T.eq(m.id, 1234, "id")
+    T.eq(P.decode(string.char(P.T.CUTSCENE_SKIP, 1)), nil, "truncated")
 end)
 
 T.finish()

@@ -31,11 +31,12 @@ end
 local function invoke(m, obj, ...)
     M.calls = (M.calls or 0) + 1 -- every engine call the mod makes (call budget tests)
     if M.call_names then M.call_names[m.key] = (M.call_names[m.key] or 0) + 1 end
+    local params = table.pack(...)
     if m.hooks then
         local args = { 0 }
         if not m.static then args[2] = raw_arg(obj) end
         local base = #args
-        for i = 1, select("#", ...) do args[base + i] = raw_arg((select(i, ...))) end
+        for i = 1, params.n do args[base + i] = raw_arg(params[i]) end
         local skip = false
         for _, h in ipairs(m.hooks) do
             if h.pre and h.pre(args) == M.SKIP_ORIGINAL then skip = true end
@@ -44,8 +45,12 @@ local function invoke(m, obj, ...)
             M.skipped = (M.skipped or 0) + 1
             return nil
         end
+        -- A pre-hook that wrote a parameter (args[i] = sdk.to_ptr(v)) changes what the method gets.
+        for i = 1, params.n do
+            if args[base + i] ~= raw_arg(params[i]) then params[i] = args[base + i] end
+        end
     end
-    local r = m.fn(obj, ...)
+    local r = m.fn(obj, table.unpack(params, 1, params.n))
     if m.hooks then
         for _, h in ipairs(m.hooks) do
             if h.post then r = h.post(r) end
@@ -315,6 +320,13 @@ function typed_methods:get_elements()
 end
 function typed_methods:get_address() return rawget(self, "__addr") end
 function typed_methods:get_type_definition() return classes["System.Array"] end
+-- REManagedObject read_*/write_* (offset from the object): value-type arrays keep their
+-- elements inline from 0x20 (the mod reads FlagInfo and PlayerCoordSetting.Pack this way).
+local function raw(t) local r = rawget(t, "__raw") if r == nil then r = {} rawset(t, "__raw", r) end return r end
+for _, w in ipairs({ "byte", "short", "dword", "qword", "float", "double" }) do
+    typed_methods["read_" .. w] = function(self, off) return raw(self)[off] or 0 end
+    typed_methods["write_" .. w] = function(self, off, v) raw(self)[off] = v end
+end
 function typed_methods:call(name)
     if name == "get_Length" or name == "get_Count" then return rawget(self, "__size") end
     error("mock: array has no method " .. tostring(name))
@@ -595,7 +607,7 @@ function M.install(opts)
     -- Hits: HitController.callbackDamageHit(DamageInfo) applies damage to its character.
     local info_fields = { "Damage", "Wince", "Break", "Stopping", "DamageDir", "AttackOwnerObject", "WeaponID",
         "IsCritical", "IsKill", "WeaponGameObject", "AttackGameObject", "DamageGameObject", "ChildHitController",
-        "AttackCollidable", "DamageCollidable" }
+        "AttackCollidable", "DamageCollidable", "AttackUserData", "AttackData", "DamageUserData" }
     local info_methods = {
         copy = { 1, function(self, src)
             for _, f in ipairs(info_fields) do self.data[f] = src.data[f] end
@@ -616,7 +628,44 @@ function M.install(opts)
         AttackType = "chainsaw.AttackType", AttackOwnerObject = "via.GameObject", WeaponGameObject = "via.GameObject",
         AttackGameObject = "via.GameObject", DamageGameObject = "via.GameObject",
         ChildHitController = "chainsaw.HitController", AttackCollidable = "via.physics.Collidable",
-        DamageCollidable = "via.physics.Collidable" })
+        DamageCollidable = "via.physics.Collidable", AttackUserData = "chainsaw.collision.AttackUserData",
+        AttackData = "chainsaw.collision.AttackHitUserData.AttackData", DamageUserData = "chainsaw.collision.DamageUserData" })
+    class("chainsaw.collision.AttackUserData", "System.Object", {})
+    class("chainsaw.collision.AttackHitUserData.AttackData", "System.Object", {})
+    class("chainsaw.collision.DamageUserData", "System.Object", {}, { Parts = "chainsaw.character.BodyParts" })
+    class("chainsaw.collision.EnemyDamageUserData", "chainsaw.collision.DamageUserData", {},
+        { Parts = "chainsaw.character.BodyParts" })
+    class("chainsaw.collision.PressUserData", "System.Object", {})
+    -- A character's colliders (HitController.get_Colliders): each with its user data.
+    class("via.physics.Collider", "System.Object", {
+        get_UserData = { 0, function(self) return self.user_data end },
+    })
+    local colliders = classes["via.physics.Colliders"].methods
+    colliders.getCollidersCount = make_method("getCollidersCount", 0, function(self) return #(self.list or {}) end, {},
+        { ret = "System.UInt32" })
+    colliders.getColliders = make_method("getColliders", 1, function(self, i) return (self.list or {})[i + 1] end,
+        { "System.UInt32" })
+    local order = classes["via.physics.Colliders"].method_order
+    order[#order + 1], order[#order + 2] = "getColliders", "getCollidersCount"
+    world.native_crashes = 0
+    -- The player's AI head and target selector: a finisher (requestFatal & co.) goes to the
+    -- selector's LockonTarget.
+    class("chainsaw.PlayerTargetSelector", "System.Object", {
+        get_LockonTarget = { 0, function(self) return self.target end },
+    })
+    local function fatal_request(name)
+        return { 0, function(self)
+            world.fatal_requests = world.fatal_requests or {}
+            world.fatal_requests[#world.fatal_requests + 1] = { kind = name, target = self.selector.target }
+            return true
+        end, {}, { ret = "System.Boolean" } }
+    end
+    class("chainsaw.PlayerHeadUpdater", "System.Object", {
+        get_TargetSelectorDriver = { 0, function(self) return self.selector end },
+        requestFatal = fatal_request("requestFatal"),
+        requestKnifeFatal = fatal_request("requestKnifeFatal"),
+        requestStompFatal = fatal_request("requestStompFatal"),
+    })
     -- A head's updater: linked to its character (Context) while in use, unlinked in the pool.
     class("chainsaw.HeadUpdater", "via.Component", {
         get_Context = { 0, function(self) return self.context end },
@@ -624,8 +673,28 @@ function M.install(opts)
     class("chainsaw.HitController", "via.Component", {
         get_DamageOwner = { 0, function(self) return self.damage_owner end },
         get_ParentHitController = { 0, function(self) return self.parent_hc end },
+        -- HitController.playDamageSe (re4.exe 0x142009440): reads DamageInfo.AttackUserData and
+        -- AttackData without a null check. In the game a null one is an access violation.
+        playDamageSe = { 1, function(_, info)
+            if info.data.AttackUserData == nil or info.data.AttackData == nil then
+                world.native_crashes = world.native_crashes + 1
+                error("access violation in HitController.playDamageSe (null AttackUserData)")
+            end
+            world.damage_sounds = (world.damage_sounds or 0) + 1
+        end, { "chainsaw.HitController.DamageInfo" } },
+        get_Colliders = { 0, function(self) return self.colliders end },
         callbackDamageHit = { 1, function(self, info)
+            self:call("playDamageSe", info)
             local ctx = self.ctx
+            -- A killing hit throws the body: RagdollUnit.onDamageHit (re4.exe 0x143795890) reads
+            -- AttackGameObject and, in addForceFromPointForce, DamageUserData without a check.
+            if ctx ~= nil and (info.data.IsKill or (info.data.Damage or 0) >= ctx.hp) then
+                if info.data.AttackGameObject == nil or info.data.DamageUserData == nil then
+                    world.native_crashes = world.native_crashes + 1
+                    error("access violation in RagdollUnit.onDamageHit (null AttackGameObject/DamageUserData)")
+                end
+                world.ragdoll_parts = info.data.DamageUserData.__fields.Parts
+            end
             self.received = self.received or {}
             self.received[#self.received + 1] = { damage = info.data.Damage, wince = info.data.Wince,
                 attacker = info.data.AttackOwnerObject, critical = info.data.IsCritical, kill = info.data.IsKill,
@@ -641,7 +710,10 @@ function M.install(opts)
     class("chainsaw.Item", "System.Object", {
         setItemId = { 1, function(self, v) self.item_id = v end },
         setItemCount = { 1, function(self, v) self.count = v end },
-    })
+        get_ItemId = { 0, function(self) return self.__fields._ItemId end, {}, { ret = "chainsaw.ItemID" } },
+        get_CurrentItemCount = { 0, function(self) return self.__fields._CurrentItemCount end, {}, { ret = "System.Int32" } },
+    }, { _ItemId = "chainsaw.ItemID", _CurrentItemCount = "System.Int32", _CurrentDurability = "System.Int32",
+        _ID = "System.Guid" })
     class("chainsaw.DropItemManager.GenerateItemOption", "System.Object", {},
         { Falldown = "System.Boolean", Effect = "System.Boolean", NeedColCheck = "System.Boolean" })
     -- Random drops: requestGenerateRandomDrop queues a roll (RandomDropStack), updateRandomDropStack
@@ -692,9 +764,6 @@ function M.install(opts)
             end },
     })
     -- Inventory "item obtained" flags.
-    class("chainsaw.InventoryManager", "System.Object", {
-        getItemGetFlag = { 1, function(_, id) return world.item_flags[id] == true end },
-    })
     -- Gimmicks.
     class("chainsaw.GimmickManager", "System.Object", { pushDirtyList = { 1, function() end } })
     class("chainsaw.GmContextBox", "System.Object", { get_ID = { 0, function(self) return self.id end } })
@@ -769,6 +838,141 @@ function M.install(opts)
     class("chainsaw.GuiManager", "System.Object", {
         get_IsPlayingEvent = { 0, function() return world.gui_event end },
     })
+    -- HighwayGuiManager.isItemWindowActive: the item window (attache case) is open.
+    class("chainsaw.HighwayGuiManager", "System.Object", {
+        isItemWindowActive = { 0, function() return world.inventory_open == true end, {}, { ret = "System.Boolean" } },
+    })
+    world.singletons["chainsaw.HighwayGuiManager"] = new("chainsaw.HighwayGuiManager")
+    -- The attache case (docs/RESEARCH.md 3.12): items by Guid; the command list of the item
+    -- under the cursor (InventoryManager.getItemCommandMenu, a Dictionary in drawing order),
+    -- each command drawn by an ItemCommandGui, the chosen one run by the select-command
+    -- state's decide (unknown ones go back to the case).
+    world.case = {}          -- Guid text -> chainsaw.Item
+    world.case_room = 99     -- how many more items fit
+    world.item_types = {}    -- ItemID -> chainsaw.ItemType (default 2, recovery)
+    world.item_names = {}    -- ItemID -> name
+    enum("chainsaw.ItemCommandType", { Use = 0, Equip = 1, Discard = 10, Store = 13 })
+    local DICT_CMD = "System.Collections.Generic.Dictionary`2<chainsaw.ItemCommandType,System.Boolean>"
+    class(DICT_CMD, "System.Object", {
+        ContainsKey = { 1, function(self, k) return self.map[k] ~= nil end, { "chainsaw.ItemCommandType" },
+            { ret = "System.Boolean" } },
+        Add = { 2, function(self, k, v)
+            assert(self.map[k] == nil, "duplicate key")
+            self.map[k] = v
+            self.order[#self.order + 1] = k
+        end, { "chainsaw.ItemCommandType", "System.Boolean" } },
+    })
+    class("chainsaw.InventoryManager.GetCommandMenuArgs", "System.Object", {}, { Item = "chainsaw.Item" })
+    class("chainsaw.InventoryManager", "System.Object", {
+        getItemGetFlag = { 1, function(_, id) return world.item_flags[id] == true end },
+        getItemCommandMenu = { 1, function(_, args)
+            local d = new(DICT_CMD, { map = {}, order = {} })
+            d:call("Add", 0, true)
+            d:call("Add", 10, true)
+            world.last_menu = d
+            return d
+        end, { "chainsaw.InventoryManager.GetCommandMenuArgs" } },
+    })
+    class("chainsaw.ItemIDDefine", "System.Object", {
+        getItemType = { 1, function(_, id) return world.item_types[id] or 2 end, { "chainsaw.ItemID" },
+            { ret = "chainsaw.ItemType", static = true } },
+    })
+    class("via.gui.Text", "System.Object", {
+        set_Message = { 1, function(self, m) self.message = m end, { "System.String" } },
+    })
+    class("chainsaw.gui.commandmenu.ItemCommandGui", "System.Object", {
+        drawCommand = { 3, function(self, cmd)
+            self.__fields._CommandText.message = "command " .. tostring(cmd)
+        end, { "chainsaw.ItemCommandType", "System.Boolean", "chainsaw.Item" } },
+    }, { _CommandText = "via.gui.Text" })
+    class("chainsaw.gui.commandmenu.ItemCommandMenuGui", "System.Object", {
+        get_CurrSelectedCommandType = { 0, function() return world.selected_command end, {},
+            { ret = "chainsaw.ItemCommandType" } },
+    })
+    class("chainsaw.AcCommandMenuGuiBehavior", "System.Object", {}, {
+        _ItemCommandMenuGui = "chainsaw.gui.commandmenu.ItemCommandMenuGui" })
+    class("chainsaw.gui.inventory.CsInventory", "System.Object", {
+        ["remove(System.Guid)"] = { 1, function(_, g)
+            world.case[g] = nil
+            world.case_room = world.case_room + 1
+        end, { "System.Guid" } },
+    })
+    class("chainsaw.gui.inventory.VirtualInventory", "System.Object", {
+        ["remove(System.Guid)"] = { 1, function() world.virtual_removed = (world.virtual_removed or 0) + 1 end,
+            { "System.Guid" } },
+    })
+    class("chainsaw.AddItemResult", "System.Object", {}, { AddCount = "System.Int32" })
+    class("chainsaw.CsInventoryController", "System.Object", {
+        ["getItem(System.Guid)"] = { 1, function(_, g) return world.case[g] end, { "System.Guid" },
+            { ret = "chainsaw.Item" } },
+        ["add(chainsaw.Item, chainsaw.InventorySlotType)"] = { 2, function(_, item)
+            local n = item.__fields._CurrentItemCount
+            local fit = math.max(0, math.min(n, world.case_room))
+            if fit > 0 then
+                world.case_room = world.case_room - 1
+                world.case_adds = (world.case_adds or 0) + 1
+                local id = ("added-%d"):format(world.case_adds)
+                world.case[id] = new("chainsaw.Item", { __fields = { _ItemId = item.__fields._ItemId,
+                    _CurrentItemCount = fit, _CurrentDurability = item.__fields._CurrentDurability, _ID = id } })
+            end
+            return new("chainsaw.AddItemResult", { __fields = { AddCount = fit } })
+        end, { "chainsaw.Item", "chainsaw.InventorySlotType" } },
+    }, { ["<_CsInventory>k__BackingField"] = "chainsaw.gui.inventory.CsInventory" })
+    world.case_ctrl = new("chainsaw.CsInventoryController", { __fields = {
+        ["<_CsInventory>k__BackingField"] = new("chainsaw.gui.inventory.CsInventory") } })
+    class("chainsaw.AttacheCaseGuiDataHolder", "System.Object", {}, { _Inventory = "chainsaw.gui.inventory.VirtualInventory" })
+    -- The player's equipment (a component of its body) holds its attache case controller.
+    class("chainsaw.PlayerEquipment", "via.Component", {
+        get_InventoryController = { 0, function(self) return self.__fields["<InventoryController>k__BackingField"] end,
+            {}, { ret = "chainsaw.CsInventoryController" } },
+    }, { ["<InventoryController>k__BackingField"] = "chainsaw.CsInventoryController" })
+    class("chainsaw.AttacheCaseManager", "System.Object", {}, {
+        ["<AttacheCaseGuiDataHolder>k__BackingField"] = "chainsaw.AttacheCaseGuiDataHolder" })
+    world.singletons["chainsaw.AttacheCaseManager"] = new("chainsaw.AttacheCaseManager", { __fields = {
+        ["<AttacheCaseGuiDataHolder>k__BackingField"] = new("chainsaw.AttacheCaseGuiDataHolder", { __fields = {
+            _Inventory = new("chainsaw.gui.inventory.VirtualInventory") } }) } })
+    class("chainsaw.InventoryControllersInfo", "System.Object", {}, { InventoryController = "chainsaw.CsInventoryController" })
+    class("chainsaw.ChainsawGuiUtil", "System.Object", {
+        -- Two overloads share the name (the first is not the one by ContextID).
+        ["getInventoryControllers(chainsaw.CharacterKindID, System.Int32)"] = { 2, function() return nil end,
+            { "chainsaw.CharacterKindID", "System.Int32" }, { ret = "chainsaw.InventoryControllersInfo", static = true } },
+        ["getInventoryControllers(chainsaw.ContextID)"] = { 1, function()
+            return new("chainsaw.InventoryControllersInfo", { __fields = { InventoryController = world.case_ctrl } })
+        end, { "chainsaw.ContextID" }, { ret = "chainsaw.InventoryControllersInfo", static = true } },
+        generateItem = { 6, function(_, id, count, durability)
+            return new("chainsaw.Item", { __fields = { _ItemId = id, _CurrentItemCount = count,
+                _CurrentDurability = durability, _ID = "new" } })
+        end, { "chainsaw.ItemID", "System.Int32", "System.Int32", "chainsaw.ItemID", "System.Int32", "System.Boolean" },
+            { ret = "chainsaw.Item", static = true } },
+    })
+    class("chainsaw.ItemMessageManager", "System.Object", {
+        getItemNameMsgId = { 1, function(_, id) return world.item_names[id] and ("msg:" .. id) or nil end,
+            { "chainsaw.ItemID" }, { ret = "System.Guid" } },
+    })
+    -- Not a singleton of its own: ItemManager.get_ItemMessageManager.
+    class("chainsaw.ItemManager", "System.Object", {
+        get_ItemMessageManager = { 0, function() return world.item_messages end, {}, { ret = "chainsaw.ItemMessageManager" } },
+    })
+    world.item_messages = new("chainsaw.ItemMessageManager")
+    world.singletons["chainsaw.ItemManager"] = new("chainsaw.ItemManager")
+    class("via.gui.message", "System.Object", {
+        ["get(System.Guid)"] = { 1, function(_, g)
+            local id = tonumber(tostring(g):match("^msg:(%d+)$"))
+            return id and world.item_names[id] or nil
+        end, { "System.Guid" }, { ret = "System.String", static = true } },
+    })
+    class("chainsaw.ItemWindowGuiState_AttacheCaseSelectCommand.EnterParam", "System.Object", {}, { TargetID = "System.Guid" })
+    class("chainsaw.ItemWindowGuiState_AttacheCaseSelectCommand", "System.Object", {
+        get__CommandMenuGuiBehavior = { 0, function(self) return self.behavior end, {}, { ret = "chainsaw.AcCommandMenuGuiBehavior" } },
+        get__InventoryController = { 0, function() return world.case_ctrl end, {}, { ret = "chainsaw.CsInventoryController" } },
+        decide = { 0, function(self)
+            if world.selected_command == 10 then
+                world.case[self.__fields._CurrEnterParam.__fields.TargetID] = nil
+            else
+                world.case_default = (world.case_default or 0) + 1 -- transitAttacheCaseDefault
+            end
+        end },
+    }, { _CurrEnterParam = "chainsaw.ItemWindowGuiState_AttacheCaseSelectCommand.EnterParam" })
     class("chainsaw.CampaignManager", "System.Object", {
         get_CurrentChapter = { 0, function() return world.chapter or 1 end },
         get_CurrentDifficulty = { 0, function() return 20 end },
@@ -829,6 +1033,13 @@ function M.install(opts)
             end
             return nil
         end, { "System.String" } },
+        ["findGameObject(System.Guid)"] = { 1, function(_, g)
+            local text = g and g.text
+            for _, go in ipairs(world.gos) do
+                if text ~= nil and go.guid == text and not go.destroyed then return go end
+            end
+            return nil
+        end, { "System.Guid" } },
         ["findComponents(System.Type)"] = { 1, function(_, t)
             local comps = {}
             if t.name == "chainsaw.DropItem" then
@@ -916,6 +1127,7 @@ function M.install(opts)
             return math.tointeger(v) or 0
         end,
         to_float = function(v) return v end,
+        to_ptr = function(v) return v end, -- objects stay objects here: a post-hook's return goes to the caller as is
         to_managed_object = function(addr)
             if type(addr) == "table" then return addr end -- value stand-ins passed as is
             return objects[addr]
@@ -1168,10 +1380,34 @@ function M.update_gimmicks()
     end
 end
 
+-- ClapperboardMediator.procSkip: a skip input on a camera that can be skipped skips it; it
+-- ends a frame later (after its fade).
+function M.update_cutscene_skip()
+    local w = M.world
+    local rec = w and w.current_cutscene
+    if rec == nil or rec.work == nil then return end
+    local f = rec.work.__fields
+    if f.DoneSkip then
+        rec.skipped = true
+        w.skips = (w.skips or 0) + 1
+        M.end_cutscene()
+    elseif f.InputSkip and rec.can_skip then
+        f.DoneSkip = true
+    end
+end
+
+-- The player holds the skip button during the playing cutscene.
+function M.press_skip()
+    local rec = M.world.current_cutscene
+    if rec and rec.work then rec.work.__fields.InputSkip = true end
+end
+
 -- One game frame in REFramework's order: behaviour updates, animation, end of frame,
 -- presentation, menu.
 function M.run_frame()
     M.update_gimmicks()
+    M.update_doors()
+    M.update_cutscene_skip()
     for _, cb in ipairs(M.callbacks.entry) do
         if cb.name == "LateUpdateBehavior" then cb.fn() end
     end
@@ -1233,7 +1469,13 @@ function M.make_character(type_name, pos, hp, spawner)
     M.add_component(body, "via.motion.Motion", { layers = motion_layers() })
     M.add_component(body, "via.motion.MotionFsm2")
     M.add_component(body, "via.physics.CharacterController", { ctx = ctx })
-    M.add_component(body, "chainsaw.HitController", { ctx = ctx })
+    -- Its colliders: one without damage data, the head, the chest.
+    local function collider(ud) return new("via.physics.Collider", { user_data = ud }) end
+    M.add_component(body, "chainsaw.HitController", { ctx = ctx, colliders = new("via.physics.Colliders", { list = {
+        collider(new("chainsaw.collision.PressUserData")),
+        collider(new("chainsaw.collision.EnemyDamageUserData", { __fields = { Parts = 0 } })),
+        collider(new("chainsaw.collision.EnemyDamageUserData", { __fields = { Parts = 1 } })),
+    } }) })
     ctx.body = body
     ctx.head = M.make_go(type_name:match("(Ch%w+)Context") and (type_name:match("(Ch%w+)Context") .. "_head") or "head")
     ctx.head_updater = M.add_component(ctx.head, "chainsaw.HeadUpdater", { context = ctx })
@@ -1279,6 +1521,8 @@ function M.make_player(pos, opts)
     M.add_component(body, "via.motion.Motion", { layers = motion_layers() })
     M.add_component(body, "chainsaw.CharacterBodyLogic")
     M.add_component(body, "via.physics.CharacterController", { ctx = ctx })
+    M.add_component(body, "chainsaw.PlayerEquipment", { __fields = {
+        ["<InventoryController>k__BackingField"] = M.world.case_ctrl } })
     ctx.sound = M.add_component(body, "chainsaw.WwiseContainerApp")
     M.child(body, "cha000_00", { mesh = M.MESH.body, mdf = M.MDF.body_dirty, same_joints = true })
     M.child(body, "cha000_10", { mesh = M.MESH.face, mdf = M.MDF.face, same_joints = true })
@@ -1370,13 +1614,26 @@ function M.fire_hooks(method_name, ...)
     end
 end
 
+-- The player starts a finisher (`request`: "requestFatal", "requestKnifeFatal" or
+-- "requestStompFatal") on `enemy`: the game's PlayerHeadUpdater call, hooks around it.
+function M.fatal(enemy, request)
+    request = request or "requestFatal"
+    local head = new("chainsaw.PlayerHeadUpdater", { selector = new("chainsaw.PlayerTargetSelector", { target = enemy }) })
+    M.fire_hooks(request, head)
+    return head:call(request)
+end
+
 -- `attacker` (default: the player's body) hits `enemy`: the game builds a DamageInfo and
 -- calls the victim's HitController.callbackDamageHit (hooks run around it).
 function M.hit(enemy, damage, wince, attacker)
+    local owner = attacker or (M.world.player and M.world.player.body)
     local info = new("chainsaw.HitController.DamageInfo", { data = {
         Damage = damage, Wince = wince or 10, Break = 0, Stopping = 0, DamageDir = vec(0, 0, -1),
-        AttackOwnerObject = attacker or (M.world.player and M.world.player.body), WeaponID = 4000, IsCritical = false,
-        IsKill = false, AttackType = 0, HitPos = vec(0, 1.6, 0), SerialNo = 777 } })
+        AttackOwnerObject = owner, AttackGameObject = owner or M.make_go("shot"), WeaponID = 4000, IsCritical = false,
+        IsKill = false, AttackType = 0, HitPos = vec(0, 1.6, 0), SerialNo = 777,
+        AttackUserData = new("chainsaw.collision.AttackUserData", { weapon = 4000 }),
+        AttackData = new("chainsaw.collision.AttackHitUserData.AttackData", { weapon = 4000 }),
+        DamageUserData = new("chainsaw.collision.DamageUserData") } })
     M.component(enemy.body, "chainsaw.HitController"):call("callbackDamageHit", info)
     return info
 end
@@ -1490,34 +1747,88 @@ function M.install_world(world, opts)
         M.value_types[name] = true
     end
 
-    -- Scenario flags: GUID -> (group, bit). requestSetFlag applies at once and runs hooks.
-    local function flag_bit(text)
-        local f = world.flag_map[tostring(text):lower()]
-        if f == nil then return nil end
-        return world.flag_groups[f.group], f.bit
+    -- Scenario flags, as re4.exe has them (docs/RESEARCH.md 3.11): every flag is a
+    -- via.userdata.Variable (GUID + value) of a ScenarioFlagManager.Group, whose words hold bit i
+    -- for variable i. Game code sets variables from anywhere (Variable.set_Bool); every change
+    -- runs ScenarioFlagManagerBehavior's change handlers (where the mod's hooks sit).
+    world.flag_vars, world.flag_events, world.pulses = {}, 0, {}
+    local function var_bit(var)
+        local g = world.flag_groups[var.group]
+        return (g.words[var.bit // 32 + 1] & (1 << (var.bit % 32))) ~= 0
     end
+    local function flag_changed(var)
+        world.flag_events = world.flag_events + 1
+        world.flag_log[#world.flag_log + 1] = { guid = var.guid, value = var.kind == 16 or var_bit(var) }
+        world.flag_behavior:call(var.common and "onSetCommonFlagEvent" or "onSetScenarioFlagEvent", var)
+    end
+    -- What the native Variable.set_Bool does: write, and announce a change.
+    local function set_var(var, value)
+        if var.write_protect then return end
+        local g = world.flag_groups[var.group]
+        local w = var.bit // 32 + 1
+        local before = var_bit(var)
+        if value then g.words[w] = g.words[w] | (1 << (var.bit % 32))
+        else g.words[w] = g.words[w] & ~(1 << (var.bit % 32)) end
+        if before ~= (value and true or false) then flag_changed(var) end
+    end
+    M.set_var = set_var
+    enum("via.userdata.TypeKind", { Boolean = 2, Trigger = 16 })
+    class("via.userdata.Variable", "System.Object", {
+        get_Guid = { 0, function(self) return guid_value(self.guid) end, {}, { ret = "System.Guid" } },
+        get_TypeKind = { 0, function(self) return self.kind end, {}, { ret = "via.userdata.TypeKind" } },
+        get_Bool = { 0, function(self)
+            if self.kind == 16 then return self.fired == true end
+            return var_bit(self)
+        end, {}, { ret = "System.Boolean" } },
+        set_Bool = { 1, function(self, v) set_var(self, v) end, { "System.Boolean" } },
+        setTrigger = { 0, function(self)
+            world.pulses[#world.pulses + 1] = self.guid
+            self.fired = true
+            flag_changed(self)
+            self.fired = false
+        end },
+    })
+    class("via.userdata.UserVariables", "System.Object", {
+        getVariable = { 1, function(self, i) return self.vars[i] end, { "System.UInt32" } },
+    })
+    class("chainsaw.ScenarioFlagManager.Group", "System.Object", {}, { ["<Name>k__BackingField"] = "System.String",
+        ["<Variables>k__BackingField"] = "via.userdata.UserVariables" })
+    class("chainsaw.ScenarioFlagManagerBehavior", "via.Component", {
+        onSetScenarioFlagEvent = { 1, function(self) self.scenario = (self.scenario or 0) + 1 end, { "via.userdata.Variable" } },
+        onSetCommonFlagEvent = { 1, function(self) self.common = (self.common or 0) + 1 end, { "via.userdata.Variable" } },
+    })
+    world.flag_behavior = new("chainsaw.ScenarioFlagManagerBehavior")
+    class("chainsaw.GlobalUserDataManager", "System.Object", {
+        findVariable = { 1, function(_, g) return world.flag_vars[g.text] end, { "System.Guid" },
+            { static = true, ret = "via.userdata.Variable" } },
+        trySetBool = { 2, function(_, g, v)
+            local var = world.flag_vars[g.text]
+            if var == nil or var.kind ~= 2 then return false end
+            set_var(var, v)
+            return true
+        end, { "System.Guid", "System.Boolean" }, { static = true, ret = "System.Boolean" } },
+    })
+    class("share.SaveDataBase", "System.Object", {})
     class("chainsaw.ScenarioFlagManager.SaveGroup", "System.Object", {}, { GroupName = "System.String",
         Flags = "System.UInt32[]" })
-    class("chainsaw.ScenarioFlagManager.SaveData", "System.Object", {}, { VersionValue = "System.UInt32",
+    class("chainsaw.ScenarioFlagManager.SaveData", "share.SaveDataBase", {}, { VersionValue = "System.UInt32",
         Datas = "chainsaw.ScenarioFlagManager.SaveGroup[]" })
     class("chainsaw.ScenarioFlagManager", "System.Object", {
-        requestSetFlag = { 2, function(_, g, value)
-            local grp, bit = flag_bit(g.text)
-            if grp == nil then return end
-            local w = bit // 32 + 1
-            if value then grp.words[w] = grp.words[w] | (1 << (bit % 32))
-            else grp.words[w] = grp.words[w] & ~(1 << (bit % 32)) end
-            world.flag_log[#world.flag_log + 1] = { guid = g.text, value = value }
+        -- requestSetFlag(flag, ck_readonly) turns a flag on; the Boolean is a read-only check.
+        requestSetFlag = { 2, function(_, g, ck_readonly)
+            local var = world.flag_vars[g.text]
+            if var == nil or (ck_readonly and var.read_only) then return end
+            set_var(var, true)
         end, { "System.Guid", "System.Boolean" } },
         checkFlag = { 1, function(_, g)
-            local grp, bit = flag_bit(g.text)
-            if grp == nil then return false end
-            return (grp.words[bit // 32 + 1] & (1 << (bit % 32))) ~= 0
+            local var = world.flag_vars[g.text]
+            return var ~= nil and var_bit(var)
         end, { "System.Guid" }, { ret = "System.Boolean" } },
         -- Decoys a careless probe could pick: a counter and a flag *watcher*.
         getFlagCount = { 0, function() return 0 end, {}, { ret = "System.Int32" } },
         setFlagWatch = { 2, function() world.watch_calls = (world.watch_calls or 0) + 1 end,
             { "System.Guid", "System.Boolean" } },
+        -- Declared with share.SaveDataBase, like the game's.
         saveGameSaveData = { 0, function()
             local groups = {}
             for i, g in ipairs(world.flag_groups) do
@@ -1528,8 +1839,10 @@ function M.install_world(world, opts)
             end
             return new("chainsaw.ScenarioFlagManager.SaveData", { __fields = {
                 Datas = typed_array("chainsaw.ScenarioFlagManager.SaveGroup", groups) } })
-        end, {}, { ret = "chainsaw.ScenarioFlagManager.SaveData" } },
+        end, {}, { ret = "share.SaveDataBase" } },
         loadGameSaveData = { 1, function(_, sd)
+            local before = {}
+            for guid, var in pairs(world.flag_vars) do before[guid] = var_bit(var) end
             for _, sg in ipairs(rawget(sd.__fields.Datas, "__items")) do
                 for _, g in ipairs(world.flag_groups) do
                     if g.name == sg.__fields.GroupName then
@@ -1537,18 +1850,34 @@ function M.install_world(world, opts)
                     end
                 end
             end
+            -- applyBit2Variable: every variable takes its bit (changes are announced).
+            for guid, var in pairs(world.flag_vars) do
+                if var_bit(var) ~= before[guid] then flag_changed(var) end
+            end
             world.flag_loads = (world.flag_loads or 0) + 1
-        end, { "chainsaw.ScenarioFlagManager.SaveData" } },
-    })
+        end, { "share.SaveDataBase" } },
+    }, { _Group = "chainsaw.ScenarioFlagManager.Group[]" })
 
-    world.singletons["chainsaw.ScenarioFlagManager"] = new("chainsaw.ScenarioFlagManager")
+    local groups = {}
+    for i, g in ipairs(world.flag_groups) do
+        g.vars = {}
+        groups[i] = new("chainsaw.ScenarioFlagManager.Group", { __fields = { ["<Name>k__BackingField"] = g.name,
+            ["<Variables>k__BackingField"] = new("via.userdata.UserVariables", { vars = g.vars }) } })
+    end
+    world.singletons["chainsaw.ScenarioFlagManager"] = new("chainsaw.ScenarioFlagManager", { __fields = {
+        _Group = typed_array("chainsaw.ScenarioFlagManager.Group", groups) } })
 
     -- Gimmick save table, keyed by ContextID; pushDirtyList announces a state change.
     class("chainsaw.GimmickContext.TriggerDone", "System.Object", {}, { SaveID = "System.UInt32", Done = "System.UInt32" })
     class("chainsaw.GimmickContext.AccessoryData", "System.Object", {})
     class("chainsaw.GimmickContext.AccessoryDataFloat", "chainsaw.GimmickContext.AccessoryData", {}, { Value = "System.Single" })
     class("chainsaw.GimmickContext.AccessoryDataUint", "chainsaw.GimmickContext.AccessoryData", {}, { Value = "System.UInt32" })
-    class("chainsaw.GimmickContext.SaveData", "System.Object", {}, { Attr = "System.Byte[]",
+    local save_data_of, record_of
+    -- SaveData.clone shares nothing with the original.
+    class("chainsaw.GimmickContext.SaveData", "System.Object", {
+        clone = { 0, function(self) return save_data_of(record_of({}, self)) end, {},
+            { ret = "chainsaw.GimmickContext.SaveData" } },
+    }, { Attr = "System.Byte[]",
         TriggerSave = "chainsaw.GimmickContext.TriggerDone[]", IsDetected = "System.Boolean",
         AccDatas = "chainsaw.GimmickContext.AccessoryData[]" })
     class("chainsaw.GimmickManager.SaveItem", "System.Object", {}, { ID = "chainsaw.ContextID",
@@ -1558,12 +1887,70 @@ function M.install_world(world, opts)
         get_Item = { 1, function(self, i) return self.items[i + 1] end, { "System.Int32" } },
         Add = { 1, function(self, x) self.items[#self.items + 1] = x end, { "chainsaw.GimmickManager.SaveItem" } },
     })
-    class("chainsaw.GimmickManager.SaveData", "System.Object", {}, { VersionValue = "System.UInt32",
+    class("chainsaw.GimmickManager.SaveData", "share.SaveDataBase", {}, { VersionValue = "System.UInt32",
         Datas = "System.Collections.Generic.List`1<chainsaw.GimmickManager.SaveItem>" })
+    -- A record's SaveData (the game builds a fresh one for every save).
+    function save_data_of(g)
+        local trig, acc = {}, {}
+        for i, t in ipairs(g.triggers) do
+            trig[i] = new("chainsaw.GimmickContext.TriggerDone", { __fields = { SaveID = t.id, Done = t.done } })
+        end
+        for i, a in ipairs(g.acc) do
+            acc[i] = new(a.type or (a.kind == 1 and "chainsaw.GimmickContext.AccessoryDataFloat"
+                or "chainsaw.GimmickContext.AccessoryDataUint"), { __fields = { Value = a.value } })
+        end
+        return new("chainsaw.GimmickContext.SaveData", { __fields = {
+            Attr = typed_array("System.Byte", { table.unpack(g.attr) }),
+            TriggerSave = typed_array("chainsaw.GimmickContext.TriggerDone", trig),
+            IsDetected = g.detected, AccDatas = typed_array("chainsaw.GimmickContext.AccessoryData", acc) } })
+    end
+    -- ...and the record a SaveData describes.
+    function record_of(ctx, data)
+        data = data.__fields
+        local g = { ctx = ctx, attr = {}, triggers = {}, acc = {}, detected = data.IsDetected == true }
+        for i = 1, data.Attr:get_size() do g.attr[i] = rawget(data.Attr, "__items")[i] end
+        for i = 1, data.TriggerSave:get_size() do
+            local t = rawget(data.TriggerSave, "__items")[i]
+            if t ~= nil then g.triggers[#g.triggers + 1] = { id = t.__fields.SaveID, done = t.__fields.Done } end
+        end
+        for i = 1, data.AccDatas:get_size() do
+            local a = rawget(data.AccDatas, "__items")[i]
+            if a ~= nil then
+                g.acc[#g.acc + 1] = { kind = a.__type:find("Float") and 1 or 2, value = a.__fields.Value,
+                    type = a.__type }
+            end
+        end
+        return g
+    end
+    world.gimmick_record_of = record_of
+    -- A gimmick's context (GimmickManager._Context): its current save state, which
+    -- loadSaveDataFromManager replaces (with a clone) as the game's load does.
+    class("chainsaw.GimmickContext", "System.Object", {
+        loadSaveDataFromManager = { 1, function(self, src)
+            local g = record_of(self.ctx, src)
+            world.gimmick_table[self.key] = g
+            world.gimmick_context_loads = (world.gimmick_context_loads or 0) + 1
+        end, { "chainsaw.GimmickContext.SaveData" } },
+    }, { _SaveCur = "chainsaw.GimmickContext.SaveData" })
+    world.gimmick_contexts = {} -- ctx key -> true: gimmicks set up in this game (default: every record)
     class("chainsaw.GimmickManager", "System.Object", {
         pushDirtyList = { 1, function() end },
         registerMove = { 1, function(_, core) world.moving[core] = true end, { "chainsaw.GimmickCore" } },
         unregisterMove = { 1, function(_, core) world.moving[core] = nil end, { "chainsaw.GimmickCore" } },
+        findContext = { 1, function(_, id)
+            local key = key_of_ctx_object(id)
+            local g = world.gimmick_table[key]
+            if g == nil and not world.gimmick_contexts[key] then return nil end
+            if world.gimmick_unset and world.gimmick_unset[key] then return nil end
+            local cur = g and save_data_of(g) or new("chainsaw.GimmickContext.SaveData", { __fields = {
+                Attr = typed_array("System.Byte", { 0, 0 }), TriggerSave = typed_array("chainsaw.GimmickContext.TriggerDone", {}),
+                IsDetected = false, AccDatas = typed_array("chainsaw.GimmickContext.AccessoryData", {}) } })
+            cur.__ctx_key = key
+            local ctx = { category = id.__fields._Category, kind = id.__fields._Kind, group = id.__fields._Group,
+                index = id.__fields._Index }
+            return new("chainsaw.GimmickContext", { key = key, ctx = ctx, __fields = { _SaveCur = cur } })
+        end, { "chainsaw.ContextID" }, { ret = "chainsaw.GimmickContext" } },
+        -- Declared with share.SaveDataBase, like the game's.
         saveGameSaveData = { 0, function()
             local keys = {}
             for k in pairs(world.gimmick_table) do keys[#keys + 1] = k end
@@ -1571,44 +1958,23 @@ function M.install_world(world, opts)
             local items = {}
             for _, k in ipairs(keys) do
                 local g = world.gimmick_table[k]
-                local trig, acc = {}, {}
-                for i, t in ipairs(g.triggers) do
-                    trig[i] = new("chainsaw.GimmickContext.TriggerDone", { __fields = { SaveID = t.id, Done = t.done } })
-                end
-                for i, a in ipairs(g.acc) do
-                    acc[i] = new(a.kind == 1 and "chainsaw.GimmickContext.AccessoryDataFloat"
-                        or "chainsaw.GimmickContext.AccessoryDataUint", { __fields = { Value = a.value } })
-                end
-                local data = new("chainsaw.GimmickContext.SaveData", { __fields = {
-                    Attr = typed_array("System.Byte", { table.unpack(g.attr) }),
-                    TriggerSave = typed_array("chainsaw.GimmickContext.TriggerDone", trig),
-                    IsDetected = g.detected, AccDatas = typed_array("chainsaw.GimmickContext.AccessoryData", acc) } })
-                items[#items + 1] = new("chainsaw.GimmickManager.SaveItem", { __fields = { ID = ctx_object(g.ctx), SaveData = data } })
+                items[#items + 1] = new("chainsaw.GimmickManager.SaveItem", { __fields = { ID = ctx_object(g.ctx),
+                    SaveData = save_data_of(g) } })
             end
             local list = new("System.Collections.Generic.List`1<chainsaw.GimmickManager.SaveItem>", { items = items })
             return new("chainsaw.GimmickManager.SaveData", { __fields = { Datas = list } })
-        end, {}, { ret = "chainsaw.GimmickManager.SaveData" } },
+        end, {}, { ret = "share.SaveDataBase" } },
+        -- The game's load clears the whole manager first: never to be used while playing.
         loadGameSaveData = { 1, function(_, sd)
+            world.gimmick_table = {}
             for _, item in ipairs(sd.__fields.Datas.items) do
                 local id = item.__fields.ID
-                local data = item.__fields.SaveData.__fields
-                local g = { ctx = { category = id.__fields._Category, kind = id.__fields._Kind, group = id.__fields._Group,
-                    index = id.__fields._Index }, attr = {}, triggers = {}, acc = {}, detected = data.IsDetected == true }
-                for i = 1, data.Attr:get_size() do g.attr[i] = rawget(data.Attr, "__items")[i] end
-                for i = 1, data.TriggerSave:get_size() do
-                    local t = rawget(data.TriggerSave, "__items")[i]
-                    if t ~= nil then g.triggers[#g.triggers + 1] = { id = t.__fields.SaveID, done = t.__fields.Done } end
-                end
-                for i = 1, data.AccDatas:get_size() do
-                    local a = rawget(data.AccDatas, "__items")[i]
-                    if a ~= nil then
-                        g.acc[#g.acc + 1] = { kind = a.__type:find("Float") and 1 or 2, value = a.__fields.Value }
-                    end
-                end
-                world.gimmick_table[key_of_ctx_object(id)] = g
+                local ctx = { category = id.__fields._Category, kind = id.__fields._Kind, group = id.__fields._Group,
+                    index = id.__fields._Index }
+                world.gimmick_table[key_of_ctx_object(id)] = record_of(ctx, item.__fields.SaveData)
             end
             world.gimmick_loads = (world.gimmick_loads or 0) + 1
-        end, { "chainsaw.GimmickManager.SaveData" } },
+        end, { "share.SaveDataBase" } },
     })
 
     -- Pauses: each pause type's parameter says what it freezes.
@@ -1633,24 +1999,112 @@ function M.install_world(world, opts)
     end
     world.singletons["share.PauseManager"] = new("share.PauseManager", { __fields = { _ParamTable = new(DICT) } })
 
-    -- Timeline events (cutscenes).
-    local TE = "chainsaw.TimelineEventDefine.ID"
-    enum(TE, { None = 0, cs_intro = 10157, cs_church = 20130 })
-    class("chainsaw.TimelineEventPlayParam", "System.Object", {})
-    class("chainsaw.TimelineEventManager", "System.Object", {
-        requestPlay = { 1, function(_, id)
-            world.played_events[#world.played_events + 1] = id
-            world.event_id = id
+    -- Cutscenes, as re4.exe plays them (docs/RESEARCH.md 3.11): a "play once" camera request
+    -- becomes a ClapperboardMediator.PayloadPlay that procPayloadPlay plays (setting the start
+    -- flags, recording the camera as seen); at the end the end flags are set and the data
+    -- owner's scripted sequence continues (EndPortrayal).
+    local PAYLOAD = "chainsaw.ClapperboardMediator.PayloadPlay"
+    class("chainsaw.ScenarioFlagManager.FlagInfo", "System.Object", {}, { GroupIndex = "System.Int32", Index = "System.Int32" })
+    class("chainsaw.PlayerCoordSetting.Pack", "System.Object", {})
+    class(PAYLOAD, "System.Object", {}, { CameraType = "System.Int32", ID = "System.Int32", Screen = "System.Int32",
+        StartFlag = "chainsaw.ScenarioFlagManager.FlagInfo[]", EndFlag = "chainsaw.ScenarioFlagManager.FlagInfo[]",
+        CoorsSettings = "chainsaw.PlayerCoordSetting.Pack[]", DataOwnerCode = "System.UInt32", EndPortrayal = "System.UInt32" })
+    world.played, world.has_done, world.play_id, world.continued = {}, {}, 0, {}
+    -- The camera playing on a screen: the skip button sets InputSkip; procSkip (each frame)
+    -- skips it when it can be skipped (DoneSkip), and it ends after the skip fade.
+    class("chainsaw.ClapperboardMediator.PlayWork", "System.Object", {
+        get_CameraID = { 0, function(self) return self.cam_id end, {}, { ret = "System.Int32" } },
+    }, { CamType = "System.Int32", DoneSkip = "System.Boolean", InputSkip = "System.Boolean" })
+    class("chainsaw.ClapperboardMediator.PlayWorkTimeline", "chainsaw.ClapperboardMediator.PlayWork", {})
+    local function flag_infos(arr)
+        local out = {}
+        if arr == nil then return out end
+        for i = 0, arr:get_size() - 1 do
+            out[#out + 1] = { group = arr:read_dword(0x20 + i * 8), index = arr:read_dword(0x24 + i * 8) }
+        end
+        return out
+    end
+    local function set_flag_info(f)
+        local g = world.flag_groups[f.group + 1]
+        local var = g and g.vars[f.index]
+        if var ~= nil then set_var(var, true) end
+    end
+    class("chainsaw.ClapperboardMediator", "System.Object", {
+        procPayloadPlay = { 2, function(_, id, p)
+            local f = p.__fields
+            local rec = { play_id = id, camera = f.CameraType, id = f.ID, screen = f.Screen, owner = f.DataOwnerCode,
+                end_portrayal = f.EndPortrayal, start_flags = flag_infos(f.StartFlag), end_flags = flag_infos(f.EndFlag) }
+            if f.CoorsSettings ~= nil then
+                local c = f.CoorsSettings
+                rec.coords = { { kind = c:read_dword(0x20), x = c:read_float(0x30), rot_y = c:read_float(0x40),
+                    reset = c:read_byte(0x44) } }
+            end
+            world.played[#world.played + 1] = rec
+            world.current_cutscene = rec
+            rec.work = new("chainsaw.ClapperboardMediator.PlayWorkTimeline", { cam_id = f.ID, __fields = {
+                CamType = f.CameraType, DoneSkip = false, InputSkip = false } })
+            rec.can_skip = not world.unskippable
+            world.singletons["chainsaw.ClapperboardMediator"].__fields._Plays =
+                typed_array("chainsaw.ClapperboardMediator.PlayWork", { rec.work })
             world.gui_event = true
-        end, { TE } },
-        requestPlayWithParam = { 2, function() error("mock: needs a real parameter object") end,
-            { TE, "chainsaw.TimelineEventPlayParam" } },
-        requestPreloadPlay = { 1, function() world.preloaded_events = world.preloaded_events + 1 end, { TE } },
-        requestStop = { 1, function() world.gui_event = false end, { TE } },
-        isPlaying = { 1, function() return world.gui_event end, { TE }, { ret = "System.Boolean" } },
-        get_CurrentEventID = { 0, function() return world.event_id end, {}, { ret = TE } },
+            for _, fi in ipairs(rec.start_flags) do set_flag_info(fi) end
+            world.has_done[("%d:%d"):format(f.CameraType, f.ID)] = true
+        end, { "System.UInt32", PAYLOAD } },
+        emitPlayID = { 0, function()
+            world.play_id = world.play_id + 1
+            return world.play_id
+        end, {}, { ret = "System.UInt32" } },
+        checkHasDone = { 2, function(_, t, i) return world.has_done[("%d:%d"):format(t, i)] == true end,
+            { "System.Int32", "System.Int32" }, { ret = "System.Boolean" } },
+    }, { _Plays = "chainsaw.ClapperboardMediator.PlayWork[]" })
+    world.singletons["chainsaw.ClapperboardMediator"] = new("chainsaw.ClapperboardMediator", { __fields = {
+        _Plays = typed_array("chainsaw.ClapperboardMediator.PlayWork", {}) } })
+
+    -- Level triggers: an InteractHolder on a level GameObject holds InteractTriggers; the
+    -- interaction update runs one through InteractTrigger.Work.executeTrigger.
+    enum("chainsaw.InteractTrigger.TriggerType", { None = 0, AreaHit = 1, Key = 2, Flag = 3, UseItem = 4 })
+    class("chainsaw.collision.GimmickSensorUserData", "System.Object", {})
+    class("chainsaw.InteractTrigger", "System.Object", {
+        get_Type = { 0, function(self) return self.ttype end },
+        get_Owner = { 0, function(self) return self.owner_go end },
+        get_Hash = { 0, function(self) return self.hash end, {}, { ret = "System.UInt32" } },
+        get_Done = { 0, function(self) return self.__fields["<Done>k__BackingField"] end, {}, { ret = "System.UInt32" } },
+        recvDone = { 1, function(self, d)
+            local f = self.__fields
+            f["<Done>k__BackingField"] = f["<Done>k__BackingField"] | d
+        end, { "System.UInt32" } },
+        ["execute(via.GameObject, chainsaw.collision.GimmickSensorUserData)"] = { 2, function(self, target)
+            M.run_trigger(self, target)
+        end, { "via.GameObject", "chainsaw.collision.GimmickSensorUserData" } },
+    }, { Succeed = "chainsaw.InteractTrigger.SucceedType", UniqueName = "System.String",
+        ["<Done>k__BackingField"] = "System.UInt32" })
+    class("chainsaw.InteractTriggerAreaHit", "chainsaw.InteractTrigger", {})
+    class("chainsaw.InteractTriggerKey", "chainsaw.InteractTrigger", {})
+    class("chainsaw.InteractTrigger.Work", "System.Object", {
+        get_Trigger = { 0, function(self) return self.trig end },
+        executeTrigger = { 2, function(self, target) M.run_trigger(self.trig, target) end,
+            { "via.GameObject", "chainsaw.collision.GimmickSensorUserData" } },
     })
-    world.singletons["chainsaw.TimelineEventManager"] = new("chainsaw.TimelineEventManager")
+    class("chainsaw.InteractHolder", "via.Component", {
+        ["findTrigger(System.UInt32)"] = { 1, function(self, h)
+            for _, t in ipairs(self.triggers or {}) do
+                if t.hash == h then return t end
+            end
+            return nil
+        end, { "System.UInt32" } },
+    })
+    class("chainsaw.PortrayalSettings.Param", "System.Object", {}, { _CalleePlay = "System.Object", _CalleeEnd = "System.Object" })
+    class("chainsaw.OptionSettings`1<chainsaw.PortrayalSettings.Param>", "System.Object", {},
+        { _Params = "chainsaw.PortrayalSettings.Param[]" })
+    class("chainsaw.PortrayalSettings", "via.Component", {}, { _Params = "chainsaw.OptionSettings`1<chainsaw.PortrayalSettings.Param>" })
+    for _, n in ipairs({ "GmPortrayalAreaHit", "SetFlagSettings", "ClapperboardSettings", "SoundCallSettings",
+        "GmDoorBase", "GmPitfall", "PlDieSettings", "InventorySettings", "CustomLevel_DropAshleyItem" }) do
+        class("chainsaw." .. n, "via.Component", {})
+    end
+    for _, n in ipairs({ "PlDieSettings.Param", "InventorySettings.Param", "SetFlagSettings.Param", "SoundCallSettings.Param" }) do
+        class("chainsaw." .. n, "System.Object", {})
+    end
+    world.trigger_runs = {}
 
     -- Chapter loads go through CampaignManager.loadGameSaveData(GameData).
     class("chainsaw.CampaignInitialSetting", "System.Object", {}, { _Chapter = "chainsaw.ChapterID",
@@ -1671,6 +2125,72 @@ function M.install_world(world, opts)
             world.loads = world.loads + 1
         end, { "chainsaw.CampaignManager.GameData" } },
     })
+    -- Saving and loading (docs/RESEARCH.md 3.15). Every save goes through
+    -- SaveFlowController.start(slot, args); SaveDataManager.requestStartSaveGameDataFlow is a
+    -- jump to it. Continue loads SaveLoadMenuGuiManager.findContinueSave() (the newest of slots
+    -- 0-20); the menus run it on their own when UDSManagerApp's game intent is requested.
+    world.save_files = {}  -- slot -> { chapter, order }
+    world.saves = {}       -- slots written, in order
+    world.save_busy = false
+    world.save_excluded = false
+    world.save_order = 0
+    class("chainsaw.ChainsawGameSaveRequestArgs", "System.Object", {})
+    class("chainsaw.SaveFlowController", "System.Object", {
+        start = { 2, function(_, slot, args)
+            assert(type(slot) == "number", "slot must be a number")
+            assert(args ~= nil and args.__type == "chainsaw.ChainsawGameSaveRequestArgs", "game save request args")
+            world.save_order = world.save_order + 1
+            world.saves[#world.saves + 1] = slot
+            world.save_files[slot] = { chapter = world.chapter, order = world.save_order }
+        end, { "System.Int32", "share.SaveLoadRequestArgs" } },
+    })
+    world.save_flow = new("chainsaw.SaveFlowController")
+    class("share.SaveDataManager", "System.Object", {
+        get_IsBusy = { 0, function() return world.save_busy end, {}, { ret = "System.Boolean" } },
+        checkExcludeGameSave = { 0, function() return world.save_excluded end, {}, { ret = "System.Boolean" } },
+        isExistSaveData = { 1, function(_, slot) return world.save_files[slot] ~= nil end, { "System.Int32" },
+            { ret = "System.Boolean" } },
+        ["setPlayLoadData(System.Boolean)"] = { 1, function() world.play_load_marked = true end, { "System.Boolean" } },
+        requestStartSaveGameDataFlow = { 2, function(_, slot, args)
+            return world.save_flow:call("start", slot, args)
+        end, { "System.Int32", "share.GameSaveRequestArgs" } },
+    })
+    world.singletons["share.SaveDataManager"] = new("share.SaveDataManager")
+    class("chainsaw.gui.SaveSlotInfo", "System.Object", {}, { SlotIndex = "System.Int32", ChapterID = "chainsaw.ChapterID" })
+    class("chainsaw.gui.SaveSlotInfoDetail", "System.Object", {
+        get_IsEmpty = { 0, function(self) return self.__fields["<IsEmpty>k__BackingField"] end },
+    }, { ["<IsEmpty>k__BackingField"] = "System.Boolean", ["<Info>k__BackingField"] = "chainsaw.gui.SaveSlotInfo" })
+    local function slot_detail(slot)
+        local f = slot ~= nil and world.save_files[slot] or nil
+        local info = f and new("chainsaw.gui.SaveSlotInfo", { __fields = { SlotIndex = slot, ChapterID = f.chapter } }) or nil
+        return new("chainsaw.gui.SaveSlotInfoDetail", { __fields = { ["<IsEmpty>k__BackingField"] = f == nil,
+            ["<Info>k__BackingField"] = info } })
+    end
+    class("chainsaw.SaveLoadMenuGuiManager", "System.Object", {
+        findContinueSave = { 0, function()
+            local best
+            for slot = 0, 20 do
+                local f = world.save_files[slot]
+                if f ~= nil and (best == nil or f.order > world.save_files[best].order) then best = slot end
+            end
+            return slot_detail(best)
+        end, {}, { ret = "chainsaw.gui.SaveSlotInfoDetail" } },
+        getSaveSlotInfoDetail = { 1, function(_, slot) return slot_detail(slot) end, { "System.Int32" },
+            { ret = "chainsaw.gui.SaveSlotInfoDetail" } },
+    })
+    world.save_menu = new("chainsaw.SaveLoadMenuGuiManager")
+    class("chainsaw.UDSManagerApp", "System.Object", {
+        set_RequestGameIntentMode = { 1, function(self, v) self.__fields["<RequestGameIntentMode>k__BackingField"] = v end,
+            { "chainsaw.UDSManagerApp.GameIntentMode" } },
+        set__IsRequestGameIntent = { 1, function(self, v) self.__fields["<_IsRequestGameIntent>k__BackingField"] = v end,
+            { "System.Boolean" } },
+        get_IsRequestGameIntent = { 0, function(self) return self.__fields["<_IsRequestGameIntent>k__BackingField"] == true end },
+    }, { ["<_IsRequestGameIntent>k__BackingField"] = "System.Boolean",
+        ["<RequestGameIntentMode>k__BackingField"] = "chainsaw.UDSManagerApp.GameIntentMode" })
+    world.singletons["chainsaw.UDSManagerApp"] = new("chainsaw.UDSManagerApp", { __fields = {
+        ["<_IsRequestGameIntent>k__BackingField"] = false, ["<RequestGameIntentMode>k__BackingField"] = 0 } })
+    class("chainsaw.GameStateTitle", "System.Object", { update = { 0, function() return true end } })
+    class("chainsaw.GameStateMainMenu", "System.Object", { update = { 0, function() return true end } })
     class("chainsaw.GameOverRequest", "System.Object", {})
     class("chainsaw.GameOverMediator", "System.Object", {
         requestGameOver = { 1, function() world.game_over_requests = world.game_over_requests + 1 end,
@@ -1751,11 +2271,47 @@ function M.install_world(world, opts)
         set_Routine = { 1, function(self, v) self.__fields._Routine = v end, { "chainsaw.GmCrow.RoutineType" } },
     }, { _Routine = "chainsaw.GmCrow.RoutineType" })
     class("chainsaw.GmBottle", "chainsaw.GmBase", {})
+    -- Doors (re4.exe, docs/RESEARCH.md 3.11): bit 0 of the context's first attribute = open;
+    -- _NeedKeepOpenSelf[0] = our player keeps it open, [1] = the other player
+    -- (recvGmParam); it closes by itself once neither does.
+    enum("chainsaw.GmDoor.RoutineType", { Close = 0, Open = 1 })
+    class("chainsaw.GmContextDoor", "System.Object", {
+        ["getAttr(System.Int32)"] = { 1, function(self, i) return self.attr[i + 1] or 0 end, { "System.Int32" },
+            { ret = "System.Byte" } },
+        ["pushAttr(System.Int32, System.Byte)"] = { 2, function(self, i, v)
+            self.attr[i + 1] = v
+            self.pushes = (self.pushes or 0) + 1
+        end, { "System.Int32", "System.Byte" } },
+    })
+    class("chainsaw.GmDoor", "chainsaw.GmBase", {
+        get_GmkContext = { 0, function(self) return self.ctx end, {}, { ret = "chainsaw.GmContextDoor" } },
+        recvGmParam = { 3, function(self, t, arg)
+            rawget(self.__fields._NeedKeepOpenSelf, "__items")[t + 1] = arg ~= 0
+        end, { "System.Int32", "System.Int32", "via.GameObject" } },
+    }, { _Routine = "chainsaw.GmDoor.RoutineType", _NeedKeepOpenSelf = "System.Boolean[]" })
+    -- Automatic / elevator doors (GmAutoDoorBase.calcRoutine): open while _OpenTimer runs; the
+    -- sensor reloads it (CloseWaitTime) by setting _ActivateOpen, consumed each update.
+    class("chainsaw.GmAutoDoorBase", "chainsaw.GmBase", {}, { _Rno0 = "System.Int32", _OpenTimer = "System.Single",
+        _ActivateOpen = "System.Boolean", CloseWaitTime = "System.Single" })
+    class("chainsaw.GmAutoDoor", "chainsaw.GmAutoDoorBase", {})
+    class("chainsaw.GmElevatorDoor", "chainsaw.GmAutoDoorBase", {})
+    -- Big double doors: open (Open/Opened) while IsAnyOneCloseToDoor > 0.
+    enum("chainsaw.GmBigDoor.RoutineType", { Closed = 0, Close = 1, Open = 2, Opened = 3, ForceOpened = 4 })
+    class("chainsaw.GmBigDoor", "chainsaw.GmBase", {}, { _Routine = "chainsaw.GmBigDoor.RoutineType",
+        IsAnyOneCloseToDoor = "System.Int32" })
 end
 
 -- Defines a scenario flag: its GUID lives at bit `bit` of flag group `group` (1-based index).
-function M.add_flag(guid, group, bit)
-    M.world.flag_map[guid:lower()] = { group = group, bit = bit }
+-- opts: { kind = 2 (Boolean) | 16 (Trigger), common = bool, read_only = bool }
+function M.add_flag(guid, group, bit, opts)
+    opts = opts or {}
+    guid = guid:lower()
+    M.world.flag_map[guid] = { group = group, bit = bit }
+    local var = new("via.userdata.Variable", { guid = guid, group = group, bit = bit, kind = opts.kind or 2,
+        common = opts.common, read_only = opts.read_only })
+    M.world.flag_vars[guid] = var
+    M.world.flag_groups[group].vars[bit] = var
+    return var
 end
 
 function M.flag_value(guid)
@@ -1764,9 +2320,14 @@ function M.flag_value(guid)
     return (g.words[f.bit // 32 + 1] & (1 << (f.bit % 32))) ~= 0
 end
 
--- Game code sets a scenario flag (hooks on the setter run).
+-- Game code sets a scenario flag (Variable.set_Bool from anywhere: its change handlers run).
 function M.game_set_flag(guid, value)
-    return M.world.singletons["chainsaw.ScenarioFlagManager"]:call("requestSetFlag", guid_value(guid), value)
+    return M.set_var(M.world.flag_vars[guid:lower()], value)
+end
+
+-- Game code fires a trigger-kind flag.
+function M.game_pulse_flag(guid)
+    return M.world.flag_vars[guid:lower()]:call("setTrigger")
 end
 
 -- A gimmick's record in the save table: attr = { bytes }, triggers = { {id, done} }.
@@ -1780,14 +2341,128 @@ function M.set_gimmick(ctx, attr, triggers, announce)
     return key
 end
 
--- The game starts a cutscene (hooks on the request run).
-function M.start_cutscene(id)
-    return M.world.singletons["chainsaw.TimelineEventManager"]:call("requestPlay", id)
+-- FlagInfo[] as the game builds it (elements inline from 0x20, 8 bytes each).
+local function flag_info_array(list)
+    if list == nil or #list == 0 then return nil end
+    local arr = typed_array("chainsaw.ScenarioFlagManager.FlagInfo", {}, #list)
+    for i, f in ipairs(list) do
+        arr:write_dword(0x20 + (i - 1) * 8, f.group)
+        arr:write_dword(0x24 + (i - 1) * 8, f.index)
+    end
+    return arr
 end
 
+-- The game requests a cutscene "play once" (what calcRequest does): refused if this save
+-- already played it, else packed into a PayloadPlay and played (hooks on procPayloadPlay run).
+-- opts: { camera = 1|2, screen, start_flags = {{group (0-based), index}}, end_flags, owner, end_portrayal }
+function M.start_cutscene(id, opts)
+    opts = opts or {}
+    local w = M.world
+    local camera = opts.camera or 1
+    if w.has_done[("%d:%d"):format(camera, id)] then return 0 end
+    local p = new("chainsaw.ClapperboardMediator.PayloadPlay", { __fields = { CameraType = camera, ID = id,
+        Screen = opts.screen or 0, StartFlag = flag_info_array(opts.start_flags), EndFlag = flag_info_array(opts.end_flags),
+        DataOwnerCode = opts.owner or 0xFFFFFFFF, EndPortrayal = opts.end_portrayal or 0 } })
+    local mediator = w.singletons["chainsaw.ClapperboardMediator"]
+    local play_id = mediator:call("emitPlayID")
+    mediator:call("procPayloadPlay", play_id, p)
+    return play_id
+end
+
+-- The playing cutscene ends: its end flags are set and its data owner's scripted sequence
+-- continues.
 function M.end_cutscene()
-    M.world.gui_event = false
-    M.world.event_id = 0
+    local w = M.world
+    w.gui_event = false
+    w.event_id = 0
+    local rec = w.current_cutscene
+    w.current_cutscene = nil
+    if rec == nil then return end
+    w.singletons["chainsaw.ClapperboardMediator"].__fields._Plays = typed_array("chainsaw.ClapperboardMediator.PlayWork", {})
+    for _, f in ipairs(rec.end_flags or {}) do
+        local g = w.flag_groups[f.group + 1]
+        local var = g and g.vars[f.index]
+        if var ~= nil then M.set_var(var, true) end
+    end
+    if rec.owner ~= nil and rec.owner ~= 0xFFFFFFFF and rec.end_portrayal ~= 0 then
+        w.continued[#w.continued + 1] = { owner = rec.owner, portrayal = rec.end_portrayal }
+    end
+end
+
+-- The 32-bit hash the game takes of a trigger's name (any stable hash serves the mock).
+function M.name_hash(s)
+    local h = 2166136261
+    for i = 1, #s do h = ((h ~ s:byte(i)) * 16777619) & 0xFFFFFFFF end
+    return h
+end
+
+-- A level trigger: a GameObject (scene GUID) with an InteractHolder holding one trigger, plus
+-- the components that make it an event (or not). opts: { components = {type names},
+-- once = bool (default true), key = bool (a key trigger instead of an area), process(target),
+-- callees = {type names a portrayal on it calls} }
+function M.make_trigger(guid, name, opts)
+    opts = opts or {}
+    local go = M.make_go(name)
+    go.guid = guid
+    local holder = M.add_component(go, "chainsaw.InteractHolder", { triggers = {} })
+    for _, tn in ipairs(opts.components or { "chainsaw.GmPortrayalAreaHit" }) do
+        if tn == "chainsaw.PortrayalSettings" then
+            local callees = {}
+            for _, c in ipairs(opts.callees or {}) do callees[#callees + 1] = new(c) end
+            local param = new("chainsaw.PortrayalSettings.Param", { __fields = { _CalleePlay = typed_array("System.Object", callees) } })
+            local settings = new("chainsaw.OptionSettings`1<chainsaw.PortrayalSettings.Param>", { __fields = {
+                _Params = typed_array("chainsaw.PortrayalSettings.Param", { param }) } })
+            M.add_component(go, tn, { __fields = { _Params = settings } })
+        else
+            M.add_component(go, tn)
+        end
+    end
+    local trig = new(opts.key and "chainsaw.InteractTriggerKey" or "chainsaw.InteractTriggerAreaHit", {
+        ttype = opts.key and 2 or 1, owner_go = go, hash = M.name_hash(name), process = opts.process,
+        __fields = { Succeed = opts.once == false and 0 or 1, UniqueName = name, ["<Done>k__BackingField"] = 0 } })
+    holder.triggers[1] = trig
+    return { go = go, holder = holder, trigger = trig }
+end
+
+-- What a trigger's registered processes do when it runs.
+function M.run_trigger(trig, target)
+    M.world.trigger_runs[#M.world.trigger_runs + 1] = { trig = trig, target = target }
+    if trig.process then trig.process(target) end
+end
+
+-- InteractManager accepts a trigger the player activated: a play-once trigger is marked done
+-- and run through executeTrigger (hooks run). False if it was done already.
+function M.activate_trigger(t, target)
+    local f = t.trigger.__fields
+    if f.Succeed == 1 and f["<Done>k__BackingField"] ~= 0 then return false end
+    if f.Succeed == 1 then f["<Done>k__BackingField"] = f["<Done>k__BackingField"] | 1 end
+    local work = new("chainsaw.InteractTrigger.Work", { trig = t.trigger })
+    work:call("executeTrigger", target, nil)
+    return true
+end
+
+-- The game saves into `slot` on its own (an autosave point: 0; a typewriter: the chosen slot).
+function M.game_save(slot)
+    M.world.save_flow:call("start", slot, M.new("chainsaw.ChainsawGameSaveRequestArgs"))
+end
+
+-- One frame of the title screen ("title") or the main menu ("menu"): the game state's update.
+-- A requested game intent makes the menus run Continue (findContinueSave, then the load):
+-- returns the slot loaded, or nil.
+function M.menu_frame(where)
+    local w = M.world
+    local st = M.new(where == "title" and "chainsaw.GameStateTitle" or "chainsaw.GameStateMainMenu")
+    st:call("update")
+    local uds = w.singletons["chainsaw.UDSManagerApp"]
+    if uds.__fields["<_IsRequestGameIntent>k__BackingField"] ~= true then return nil end
+    if where == "title" then return nil end -- the title only skips to the main menu
+    uds.__fields["<_IsRequestGameIntent>k__BackingField"] = false -- Decided: resetRequestGameIntent
+    local detail = w.save_menu:call("findContinueSave")
+    if detail == nil or detail.__fields["<IsEmpty>k__BackingField"] then return nil end
+    local slot = detail.__fields["<Info>k__BackingField"].__fields.SlotIndex
+    w.loaded_slot = slot
+    M.load_save(w.save_files[slot].chapter)
+    return slot
 end
 
 -- The game loads a save (Continue / Load) of `chapter` through CampaignManager.loadGameSaveData.
@@ -1814,6 +2489,120 @@ function M.make_object(type_name, guid, pos, routine)
     list[#list + 1] = comp
     M.world.components[type_name] = list
     return comp
+end
+
+-- A door (GmDoor) in the scene with that GameObject GUID, closed.
+function M.make_door(guid, pos)
+    local go = M.make_go("Door", { wpos = vec(pos.x, pos.y, pos.z) })
+    go.guid = guid
+    local comp = M.add_component(go, "chainsaw.GmDoor", { __fields = { _Routine = 0,
+        _NeedKeepOpenSelf = typed_array("System.Boolean", { false, false }) } })
+    comp.ctx = new("chainsaw.GmContextDoor", { attr = { 0, 0, 0, 0 } })
+    local list = M.world.components["chainsaw.GmDoor"] or {}
+    list[#list + 1] = comp
+    M.world.components["chainsaw.GmDoor"] = list
+    return comp
+end
+
+-- An automatic door (or "chainsaw.GmElevatorDoor"...) / a big double door in the scene.
+function M.make_auto_door(guid, pos, type_name)
+    type_name = type_name or "chainsaw.GmAutoDoor"
+    local go = M.make_go("AutoDoor", { wpos = vec(pos.x, pos.y, pos.z) })
+    go.guid = guid
+    local comp = M.add_component(go, type_name, { __fields = { _Rno0 = 0, _OpenTimer = 0, _ActivateOpen = false,
+        CloseWaitTime = 1.0 } })
+    local list = M.world.components[type_name] or {}
+    list[#list + 1] = comp
+    M.world.components[type_name] = list
+    return comp
+end
+
+function M.make_big_door(guid, pos)
+    local go = M.make_go("BigDoor", { wpos = vec(pos.x, pos.y, pos.z) })
+    go.guid = guid
+    local comp = M.add_component(go, "chainsaw.GmBigDoor", { __fields = { _Routine = 0, IsAnyOneCloseToDoor = 0 } })
+    local list = M.world.components["chainsaw.GmBigDoor"] or {}
+    list[#list + 1] = comp
+    M.world.components["chainsaw.GmBigDoor"] = list
+    return comp
+end
+
+-- Our player opens the door and stands in it (in_doorway = true) or walks on (false).
+function M.player_at_door(door, in_doorway)
+    if in_doorway then door.ctx.attr[1] = door.ctx.attr[1] | 1 end
+    door.player_in = in_doorway
+end
+
+-- GmDoor.updateGimmick for every door: an open bit opens it; open, it closes once nobody keeps
+-- it open (Host: our player in the doorway; Guest: set by recvGmParam). Automatic doors and
+-- big doors as their own updates do (0.1 s per call).
+function M.update_doors()
+    for _, list in ipairs({ M.world.components["chainsaw.GmAutoDoor"] or {}, M.world.components["chainsaw.GmElevatorDoor"] or {} }) do
+        for _, d in ipairs(list) do
+            local f = d.__fields
+            if d.sensor then f._ActivateOpen = true end -- our player in its sensor
+            if f._ActivateOpen then
+                f._OpenTimer, f._ActivateOpen = f.CloseWaitTime, false
+            else
+                f._OpenTimer = math.max(0, f._OpenTimer - 0.1)
+            end
+            f._Rno0 = f._OpenTimer > 0 and 1 or 0
+        end
+    end
+    for _, d in ipairs(M.world.components["chainsaw.GmBigDoor"] or {}) do
+        local f = d.__fields
+        if f._Routine >= 2 and f.IsAnyOneCloseToDoor <= 0 then f._Routine = 0 end
+    end
+    for _, door in ipairs(M.world.components["chainsaw.GmDoor"] or {}) do
+        local f = door.__fields
+        local keep = rawget(f._NeedKeepOpenSelf, "__items")
+        keep[1] = door.player_in == true
+        if f._Routine == 0 and (door.ctx.attr[1] & 1) ~= 0 then
+            f._Routine = 1
+            door.opened = (door.opened or 0) + 1
+        elseif f._Routine == 1 and not keep[1] and not keep[2] then
+            door.ctx.attr[1] = door.ctx.attr[1] & 0xFE
+            f._Routine = 0
+            door.closed = (door.closed or 0) + 1
+        end
+    end
+end
+
+-- An item in our attache case (Guid text `id`).
+function M.case_item(id, item_id, count)
+    local item = new("chainsaw.Item", { __fields = { _ItemId = item_id, _CurrentItemCount = count or 1,
+        _CurrentDurability = -1, _ID = id } })
+    M.world.case[id] = item
+    M.world.case_room = M.world.case_room - 1
+    return item
+end
+
+-- The player opens the command list of an item in the case: it is built and drawn. Returns the
+-- command list (keys in drawing order) and the label each command got.
+function M.open_item_commands(item)
+    local w = M.world
+    local args = new("chainsaw.InventoryManager.GetCommandMenuArgs", { __fields = { Item = item } })
+    local dict = w.singletons["chainsaw.InventoryManager"]:call("getItemCommandMenu", args)
+    local labels = {}
+    for _, cmd in ipairs(dict.order) do
+        local g = new("chainsaw.gui.commandmenu.ItemCommandGui", { __fields = { _CommandText = new("via.gui.Text") } })
+        g:call("drawCommand", cmd, true, item)
+        labels[cmd] = g.__fields._CommandText.message
+    end
+    return dict, labels
+end
+
+-- ...and decides on `cmd` (ItemWindowGuiState_AttacheCaseSelectCommand.decide).
+function M.choose_item_command(item, cmd)
+    local w = M.world
+    w.selected_command = cmd
+    local behavior = new("chainsaw.AcCommandMenuGuiBehavior", { __fields = {
+        _ItemCommandMenuGui = new("chainsaw.gui.commandmenu.ItemCommandMenuGui") } })
+    local param = new("chainsaw.ItemWindowGuiState_AttacheCaseSelectCommand.EnterParam", { __fields = {
+        TargetID = item.__fields._ID } })
+    local state = new("chainsaw.ItemWindowGuiState_AttacheCaseSelectCommand", { behavior = behavior,
+        __fields = { _CurrEnterParam = param } })
+    state:call("decide")
 end
 
 -- Removes a scene object (broken and cleaned up, or unloaded with its area).

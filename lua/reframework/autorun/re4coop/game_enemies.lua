@@ -16,7 +16,9 @@
 --     about its layout is hard-coded), and for a puppet makes sure our game cannot kill it (the
 --     owner decides). A partner's hit is run through the same callback with those values.
 --   * Deaths: HitPoint.dead() (or HP 0), preceded by the killing hit when we have it;
---     erasing = CharacterContext.eliminate() + CharacterSpawnParam.invalidateSpawn(true).
+--     erasing = CharacterSpawnParam.invalidateSpawn(true), undone when the partner's world
+--     brings the enemy back (never CharacterContext.eliminate(): that one is permanent and ends
+--     up in the save).
 
 local P = require("re4coop.protocol")
 
@@ -37,12 +39,16 @@ local MAX_HIT_EVENTS = 64
 local DAMAGE_INFO = "chainsaw.HitController.DamageInfo"
 -- Object fields of a DamageInfo (and its HitInfo/ContactInfo parents) and what a replayed hit
 -- carries in them: "attacker" = our live body, "target" = the enemy's body, "go" = kept if the
--- GameObject is alive, "comp" = kept if the component is alive, "clear" = null.
+-- GameObject is alive, "comp" = kept if the component is alive, "clear" = null. AttackGameObject
+-- is never null: RagdollUnit.onDamageHit (a killing hit that throws the body) reads its position
+-- without a check - a null one crashed the game (docs/RESEARCH.md 3.13). DamageCollidable and
+-- DamageUserData are the enemy's own (build_hit).
 local HIT_OBJECT_FIELDS = {
-    { "AttackOwnerObject", "attacker" }, { "WeaponGameObject", "go" }, { "AttackGameObject", "go" },
+    { "AttackOwnerObject", "attacker" }, { "WeaponGameObject", "go" }, { "AttackGameObject", "attacker" },
     { "DamageGameObject", "target" }, { "ChildHitController", "comp" }, { "AttackCollidable", "clear" },
     { "DamageCollidable", "clear" },
 }
+local CHEST = 1 -- chainsaw.character.BodyParts.Chest: the part a replayed hit lands on
 -- DamageInfo values that only mean something in the game that made them are not copied.
 local HIT_FIELD_EXCLUDE = { "serial", "unique", "handle", "address", "pointer", "ptr", "frame", "time" }
 local HIT_VALUE_TYPES = {
@@ -80,7 +86,13 @@ function M.install(Game, H)
         self.enemy_hidden = {}  -- id -> { body_addr, gos = {GameObjects we stopped drawing} }
         self.parked_bodies = {} -- body address -> gos: hidden by us when its enemy left the list
         self.last_hits = {}     -- id -> values of the last hit it took (any attacker)
+        -- The attack data of our own player's real hits (docs/RESEARCH.md 3.13): a hit we run
+        -- for the partner needs them - HitController.playDamageSe dereferences
+        -- DamageInfo.AttackUserData without a check (a null one crashed the game).
+        self.hit_templates = { by_weapon = {}, any = nil, by_kind = {}, refs = {} }
+        self.erased_spawns = {} -- uid (or "id:<id>") -> spawn param we invalidated (enemy_erase)
         self.hit_events = {}
+        self.fatal_events = {} -- enemies our player started a finisher on (see on_local_fatal)
         self.hit_stats = { seen = 0, by_player = 0, other_owner = 0, not_enemy = 0, clamped = 0, applied = 0,
             apply_failed = 0, kills_with_hit = 0, fields = 0 }
         self.anim_stats = { changes = 0, seeks = 0, speeds = 0, failed = 0 }
@@ -93,7 +105,7 @@ function M.install(Game, H)
         for id in pairs(self.puppets) do self:restore_puppet(id) end
         for id in pairs(self.enemy_hidden) do self:park_body(id) end
         self.enemy_ctx, self.enemy_info, self.enemy_by_body = {}, {}, {}
-        self.puppets, self.last_hits, self.hit_events = {}, {}, {}
+        self.puppets, self.last_hits, self.hit_events, self.fatal_events = {}, {}, {}, {}
         self.elim_scan = nil
     end
 
@@ -653,6 +665,7 @@ function M.install(Game, H)
             return
         end
         stats.by_player = stats.by_player + 1
+        self:remember_hit_template(info, self.enemy_info[id] and self.enemy_info[id].kind)
         local ctx = self.enemy_ctx[id]
         local hp_obj = ctx and self:call(ctx, "get_HitPoint")
         local hp = hp_obj and tonumber(self:call(hp_obj, "get_CurrentHitPoint")) or nil
@@ -703,6 +716,64 @@ function M.install(Game, H)
             end
         end, function(retval) return retval end)
         self:cap("hit_hook", ok, ok and "HitController.callbackDamageHit" or "sdk.hook failed")
+        -- Guard: a hit we run never reaches the damage sound without attack data (the null
+        -- dereference in playDamageSe that crashed the partner's game).
+        local okS, se = pcall(function() return td:get_method("playDamageSe") end)
+        if okS and se ~= nil then
+            pcall(sdk.hook, se, function(args)
+                if not game.replaying then return end
+                local skip = false
+                pcall(function()
+                    local info = sdk.to_managed_object(args[3])
+                    skip = info == nil or info:call("get_AttackUserData") == nil or info:call("get_AttackData") == nil
+                end)
+                if skip then
+                    game.hit_stats.se_skipped = (game.hit_stats.se_skipped or 0) + 1
+                    return sdk.PreHookResult.SKIP_ORIGINAL
+                end
+            end, function(retval) return retval end)
+        end
+        -- Finishers (stealth kill, grab, knife finish, stomp): PlayerHeadUpdater.requestFatal /
+        -- requestKnifeFatal / requestStompFatal hand the request to the target's AI head
+        -- (CharacterContext._HeadUpdater) - which a puppet has switched off. See on_local_fatal.
+        local ptd = find_type("chainsaw.PlayerHeadUpdater")
+        local fatal_hooked = 0
+        for _, name in ipairs({ "requestFatal", "requestKnifeFatal", "requestStompFatal" }) do
+            local okF, fm = pcall(function() return ptd and ptd:get_method(name) end)
+            if okF and fm ~= nil and pcall(sdk.hook, fm, function(args)
+                if not game.active then return end
+                pcall(function()
+                    local head = sdk.to_managed_object(args[2])
+                    local sel = head and head:call("get_TargetSelectorDriver")
+                    local target = sel and sel:call("get_LockonTarget")
+                    local id = target and address_of(target)
+                    if id ~= nil then game:on_local_fatal(id) end
+                end)
+            end, function(retval) return retval end) then
+                fatal_hooked = fatal_hooked + 1
+            end
+        end
+        self:cap("fatal_hook", fatal_hooked > 0, ("%d finisher request(s) watched"):format(fatal_hooked))
+        -- Guard: the body thrown by a killing hit (RagdollUnit.onDamageHit, maybe a frame later)
+        -- never gets a hit without the attacker's GameObject or the damage data - the original
+        -- dereferences both without a check (the crash at re4.exe+0x37959f8). Only adds force.
+        local rtd = find_type("chainsaw.RagdollUnit")
+        local okR, rm = pcall(function() return rtd and rtd:get_method("onDamageHit") end)
+        if okR and rm ~= nil then
+            pcall(sdk.hook, rm, function(args)
+                if not game.active then return end
+                local skip = false
+                pcall(function()
+                    local info = sdk.to_managed_object(args[3])
+                    skip = info == nil or info:call("get_AttackGameObject") == nil
+                        or info:call("get_DamageUserData") == nil
+                end)
+                if skip then
+                    game.hit_stats.ragdoll_skipped = (game.hit_stats.ragdoll_skipped or 0) + 1
+                    return sdk.PreHookResult.SKIP_ORIGINAL
+                end
+            end, function(retval) return retval end)
+        end
         self:damage_schema()
     end
 
@@ -713,6 +784,30 @@ function M.install(Game, H)
         local out = self.hit_events
         if #out == 0 then return out end
         self.hit_events = {}
+        return out
+    end
+
+    -- Our player starts a finisher on enemy `id` (inside the game's request, before the enemy's
+    -- AI head receives it). A puppet's head is off: it would keep the request and do nothing
+    -- while the partner's game ran the enemy on - the enemy chased the partner and only died
+    -- when it changed hands seconds later. If `fatal_filter(id)` allows it (enemy sync: our game
+    -- may take the enemy over), its head and animation driver go back on right here, so the
+    -- finisher plays out in our game; enemy_net takes the enemy over (take_fatal_events).
+    function Game:on_local_fatal(id)
+        if self.enemy_ctx[id] == nil then return end
+        if self.fatal_filter ~= nil and not self.fatal_filter(id) then return end
+        self.perf:crumb("enemy.fatal", self.enemy_info[id] and self.enemy_info[id].kind, true)
+        if self.puppets[id] ~= nil then self:restore_puppet(id) end
+        for _, v in ipairs(self.fatal_events) do
+            if v == id then return end
+        end
+        if #self.fatal_events < MAX_HIT_EVENTS then self.fatal_events[#self.fatal_events + 1] = id end
+    end
+
+    -- Enemies our player started a finisher on since the last call: { id, ... }.
+    function Game:take_fatal_events()
+        local out = self.fatal_events or {}
+        if #out > 0 then self.fatal_events = {} end
         return out
     end
 
@@ -743,12 +838,92 @@ function M.install(Game, H)
         return true
     end
 
-    -- A fresh DamageInfo carrying a hit's values (nil if one cannot be built).
+    -- Keeps a managed object alive while we hold it (REFramework releases what nothing refers to).
+    function Game:keep(obj)
+        local a = address_of(obj)
+        if a == nil then return nil end
+        local refs = self.hit_templates.refs
+        if refs[a] == nil then
+            pcall(obj.add_ref, obj)
+            refs[a] = obj
+        end
+        return refs[a]
+    end
+
+    -- Remembers the attack data of a real hit by our player (by weapon), and the damage data of
+    -- the kind of enemy it hit.
+    function Game:remember_hit_template(info, kind)
+        local au = self:call(info, "get_AttackUserData")
+        local ad = self:call(info, "get_AttackData")
+        if au == nil or ad == nil then return end
+        local t = self.hit_templates
+        local tpl = { au = self:keep(au), ad = self:keep(ad) }
+        if tpl.au == nil or tpl.ad == nil then return end
+        local weapon = tonumber(self:call(info, "get_WeaponID"))
+        if weapon ~= nil then t.by_weapon[weapon] = tpl end
+        t.any = t.any or tpl
+        local du = self:call(info, "get_DamageUserData")
+        if kind ~= nil and du ~= nil then t.by_kind[kind] = self:keep(du) end
+        self:cap("hit_templates", true, ("attack data of %d weapon(s)"):format((function()
+            local n = 0
+            for _ in pairs(t.by_weapon) do n = n + 1 end
+            return n
+        end)()))
+    end
+
+    -- One of the enemy's own damage colliders (its HitController's Colliders) and its
+    -- DamageUserData - the chest one when there is one: collider, user data | nil.
+    function Game:enemy_damage_collider(info)
+        local hc = info.body and self:get_component(info.body, "chainsaw.HitController")
+        local cols = hc and self:call(hc, "get_Colliders")
+        local n = cols and tonumber(self:call(cols, "getCollidersCount")) or 0
+        local first_col, first_ud
+        for i = 0, math.min(n, 128) - 1 do
+            local col = self:call(cols, "getColliders", i)
+            local ud = col and self:call(col, "get_UserData")
+            local tname = ud and type_name_of(ud)
+            if tname ~= nil and tname:find("DamageUserData", 1, true) then
+                local okP, parts = pcall(ud.get_field, ud, "Parts")
+                if okP and tonumber(parts) == CHEST then return col, ud end
+                first_col, first_ud = first_col or col, first_ud or ud
+            end
+        end
+        return first_col, first_ud
+    end
+
+    -- A fresh DamageInfo carrying a hit's values (nil if one cannot be built: no live attacker,
+    -- no attack data yet, or no damage data for the enemy). The game reads these without a
+    -- check: AttackUserData/AttackData in the damage sound (HitController.playDamageSe),
+    -- AttackGameObject and DamageUserData when a killing hit throws the body
+    -- (RagdollUnit.onDamageHit -> addForceFromPointForce). Each null one crashed the game.
     function Game:build_hit(info, fields)
         local okC, d = pcall(sdk.create_instance, DAMAGE_INFO)
         if not okC or d == nil then return nil end
         self:write_damage_fields(d, fields)
         if not self:sanitize_damage_info(d, info.body) then return nil end
+        local t = self.hit_templates
+        local weapon = tonumber(self:call(d, "get_WeaponID"))
+        local tpl = weapon ~= nil and t.by_weapon[weapon] or t.any
+        if tpl == nil then
+            self.hit_stats.no_template = (self.hit_stats.no_template or 0) + 1
+            return nil
+        end
+        if not (pcall(d.call, d, "set_AttackUserData", tpl.au) and pcall(d.call, d, "set_AttackData", tpl.ad)) then
+            return nil
+        end
+        if self:call(d, "get_AttackUserData") == nil or self:call(d, "get_AttackData") == nil then return nil end
+        -- The enemy's own collider and damage data; else what a hit of ours on its kind had.
+        local col, du = self:enemy_damage_collider(info)
+        if du ~= nil then
+            pcall(d.call, d, "set_DamageCollidable", col)
+        else
+            du = info.kind and t.by_kind[info.kind]
+        end
+        if du ~= nil then pcall(d.call, d, "set_DamageUserData", du) end
+        if self:call(d, "get_DamageUserData") == nil or self:call(d, "get_AttackGameObject") == nil then
+            self.hit_stats.no_damage_data = (self.hit_stats.no_damage_data or 0) + 1
+            return nil
+        end
         return d
     end
 
@@ -823,12 +998,14 @@ function M.install(Game, H)
         return self:write_hp(hp, 0)
     end
 
-    -- Removes an enemy that is already dead in the partner's world, the way the game removes
-    -- an enemy it has finished with: CharacterContext.eliminate() marks it eliminated (the
-    -- backup the game stores when it unlinks the character keeps that, so its spawn param never
-    -- spawns it again - CharacterSpawnParam.isNextSpawn checks it), and the spawn param's
-    -- invalidateSpawn(true) despawns it now (updateSpawn: suspend, destroy body and head). No
-    -- death animation, no corpse, no loot. False when the enemy has no spawn param.
+    -- Removes an enemy that is already dead in the partner's world: its spawn param's
+    -- invalidateSpawn(true) despawns it now (updateSpawn: suspend, destroy body and head) and
+    -- keeps it from spawning while it stays invalid. No death animation, no corpse, no loot.
+    -- Never CharacterContext.eliminate(): that marks the character's backup eliminated for good -
+    -- it is written into the save, so the enemy would be gone from this save forever, also after
+    -- the partner's world brought it back (a checkpoint reload). If the area reloads, the
+    -- spawn param is new and spawns the enemy again: the graveyard erases it again then.
+    -- False when the enemy has no spawn param.
     function Game:enemy_erase(id)
         local info = self:live_enemy(id)
         local ctx = info and self.enemy_ctx[id]
@@ -840,10 +1017,28 @@ function M.install(Game, H)
         end
         self.perf:crumb("enemy.erase", info.kind, true)
         self:restore_puppet(id) -- its pooled head and body are reused later
-        local ok = pcall(ctx.call, ctx, "eliminate") and pcall(sp.call, sp, "invalidateSpawn", true)
-        self:cap("enemy_erase", ok, ok and "CharacterContext.eliminate + CharacterSpawnParam.invalidateSpawn"
-            or "eliminate/invalidateSpawn failed")
+        local ok = pcall(sp.call, sp, "invalidateSpawn", true)
+        if ok then
+            pcall(sp.add_ref, sp)
+            self.erased_spawns[info.uid or ("id:" .. tostring(id))] = sp
+        end
+        self:cap("enemy_erase", ok, ok and "CharacterSpawnParam.invalidateSpawn (undone when the enemy comes back)"
+            or "invalidateSpawn failed")
         return ok
+    end
+
+    -- The partner's world has these enemies alive again (uid; nil = all, after its checkpoint
+    -- reload): their spawn params may spawn them again here. Returns how many were restored.
+    function Game:enemy_restore_spawns(uid)
+        local n = 0
+        for key, sp in pairs(self.erased_spawns) do
+            if uid == nil or key == uid then
+                if self:alive(sp) and pcall(sp.call, sp, "invalidateSpawn", false) then n = n + 1 end
+                self.erased_spawns[key] = nil
+            end
+        end
+        if n > 0 then self.perf:crumb("enemy.restore_spawns", tostring(n)) end
+        return n
     end
 
     -- Host: the uids of every enemy our save has eliminated. The game keeps the state of every

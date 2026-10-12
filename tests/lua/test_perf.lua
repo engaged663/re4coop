@@ -93,4 +93,11 @@ T.run("breadcrumbs_urgent_and_throttled", function()
     T.eq(env.files[Perf.CRUMB_FILE].last.step, "closed", "a clean unload is marked")
 end)
 
+T.run("each_copy_of_the_game_keeps_its_own_crash_file", function()
+    local Perf = require("re4coop.perf")
+    T.eq(Perf.file_name("re4coop_breadcrumb.json", nil), "re4coop_breadcrumb.json", "alone: the usual name")
+    T.eq(Perf.file_name("re4coop_breadcrumb.json", "host"), "re4coop_breadcrumb_host.json", "the host's")
+    T.eq(Perf.file_name("re4coop_perf.json", "client"), "re4coop_perf_client.json", "the client's")
+end)
+
 T.finish()

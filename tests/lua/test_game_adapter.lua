@@ -261,7 +261,7 @@ T.run("erasing_an_enemy_the_partner_already_killed", function()
     local ctx = world.enemies[1]
     T.check(game:enemy_set_puppet(list[1].id, true), "a puppet: AI off")
     T.check(game:enemy_erase(list[1].id), "erased")
-    T.eq(ctx.eliminated, true, "CharacterContext.eliminate(): the stored backup keeps it dead")
+    T.eq(ctx.eliminated, nil, "never CharacterContext.eliminate(): that one would end up in the save")
     T.eq(ctx.spawn_param.invalid, true, "CharacterSpawnParam.invalidateSpawn(true)")
     T.eq(ctx.despawned, true, "the game despawned it")
     T.eq(ctx.head.update_self, true, "its pooled head was switched back on first")
@@ -271,6 +271,10 @@ T.run("erasing_an_enemy_the_partner_already_killed", function()
     -- A runtime enemy has no spawn param: the caller kills it instead.
     T.check(not game:enemy_erase(list[2].id), "no spawn param: not erased")
     T.eq(world.enemies[1].hp, 300, "and not touched")
+    -- The partner's world brings it back (their checkpoint reload): it may spawn here again.
+    T.eq(game:enemy_restore_spawns(nil), 1, "one spawn param restored")
+    T.eq(ctx.spawn_param.invalid, false, "invalidateSpawn(false)")
+    T.eq(game:enemy_restore_spawns(nil), 0, "only once")
 end)
 
 T.run("a_head_switched_off_goes_back_to_the_pool_switched_on", function()
@@ -675,6 +679,89 @@ T.run("a_partners_hit_runs_through_the_games_hit_code", function()
     T.check(not game:enemy_apply_hit(id, { damage = 5, fields = {} }), "nothing to run without values")
 end)
 
+T.run("a_partners_hit_never_runs_without_attack_data", function()
+    -- re4.exe crashed in HitController.playDamageSe: a hit we ran for the partner had no
+    -- AttackUserData. Until our own player has hit something, a partner's hit and kill take
+    -- the HP path instead; afterwards they carry our weapon's attack data.
+    local game, world = fresh_game()
+    game:set_active(true)
+    game:read_player_state()
+    local list = game:list_enemies()
+    local e2 = world.enemies[2]
+    local fields = { { h = P.hash("Damage"), t = P.HIT_VALUE.I32, v = 30 },
+        { h = P.hash("WeaponID"), t = P.HIT_VALUE.I32, v = 4000 } }
+    T.eq(game:enemy_apply_hit(list[2].id, { damage = 30, fields = fields }), false, "not run through the hit code")
+    T.eq(mock.component(e2.body, "chainsaw.HitController").received, nil, "callbackDamageHit never called")
+    T.check(game:enemy_kill(list[2].id, fields), "a kill still happens")
+    T.eq(e2.hp, 0, "through HitPoint.dead()")
+    T.eq(world.native_crashes, 0, "no crash")
+    -- Our player hits an enemy: from now on the partner's hits carry that attack data.
+    local e1 = world.enemies[1]
+    mock.hit(e1, 0, 0)
+    game:take_hit_events()
+    T.check(game:enemy_apply_hit(list[1].id, { damage = 30, fields = fields }), "now it runs")
+    T.eq(world.native_crashes, 0, "still no crash")
+    T.eq(world.damage_sounds, 2, "the damage sound played (ours and the partner's)")
+    T.check(game:capabilities().hit_templates.ok, "shown in Diagnostics")
+end)
+
+T.run("a_killing_hit_from_the_partner_never_throws_a_body_without_its_data", function()
+    -- re4.exe crashed in RagdollUnit.onDamageHit: the partner's killing hit, run here on an enemy
+    -- kind our player had never hit, had no AttackGameObject and no DamageUserData. Now it
+    -- carries our body and the enemy's own (chest) damage data; an enemy without damage
+    -- colliders dies through HitPoint.dead() instead.
+    local game, world = fresh_game()
+    game:set_active(true)
+    game:read_player_state()
+    local list = game:list_enemies()
+    mock.hit(world.enemies[1], 0, 0) -- attack data known
+    game:take_hit_events()
+    game.hit_templates.by_kind = {}  -- but never this kind
+    local fields = { { h = P.hash("Wince"), t = P.HIT_VALUE.F32, v = 44 } }
+    local e2 = world.enemies[2]
+    T.check(game:enemy_kill(list[2].id, fields), "killed")
+    T.eq(world.native_crashes, 0, "no crash")
+    T.eq(mock.component(e2.body, "chainsaw.HitController").received[1].kill, true, "by the killing hit")
+    T.eq(world.ragdoll_parts, 1, "the body thrown from the enemy's own chest collider")
+    T.eq(game.hit_stats.kills_with_hit, 1, "counted")
+    -- An enemy without damage colliders: no hit run at all.
+    local e1 = world.enemies[1]
+    local hc1 = mock.component(e1.body, "chainsaw.HitController")
+    hc1.colliders = nil
+    T.check(game:enemy_kill(list[1].id, fields), "still killed")
+    T.eq(#hc1.received, 1, "not through the hit code (only our own earlier hit)")
+    T.eq(e1.hp, 0, "through HitPoint.dead()")
+    T.eq(world.native_crashes, 0, "still no crash")
+end)
+
+T.run("a_finisher_on_a_puppet_switches_it_back_on_at_once", function()
+    -- A stealth kill / grab / knife finish goes to the enemy's AI head, which a puppet has
+    -- switched off: when the sync allows it, the head is back on before the request reaches it.
+    local game, world = fresh_game()
+    game:set_active(true)
+    game:read_player_state()
+    local list = game:list_enemies()
+    local e2 = world.enemies[2]
+    local id = list[2].id
+    game:enemy_set_puppet(id, true)
+    T.eq(e2.head.update_self, false, "a puppet: AI off")
+    game.fatal_filter = function() return false end
+    mock.fatal(e2)
+    T.eq(e2.head.update_self, false, "not when the sync says no")
+    T.eq(#game:take_fatal_events(), 0, "nothing reported")
+    game.fatal_filter = function(i) return i == id end
+    mock.fatal(e2, "requestKnifeFatal")
+    T.eq(e2.head.update_self, true, "its AI head is back on before the request reaches it")
+    T.eq(mock.component(e2.body, "via.motion.MotionFsm2").enabled, true, "and its animation driver")
+    T.eq(world.fatal_requests[2].target, e2, "the game's request still goes through")
+    local ev = game:take_fatal_events()
+    T.eq(ev[1], id, "reported")
+    T.eq(#ev, 1, "once")
+    mock.fatal(e2, "requestStompFatal")
+    T.eq(game:take_fatal_events()[1], id, "the stomp too")
+    T.check(game:capabilities().fatal_hook.ok, "shown in Diagnostics")
+end)
+
 T.run("a_death_from_the_partners_game_comes_with_its_killing_hit", function()
     local game, world = fresh_game()
     game:set_active(true)
@@ -683,6 +770,8 @@ T.run("a_death_from_the_partners_game_comes_with_its_killing_hit", function()
     local e2 = world.enemies[2]
     local id = list[2].id
     game:enemy_set_puppet(id, true)
+    mock.hit(world.enemies[1], 0, 0) -- our player has hit something: its attack data is known
+    game:take_hit_events()
     local fields = { { h = P.hash("Wince"), t = P.HIT_VALUE.F32, v = 44 },
         { h = P.hash("IsCritical"), t = P.HIT_VALUE.BOOL, v = true } }
     T.check(game:enemy_kill(id, fields), "killed")
@@ -759,6 +848,64 @@ T.run("item_flags_and_time_scale", function()
     T.eq(game:get_time_scale(), 0, "read back")
     world.singletons["chainsaw.InventoryManager"] = nil
     T.eq(game:item_get_flags({ 1 }), nil, "no inventory: nil")
+end)
+
+T.run("give_an_item_from_the_attache_case", function()
+    local game, world = fresh_game()
+    local given, refused, enabled = {}, {}, true
+    T.check(game:install_give_hooks({
+        enabled = function() return enabled end,
+        label = function() return "Give to Bob" end,
+        on_give = function(ev) given[#given + 1] = ev end,
+        on_refused = function(why) refused[#refused + 1] = why end,
+    }), "hooks installed")
+    T.eq(game:capabilities().give_items.ok, true, "capability")
+    world.item_names[114400000] = "Green Herb"
+    local herb = mock.case_item("g-herb", 114400000, 3)
+    -- The command list: ours is the last entry, with our label.
+    local menu, labels = mock.open_item_commands(herb)
+    T.eq(menu.order[#menu.order], 13, "'give' is the last command")
+    T.eq(menu.map[13], true, "enabled")
+    T.eq(labels[13], "Give to Bob", "labelled")
+    T.eq(labels[10], "command 10", "the game's own labels are left alone")
+    -- Never for key items or weapons, nor without a partner.
+    world.item_types[100] = 0
+    local key = mock.case_item("g-key", 100, 1)
+    T.eq(mock.open_item_commands(key).map[13], nil, "no 'give' for a key item")
+    enabled = false
+    T.eq(mock.open_item_commands(herb).map[13], nil, "no 'give' without a partner")
+    enabled = true
+    -- Choosing it: out of the case like a discard, handed to the partner, back to the case.
+    mock.open_item_commands(herb)
+    mock.choose_item_command(herb, 13)
+    T.eq(#given, 1, "given")
+    T.eq(given[1].item_id, 114400000, "the item")
+    T.eq(given[1].count, 3, "the whole stack")
+    T.eq(world.case["g-herb"], nil, "out of our case")
+    T.eq(world.virtual_removed, 1, "and out of the case GUI")
+    T.eq(world.case_default, 1, "the game goes back to the case by itself")
+    -- Any other command is the game's.
+    local ammo = mock.case_item("g-ammo", 112800000, 10)
+    mock.choose_item_command(ammo, 10)
+    T.eq(#given, 1, "a discard is not a gift")
+    T.eq(game:item_name(114400000), "Green Herb", "item names from the game's messages")
+    -- Receiving: into our case (the player's PlayerEquipment holds it), as much as fits; not
+    -- while the case is open.
+    T.eq(game:give_receive(114400000, 2, -1), 2, "placed")
+    T.check(game:capabilities().give_receive.detail:find("PlayerEquipment") ~= nil, "found through PlayerEquipment")
+    -- Without it: ChainsawGuiUtil.getInventoryControllers by its ContextID overload (another
+    -- overload of the same name comes first).
+    mock.component(world.player.body, "chainsaw.PlayerEquipment").__fields["<InventoryController>k__BackingField"] = nil
+    T.eq(game:give_receive(114400000, 1, -1), 1, "placed through getInventoryControllers(ContextID)")
+    T.check(game:capabilities().give_receive.detail:find("getInventoryControllers") ~= nil, "reported")
+    world.case_room = world.case_room + 1
+    T.eq(world.case["added-1"].__fields._CurrentItemCount, 2, "in our case")
+    world.inventory_open = true
+    T.eq(game:give_receive(114400000, 1, -1), nil, "waits while the case is open")
+    world.inventory_open = false
+    world.case_room = 0
+    T.eq(game:give_receive(114400000, 1, -1), 0, "nothing fits")
+    T.eq(#refused, 0, "nothing refused")
 end)
 
 T.run("hooks_absent_without_sdk_hook", function()

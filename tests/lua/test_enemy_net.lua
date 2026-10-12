@@ -95,7 +95,15 @@ local function make_world(id_base)
         self.calls.erase = self.calls.erase + 1
         e.erased = true
         self:remove(e)
+        self.invalid_spawns = (self.invalid_spawns or 0) + 1
         return true
+    end
+    -- Undoing an erase: the spawn param may spawn it again.
+    function w:enemy_restore_spawns()
+        local n = self.invalid_spawns or 0
+        self.invalid_spawns = 0
+        self.restored = (self.restored or 0) + n
+        return n
     end
     -- A partner's hit, through the "hit code": its Damage value comes off the HP.
     function w:enemy_apply_hit(id, hit)
@@ -222,6 +230,15 @@ local function make_pair(settings)
         e.last_hit = hit_fields(damage)
         events[#events + 1] = { id = e.id, damage = damage, hp = hp, local_damage = local_damage, lethal = damage >= hp,
             fields = hit_fields(damage) }
+    end
+
+    -- Our player starts a finisher (stealth kill, grab...) on `e`, the way game.lua's hook
+    -- reports it: the adapter switches a puppet back on at once when the sync allows it.
+    function pair:fatal(side, e)
+        local sync = side == "host" and self.host or self.client
+        local world = side == "host" and self.host_world or self.client_world
+        if sync:may_fatal(e.id) then world.puppet[e.id] = nil end
+        sync:on_local_fatal({ e.id }, self.now, world)
     end
 
     return pair
@@ -686,6 +703,99 @@ T.run("an_enemy_the_client_runs_dies_in_both_games", function()
     T.eq(pair.client.counters.deaths_sent, 1, "announced once")
 end)
 
+-------------------------------------------------------------------------------
+-- Finishers (stealth kill, grab, knife finish, stomp)
+-------------------------------------------------------------------------------
+
+-- The bug: the host's player grabbed and killed an enemy the client's game ran. The request
+-- went to the host's puppet (AI off), the client's enemy went on chasing the client and only
+-- died when it changed hands seconds later.
+T.run("the_host_finishing_an_enemy_the_client_runs_takes_it_at_once", function()
+    local pair = make_pair()
+    pair.host_player = { x = -30, y = 0, z = 0 }
+    pair.client_player = { x = 9, y = 0, z = 0 }
+    local h, c = standard_level(pair)
+    pair:step(8)
+    T.eq(owner_of(pair, h.b), CLIENT, "B is the client's (it chases the client)")
+    pair.host_player = { x = 9.5, y = 0, z = 0 } -- the host's player walks up behind it
+    pair:fatal("host", h.b)
+    T.eq(owner_of(pair, h.b), HOST, "the host's game runs it at once")
+    T.eq(pair.host_world.puppet[h.b.id], nil, "its AI is on here for the finisher")
+    pair:step(2)
+    T.eq(pair.client_world.puppet[c.b.id], true, "the client's copy follows the host's")
+    pair:step(60) -- 3 s, the client still a little closer
+    T.eq(owner_of(pair, h.b), HOST, "it stays with the host while the finisher plays out")
+    pair.host_world:damage(h.b, 100) -- the finisher kills it
+    pair:step(3)
+    T.check(not c.b.alive, "dead in the client's game too, right away")
+    T.eq(pair.host.counters.fatals, 1, "counted")
+end)
+
+T.run("the_clients_finisher_on_a_host_enemy_runs_in_the_clients_game", function()
+    local pair = make_pair()
+    local h, c = standard_level(pair)
+    pair:step(6)
+    T.eq(owner_of(pair, h.a), HOST, "A is the host's")
+    T.eq(pair.client_world.puppet[c.a.id], true, "the client shows a puppet")
+    pair:fatal("client", c.a)
+    T.eq(pair.client_world.puppet[c.a.id], nil, "the client's game runs it from this moment")
+    c.a.pos = { x = 1.5, y = 0, z = 0.5 } -- the finisher moves it
+    pair:player_hit("client", c.a, 30) -- the knife
+    T.eq(c.a.hp, 70, "the finisher's hits count here")
+    pair:step(1)
+    T.eq(pair.client_world.puppet[c.a.id], nil, "not a puppet again while the host answers")
+    T.eq(h.a.hp, 100, "those hits are not run in the host's game as well")
+    pair:step(3)
+    T.eq(owner_of(pair, h.a), CLIENT, "the host handed it over")
+    T.eq(pair.host_world.puppet[h.a.id], true, "the host's copy follows the client's")
+    T.near(c.a.pos.x, 1.5, 1e-6, "the client's enemy stayed where the finisher put it")
+    T.eq(c.a.hp, 70, "and kept its damage")
+    T.eq(pair.host.counters.claims_granted, 1, "granted")
+    pair:step(60)
+    T.eq(owner_of(pair, h.a), CLIENT, "it stays with the client while the finisher plays out")
+    pair.client_world:damage(c.a, 70)
+    pair:step(3)
+    T.check(not h.a.alive, "dead in the host's game too")
+end)
+
+T.run("a_finisher_that_kills_before_the_host_answers_still_kills_in_both_games", function()
+    local pair = make_pair()
+    local h, c = standard_level(pair)
+    pair:step(6)
+    pair:fatal("client", c.a)
+    pair.client_world:damage(c.a, 100) -- a quick finisher: dead before the host's answer
+    pair:step(1)
+    T.eq(pair.client.counters.deaths_sent, 1, "the client announces the death (its game ran it)")
+    pair:step(3)
+    T.check(not h.a.alive, "dead in the host's game too")
+    pair:step(60)
+    T.check(not h.a.alive, "and it stays dead")
+end)
+
+T.run("two_finishers_on_one_enemy_the_hosts_wins", function()
+    local pair = make_pair()
+    local h, c = standard_level(pair)
+    pair:step(6)
+    pair:fatal("host", h.a)
+    pair:fatal("client", c.a)
+    pair:step(3)
+    T.eq(owner_of(pair, h.a), HOST, "the host keeps it")
+    T.eq(pair.host.counters.claims_refused, 1, "the client's claim refused")
+    pair:step(40) -- the claim runs out
+    T.eq(pair.client_world.puppet[c.a.id], true, "the client's copy follows the host's again")
+end)
+
+T.run("host_authority_never_runs_a_finisher_in_the_clients_game", function()
+    local pair = make_pair({ enemy_authority = "host" })
+    local h, c = standard_level(pair)
+    pair:step(6)
+    pair:fatal("client", c.a)
+    T.eq(pair.client_world.puppet[c.a.id], true, "still a puppet")
+    pair:step(3)
+    T.eq(owner_of(pair, h.a), HOST, "still the host's")
+    T.eq(pair.client.counters.claims_sent, 0, "nothing claimed")
+end)
+
 T.run("dead_stays_dead_for_enemies_that_spawn_later", function()
     local pair = make_pair({ enemy_authority = "host" })
     pair.client_player = { x = 0, y = 0, z = -5 }
@@ -745,9 +855,29 @@ T.run("a_host_reload_brings_its_dead_back_for_the_client_too", function()
     pair.host:on_local_reload()
     pair:step(1)
     T.eq(pair.client.grave_count, 0, "the client forgets the dead")
+    T.eq(pair.client_world.invalid_spawns or 0, 0, "and nothing it erased stays unable to spawn")
     pair:step(3)
     T.check(net_of(pair.host, h.b) ~= old, "the host numbered its enemies anew")
     T.eq(net_of(pair.client, c.b), net_of(pair.host, h.b), "and the client paired them again")
+end)
+
+T.run("an_enemy_erased_here_can_spawn_again_after_the_hosts_reload", function()
+    -- The host kills an enemy the client has not loaded; when the client's level spawns it,
+    -- it is erased (its spawn param invalidated). The host then reloads a checkpoint: that
+    -- enemy is alive in its world again, so the client's spawn param must be able to spawn it.
+    local pair = make_pair({ enemy_authority = "host" })
+    local h = pair.host_world:spawn(GANADO, 0, 0, 0, 100, 0x2001)
+    pair:step(5)
+    pair.host_world:damage(h, 100)
+    pair:step(3)
+    T.eq(pair.client.grave_count, 1, "dead in the host's world")
+    pair.client_world:spawn(GANADO, 30, 0, 0, 100, 0x2001) -- the client's level spawns it
+    pair:step(5)
+    T.eq(pair.client_world.calls.erase, 1, "erased on sight")
+    T.eq(pair.client_world.invalid_spawns, 1, "its spawn param is invalid")
+    pair.host:on_local_reload()
+    pair:step(2)
+    T.eq(pair.client_world.restored, 1, "valid again after the host's reload")
 end)
 
 T.run("host_authority_holds_client_only_enemies_until_the_host_has_them", function()

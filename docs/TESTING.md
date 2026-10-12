@@ -24,6 +24,7 @@ cd build && ctest --output-on-failure
 | `lua_test_animal_sync` | Animals between two simulated games through the real codec: the client's copies of the host's animals follow them (position, flight, animation once per change), only animals near both players and loaded in both games, released after a second without news; a host animal that dies dies in the client's game with its AI running, where the host's died, and never follows again (also when its routine leaves Dead); one the client shoots is released for its own death and reported once; far puppets move every third frame; switching animal sync off gives every animal back and stops the host sending; a client reload starts afresh; traffic for 40 animals |
 | `lua_test_items_sync` | Key items exist once (also: **inventory "obtained" flag** confirms pickups anywhere, late flags still confirm, an already-set flag is no signal, proven flags ignore unconfirmed vanishes, only-copy matching in the same stage, removals without effect are reported): a pickup removes the partner's copy (again after an area reload). An area unloading far away, or a stale sighting after a loading screen, is never treated as a pickup. Ordinary items stay separate. Matching works without a ContextID, by level ContextID across positions, and **never by runtime ContextIDs**. Simultaneous pickups don't remove anything retroactively. **Pickup callbacks**: a confirmed pickup counts even during the key-item screen or an area swap, a late callback still confirms, a callback for an item that stays is ignored, and once callbacks are proven an unconfirmed disappearance is not a pickup |
 | `lua_test_world_sync` | Flags, gimmicks, objects and cutscenes between two simulated games through the real codec: flags both ways without echo, clears, repeated sets not resent, flapping flags muted, full flag copy for a joining client, word deltas when setter hooks are missing; gimmick changes both ways with the host as referee, conflicts converge, **a change the game announces (pushDirtyList) goes out within a second**, **new records never overwrite the partner's** (the host answers with its own state, area loads are not sent), the full table for a joining client; broken crates and killed crows both ways, area unloads ignored, events waiting for objects that are not loaded, history for late joiners; cutscenes played once on both sides, triggered by both = one, travel before the replay, other chapters dropped |
+| `lua_test_save_sync` | Saves for both through the real codec: a host autosave saves the client into its co-op slot (once, never reported back); a client autosave goes to the co-op slot and saves the host into its autosave; a typewriter save stays in the chosen slot and the client's is copied to its co-op slot; the same save in both games is made once; a partner's save waits while the game cannot save (not playing, busy) and is dropped after 90 s; switches and no partner. **Joining from the menus**: only for a joining client once the host is in game, once; the co-op save if there is one, else the latest; no save asks for a New Game; a game over later reloads the co-op slot only once it holds this session's progress. The adapter against the mock (`SaveFlowController.start` reported and redirected, `requestStartSaveGameDataFlow`, busy / excluded, slots), and a real client Session on the title screen: joining turns the game intent on, the title skips to the main menu, Continue loads slot 20 (not the newer slot 3) into the host's chapter |
 | `lua_test_travel` | The travel state machine: same-stage warp, stage preload, chapter switch + reload + world sync + warp, title screen, one reload offer, following a moving partner, retries and failure reporting |
 | `lua_test_session` | Session-level shared world: reliable world messages kept while the game loop is not running (enemy states dropped) and applied only once the game has run for a moment after loading; **UI actions run on the game thread** (a teleport queued from the render thread waits; leave/host/join may run anywhere but restoring the game waits for the game thread); a disconnect restores enemy AI on the game thread; **joining**: world request → host's state → warp next to the host; from another chapter: chapter switch armed, reload started, world requested once there; from the title screen: the next load redirected; following the host into a later chapter after the delay (never back to an earlier one); **F6 loads the chapter the host waits in**; cross-stage teleports use the game's warp; the partner's cutscene plays here and ours is announced; the host answers world requests; a host reload resets the client's death records; **the host answers an enemies request with every enemy dead in its world** (save backups read over several ticks, after the world transfer's own marker), a client without a world adapter still asks for them, and **a client whose game reloaded takes the host's world again** (only once it had taken it over before, not across chapters); no-pause follows hosting/connection/leaving; shutdown restores pauses, enemy AI and the chapter switch |
 | `lua_test_world_adapter` | `game_world.lua`, `game_pause.lua` and the enemy puppets in `game_enemies.lua` against the mock: **animals** (the host reads the ones near both players with position, routine and animation; a client copy leaves `GimmickManager`'s move list and its AI stops, takes the host's transform and animation, goes back on release, never if the game finished its gimmick, dies with `set_Routine(Die)` with its AI running, and leaving gives every animal back except destroyed ones; an animal the partner killed dies instead of being hidden), methods found by signature (a flag watcher, preloads, stops and queries are never hooked), flag hooks report the game's changes but not ours, do nothing without a partner and read at most 400 setter calls a second (word diffs take over meanwhile), flag words through save/load with boxed array elements (live delta reloads only with the experimental switch), the gimmick table read (incrementally, 40 per call; targeted reads of announced gimmicks) and written (arrays resized, new records), pushDirtyList announcements with the announcing gimmick's key, breakables/animals by GameObject GUID (state machine forced only with the experimental switch, hidden otherwise, an object destroyed since the scan left alone), cutscene hooks and replay, stage preload + `requestWarp` with **real `Nullable` structs** (facing, StageIdentifier; experimental) and the exact fallback move, chapter switch on the next load (one-shot, a save already in that chapter untouched), game over reload (experimental), missing types disabling features quietly, menu pauses neutralised but saving/typewriter kept (re-applied after a rebuild, restored, modes *all*/*off*), pause requests refused in aggressive mode; enemy rotation and animation layers read, the puppet's transform with `CharacterController.warp` and animation (`changeMotion`), the AI head switched off and back on (also before a kill and when the session ends) |
@@ -59,6 +60,7 @@ re4coop zip.
    `enemy_kill`, `pickups`, `pickup_hook`; once connected `hit_hook`, `drop_hook`,
    `drop_request`, `gimmick_hook`; for the shared world
    `flags`, `flag_hooks`, `flag_words`, `gimmicks`, `objects`, `animal_puppets`, `cutscenes`, `cutscene_hooks`,
+   `cutscene_skips`, `triggers`, `trigger_hooks`,
    `chapter_switch`, `no_pause` (and `no_pause_requests`); `enemy_uid` shows how many
    enemies have a level identity (all of them, normally); once connected `enemy_erase` and, on the
    host, `enemy_backups` (after the client joined); `hit_values` (the DamageInfo values a hit
@@ -76,10 +78,15 @@ re4coop zip.
    save of chapter 1 and clicks *Join game*. B's HUD shows "Travelling to …", the log says
    "World synchronised with the host", and B appears next to A. Doors A opened, items A picked
    up and the current objective/map match on B.
-5. **Join from elsewhere**: B loads a different chapter (or stays on the title screen) and
-   joins, then loads any save (or *Continue*): the game loads into A's chapter and B appears
-   next to A. (With *Experimental → Load the partner's chapter automatically*, the game over
-   screen appears by itself.)
+5. **Join from elsewhere**: B loads a different chapter and joins, then loads any save (or
+   *Continue*): the game loads into A's chapter and B appears next to A. (With *Experimental →
+   Load the partner's chapter automatically*, the game over screen appears by itself.)
+5b. **Join from the title screen**: B stays on the title screen (or the main menu, any of its
+   windows open) and joins while A plays. Without touching anything B's game goes to the main
+   menu and loads: the HUD says "Loading your co-op save (slot 20)..." (or "your latest save"
+   the first time), it loads into A's chapter, takes A's world and B appears next to A.
+   *Diagnostics*: `join_load` reads `[ok]`, the *saves* line counts "join loads 1", "menu asked 1"
+   and "co-op save used" once slot 20 exists.
 6. **Partner model**: on each PC, the partner appears as Leon (not a stick figure) wearing the
    same costume. *Diagnostics* → *Partner model: ready (prefab) - ch0a0z0*, with all joints
    animated. Walk around the partner: no extra jacket or missing head/hair.
@@ -88,7 +95,12 @@ re4coop zip.
    B sees each animation, with the weapon in Leon's hand (no gap), the slide moving.
 8. **Shots and sound**: A fires. B hears the gunshot from A's position (louder when close),
    sees a muzzle flash, hears A's reloads and footsteps.
-9. **Doors, keys, levers**: A unlocks a door with a key / pulls a lever / solves a puzzle. On B
+9. **Doors open for both**: B walks through a door while A watches: on A's screen it swings
+   open and stays open while B is in the doorway, then closes in both games once B walked on
+   (*Diagnostics*: `doors` reads `[ok]`, the *doors* line counts what was sent and applied).
+   Then both stand in the same door: it stays open until both left. The same with an automatic
+   or elevator door and a big double door (e.g. the church/castle doors) if the chapter has one.
+   **Doors, keys, levers**: A unlocks a door with a key / pulls a lever / solves a puzzle. On B
    the door is usable (after re-entering the area if it was loaded) and the lever is down.
    *Diagnostics → gimmicks* counters go up on both sides.
 10. **Breakables and animals**: A breaks a crate and shoots a crow; B's crate breaks and the
@@ -98,10 +110,33 @@ re4coop zip.
     lands the same way on both screens (*Diagnostics → animals* counts the ones following and
     `animal_puppets` reads `[ok]`). B shoots a crow that is following A's: it dies on B's screen
     at once and on A's a moment later.
-11. **Cutscene**: A walks into a cutscene trigger while B is elsewhere: A waits after 1.5 s
-    ("Waiting for B…"), B gets an F6 prompt; when B arrives, A's cutscene continues and B's
-    game plays it when B walks into it. (*Experimental → A cutscene one player triggers starts
-    in the partner's game* tries starting it in B's game directly.)
+11. **Cutscenes, events and story flags for both** (0.9.1):
+    * **Event**: A and B stand together; A walks into a spot that starts a scripted event (a
+      camera shot, a voice line, something that moves). B's game shows the same event. On A,
+      *Diagnostics → seen in our game* counts *event triggers*; on B, *event triggers* counts it
+      as *run*. Walking into a door, a ladder, an item or a trap counts under *other triggers*
+      and never runs on B.
+    * **Cutscene nearby**: A walks into a cutscene while B stands close: it plays on both
+      screens (*cutscenes*: *sent* on A, *played* on B), and afterwards the objective, doors and
+      map are the same on both. B never gets it twice when B walks into the same spot later.
+    * **Cutscene far away**: A walks into a cutscene while B is more than 30 m away (or in
+      another area): it starts on B's screen at once, at the same time as on A's, and A is never
+      frozen waiting. When it ends, B's HUD says "Joining your partner where the cutscene took
+      place" and B appears next to A.
+    * **Skip**: while both watch a cutscene, A holds the skip button: it is skipped on both
+      screens (*cutscenes*: *skips_sent* on A, *skips_applied* on B), and afterwards both games
+      continue the same way (objective, doors). Then B skips one: the same on A.
+    * **Doors and levers from the client**: B unlocks a door or pulls a lever: on A,
+      *partner gimmick states applied here* counts up and the door/lever works for A (if it was
+      on A's screen, after A re-enters the area at the latest).
+    * **Event far away**: B walks into an event while A is far away: A's game does not run it
+      (*missed* on A); when A walks there later, A's game runs it itself.
+    * **Flags**: A completes an objective or reveals part of the map: B's objective and map
+      update (*flags*: *sent* on A, *applied* on B). A dies and reloads a checkpoint: B's world
+      keeps what A had done (flags never cross *off*).
+    * If a cutscene or an event misbehaves, untick it in *Options → Shared world* and tell us
+      which one (*cutscenes* names the one waiting or playing; *seen in our game* names the
+      last trigger that was not an event and why).
 12. **One enemy, one game**: both stand in a room with Ganados (and dogs), B a bit away from A.
     *Diagnostics* → `enemy_uid` reads `[ok] N of N enemies have a level identity` and *enemy
     sync* shows the pairs made by ID. Every enemy stands in the same place on both screens,
@@ -131,7 +166,21 @@ re4coop zip.
     back for B (B's log says it took over the host's world again).
 15. **Key items**: A picks up a key item (e.g. the Wooden Cog). On B it disappears and B's HUD
     says "Partner picked up a key item".
-16. **Left behind**: A goes through a door into the next stage. After ~6 s B's HUD offers a
+15b. **Give an item**: A opens the attache case, picks a herb or ammo: the last command reads
+    "Give to B". A chooses it: the item leaves A's case and appears in B's, and both are told.
+    With B's case full, what does not fit comes back to A. A key item or a weapon has no such
+    command. *Diagnostics*: `give_items` reads `[ok]`, the *items given* line counts them.
+15c. **Saves for both**: A walks through an autosave point (the save icon shows): B's game saves
+    too ("Saved with A (slot 20)"). B saves at a typewriter in slot 3: A's game autosaves, and B's
+    slot 20 follows ("Your save is in your co-op slot too"). Both through the same autosave point:
+    one save each. B's Load Game list shows slot 20 at A's chapter; A's slot 0 is untouched by B
+    (two copies on one PC). B quits to the title and joins again: slot 20 loads, with B's
+    inventory. B dies and picks *Continue*: B's game reloads slot 20, not A's autosave.
+    *Diagnostics*: `save_sync` reads `[ok]`; the *saves* line counts them.
+16. **Teleport any time**: B presses **F6** with A 10 m away, then in another room, then in
+    another stage: each time B appears next to A (the HUD line shows "F6: teleport"). Pressing
+    it twice in a row says "Teleport ready again in …"; during a cutscene it says why it waits.
+    **Left behind**: A goes through a door into the next stage. After ~6 s B's HUD offers a
     teleport; **F6** moves B next to A. (Cross-stage warps through the game's own loader are
     *Experimental*.)
 17. **Partner's hits and loot**: A shoots an enemy near B: a yellow line runs from A's character

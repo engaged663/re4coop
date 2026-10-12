@@ -14,9 +14,17 @@
 --     findComponents and GameObject GUIDs.
 --   * In this mod's own research dump (v0.5): GimmickManager.pushDirtyList (a gimmick
 --     changed state, hooked in game.lua), CampaignManager.get_CurrentStageIdentifier.
---   * Found in the game's type database, method names probed at runtime by signature:
---     the setters to hook, save/load of the flag and gimmick tables, the timeline event
---     (cutscene) request methods, gimmick _Routine states.
+--   * Read in re4.exe's code (docs/RESEARCH.md 3.11): flag changes through
+--     ScenarioFlagManagerBehavior.onSetScenarioFlagEvent / onSetCommonFlagEvent and
+--     GlobalUserDataManager.findVariable / trySetBool; cutscenes through
+--     ClapperboardMediator.procPayloadPlay (PayloadPlay); level triggers through
+--     InteractTrigger.Work.executeTrigger, InteractHolder.findTrigger and
+--     via.Scene.findGameObject(System.Guid).
+--   * Read in re4.exe's code too: the gimmick table through GimmickManager.saveGameSaveData,
+--     applied gimmick by gimmick (findContext, GimmickContext.loadSaveDataFromManager,
+--     pushDirtyList); cutscene skips through ClapperboardMediator._Plays (PlayWork.InputSkip /
+--     DoneSkip).
+--   * Found in the game's type database: gimmick _Routine states.
 -- Every lookup is cached and every engine call is pcall'ed; missing pieces switch the
 -- corresponding feature off and show up in the Diagnostics panel.
 
@@ -28,9 +36,21 @@ local World = {}
 World.__index = World
 
 local SFM = "chainsaw.ScenarioFlagManager"
+local SFM_BHV = "chainsaw.ScenarioFlagManagerBehavior"
+local GUD = "chainsaw.GlobalUserDataManager"
+local VARIABLE = "via.userdata.Variable"
+local SAVE_BASE = "share.SaveDataBase"
 local GIM = "chainsaw.GimmickManager"
-local TEM = "chainsaw.TimelineEventManager"
-local TE_ID = "chainsaw.TimelineEventDefine.ID"
+local GIM_CONTEXT = "chainsaw.GimmickContext"
+local GIM_SAVE = "chainsaw.GimmickContext.SaveData"
+local CLAP = "chainsaw.ClapperboardMediator"
+local PAYLOAD_PLAY = "chainsaw.ClapperboardMediator.PayloadPlay"
+local PLAY_WORK = "chainsaw.ClapperboardMediator.PlayWork"
+local GM_DOOR = "chainsaw.GmDoor"
+local FLAG_INFO = "chainsaw.ScenarioFlagManager.FlagInfo"
+local COORD_PACK = "chainsaw.PlayerCoordSetting.Pack"
+local TRIGGER_WORK = "chainsaw.InteractTrigger.Work"
+local HOLDER = "chainsaw.InteractHolder"
 local CHARACTER_MANAGER = "chainsaw.CharacterManager"
 local CAMPAIGN = "chainsaw.CampaignManager"
 local GUI_MANAGER = "chainsaw.GuiManager"
@@ -58,17 +78,47 @@ World.ANIMAL_TYPES = {
     ["chainsaw.GmFish"] = true, ["chainsaw.GmBat"] = true, ["chainsaw.GmMouse"] = true,
 }
 
--- Scenario flag setters worth hooking (lower case name -> "value": takes the new value as
--- its Boolean parameter, true/false: sets / clears the flag given only the GUID).
-World.FLAG_SETTERS = {
-    requestsetflag = "value", setflag = "value", requestflag = "value", setflagvalue = "value",
-    requestsetflagvalue = "value", onflagchanged = "value", applyflag = "value", requestapplyflag = "value",
-    setflagon = true, requestflagon = true, onsetflag = true,
-    setflagoff = false, requestflagoff = false, resetflag = false, requestresetflag = false, clearflag = false,
-}
+-- via.userdata.TypeKind of the variables behind scenario flags.
+local KIND_BOOLEAN = 2
+local KIND_TRIGGER = 16 -- fires for a frame (setTrigger) instead of holding a value
 
-local CUTSCENE_EXCLUDE = { "load", "release", "stop", "skip", "end", "cancel", "pause", "finish", "clear", "reset",
-    "prepare", "ready", "standby", "preview", "debug", "test" }
+-- The handlers the game calls for every scenario / common flag change
+-- (GlobalUserDataManager.registerValueChangedEvent, ScenarioFlagManagerBehavior.start).
+World.FLAG_EVENTS = { "onSetScenarioFlagEvent", "onSetCommonFlagEvent" }
+
+-- chainsaw.InteractTrigger.TriggerType.AreaHit: the player walked into an area.
+local TRIGGER_AREA_HIT = 1
+
+-- Level triggers whose GameObject carries one of these components run a pure event: the
+-- game's scripted sequences (portrayals) and the option parameters they call, camera shots,
+-- mini demos. Their effects are what the partner should see happen in their game too.
+World.EVENT_COMPONENTS = {}
+for _, n in ipairs({ "GmPortrayalAreaHit", "GmPortrayal", "CustomGmPortrayal", "PortrayalSettings",
+    "ClapperboardSettings", "ClapperboardSequenceSettings", "CaptionSettings", "SetFlagSettings",
+    "MessageSettings", "SoundCallSettings", "SoundCommonParamSettings", "SoundSupportSettings",
+    "CameraShakeSettings", "EffectsPlaySettings", "EnvTransPlaySettings", "ObjectHideSettings",
+    "ObjectHideSettings_CP11", "ObjectMoveSettings", "MotionPlaySettings", "MotionFsmPlaySettings",
+    "RealTimeTimelineSettings", "NaviCutSettings", "NaviCutSettings_CP11", "WaitSettings",
+    "VibrationPlaySettings", "VibrationPlaySettings_CP11", "RandomVibrationPlaySetting",
+    "MaterialParamAnimationSettings", "MaterialParamAnimatorEnableSettings", "ParamCurveAnimatorSettings",
+    "ChainEnableSettings", "ColliderEnableSettings", "RigidBodyPlaySettings", "EmoteVoiceSettings",
+    "CharacterTalkSettings", "MapSettings", "NPCMonitorSettings", "MeshPartsHideSettings_CP11",
+    "OffsetParentSettings", "PlMinorDemoSettings", "GmCameraBase", "GmCamera1Shot",
+    "GmCamera1ShotForIronBallCrane", "GmCameraMultiShots", "GmMiniDemo", "GmMiniDemoBase", "GmMiniDemoFsm" }) do
+    World.EVENT_COMPONENTS["chainsaw." .. n] = true
+end
+-- ...and never one of these: they kill or change the player, hand out or take items, save,
+-- switch the game mode or the campaign. Any other gimmick (chainsaw.Gm*, chainsaw.Custom*: a
+-- door, a ladder, a trap, a lever...) is a player action or a per-player hazard, not an event.
+World.DENY_COMPONENTS = {}
+for _, n in ipairs({ "PlDieSettings", "PlConditionSettings", "InventorySettings", "ReduceInventoryItemSettings",
+    "ForceGetFileSettings", "RelatedDropItemSettings", "GameModeSettings", "CampaignProcessSettings",
+    "GameRankSystemSettings", "DevelopProcessSettings", "TelemetrySaveSettings", "RichTutorialSettings",
+    "TutorialSettings", "TestMovieSettings", "DevelopEventTextureSettings", "DevelopJumpPro_AO",
+    "InteractGetPickupItem", "DropItem", "DollCustomSettings", "DeadBodyRemoveSettings",
+    "JetSkiCrewReactionCauseSettings", "JetSkiDebriBlowAwaySettings", "cp1011BinocularsOptionSettings" }) do
+    World.DENY_COMPONENTS["chainsaw." .. n] = true
+end
 
 -- Routine names (lower case prefixes) that mean "this object is finished" ("Break",
 -- "BrokenWait", "Dead"...; not "WaitBreak").
@@ -97,14 +147,6 @@ local function starts_any(name, list)
     return false
 end
 
-local function contains_any(name, list)
-    local n = lower(name)
-    for _, p in ipairs(list) do
-        if n:find(p, 1, true) then return true end
-    end
-    return false
-end
-
 local function yaw_of(q)
     if q == nil then return 0 end
     local x, y, z, w = q.x or 0, q.y or 0, q.z or 0, q.w or 1
@@ -117,11 +159,24 @@ function World.new(game, log)
     self.game = game
     self.log = log or function() end
     self.r = R.new(self.log)
-    self.callbacks = {}      -- on_flag(guid, value), on_cutscene(id, method)
-    self.applying = false
+    self.callbacks = {}      -- on_flag(guid, value, pulse), on_cutscene(ev), on_trigger(ev)
+    self.applying = false    -- we are setting a flag ourselves (its change event is ours)
+    self.applying_cutscene = false
+    self.applying_trigger = false
     self.dirty_seen = 0      -- game.gimmick_calls already reported by gimmicks_dirty()
     self.active = false      -- a partner is connected (set by the session)
     self.word_queue = {}     -- pending flag word changes (group -> word -> {set, clear})
+    self.flag_groups = nil   -- group name -> ScenarioFlagManager.Group (per manager)
+    self.trigger_events = {} -- triggers our player set off this frame (hook), classified in update()
+    self.trigger_owner_info = {} -- GameObject GUID -> {event, why}: what kind of trigger owner it is
+    self.counters = { flag_events = 0, cutscene_events = 0, trigger_events = 0, trigger_not_event = 0,
+        skip_events = 0, gimmicks_applied = 0, gimmicks_waiting = 0 }
+    self.gim_waiting = {}    -- ctx_key -> {item, since}: partner gimmicks whose context is not set up here yet
+    self.skips_seen = {}     -- PlayWork address -> true: skips already reported
+    self.doors = {}          -- GameObject GUID -> {comp, go, pos, kind}: the doors of the loaded areas
+    self.door_guest = {}     -- GUID -> true: doors our partner keeps open here (Guest slot set)
+    self.auto_hold = {}      -- GUID -> true: automatic doors we keep activating for the partner
+    self.big_added = {}      -- GUID -> true: big doors whose "someone close" count we raised
     self.object_index = {}   -- guid -> {comp, go, info={field, enum}, kind, animal, pos} from the latest scan
     self.comp_guid = {}      -- component address -> guid
     self.animal_frozen = {}  -- guid -> {core, go, how}: animals whose state machine we took off the update
@@ -160,6 +215,15 @@ function World:on_reload()
     self.gim_scan = nil
     self.object_scan = nil
     self.word_queue = {}
+    self.flag_groups = nil
+    self.trigger_events = {}
+    self.trigger_owner_info = {}
+    self.skips_seen = {}
+    self.doors = {}
+    self.doors_at = nil
+    self.door_guest = {}
+    self.auto_hold = {}
+    self.big_added = {}
 end
 
 function World:cap(name, ok, detail)
@@ -185,38 +249,56 @@ local function ret_ends(info, suffix)
     return ends_with(info.ret, suffix)
 end
 
+-- A save/load method of a manager: the game declares them with share.SaveDataBase (the
+-- object is the manager's own SaveData).
+local function save_method(info, save_type)
+    return #info.params == 0 and (ret_ends(info, save_type) or info.ret == SAVE_BASE)
+end
+local function load_method(info, save_type)
+    return #info.params == 1 and (ends_with(info.params[1], save_type) or info.params[1] == SAVE_BASE)
+end
+
 function World:probe()
     local r = self.r
-    -- Scenario flags.
-    self.flag_set_m = r:find_method(SFM, function(i) return params_are(i, { "System.Guid", "System.Boolean" })
-        and lower(i.name):find("flag") ~= nil and starts_any(i.name, { "request", "set" }) end,
-        { "requestSetFlag", "setFlag" })
-    self.flag_check_m = r:find_method(SFM, function(i) return params_are(i, { "System.Guid" })
-        and i.ret == "System.Boolean" and starts_any(i.name, { "check", "is", "get" }) end,
-        { "checkFlag", "isFlag", "getFlag" })
-    -- Only names that clearly mean "this flag now has this value": a wrongly hooked method
-    -- (a watcher, a lock...) would report flags that never changed.
-    self.flag_hook_ms = r:find_methods(SFM, function(i)
-        if #i.params < 1 or #i.params > 2 or i.params[1] ~= "System.Guid" then return false end
-        if #i.params == 2 and i.params[2] ~= "System.Boolean" then return false end
-        return World.FLAG_SETTERS[lower(i.name)] ~= nil and (#i.params == 2 or World.FLAG_SETTERS[lower(i.name)] ~= "value")
-    end)
-    self.flag_save_m = r:find_method(SFM, function(i) return #i.params == 0 and ret_ends(i, "ScenarioFlagManager.SaveData") end,
-        { "saveGameSaveData", "createSaveData", "getSaveData", "makeSaveData" })
-    self.flag_load_m = r:find_method(SFM, function(i) return #i.params == 1 and ends_with(i.params[1], "ScenarioFlagManager.SaveData") end,
-        { "loadGameSaveData", "loadSaveData", "setSaveData", "applySaveData" })
-    self:cap("flags", self.flag_set_m ~= nil and self.flag_check_m ~= nil,
-        self.flag_set_m and (self.flag_set_m.name .. " / " .. (self.flag_check_m and self.flag_check_m.name or "no check")) or "no setter")
+    -- Scenario flags. Every flag is a via.userdata.Variable (a GUID and a value); the game sets
+    -- them from everywhere (requestSetFlag, portrayals, cutscene start/end flags, a thousand
+    -- direct Variable.set_Bool calls) and announces every change to two handlers of
+    -- ScenarioFlagManagerBehavior. GlobalUserDataManager finds and sets any of them by GUID.
+    self.flag_event_ms = {}
+    for _, name in ipairs(World.FLAG_EVENTS) do
+        local m = r:find_method(SFM_BHV, function(i) return i.name == name and params_are(i, { VARIABLE }) end)
+        if m ~= nil then self.flag_event_ms[#self.flag_event_ms + 1] = m end
+    end
+    self.var_find_m = r:find_method(GUD, function(i) return i.name == "findVariable" and params_are(i, { "System.Guid" }) end)
+    self.var_set_m = r:find_method(GUD, function(i) return i.name == "trySetBool" and params_are(i, { "System.Guid", "System.Boolean" }) end)
+    -- requestSetFlag(Guid, ck_readonly) turns a flag on (the Boolean is a read-only check, not
+    -- the value); checkFlag(Guid) reads it.
+    self.flag_set_m = r:find_method(SFM, function(i) return i.name == "requestSetFlag" and params_are(i, { "System.Guid", "System.Boolean" }) end)
+    self.flag_check_m = r:find_method(SFM, function(i) return i.name == "checkFlag" and params_are(i, { "System.Guid" }) end)
+    self.flag_save_m = r:find_method(SFM, function(i) return save_method(i, "ScenarioFlagManager.SaveData") end,
+        { "saveGameSaveData" })
+    self.flag_load_m = r:find_method(SFM, function(i) return load_method(i, "ScenarioFlagManager.SaveData") end,
+        { "loadGameSaveData" })
+    local can_set = self.var_set_m ~= nil or self.flag_set_m ~= nil
+    local can_read = self.var_find_m ~= nil or self.flag_check_m ~= nil
+    self:cap("flags", can_set and can_read, can_set and ((self.var_set_m and "GlobalUserDataManager.trySetBool" or "requestSetFlag")
+        .. " / " .. (self.var_find_m and "findVariable" or (self.flag_check_m and "checkFlag" or "no check"))) or "no setter")
     self:cap("flag_words", self.flag_save_m ~= nil and self.flag_load_m ~= nil,
         self.flag_save_m and (self.flag_save_m.name .. " / " .. (self.flag_load_m and self.flag_load_m.name or "no load")) or "no save/load")
 
-    -- Gimmick save table.
-    self.gim_save_m = r:find_method(GIM, function(i) return #i.params == 0 and ret_ends(i, "GimmickManager.SaveData") end,
-        { "saveGameSaveData", "createSaveData", "getSaveData" })
-    self.gim_load_m = r:find_method(GIM, function(i) return #i.params == 1 and ends_with(i.params[1], "GimmickManager.SaveData") end,
-        { "loadGameSaveData", "loadSaveData", "setSaveData" })
-    self:cap("gimmicks", self.gim_save_m ~= nil and self.gim_load_m ~= nil,
-        self.gim_save_m and (self.gim_save_m.name .. " / " .. (self.gim_load_m and self.gim_load_m.name or "no load")) or "no save/load")
+    -- Gimmick save table: read through saveGameSaveData (a fresh copy); partner states are
+    -- applied gimmick by gimmick the way the game's own load does it -
+    -- GimmickManager.findContext(id) -> GimmickContext.loadSaveDataFromManager(SaveData), then
+    -- pushDirtyList - never through loadGameSaveData, which clears the whole manager first.
+    self.gim_save_m = r:find_method(GIM, function(i) return save_method(i, "GimmickManager.SaveData") end,
+        { "saveGameSaveData" })
+    self.gim_find_m = r:find_method(GIM, function(i) return i.name == "findContext" and params_are(i, { CONTEXT_ID }) end)
+    self.gim_ctx_load_m = r:find_method(GIM_CONTEXT, function(i)
+        return i.name == "loadSaveDataFromManager" and params_are(i, { GIM_SAVE }) end)
+    self.gim_dirty_m = r:find_method(GIM, function(i) return i.name == "pushDirtyList" and #i.params == 1 end)
+    local gim_ok = self.gim_save_m ~= nil and self.gim_find_m ~= nil and self.gim_ctx_load_m ~= nil
+    self:cap("gimmicks", gim_ok, gim_ok and "saveGameSaveData / findContext + loadSaveDataFromManager"
+        or (self.gim_save_m == nil and "no saveGameSaveData" or "no findContext / loadSaveDataFromManager"))
 
     -- Breakables / animals present in this game build.
     self.object_types = {}
@@ -232,42 +314,41 @@ function World:probe()
     self:cap("animal_puppets", self.move_reg_m ~= nil and self.move_unreg_m ~= nil,
         self.move_unreg_m and "GimmickManager.unregisterMove / registerMove" or "no move registry")
 
-    -- Cutscenes.
-    local function has_event_param(i)
-        for _, p in ipairs(i.params) do
-            if p == TE_ID then return true end
-        end
-        return false
-    end
-    -- Requests that start playback. Preloads, stops, skips and queries must not count: a
-    -- hooked preload would make the partner play the cutscene before it happens.
-    self.cs_hook_ms = r:find_methods(TEM, function(i)
-        local n = lower(i.name)
-        return has_event_param(i) and (n:find("play", 1, true) or n:find("start", 1, true))
-            and not contains_any(n, CUTSCENE_EXCLUDE) and not starts_any(n, { "is", "get", "check", "has", "can" })
-    end)
-    local simple = { [TE_ID] = true, ["System.Boolean"] = true, ["System.Int32"] = true, ["System.UInt32"] = true,
-        ["System.Single"] = true }
-    self.cs_play_ms = {}
-    for _, i in ipairs(self.cs_hook_ms) do
-        local ok = true
-        for _, p in ipairs(i.params) do
-            if not simple[p] then ok = false break end
-        end
-        if ok then self.cs_play_ms[#self.cs_play_ms + 1] = i end
-    end
-    table.sort(self.cs_play_ms, function(a, b)
-        local pa = lower(a.name):find("requestplay") and 0 or 1
-        local pb = lower(b.name):find("requestplay") and 0 or 1
-        if pa ~= pb then return pa < pb end
-        if #a.params ~= #b.params then return #a.params < #b.params end
-        return a.name < b.name
-    end)
-    self.cs_current = r:find_method(TEM, function(i) return #i.params == 0 and i.ret == TE_ID and starts_any(i.name, { "get_" }) end,
-        { "get_CurrentEventID", "get_PlayingEventID", "get_CurrentID", "get_PlayingID" })
-    self.cs_current_field = self.cs_current == nil and r:find_field(TEM, function(i) return i.type == TE_ID end) or nil
-    self:cap("cutscenes", #self.cs_play_ms > 0,
-        #self.cs_play_ms > 0 and (self.cs_play_ms[1].name .. (" (%d hooks)"):format(#self.cs_hook_ms)) or "no play method")
+    -- Cutscenes: every "play once" camera request (story cutscenes, movies) ends in
+    -- ClapperboardMediator.procPayloadPlay(play id, PayloadPlay); checkHasDone(type, id) says
+    -- whether this save already played one.
+    self.cs_proc_m = r:find_method(CLAP, function(i) return i.name == "procPayloadPlay" and params_are(i, { "System.UInt32", PAYLOAD_PLAY }) end)
+    self.cs_emit_m = r:find_method(CLAP, function(i) return i.name == "emitPlayID" and #i.params == 0 end)
+    self.cs_done_m = r:find_method(CLAP, function(i) return i.name == "checkHasDone" and params_are(i, { "System.Int32", "System.Int32" }) end)
+    local cs_ok = self.cs_proc_m ~= nil and self.cs_emit_m ~= nil and r:type(PAYLOAD_PLAY) ~= nil
+    self:cap("cutscenes", cs_ok, cs_ok and "ClapperboardMediator.procPayloadPlay (PayloadPlay)"
+        or (self.cs_proc_m == nil and "no procPayloadPlay" or "no emitPlayID / PayloadPlay"))
+    -- Skips: the skip button only sets PlayWork.InputSkip; the mediator's procSkip then skips
+    -- the playing camera if it can be skipped (and sets DoneSkip). _Plays holds one PlayWork
+    -- per screen.
+    self.cs_skip_ok = r:find_field(CLAP, function(i) return i.name == "_Plays" end) ~= nil
+        and r:find_field(PLAY_WORK, function(i) return i.name == "InputSkip" end) ~= nil
+        and r:find_field(PLAY_WORK, function(i) return i.name == "DoneSkip" end) ~= nil
+    self:cap("cutscene_skips", self.cs_skip_ok, self.cs_skip_ok and "PlayWork.InputSkip / DoneSkip" or "no PlayWork skip fields")
+
+    -- Level triggers: InteractManager runs every activated trigger through
+    -- InteractTrigger.Work.executeTrigger(target, userdata); InteractHolder.findTrigger(hash)
+    -- finds one again on its GameObject.
+    self.trig_exec_m = r:find_method(TRIGGER_WORK, function(i) return i.name == "executeTrigger" and #i.params == 2 end)
+    self.trig_find_m = r:find_method(HOLDER, function(i) return i.name == "findTrigger" and params_are(i, { "System.UInt32" }) end)
+    local trig_ok = self.trig_exec_m ~= nil and self.trig_find_m ~= nil
+    self:cap("triggers", trig_ok, trig_ok and "InteractTrigger.Work.executeTrigger / InteractHolder.findTrigger"
+        or (self.trig_exec_m == nil and "no executeTrigger" or "no findTrigger"))
+
+    -- Doors: GmDoor opens when bit 0 (Attr0Bit.Open) of its first attribute is set and closes
+    -- by itself once nobody keeps it open: _NeedKeepOpenSelf[Host] is our player (a timer
+    -- refreshed while it stands in the doorway), [Guest] the other player - which only the
+    -- game's dormant network receiver recvGmParam(NeedOpenSelfIndex, value) sets.
+    self.door_ok = r:type(GM_DOOR) ~= nil
+        and r:find_method(GM_DOOR, function(i) return i.name == "recvGmParam" and #i.params == 3 end) ~= nil
+        and r:find_field(GM_DOOR, function(i) return i.name == "_NeedKeepOpenSelf" end) ~= nil
+    self:cap("doors", self.door_ok, self.door_ok and "GmDoor Guest slot, GmAutoDoorBase sensor, GmBigDoor count"
+        or "no GmDoor keep-open slots")
 
     -- Travel.
     self.warp_m = r:find_method(CHARACTER_MANAGER, function(i) return i.name == "requestWarp" and #i.params == 4 end)
@@ -283,46 +364,71 @@ function World:install_hooks(callbacks)
     local r = self.r
     local installed = 0
 
-    -- Flag setters: report local changes.
-    for _, info in ipairs(self.flag_hook_ms or {}) do
+    -- Flag changes: the game's own change events report every flag, whoever set it. Only
+    -- flags turning on (and trigger-kind flags firing) are news for the partner; a reload
+    -- turning flags back off stays local, but flag_sync hears of it so the flag counts as
+    -- news again the next time it turns on.
+    for _, info in ipairs(self.flag_event_ms or {}) do
         local base = info.static and 2 or 3
-        local kind = World.FLAG_SETTERS[lower(info.name)]
-        local implied = kind ~= false
-        local nparams = #info.params
         local ok = r:hook(info, function(args)
-            -- Cheap checks first: this runs for every flag the game sets.
+            -- Cheap checks first: this runs for every flag the game changes.
             if self.applying or not self.active then return end
             local cb = self.callbacks.on_flag
             if cb == nil or not self:flag_hook_budget() then return end
-            local guid = R.arg_guid(args[base])
+            local var = R.arg_obj(args[base])
+            if var == nil then return end
+            local kind = R.number(R.call(var, "get_TypeKind"))
+            local pulse = kind == KIND_TRIGGER
+            local value = pulse or R.call(var, "get_Bool") == true
+            local guid = R.guid_string(R.call(var, "get_Guid"))
             if guid == nil then return end
-            local value = implied
-            if nparams == 2 then value = R.arg_bool(args[base + 1]) end
-            pcall(cb, guid, value)
+            self.counters.flag_events = self.counters.flag_events + 1
+            pcall(cb, guid, value, pulse)
         end)
         if ok then installed = installed + 1 end
     end
     self.flag_hooks = installed > 0
-    self:cap("flag_hooks", self.flag_hooks, ("%d setter hooks"):format(installed))
+    self:cap("flag_hooks", self.flag_hooks, ("%d change handlers hooked"):format(installed))
 
-    -- Cutscene requests: report local starts.
-    local cs = 0
-    for _, info in ipairs(self.cs_hook_ms or {}) do
-        local base = info.static and 2 or 3
-        local idx
-        for k, p in ipairs(info.params) do
-            if p == TE_ID then idx = k break end
-        end
-        local ok = r:hook(info, function(args)
-            if self.applying then return end
+    -- Cutscenes: every "play once" request our game plays, as its PayloadPlay.
+    local cs_hooked = false
+    if self.cs_proc_m ~= nil then
+        local base = self.cs_proc_m.static and 2 or 3
+        cs_hooked = r:hook(self.cs_proc_m, function(args)
+            if self.applying_cutscene or not self.active then return end
             local cb = self.callbacks.on_cutscene
             if cb == nil then return end
-            local id = R.arg_i32(args[base + idx - 1])
-            if id ~= nil then pcall(cb, id, info.name) end
+            local ev = self:read_payload(R.arg_obj(args[base + 1]))
+            if ev ~= nil then
+                self.counters.cutscene_events = self.counters.cutscene_events + 1
+                pcall(cb, ev)
+            end
         end)
-        if ok then cs = cs + 1 end
     end
-    self:cap("cutscene_hooks", cs > 0, ("%d request hooks"):format(cs))
+    self:cap("cutscene_hooks", cs_hooked, cs_hooked and "procPayloadPlay hooked" or "not hooked")
+
+    -- Level triggers our player sets off: queued here (the hook runs inside the game's
+    -- interaction update), classified and reported by update().
+    local trig_hooked = false
+    if self.trig_exec_m ~= nil then
+        local base = self.trig_exec_m.static and 2 or 3
+        trig_hooked = r:hook(self.trig_exec_m, function(args)
+            if self.applying_trigger or not self.active or self.callbacks.on_trigger == nil then return end
+            local target = R.arg_int(args[base])
+            local objs = self.game and self.game.player_objects
+            if target == nil or objs == nil or not objs[target] then return end -- an NPC, an enemy, a doll
+            local work = R.arg_obj(args[base - 1])
+            local trig = work and R.call(work, "get_Trigger")
+            if trig == nil or R.number(R.call(trig, "get_Type")) ~= TRIGGER_AREA_HIT then return end
+            if #self.trigger_events < 32 then
+                local body = self.game.player_body
+                local okb, body_addr = pcall(function() return body:get_address() end)
+                local head = okb and body_addr ~= nil and target ~= body_addr
+                self.trigger_events[#self.trigger_events + 1] = { trig = trig, head = head }
+            end
+        end)
+    end
+    self:cap("trigger_hooks", trig_hooked, trig_hooked and "executeTrigger hooked" or "not hooked")
 
     -- Chapter switch: rewrite the chapter of the next save load when armed.
     if self.load_save_m ~= nil then
@@ -358,19 +464,59 @@ function World:flag_mgr()
     return self.r:singleton(SFM)
 end
 
+-- The via.userdata.Variable behind a flag GUID (GlobalUserDataManager.findVariable), or nil.
+function World:flag_variable(guid)
+    local m = self.var_find_m
+    if m == nil then return nil end
+    local g = self.r:guid_value(guid)
+    if g == nil then return nil end
+    local ok, var = pcall(m.method.call, m.method, nil, g)
+    if ok and var ~= nil then return var end
+    return nil
+end
+
+-- Sets a flag through the game, so everything that reacts to it reacts (its change event
+-- runs): GlobalUserDataManager.trySetBool, else ScenarioFlagManager.requestSetFlag (on only).
 function World:flag_set(guid, value)
-    local m, mgr = self.flag_set_m, self:flag_mgr()
-    if m == nil or mgr == nil then return false end
     local g = self.r:guid_value(guid)
     if g == nil then return false end
+    value = value and true or false
     self:crumb("world.flag_set", guid)
     self.applying = true
-    local ok = pcall(m.method.call, m.method, mgr, g, value and true or false)
+    local ok = false
+    local m = self.var_set_m
+    if m ~= nil then
+        local okc, r = pcall(m.method.call, m.method, nil, g, value)
+        ok = okc and r ~= false
+    end
+    if not ok and value and self.flag_set_m ~= nil then
+        local mgr = self:flag_mgr()
+        if mgr ~= nil then
+            -- ck_readonly = false: the partner's game already decided this flag may be set.
+            ok = pcall(self.flag_set_m.method.call, self.flag_set_m.method, mgr, g, false)
+        end
+    end
+    self.applying = false
+    return ok
+end
+
+-- Fires a trigger-kind flag (via.userdata.Variable.setTrigger).
+function World:flag_pulse(guid)
+    local var = self:flag_variable(guid)
+    if var == nil then return false end
+    self:crumb("world.flag_pulse", guid)
+    self.applying = true
+    local ok = pcall(var.call, var, "setTrigger")
     self.applying = false
     return ok
 end
 
 function World:flag_check(guid)
+    local var = self:flag_variable(guid)
+    if var ~= nil then
+        local v = R.call(var, "get_Bool")
+        if type(v) == "boolean" then return v end
+    end
     local m, mgr = self.flag_check_m, self:flag_mgr()
     if m == nil or mgr == nil then return nil end
     local g = self.r:guid_value(guid)
@@ -440,15 +586,11 @@ function World:flag_words_snapshot()
     return out
 end
 
--- Rewrites groups in a fresh save object and loads it back. changes(name, words_array, current)
--- returns true if it modified the array.
--- Reloading the whole flag table while playing is experimental (exp_table_reload); the
--- complete copy a joining client takes over (full = true) is always allowed.
-function World:flag_rewrite(edit, full)
-    if not full and self:setting("exp_table_reload") ~= true then
-        self.table_reloads_skipped = (self.table_reloads_skipped or 0) + 1
-        return false
-    end
+-- Rewrites groups in a fresh save object and loads it back (the game's own load: it sets
+-- every flag variable from the words). changes(name, words_array, current) returns true if it
+-- modified the array. Only for the complete copy a joining client takes over; live changes
+-- go flag by flag (apply_word_queue).
+function World:flag_rewrite(edit)
     local sd = self:flag_save_data()
     if sd == nil then return false end
     local changed = false
@@ -458,7 +600,7 @@ function World:flag_rewrite(edit, full)
         if name ~= nil and arr ~= nil and edit(name, arr, R.numbers(arr)) then changed = true end
     end)
     if not changed then return true end
-    self:crumb("world.flag_table_reload", full and "full" or "delta", true)
+    self:crumb("world.flag_table_reload", "full", true)
     self.applying = true
     local ok = pcall(self.flag_load_m.method.call, self.flag_load_m.method, self:flag_mgr(), sd)
     self.applying = false
@@ -478,40 +620,71 @@ function World:flag_words_apply_full(groups)
             end
         end
         return changed
-    end, true)
+    end)
 end
 
--- Queued; applied together by World:update().
+-- Queued; applied together by World:update(). Only bits turning on are applied (a flag going
+-- off in the partner's game is their reload, not news).
 function World:flag_words_apply(group, word, set, clear)
+    if set == 0 then return true end
     local g = self.word_queue[group]
     if g == nil then
         g = {}
         self.word_queue[group] = g
     end
-    local c = g[word] or { set = 0, clear = 0 }
-    c.set = (c.set | set) & ~clear
-    c.clear = (c.clear | clear) & ~set
-    g[word] = c
+    g[word] = (g[word] or 0) | set
     return true
 end
 
-function World:update()
+-- ScenarioFlagManager.Group by its name (the SaveGroup.GroupName of the words): bit i of its
+-- words is the flag variable i of its UserVariables (ScenarioFlagManager.applyBit2Variable).
+function World:flag_group(name)
+    if self.flag_groups == nil then
+        local groups = {}
+        R.each(R.get(self:flag_mgr(), "_Group"), function(g)
+            local n = R.string(R.get(g, "<Name>k__BackingField") or R.call(g, "get_Name"))
+            if n ~= nil then groups[n] = g end
+        end)
+        if next(groups) == nil then return nil end
+        self.flag_groups = groups
+    end
+    return self.flag_groups[name]
+end
+
+-- Turns flags on bit by bit through their variables (the change events run, as for any flag
+-- the game sets). No table reload while playing.
+function World:apply_word_queue()
     if next(self.word_queue) == nil then return end
     local queue = self.word_queue
     self.word_queue = {}
-    self:flag_rewrite(function(name, arr, cur)
-        local g = queue[name]
-        if g == nil then return false end
-        local changed = false
-        for word, c in pairs(g) do
-            local old = cur[word + 1]
-            if old ~= nil then
-                local new = (old | c.set) & ~c.clear
-                if new ~= old and R.set_number(arr, word, new) then changed = true end
+    for name, words in pairs(queue) do
+        local g = self:flag_group(name)
+        local vars = g and (R.get(g, "<Variables>k__BackingField") or R.call(g, "get_Variables"))
+        if vars ~= nil then
+            for word, set in pairs(words) do
+                for bit = 0, 31 do
+                    if (set >> bit) & 1 == 1 then
+                        local var = R.call(vars, "getVariable", word * 32 + bit)
+                        if var ~= nil and R.call(var, "get_Bool") ~= true then
+                            self.applying = true
+                            pcall(var.call, var, "set_Bool", true)
+                            self.applying = false
+                        end
+                    end
+                end
             end
+        else
+            self.word_apply_failed = (self.word_apply_failed or 0) + 1
         end
-        return changed
-    end)
+    end
+end
+
+function World:update()
+    self:apply_word_queue()
+    self:report_triggers()
+    self:report_skips()
+    self:retry_waiting_gimmicks()
+    self:refresh_auto_holds()
 end
 
 -------------------------------------------------------------------------------
@@ -530,7 +703,7 @@ end
 
 function World:gim_save_data()
     local mgr = self.r:singleton(GIM)
-    if mgr == nil or self.gim_save_m == nil or self.gim_load_m == nil then return nil, nil end
+    if mgr == nil or self.gim_save_m == nil then return nil, nil end
     local ok, sd = pcall(self.gim_save_m.method.call, self.gim_save_m.method, mgr)
     if ok and sd ~= nil then return sd, mgr end
     return nil, nil
@@ -601,18 +774,18 @@ function World:gimmicks_snapshot(force, keys)
     return scan.out
 end
 
+-- Writes a partner's state into a SaveData (a clone of our context's current one): new
+-- arrays only (a clone may share its arrays with the live state), and accessory values only
+-- where our record has the same kind of value - an accessory object of another type is the
+-- gimmick's own and stays.
 function World:write_gimmick(data, item)
-    -- Attr bytes: rewrite in place when the size matches, else a new array.
-    local attr = R.get(data, "Attr")
     local n = #item.attr
-    if attr == nil or R.count(attr) ~= n then
-        attr = R.new_array("System.Byte", n)
-        if attr == nil then return false end
-        R.set(data, "Attr", attr)
-    end
+    local attr = R.new_array("System.Byte", n)
+    if attr == nil then return false end
     for i = 1, n do
         R.set_number(attr, i - 1, item.attr:byte(i), "byte")
     end
+    R.set(data, "Attr", attr)
     -- Triggers that already fired.
     local trig = R.new_array("chainsaw.GimmickContext.TriggerDone", #item.triggers)
     if trig ~= nil then
@@ -628,15 +801,25 @@ function World:write_gimmick(data, item)
     end
     R.set(data, "IsDetected", item.detected and true or false)
     -- Accessory values.
-    local acc = R.new_array("chainsaw.GimmickContext.AccessoryData", #item.acc)
-    if acc ~= nil then
-        for i, a in ipairs(item.acc) do
-            local obj = R.new_instance(a.kind == 1 and "chainsaw.GimmickContext.AccessoryDataFloat"
-                or "chainsaw.GimmickContext.AccessoryDataUint")
-            if obj ~= nil then
-                R.set(obj, "Value", a.value)
-                pcall(function() acc[i - 1] = obj end)
+    local old = {}
+    R.each(R.get(data, "AccDatas"), function(a) old[#old + 1] = a end)
+    local count = math.max(#old, #item.acc)
+    if count > 0 then
+        local acc = R.new_array("chainsaw.GimmickContext.AccessoryData", count)
+        if acc == nil then return true end
+        for i = 1, count do
+            local a, v = old[i], item.acc[i]
+            local tn = a and R.type_name(a) or nil
+            local obj = a
+            if v ~= nil and (a == nil or tn == "chainsaw.GimmickContext.AccessoryDataFloat"
+                or tn == "chainsaw.GimmickContext.AccessoryDataUint") then
+                local want = v.kind == 1 and "chainsaw.GimmickContext.AccessoryDataFloat" or "chainsaw.GimmickContext.AccessoryDataUint"
+                if a == nil or (tn == want and R.number(R.get(a, "Value")) ~= v.value) then
+                    obj = R.new_instance(want)
+                    if obj ~= nil then R.set(obj, "Value", v.value) end
+                end
             end
+            if obj ~= nil then pcall(function() acc[i - 1] = obj end) end
         end
         R.set(data, "AccDatas", acc)
     end
@@ -653,45 +836,72 @@ function World:new_ctx_value(ctx)
     return id
 end
 
+-- One partner gimmick state into our game: "applied", "missing" (no context for it here yet)
+-- or "failed".
+function World:apply_gimmick(mgr, it)
+    local id = self:new_ctx_value(it.ctx)
+    if id == nil then return "failed" end
+    local okf, ctx = pcall(self.gim_find_m.method.call, self.gim_find_m.method, mgr, id)
+    if not okf or ctx == nil then return "missing" end
+    local cur = R.get(ctx, "_SaveCur")
+    local data = cur and R.call(cur, "clone") or R.new_instance(GIM_SAVE)
+    if data == nil or not self:write_gimmick(data, it) then return "failed" end
+    local ok = pcall(self.gim_ctx_load_m.method.call, self.gim_ctx_load_m.method, ctx, data)
+    if not ok then return "failed" end
+    -- Into the game's own save buffer too, as for any gimmick that changed state.
+    if self.gim_dirty_m ~= nil then pcall(self.gim_dirty_m.method.call, self.gim_dirty_m.method, mgr, ctx) end
+    self.counters.gimmicks_applied = self.counters.gimmicks_applied + 1
+    return "applied"
+end
+
+local GIMMICK_WAIT = 1800.0 -- how long a partner state waits for its gimmick to be set up here
+local GIMMICK_RETRY = 3.0
+
 function World:gimmicks_apply(items)
     self.gim_scan = nil -- a scan in progress would read the old states
-    -- Not while the game is loading or playing a cutscene: the table is being rebuilt then.
+    -- Not while the game is loading or playing a cutscene: gimmicks are being set up then.
     local loc = self:location()
     if loc == nil or loc.loading or loc.cutscene then return nil end -- not now: keep the queue
-    local sd, mgr = self:gim_save_data()
-    if sd == nil then return false end
-    local list = R.get(sd, "Datas")
-    if list == nil then return false end
-    local existing = {}
-    R.each(list, function(item)
-        local ctx = self:read_ctx(R.get(item, "ID"))
-        if ctx ~= nil then existing[P.ctx_key(ctx)] = item end
-    end)
+    local mgr = self.r:singleton(GIM)
+    if mgr == nil or self.gim_find_m == nil or self.gim_ctx_load_m == nil then return false end
+    self:crumb("world.gimmick_apply", ("%d items"):format(#items), true)
+    local now = self:now()
     for _, it in ipairs(items) do
         local key = P.ctx_key(it.ctx)
-        local item = existing[key]
-        if item == nil then
-            item = R.new_instance("chainsaw.GimmickManager.SaveItem")
-            local data = R.new_instance("chainsaw.GimmickContext.SaveData")
-            local id = self:new_ctx_value(it.ctx)
-            if item ~= nil and data ~= nil and id ~= nil then
-                R.set(item, "ID", id)
-                R.set(item, "SaveData", data)
-                if R.call(list, "Add", item) == nil then
-                    pcall(function() list:call("Add(chainsaw.GimmickManager.SaveItem)", item) end)
-                end
-            else
-                item = nil
-            end
+        local r = self:apply_gimmick(mgr, it)
+        if r == "missing" then
+            self.gim_waiting[key] = { item = it, since = (self.gim_waiting[key] or {}).since or now }
+        else
+            self.gim_waiting[key] = nil
         end
-        local data = item and R.get(item, "SaveData")
-        if data ~= nil then self:write_gimmick(data, it) end
     end
-    self:crumb("world.gimmick_table_reload", ("%d items"):format(#items), true)
-    self.applying = true
-    local ok = pcall(self.gim_load_m.method.call, self.gim_load_m.method, mgr, sd)
-    self.applying = false
-    return ok
+    self:count_waiting_gimmicks()
+    return true
+end
+
+function World:count_waiting_gimmicks()
+    local n = 0
+    for _ in pairs(self.gim_waiting) do n = n + 1 end
+    self.counters.gimmicks_waiting = n
+end
+
+-- Partner states whose gimmick had no context here (its area not set up yet): tried again now
+-- and then.
+function World:retry_waiting_gimmicks()
+    if next(self.gim_waiting) == nil then return end
+    local now = self:now()
+    if now - (self.gim_retry_at or -math.huge) < GIMMICK_RETRY then return end
+    self.gim_retry_at = now
+    local loc = self:location()
+    if loc == nil or loc.loading or loc.cutscene then return end
+    local mgr = self.r:singleton(GIM)
+    if mgr == nil or self.gim_find_m == nil or self.gim_ctx_load_m == nil then return end
+    for key, w in pairs(self.gim_waiting) do
+        if now - w.since > GIMMICK_WAIT or self:apply_gimmick(mgr, w.item) ~= "missing" then
+            self.gim_waiting[key] = nil
+        end
+    end
+    self:count_waiting_gimmicks()
 end
 
 -- True once after GimmickManager.pushDirtyList ran (game.lua hooks it and counts the
@@ -1073,44 +1283,499 @@ end
 -- Cutscenes
 -------------------------------------------------------------------------------
 
+-- RE4 plays every "play once" camera request - story cutscenes (timeline events) and movies -
+-- through ClapperboardMediator.calcRequest, which strips the requester's callbacks and packs
+-- the request into a PayloadPlay, complete data made to be sent to another game: camera type
+-- and ID, screen, start and end flags (ScenarioFlagManager.FlagInfo group/index pairs), the
+-- data owner (ContextID code of the level object whose scripted sequence continues when it
+-- ends), that next step (EndPortrayal) and, for movies, where to put the players
+-- (PlayerCoordSetting.Pack). procPayloadPlay plays it and records it as seen (checkHasDone).
+
 function World:cutscene_playing()
     local gui = self.r:singleton(GUI_MANAGER)
     if gui == nil or R.call(gui, "get_IsPlayingEvent") ~= true then return nil end
-    local mgr = self.r:singleton(TEM)
-    if mgr ~= nil then
-        local id
-        if self.cs_current ~= nil then
-            local ok, v = pcall(self.cs_current.method.call, self.cs_current.method, mgr)
-            id = ok and R.number(v) or nil
-        elseif self.cs_current_field ~= nil then
-            id = R.number(R.get(mgr, self.cs_current_field.name))
-        end
-        if id ~= nil and id > 0 then return id end
-    end
     return true
 end
 
-function World:cutscene_play(id, method)
-    local mgr = self.r:singleton(TEM)
-    if mgr == nil or #self.cs_play_ms == 0 then return false end
-    self:crumb("world.cutscene_play", tostring(id), true)
-    local candidates = {}
-    for _, i in ipairs(self.cs_play_ms) do
-        if i.name == method then table.insert(candidates, 1, i) else candidates[#candidates + 1] = i end
-    end
-    for _, info in ipairs(candidates) do
-        local args = {}
-        for k, p in ipairs(info.params) do
-            if p == TE_ID then args[k] = id
-            elseif p == "System.Boolean" then args[k] = false
-            else args[k] = 0 end
+-- Whether this save already played that camera (ClapperboardMediator.checkHasDone).
+function World:cutscene_done(camera, id)
+    local m, mgr = self.cs_done_m, self.r:singleton(CLAP)
+    if m == nil or mgr == nil then return nil end
+    local ok, v = pcall(m.method.call, m.method, mgr, camera or P.CAMERA.TIMELINE, id)
+    if ok and type(v) == "boolean" then return v end
+    return nil
+end
+
+-- Elements of a value-type array: the array object keeps its count at 0x1C and its elements
+-- inline from 0x20 (what the game's own code reads).
+local ARRAY_DATA = 0x20
+local FLAG_INFO_SIZE = 8     -- FlagInfo { Int32 GroupIndex, Int32 Index }
+local COORD_PACK_SIZE = 0x30 -- PlayerCoordSetting.Pack { PlKind, _, Position @0x10, RotationY @0x20, flags @0x24.. }
+
+local function i32(v)
+    v = math.floor(tonumber(v) or 0) & 0xFFFFFFFF
+    if v >= 0x80000000 then v = v - 0x100000000 end
+    return v
+end
+
+local function read_flag_infos(arr)
+    local out = {}
+    if arr == nil then return out end
+    local n = math.min(R.count(arr), P.MAX_CUTSCENE_FLAGS)
+    for i = 0, n - 1 do
+        local okg, g = pcall(arr.read_dword, arr, ARRAY_DATA + i * FLAG_INFO_SIZE)
+        local oki, idx = pcall(arr.read_dword, arr, ARRAY_DATA + i * FLAG_INFO_SIZE + 4)
+        if okg and oki and g ~= nil and idx ~= nil then
+            out[#out + 1] = { group = i32(g), index = i32(idx) }
         end
-        self.applying = true
-        local ok = pcall(info.method.call, info.method, info.static and nil or mgr, table.unpack(args, 1, #info.params))
-        self.applying = false
-        if ok then return true end
     end
-    return false
+    return out
+end
+
+local function read_coord_packs(arr)
+    local out = {}
+    if arr == nil then return out end
+    local n = math.min(R.count(arr), P.MAX_CUTSCENE_COORDS)
+    for i = 0, n - 1 do
+        local base = ARRAY_DATA + i * COORD_PACK_SIZE
+        local ok, c = pcall(function()
+            return { kind = i32(arr:read_dword(base)),
+                pos = { x = arr:read_float(base + 0x10), y = arr:read_float(base + 0x14), z = arr:read_float(base + 0x18) },
+                rot_y = arr:read_float(base + 0x20), reset_camera = arr:read_byte(base + 0x24) ~= 0,
+                only_npc = arr:read_byte(base + 0x25) ~= 0, only_pc = arr:read_byte(base + 0x26) ~= 0 }
+        end)
+        if ok and c ~= nil then out[#out + 1] = c end
+    end
+    return out
+end
+
+local function write_flag_infos(list)
+    if list == nil or #list == 0 then return nil end
+    local arr = R.new_array(FLAG_INFO, #list)
+    if arr == nil then return nil end
+    for i, f in ipairs(list) do
+        local base = ARRAY_DATA + (i - 1) * FLAG_INFO_SIZE
+        if not pcall(arr.write_dword, arr, base, (f.group or 0) & 0xFFFFFFFF)
+            or not pcall(arr.write_dword, arr, base + 4, (f.index or 0) & 0xFFFFFFFF) then
+            return nil
+        end
+    end
+    return arr
+end
+
+local function write_coord_packs(list)
+    if list == nil or #list == 0 then return nil end
+    local arr = R.new_array(COORD_PACK, #list)
+    if arr == nil then return nil end
+    for i, c in ipairs(list) do
+        local base = ARRAY_DATA + (i - 1) * COORD_PACK_SIZE
+        local p = c.pos or { x = 0, y = 0, z = 0 }
+        local ok = pcall(function()
+            arr:write_dword(base, (c.kind or 0) & 0xFFFFFFFF)
+            arr:write_float(base + 0x10, p.x)
+            arr:write_float(base + 0x14, p.y)
+            arr:write_float(base + 0x18, p.z)
+            arr:write_float(base + 0x20, c.rot_y or 0)
+            arr:write_byte(base + 0x24, c.reset_camera and 1 or 0)
+            arr:write_byte(base + 0x25, c.only_npc and 1 or 0)
+            arr:write_byte(base + 0x26, c.only_pc and 1 or 0)
+        end)
+        if not ok then return nil end
+    end
+    return arr
+end
+
+-- The cutscene a PayloadPlay describes, as the CUTSCENE message carries it, or nil.
+function World:read_payload(p)
+    if p == nil then return nil end
+    local camera = R.number(R.get(p, "CameraType"))
+    local id = R.number(R.get(p, "ID"))
+    if camera == nil or id == nil or (camera ~= P.CAMERA.TIMELINE and camera ~= P.CAMERA.MOVIE) then return nil end
+    return {
+        camera = camera, id = id, screen = R.number(R.get(p, "Screen")) or 0,
+        owner_code = (R.number(R.get(p, "DataOwnerCode")) or 0xFFFFFFFF) & 0xFFFFFFFF,
+        end_portrayal = (R.number(R.get(p, "EndPortrayal")) or 0) & 0xFFFFFFFF,
+        start_flags = read_flag_infos(R.get(p, "StartFlag")),
+        end_flags = read_flag_infos(R.get(p, "EndFlag")),
+        coords = camera == P.CAMERA.MOVIE and read_coord_packs(R.get(p, "CoorsSettings")) or {},
+    }
+end
+
+-- Plays the partner's cutscene here: the same payload through our own procPayloadPlay, the
+-- way calcRequest plays a request of our own game.
+function World:cutscene_play(ev)
+    local mgr = self.r:singleton(CLAP)
+    if mgr == nil or self.cs_proc_m == nil then return false, "no ClapperboardMediator" end
+    local p = R.new_instance(PAYLOAD_PLAY)
+    if p == nil then return false, "cannot create a PayloadPlay" end
+    local ok = R.set(p, "CameraType", ev.camera or P.CAMERA.TIMELINE) and R.set(p, "ID", ev.id)
+        and R.set(p, "Screen", ev.screen or 0)
+        and R.set(p, "DataOwnerCode", (ev.owner_code or 0xFFFFFFFF) & 0xFFFFFFFF)
+        and R.set(p, "EndPortrayal", (ev.end_portrayal or 0) & 0xFFFFFFFF)
+    if not ok then return false, "cannot fill the PayloadPlay" end
+    local start_flags, end_flags = write_flag_infos(ev.start_flags), write_flag_infos(ev.end_flags)
+    if (start_flags == nil and #(ev.start_flags or {}) > 0) or (end_flags == nil and #(ev.end_flags or {}) > 0) then
+        return false, "cannot build the flag lists"
+    end
+    if start_flags ~= nil then R.set(p, "StartFlag", start_flags) end
+    if end_flags ~= nil then R.set(p, "EndFlag", end_flags) end
+    if ev.camera == P.CAMERA.MOVIE then
+        local coords = write_coord_packs(ev.coords)
+        if coords ~= nil then R.set(p, "CoorsSettings", coords) end
+    end
+    local play_id = 0
+    if self.cs_emit_m ~= nil then
+        local okid, v = pcall(self.cs_emit_m.method.call, self.cs_emit_m.method, mgr)
+        play_id = okid and R.number(v) or 0
+    end
+    self:crumb("world.cutscene_play", ("%d:%d"):format(ev.camera or 1, ev.id or 0), true)
+    self.applying_cutscene = true
+    local played = pcall(self.cs_proc_m.method.call, self.cs_proc_m.method, mgr, play_id, p)
+    self.applying_cutscene = false
+    if not played then return false, "procPayloadPlay failed" end
+    return true
+end
+
+-- The cameras playing in our game (ClapperboardMediator._Plays, one PlayWork per screen).
+function World:play_works()
+    local out = {}
+    if not self.cs_skip_ok then return out end
+    local mgr = self.r:singleton(CLAP)
+    R.each(mgr and R.get(mgr, "_Plays"), function(w)
+        if w ~= nil then
+            local camera, id = R.number(R.get(w, "CamType")), R.number(R.call(w, "get_CameraID"))
+            if camera ~= nil and id ~= nil then out[#out + 1] = { work = w, camera = camera, id = id } end
+        end
+    end)
+    return out
+end
+
+local function address_of(obj)
+    local ok, a = pcall(function() return obj:get_address() end)
+    return ok and a or tostring(obj)
+end
+
+-- Reports the cameras our player skipped (DoneSkip turned on), once each.
+function World:report_skips()
+    local cb = self.callbacks.on_cutscene_skip
+    if cb == nil or not self.active or not self.cs_skip_ok then return end
+    local live = {}
+    for _, p in ipairs(self:play_works()) do
+        local a = address_of(p.work)
+        live[a] = true
+        if R.get(p.work, "DoneSkip") == true and not self.skips_seen[a] then
+            self.skips_seen[a] = true
+            if not (self.skips_applied or {})[a] then
+                self.counters.skip_events = self.counters.skip_events + 1
+                pcall(cb, { camera = p.camera, id = p.id })
+            end
+        end
+    end
+    for a in pairs(self.skips_seen) do
+        if not live[a] then self.skips_seen[a] = nil end
+    end
+    for a in pairs(self.skips_applied or {}) do
+        if not live[a] then self.skips_applied[a] = nil end
+    end
+end
+
+-- Skips that camera here the way our skip button does: InputSkip on its PlayWork; the game
+-- skips it if it can be skipped. "skipped" | "missing" (not playing here).
+function World:cutscene_skip(camera, id)
+    for _, p in ipairs(self:play_works()) do
+        if p.camera == camera and p.id == id and R.get(p.work, "DoneSkip") ~= true then
+            self:crumb("world.cutscene_skip", ("%d:%d"):format(camera, id))
+            if not R.set(p.work, "InputSkip", true) then return "failed" end
+            self.skips_applied = self.skips_applied or {}
+            self.skips_applied[address_of(p.work)] = true
+            return "skipped"
+        end
+    end
+    return "missing"
+end
+
+-------------------------------------------------------------------------------
+-- Doors
+-------------------------------------------------------------------------------
+
+local DOOR_SCAN_INTERVAL = 2.0
+local DOOR_OPEN_BIT = 1   -- chainsaw.GmDoor.Attr0Bit.Open
+local DOOR_HOST, DOOR_GUEST = 0, 1 -- chainsaw.GmDoor.NeedOpenSelfIndex
+local AUTO_OPEN = 1       -- chainsaw.GmAutoDoorBase.RoutineType.Open
+local BIG_OPEN = 2        -- chainsaw.GmBigDoor.RoutineType: Open = 2, Opened = 3, ForceOpened = 4
+
+-- The kinds of doors that close by themselves once nobody is near, and how each is held open:
+--   door: GmDoor and its kick-open variant - the Guest slot of _NeedKeepOpenSelf (recvGmParam);
+--   auto: automatic, elevator and timing-shutter doors (GmAutoDoorBase) - open while _OpenTimer
+--         runs, which their sensor reloads by setting _ActivateOpen (calcRoutine);
+--   big:  big double doors (GmBigDoor) - open while IsAnyOneCloseToDoor > 0.
+World.DOOR_KINDS = {
+    ["chainsaw.GmDoor"] = "door", ["chainsaw.GmKickOpenDoor"] = "door",
+    ["chainsaw.GmAutoDoor"] = "auto", ["chainsaw.GmAutoDoorMotion"] = "auto", ["chainsaw.GmElevatorDoor"] = "auto",
+    ["chainsaw.GmTimingShutter"] = "auto", ["chainsaw.GmBigDoor"] = "big",
+}
+
+local function first_bool(arr)
+    local v
+    R.each(arr, function(x)
+        v = x
+        return true
+    end)
+    return v == true or R.number(v) == 1
+end
+
+-- The doors of the loaded areas, by GameObject GUID (scene data: the same on both PCs).
+function World:doors_refresh(now)
+    if not self.door_ok or (self.doors_at ~= nil and now - self.doors_at < DOOR_SCAN_INTERVAL) then return end
+    self.doors_at = now
+    local scene = self:scene()
+    if scene == nil then return end
+    local doors = {}
+    for tname in pairs(World.DOOR_KINDS) do
+        local t = self.r:typeof(tname)
+        if t ~= nil then
+            R.each(R.call(scene, "findComponents(System.Type)", t) or R.call(scene, "findComponents", t), function(comp)
+                local go = R.call(comp, "get_GameObject")
+                local guid = go and R.game_object_guid(go)
+                if guid ~= nil and doors[guid] == nil then
+                    local old = self.doors[guid]
+                    local kind = World.DOOR_KINDS[R.type_name(comp) or ""] or World.DOOR_KINDS[tname]
+                    doors[guid] = { comp = comp, go = go, kind = kind, pos = old and old.pos or position_of(go) }
+                end
+            end)
+        end
+    end
+    self.doors = doors
+end
+
+function World:door_context(d)
+    return R.call(d.comp, "get_GmkContext") or R.call(d.comp, "get_Context")
+end
+
+-- One door as our game has it: {open, hold, attr} (hold: our player keeps it open - never
+-- what we do for the partner, or the two games would keep each other's doors open forever).
+function World:door_state(guid, d)
+    if d.kind == "auto" then
+        local rno = R.number(R.get(d.comp, "_Rno0"))
+        if rno == nil then return nil end
+        local timer = R.number(R.get(d.comp, "_OpenTimer")) or 0
+        return { open = rno == AUTO_OPEN, hold = timer > 0 and not self.auto_hold[guid], attr = 0 }
+    elseif d.kind == "big" then
+        local routine = R.number(R.get(d.comp, "_Routine"))
+        if routine == nil then return nil end
+        local near = (R.number(R.get(d.comp, "IsAnyOneCloseToDoor")) or 0) - (self.big_added[guid] and 1 or 0)
+        return { open = routine >= BIG_OPEN, hold = near > 0, attr = 0 }
+    end
+    local routine = R.number(R.get(d.comp, "_Routine"))
+    if routine == nil then return nil end
+    local ctx = self:door_context(d)
+    local attr = ctx and R.number(R.call(ctx, "getAttr(System.Int32)", 0)) or 0
+    return { open = routine == 1, hold = first_bool(R.get(d.comp, "_NeedKeepOpenSelf")), attr = (attr or 0) & 0xFF }
+end
+
+-- How the doors within `radius` of `pos` are here: { [guid] = {open, hold, attr} } (open: it is
+-- open or opening; hold: our player keeps it open; attr: a GmDoor's first attribute byte).
+function World:doors_near(pos, radius)
+    if not self.door_ok or pos == nil then return nil end
+    self:doors_refresh(self:now())
+    local out = {}
+    for guid, d in pairs(self.doors) do
+        if d.pos ~= nil and dist3(d.pos, pos) <= radius then
+            out[guid] = self:door_state(guid, d)
+        end
+    end
+    return out
+end
+
+-- The partner's door here: opened now if theirs opened, and held open while they hold
+-- theirs - each kind through its own mechanism. "done" | "missing"
+function World:door_apply(guid, st)
+    local d = self.doors[guid]
+    if d == nil or (self.game and self.game.go_alive and not self.game:go_alive(d.go)) then return "missing" end
+    local hold = st.hold and true or false
+    if d.kind == "auto" then
+        self.auto_hold[guid] = hold or nil
+        if hold or st.open then R.set(d.comp, "_ActivateOpen", true) end -- as its sensor does
+        return "done"
+    elseif d.kind == "big" then
+        if hold ~= (self.big_added[guid] == true) then
+            local n = R.number(R.get(d.comp, "IsAnyOneCloseToDoor")) or 0
+            R.set(d.comp, "IsAnyOneCloseToDoor", hold and n + 1 or math.max(0, n - 1))
+            self.big_added[guid] = hold or nil
+        end
+        return "done"
+    end
+    if hold or self.door_guest[guid] then
+        pcall(d.comp.call, d.comp, "recvGmParam", DOOR_GUEST, hold and 1 or 0, nil)
+        self.door_guest[guid] = hold or nil
+    end
+    if st.open then
+        local ctx = self:door_context(d)
+        local attr = ctx and R.number(R.call(ctx, "getAttr(System.Int32)", 0)) or nil
+        if ctx ~= nil and attr ~= nil and (attr & DOOR_OPEN_BIT) == 0 and R.number(R.get(d.comp, "_Routine")) ~= 1 then
+            self:crumb("world.door_open", guid)
+            pcall(ctx.call, ctx, "pushAttr(System.Int32, System.Byte)", 0, ((st.attr or 0) | DOOR_OPEN_BIT) & 0xFF)
+        end
+    end
+    return "done"
+end
+
+-- Automatic doors the partner stands in: their sensor flag, every frame (it is consumed each
+-- time the door decides).
+function World:refresh_auto_holds()
+    for guid in pairs(self.auto_hold) do
+        local d = self.doors[guid]
+        if d == nil then
+            self.auto_hold[guid] = nil
+        else
+            R.set(d.comp, "_ActivateOpen", true)
+        end
+    end
+end
+
+-- The partner left: nothing of theirs keeps our doors open any more.
+function World:doors_release()
+    for guid in pairs(self.door_guest) do
+        local d = self.doors[guid]
+        if d ~= nil then pcall(d.comp.call, d.comp, "recvGmParam", DOOR_GUEST, 0, nil) end
+    end
+    for guid in pairs(self.big_added) do
+        local d = self.doors[guid]
+        if d ~= nil then
+            R.set(d.comp, "IsAnyOneCloseToDoor", math.max(0, (R.number(R.get(d.comp, "IsAnyOneCloseToDoor")) or 0) - 1))
+        end
+    end
+    self.door_guest, self.auto_hold, self.big_added = {}, {}, {}
+end
+
+-------------------------------------------------------------------------------
+-- Level triggers (docs/RESEARCH.md 3.11): an InteractHolder on a level GameObject holds its
+-- InteractTriggers; the gimmicks and option settings on that GameObject register what a
+-- trigger does (InteractHolder.initParamObjects). InteractManager marks a play-once trigger
+-- done (Done |= 1, saved with its gimmick) and runs it through executeTrigger(target,
+-- userdata). The same trigger exists in the partner's game: the GameObject's GUID comes from
+-- the scene file and InteractHolder.findTrigger takes the hash of the trigger's name.
+-------------------------------------------------------------------------------
+
+local SUCCEED_ONCE = 1
+
+-- What the components of a trigger's GameObject make of it: an event (see EVENT_COMPONENTS),
+-- or not (and why). Cached by GUID.
+function World:trigger_owner_kind(owner, guid)
+    local info = self.trigger_owner_info[guid]
+    if info ~= nil then return info end
+    local event, why = false, "no event component"
+    R.each(R.call(owner, "get_Components"), function(c)
+        local tn = R.type_name(c) or ""
+        if World.EVENT_COMPONENTS[tn] then
+            event = true
+        elseif World.DENY_COMPONENTS[tn] or tn:find("^chainsaw%.Gm") or tn:find("^chainsaw%.Custom") then
+            why = tn
+            event = false
+            return true -- one is enough to rule it out
+        end
+    end)
+    info = { event = event and why == "no event component", why = event and "" or why }
+    if not info.event and info.why == "" then info.why = "no event component" end
+    -- Whatever the portrayals on it call must pass the same test.
+    if info.event then
+        local bad = self:portrayal_callee_denied(owner)
+        if bad ~= nil then info = { event = false, why = bad } end
+    end
+    self.trigger_owner_info[guid] = info
+    return info
+end
+
+-- The first deny-listed parameter a PortrayalSettings on this GameObject would run, or nil.
+function World:portrayal_callee_denied(owner)
+    local port = self.game and self.game.get_component and self.game:get_component(owner, "chainsaw.PortrayalSettings") or nil
+    if port == nil then return nil end
+    local bad
+    R.each(R.get(R.get(port, "_Params"), "_Params"), function(param)
+        for _, list in ipairs({ "_CalleePlay", "_CalleeEnd" }) do
+            R.each(R.get(param, list), function(callee)
+                local tn = (R.type_name(callee) or ""):gsub("%.Param$", "")
+                if World.DENY_COMPONENTS[tn] then
+                    bad = tn
+                    return true
+                end
+            end)
+            if bad then return true end
+        end
+    end)
+    return bad
+end
+
+-- Reports the event triggers our player set off since the last frame (queued by the hook).
+function World:report_triggers()
+    if #self.trigger_events == 0 then return end
+    local events = self.trigger_events
+    self.trigger_events = {}
+    local cb = self.callbacks.on_trigger
+    if cb == nil then return end
+    for _, e in ipairs(events) do
+        local trig = e.trig
+        local owner = R.call(trig, "get_Owner")
+        local guid = R.game_object_guid(owner)
+        if guid ~= nil then
+            local kind = self:trigger_owner_kind(owner, guid)
+            if kind.event then
+                self.counters.trigger_events = self.counters.trigger_events + 1
+                pcall(cb, { guid = guid, hash = R.number(R.call(trig, "get_Hash")), trigger_type = TRIGGER_AREA_HIT,
+                    once = R.number(R.get(trig, "Succeed")) == SUCCEED_ONCE, head = e.head })
+            else
+                self.counters.trigger_not_event = self.counters.trigger_not_event + 1
+                self.last_not_event = kind.why
+            end
+        end
+    end
+end
+
+-- Our copy of a trigger: the InteractTrigger with that name hash on the GameObject with that
+-- GUID, or nil and why.
+function World:trigger_find(guid, hash)
+    local scene = self:scene()
+    local g = self.r:guid_value(guid)
+    if scene == nil or g == nil then return nil, "missing" end
+    local go = R.call(scene, "findGameObject(System.Guid)", g)
+    if go == nil or (self.game and self.game.go_alive and not self.game:go_alive(go)) then return nil, "missing" end
+    local holder = self.game and self.game.get_component and self.game:get_component(go, HOLDER) or nil
+    if holder == nil then return nil, "missing" end
+    local trig = R.call(holder, "findTrigger(System.UInt32)", hash)
+    if trig == nil then return nil, "missing" end
+    return trig
+end
+
+local function trigger_done(trig)
+    return R.number(R.get(trig, "Succeed")) == SUCCEED_ONCE and (R.number(R.call(trig, "get_Done")) or 0) ~= 0
+end
+
+-- Our player sets off the partner's trigger here: marked done like InteractManager does for a
+-- play-once trigger (InteractTrigger.recvDone), then run with our player as the target. Only an
+-- area trigger that is an event in our game too (the partner's game decided with its own data).
+function World:trigger_run(ev)
+    local trig, why = self:trigger_find(ev.guid, ev.hash)
+    if trig == nil then return why end
+    if trigger_done(trig) then return "done" end
+    if R.number(R.call(trig, "get_Type")) ~= TRIGGER_AREA_HIT then
+        self.last_not_event = "not an area trigger here"
+        return "refused"
+    end
+    local owner = R.call(trig, "get_Owner")
+    local kind = owner and self:trigger_owner_kind(owner, ev.guid)
+    if kind == nil or not kind.event then
+        self.last_not_event = kind and kind.why or "no owner"
+        return "refused"
+    end
+    local ctx = self.game and self.game:player_context()
+    local target = ctx and R.call(ctx, ev.head and "get_HeadGameObject" or "get_BodyGameObject")
+    if target == nil then return "failed" end
+    self:crumb("world.trigger_run", ("%s:%s"):format(tostring(ev.guid), tostring(ev.hash)), true)
+    self.applying_trigger = true
+    if R.number(R.get(trig, "Succeed")) == SUCCEED_ONCE then pcall(trig.call, trig, "recvDone", 1) end
+    local ok = pcall(trig.call, trig, "execute(via.GameObject, chainsaw.collision.GimmickSensorUserData)", target, nil)
+    self.applying_trigger = false
+    return ok and "run" or "failed"
 end
 
 -------------------------------------------------------------------------------
@@ -1249,11 +1914,12 @@ end
 -- Diagnostics
 -------------------------------------------------------------------------------
 
-World.DUMP_TYPES = { SFM, GIM, TEM, CAMPAIGN, CHARACTER_MANAGER, GAME_OVER, PREF_SCENE, LOC_SCENE, ENV_SCENE,
-    "share.PauseManager", "chainsaw.PauseManagerCustom", "chainsaw.TimerManager", "chainsaw.GimmickContext",
-    "chainsaw.GimmickCore", "chainsaw.GmBase", "chainsaw.GmWoodBox", "chainsaw.GmCrow", "chainsaw.GmDoor",
-    "chainsaw.TimelineEventPlayer", "chainsaw.TimelineEventSensor", "chainsaw.PurposeManager", "chainsaw.MapManager",
+World.DUMP_TYPES = { SFM, SFM_BHV, GUD, GIM, GIM_CONTEXT, CLAP, PAYLOAD_PLAY, PLAY_WORK, GM_DOOR, CAMPAIGN, CHARACTER_MANAGER, GAME_OVER, PREF_SCENE,
+    LOC_SCENE, ENV_SCENE, "share.PauseManager", "chainsaw.PauseManagerCustom", "chainsaw.TimerManager",
+    "chainsaw.GimmickContext", "chainsaw.GimmickCore", "chainsaw.GmBase", "chainsaw.GmWoodBox", "chainsaw.GmCrow",
+    "chainsaw.GmDoor", "chainsaw.TimelineEventManager", "chainsaw.PurposeManager", "chainsaw.MapManager",
     "chainsaw.CharacterSpawnController", "chainsaw.CharacterSpawnPointController", "chainsaw.EnemyManager",
-    "chainsaw.InteractManager", "chainsaw.MovieManager" }
+    "chainsaw.InteractManager", "chainsaw.InteractTrigger", TRIGGER_WORK, HOLDER, "chainsaw.PortrayalSettings",
+    "chainsaw.GmPortrayalAreaHit", "chainsaw.MovieManager" }
 
 return World

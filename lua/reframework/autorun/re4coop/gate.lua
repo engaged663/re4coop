@@ -3,7 +3,8 @@
 --
 --   * Event gate: a cutscene/scripted event (GuiManager.get_IsPlayingEvent) that is still
 --     running after `gate_grace` seconds holds the player, unless the partner is already in
---     an event nearby or standing within `gate_radius`. Short animations (doors, ladders,
+--     an event nearby (anywhere, with cutscene sync: their game plays ours) or standing within
+--     `gate_radius`. Short animations (doors, ladders,
 --     pickups) end before the grace period and never hold anyone.
 --   * Chapter gate: the player whose chapter (chainsaw.ChapterID, which also changes between
 --     the parts of a chapter) moved ahead of the partner's waits at the start of the new one
@@ -73,6 +74,9 @@ function Gate:partner_ready_for_event(s, now)
     if s.partner_event and (d <= radius * EVENT_RADIUS_FACTOR or (s.stage ~= nil and s.stage == s.partner_stage)) then
         return true
     end
+    -- With cutscene sync the partner's game plays our cutscene at once, wherever they are (and
+    -- brings them over when it ends): in an event, they are watching it with us.
+    if s.partner_event and self.settings.sync_cutscenes ~= false then return true end
     return self.near_since ~= nil and now - self.near_since >= READY_NEAR_SECONDS
 end
 

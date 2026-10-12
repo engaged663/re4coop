@@ -145,7 +145,71 @@ T.run("f7_snoozes_the_prompt", function()
     T.eq(#w.gb.teleports, 0, "no teleport")
     w.gb.keys[0x75] = true
     w:advance(0.1)
-    T.eq(#w.gb.teleports, 0, "F6 does nothing without a prompt")
+    T.eq(#w.gb.teleports, 1, "F6 still teleports: the key works without the prompt")
+end)
+
+T.run("f6_works_any_time", function()
+    local w = make_world()
+    w.ga.pos = { x = 12, y = 0, z = 0 } -- just around the corner: no prompt
+    w:advance(1)
+    T.eq(w.sb.left_behind, nil, "no prompt")
+    w.gb.keys[0x75] = true
+    w:advance(0.1)
+    w.gb.keys[0x75] = false
+    T.eq(#w.gb.teleports, 1, "teleported")
+    T.near(w.gb.teleports[1].x, 12, 0.5, "to the partner")
+    -- Again at once: it recharges for a moment.
+    w.ga.pos = { x = 40, y = 0, z = 0 }
+    w:advance(0.5)
+    w.gb.keys[0x75] = true
+    w:advance(0.1)
+    w.gb.keys[0x75] = false
+    T.eq(#w.gb.teleports, 1, "not twice within the cooldown")
+    local said = false
+    for _, m in ipairs(w.sb.messages) do
+        if m.text:find("ready again") then said = true end
+    end
+    T.check(said, "told when it is ready")
+    w:advance(3)
+    w.gb.keys[0x75] = true
+    w:advance(0.1)
+    w.gb.keys[0x75] = false
+    T.eq(#w.gb.teleports, 2, "then again")
+end)
+
+T.run("f6_says_why_it_cannot_teleport", function()
+    local w = make_world()
+    local function last_message() return w.sb.messages[#w.sb.messages].text end
+    local function press()
+        w.gb.keys[0x75] = true
+        w:advance(0.1)
+        w.gb.keys[0x75] = false
+        w:advance(0.1)
+    end
+    w.ga.pos = { x = 1, y = 0, z = 0 }
+    w:advance(1)
+    press()
+    T.eq(#w.gb.teleports, 0, "next to the partner: nothing to do")
+    T.check(last_message():find("already next to") ~= nil, "said so")
+    w.ga.pos = { x = 50, y = 0, z = 0 }
+    w.ga.cutscene = true
+    w.sa.settings.transition_gate = false
+    w:advance(1)
+    press()
+    T.eq(#w.gb.teleports, 0, "partner in a cutscene")
+    T.check(last_message():find("cutscene") ~= nil, "said so")
+    w.ga.cutscene = false
+    w.gb.cutscene = true
+    w.sb.settings.transition_gate = false
+    w:advance(1)
+    press()
+    T.eq(#w.gb.teleports, 0, "we are in a cutscene")
+    w.gb.cutscene = false
+    w.ga.chapter = 22100
+    w:advance(1)
+    press()
+    T.eq(#w.gb.teleports, 0, "partner in another chapter")
+    T.check(last_message():find("another chapter") ~= nil, "said so")
 end)
 
 T.run("no_prompt_during_cutscenes", function()

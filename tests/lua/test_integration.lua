@@ -149,6 +149,13 @@ function client_game:take_hit_events()
     self.hit_queue = {}
     return q
 end
+-- Finishers our player started (game.lua's requestFatal hook).
+client_game.fatal_queue = {}
+function client_game:take_fatal_events()
+    local q = self.fatal_queue
+    self.fatal_queue = {}
+    return q
+end
 function client_game:take_drop_events()
     local q = self.drop_queue
     self.drop_queue = {}
@@ -322,7 +329,9 @@ T.run("enemy_sync_end_to_end", function()
     T.wait_until(function() return client_game.puppet[1] and client_game.puppet[2] end, step, 5)
     T.eq(client_game.puppet[1], true, "the client's copies are puppets of the host's")
 
-    -- The client shoots enemy 1: the hit runs through the host's own hit code, with its values.
+    -- The client shoots enemy 1: the hit runs through the host's own hit code, with its values
+    -- (and the attack data of the host's own weapon: the host has shot something before).
+    mock.hit(host_e2, 0, 0)
     client_hit(1, 40, 7)
     local ok = T.wait_until(function() return host_e1.hp == 60 end, step, 5)
     T.check(ok, "the host's enemy took the client's hit (hp=" .. host_e1.hp .. ")")
@@ -369,6 +378,28 @@ T.run("hits_and_drops_end_to_end", function()
     T.eq(client_game.spawned[1] and client_game.spawned[1].enemy, 1, "from that enemy")
     for _ = 1, 50 do step() end
     T.eq(#client_game.spawned, 1, "exactly once")
+end)
+
+T.run("a_finisher_by_the_client_end_to_end", function()
+    -- A new enemy near the host: the host's game runs it, the client shows a puppet.
+    local host_e3 = mock.make_character("chainsaw.Ch1c0z0Context", { x = 2, y = 0, z = -2 }, 100)
+    world.enemies[#world.enemies + 1] = host_e3
+    client_game.enemies[3] = { id = 3, kind = "chainsaw.Ch1c0z0Context", pos = { x = 2.2, y = 0, z = -2.1 }, yaw = 0,
+        hp = 100, max_hp = 100, alive = true }
+    local ok = T.wait_until(function() return client_game.puppet[3] == true end, step, 5)
+    T.check(ok, "the client's copy is a puppet of the host's")
+    -- The client's player grabs it for a stealth kill: game.lua's hook asks the session first,
+    -- switches the puppet back on, and reports it.
+    T.check(client_game.fatal_filter ~= nil and client_game.fatal_filter(3), "the session lets the client take it")
+    client_game.puppet[3] = nil
+    client_game.fatal_queue = { 3 }
+    ok = T.wait_until(function() return host_e3.head.update_self == false end, step, 5)
+    T.check(ok, "the host's copy became the puppet (its AI off)")
+    T.eq(client_game.puppet[3], nil, "the client's game runs it")
+    -- The finisher kills it in the client's game: dead in the host's too.
+    client_game.enemies[3].hp, client_game.enemies[3].alive = 0, false
+    ok = T.wait_until(function() return host_e3.hp == 0 end, step, 5)
+    T.check(ok, "the host's copy died (hp=" .. host_e3.hp .. ")")
 end)
 
 T.run("key_items_exist_once", function()

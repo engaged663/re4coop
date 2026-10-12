@@ -384,13 +384,13 @@ type/fields exist in the game's type database, method names are found at runtime
 | Area | Type / member | Status | Used for |
 |---|---|---|---|
 | Scenario flags | `chainsaw.ScenarioFlagManager.requestSetFlag(System.Guid, System.Boolean)`, `checkFlag(System.Guid)`; GUIDs from `System.Guid.Parse(System.String)` | Live (AP Wizard re-fires pickup flags with it) | Applying the partner's flag changes through the game's own setter |
-| Scenario flags | Setters `(Guid[, Boolean])` on `ScenarioFlagManager` with an allow-listed name (`requestSetFlag`, `setFlag`, `...FlagOn/Off`, `resetFlag`...) | Dump + signature probe | Hooked to report local changes. Watchers, counters and locks are never hooked |
+| Scenario flags | Setters `(Guid[, Boolean])` on `ScenarioFlagManager` with an allow-listed name (`requestSetFlag`, `setFlag`, `...FlagOn/Off`, `resetFlag`...) | Dump + signature probe | Hooked to report local changes. Watchers, counters and locks are never hooked. Replaced in v0.9.1 by the change handlers (§3.11) |
 | Scenario flags | `ScenarioFlagManager.SaveData {Datas: SaveGroup[] {GroupName, Flags: UInt32[]}}`, save/load methods returning/taking it | Dump + signature probe | Full flag copy for a joining client; 32-bit word diffs when no setter can be hooked |
 | Gimmicks | `chainsaw.GimmickManager.SaveData {Datas: List<SaveItem {ID: ContextID, SaveData}>}`, `GimmickContext.SaveData {Attr: Byte[], TriggerSave: TriggerDone[] {SaveID, Done}, IsDetected, AccDatas: AccessoryData{Float,Uint}[]}` | Dump + signature probe | Locks, keys used, levers, shutters, puzzles: diffed and replicated by ContextID (the save table is what goes into save files, so its IDs are level IDs) |
 | Gimmicks | `GimmickManager.pushDirtyList(context)` | This mod's dump (§3.5) | A gimmick announced a state change: its record is read and sent at once instead of at the next 2 s scan |
 | Breakables, animals | `chainsaw.GmWoodBox`, `GmOilDrum`, `GmBottle`, `GmSimpleBreak`, `GmShootObj`, `GmBlueCoin`, `GmWindowBreakable`, `GmCrow`, `GmChicken`, `GmFish`, `GmBat`… with a `_Routine` state enum | Dump | Watched by GameObject GUID; a terminal routine name (`Break`, `Dead`, …) is "destroyed". Applied by setting the same routine (the object plays its own break/death), else a break/kill method, else hiding it |
 | Scene | `via.SceneManager.get_CurrentScene` → `findComponents(System.Type)`; GameObject `ToString()` → `name@<guid>` | Live (AP Wizard) | Finding objects; a cross-PC object identity from the scene file |
-| Cutscenes | `chainsaw.TimelineEventManager` methods taking `chainsaw.TimelineEventDefine.ID`; `GuiManager.get_IsPlayingEvent` | Dump + signature probe (`get_IsPlayingEvent` confirmed) | Hooking local cutscene starts (play/start requests only; preloads, stops and queries excluded), replaying the partner's |
+| Cutscenes | `chainsaw.TimelineEventManager` methods taking `chainsaw.TimelineEventDefine.ID`; `GuiManager.get_IsPlayingEvent` | Dump + signature probe (`get_IsPlayingEvent` confirmed) | Hooking local cutscene starts (play/start requests only; preloads, stops and queries excluded), replaying the partner's. None exist in this build: replaced in v0.9.1 by `ClapperboardMediator.procPayloadPlay` (§3.11) |
 | Pauses | `share.PauseManager` with `Dictionary<UInt32, PauseParameter {TargetUpdate, TargetDraw}>`, `PauseType` and `chainsaw.PauseManagerCustom.CustomPause` enums; `PauseLayer` = {Self 1, Inventory 2, Map 4, …} (§3.5) | Dump | Neutralising menu pauses (their targets set to 0 while in a session, restored afterwards), optionally refusing the requests |
 | Location | `PlayerContext.get_CurrentStageID()`, `CampaignManager.get_CurrentChapter()` (ChapterID 21100 = chapter 1 … 25400 = chapter 16) | Live (AP Wizard, this mod's dump) | Where each player is |
 | Warp | `Prefecture/Location/EnvSceneManager.requestToChangeStatus(id, Nullable<EnvSceneStatus> = 3, priority 1)` (prefecture = stage / 1000, location = prefecture × 1000), then `CharacterManager.requestWarp(ContextID, Nullable<vec3>, Nullable<Quaternion>, StageIdentifier.setup(location, stage, 0))` | Live (AP Wizard typewriter warps; technique by JumperDenfer, Nexus 5923) | Travelling to the partner in another stage |
@@ -706,6 +706,218 @@ game), effects spawned by the AI itself (both games play them from the animation
 same particles), and grabs: a puppet's grab plays its animation, the grabbed character's own
 reaction exists only in the owner's game.
 
+### 3.11 v0.9.1: player events for both players
+
+Report: when one player set off a level event (walked into an area that starts a scripted
+scene) or a cutscene, the other player saw nothing. The in-game log and re4.exe's code (read
+at the addresses of the REFramework dump, decompiled function by function) showed why:
+
+1. **The flag hooks watched the wrong thing.** v0.6 hooked `ScenarioFlagManager` setters by
+   name and took their Boolean for the value. `requestSetFlag(Guid, Boolean)`'s Boolean is
+   `ck_readonly` (the method only ever turns a flag on), and most flags never go through it: the
+   game sets the `via.userdata.Variable` behind a flag directly, from portrayals, cutscene
+   start/end flags, gimmicks. Most changes were never seen.
+2. **The save probes found nothing.** `saveGameSaveData`/`loadGameSaveData` are declared with
+   `share.SaveDataBase`, not with the manager's own SaveData type ("0 flag groups, 0 gimmicks"
+   in the log): no full flag copy for a joining client, no word diffs, and no gimmick sync at
+   all (doors, locks, levers).
+5. **A skip was local**: skipping a cutscene skipped only that player's copy.
+3. **Cutscene sync could never start.** Its probe looked for `TimelineEventManager` methods
+   taking a `TimelineEventDefine.ID`; this build has none, so the feature was empty (and off by
+   default, as experimental).
+4. **Level triggers were never replicated**: an area trigger runs only in the game of the
+   player who walked into it.
+
+What the game's code shows (addresses in re4.exe of this build):
+
+| Area | Member (address) | Finding |
+|---|---|---|
+| Flags | `via.userdata.Variable.set_Bool` (0x1402bd2f0), `setTrigger` (0x1402b09d0), `get_TypeKind` (0x1402b6380), `get_Guid` | Every scenario and common flag is a Variable: a GUID and a value. TypeKind 2 = Boolean, 16 = Trigger (fires for a frame) |
+| Flags | `GlobalUserDataManager.registerValueChangedEvent(Guid, Action<Variable>)` (0x142390560); `ScenarioFlagManagerBehavior.start` (0x141442620) registers `onSetScenarioFlagEvent(Variable)` (0x1413fdee0) and `onSetCommonFlagEvent(Variable)` (0x140531a00) | Every flag change, whoever makes it, reaches one of these two handlers: one hook point for all of them |
+| Flags | `GlobalUserDataManager.findVariable(Guid)` (0x14233e6a0), `trySetBool(Guid, Boolean)` (0x140a312e0), both static | Find and set any flag by GUID; its change event runs, so the game reacts as to its own |
+| Flags | `ScenarioFlagManager.requestSetFlag(Guid, Boolean ck_readonly)` (0x141234060), `checkFlag(Guid)` (0x14050b120) | Fallback setter (on only) and reader |
+| Flags | `ScenarioFlagManager.saveGameSaveData() -> share.SaveDataBase` (0x141238e50), `loadGameSaveData(share.SaveDataBase)` (0x1411ec760); `_Group[]` (0x20), each with its `<Variables>`: bit i of a group's words is variable i | Full copy for a joining client; live bits set variable by variable |
+| Cutscenes | `ClapperboardMediator.requestPlayWithID` (0x1419baa60) → `setupAndCheck` (0x1419df720: the play-once check against `_HasDone`, a `HashSet<via.Int2>` of camera type and id) → `calcRequest` (0x141913670) → `PayloadPlay.createPayload` (0x141f54db0) → `procPayloadPlay(UInt32, PayloadPlay)` (0x1419b1ae0), which also adds the cutscene to `_HasDone` | Every "play once" camera request (story cutscenes, movies) ends in one call with one data object |
+| Cutscenes | `PayloadPlay {CameraType 0x10, ID 0x14, Screen 0x18, EndFlag 0x20 and StartFlag 0x28: FlagInfo[] {GroupIndex, Index}, CoorsSettings 0x30: PlayerCoordSetting.Pack[], DataOwnerCode 0x38, EndPortrayal 0x3c}`; `emitPlayID` (0x1419328f0); `checkHasDone(Int32, Int32)` (0x140b6e2b0) | Pure data - no callbacks, no object references - made to be handed to another game (a dormant online design). The partner's game plays it through its own procPayloadPlay: its copy sets its own flags, places its players and continues its own scripted sequence (the data owner's EndPortrayal) |
+| Triggers | `InteractTrigger.Work.executeTrigger(GameObject target, GimmickSensorUserData)` (0x14079c380) → `InteractTrigger.execute` (0x140827650), which calls the `_Execute` callbacks the GameObject's gimmicks and settings registered (`InteractHolder.initParamObjects`, 0x142fa5f60) | Every trigger InteractManager accepts, with the GameObject (body or head) that set it off |
+| Triggers | `InteractTrigger {UniqueName 0x20, Succeed 0x28 (Once = 1)}`, `get_Type` (AreaHit = 1), `get_Owner`, `get_Hash` (0x140818680), `get_Done` (0x1400f7490), `recvDone(UInt32)` (0x1417cee90) | A play-once trigger is marked done (and saved with its gimmick) |
+| Triggers | `InteractHolder.findTrigger(UInt32 hash)` (0x142f8be80); `via.Scene.findGameObject(System.Guid)` (0x140a89e60) | The same trigger in the partner's game: the GameObject's GUID (scene file) and the hash of the trigger's name |
+| Skips | The skip button (`EventPauseSkipGuiBehavior`, through `PlayWork`'s GUI callback 0x1405b94f0) only sets `PlayWork.InputSkip` (0x35). `ClapperboardMediator.procSkip(PlayWork)` (0x1419b28a0) skips a camera that `canSkip()` with InputSkip set: `DoneSkip` (0x34) = 1, then `onRequestedSkip` (`PlayWorkTimeline`: 0x1439631b0). `_Plays` (0x28) holds one PlayWork per screen, with `CamType` (0x14) and `get_CameraID` | A skip is seen as DoneSkip turning on, and applied in the partner's game through the same InputSkip, so the game's own rules (unskippable cameras, the skip fade) apply |
+| Gimmicks | `GimmickManager.loadGameSaveData` (0x140ff4010) starts with `clear()` (0x140fa76d0) of the whole manager, then for each saved record finds its context and calls `GimmickContext.loadSaveDataFromManager(SaveData)` (0x1411ecde0: `_SaveCur` = a clone, a new `_SaveBuff`, then the context's `onLoadedGameSave`) and `pushDirtyList` (0x14101f290). `findContext(ContextID)` (0x140fbd7a0); `saveGameSaveData` (0x14102d7c0) returns `share.SaveDataBase` | v0.6 applied partner states by rewriting the table and calling `loadGameSaveData` mid-game - a full clear of every gimmick. 0.9.1 applies one gimmick at a time the way that load does, without the clear |
+| Doors | `GmDoor`: bit 0 of the context's first attribute = open (`Attr0Bit` Open 1, SideB 2, NoOne 4); `updateGimmick` (0x1428e67b0) opens a closed door whose bit is set; `updateOpen` (0x1428eb200) closes it - clearing the bit - once `checkClose` (0x142801830) finds no entry of `_NeedKeepOpenSelf` (0x1a0, `bool[]` by `NeedOpenSelfIndex` Host 0 / Guest 1) set and no forced keep-open. Host is our player (a timer refreshed in the doorway); Guest is only written by `recvGmParam(param_type, arg, user)` (0x1406b9720: `_NeedKeepOpenSelf[param_type] = arg != 0`) | A dormant two-player design: the partner's game opens the door when the shared state says so, but without the Guest slot nobody holds it there and it swings shut while it stays open for the player in it |
+| Other doors | `GmKickOpenDoor` (a GmDoor that stays open once kicked). `GmAutoDoorBase` - `GmAutoDoor`, `GmAutoDoorMotion`, `GmElevatorDoor`, `GmTimingShutter`: `calcRoutine` (0x141cd1550) keeps it open while `_OpenTimer` (0xb4) > 0 or `_KeepOpen`; the sensor reloads the timer to `CloseWaitTime` by setting `_ActivateOpen` (0xb0), consumed each update; `_Rno0` (0xf0) Close 0 / Open 1. `GmBigDoor`: `updateOpened` (0x1410916b0) closes it once `IsAnyOneCloseToDoor` (0x164) is 0; `_Routine` Closed 0, Close 1, Open 2, Opened 3, ForceOpened 4. `GmShutter` is not of this kind: `updateOpen` (0x141091360) closes it only when it is locked again (a gimmick state the gimmick sync carries) | The same "open while someone is near" decision, each with its own switch |
+| Events | `GmPortrayalAreaHit` → `PortrayalSettings.call(hash(UniqueName))`; `PortrayalSettings._Params._Params[]._CalleePlay/_CalleeEnd` are option parameters (`SetFlagSettings`, `ClapperboardSettings`, `MessageSettings`, `ObjectMoveSettings`, `PlDieSettings`, `InventorySettings`…) | What an area event runs, and so whether it is safe to run for both |
+
+What v0.9.1 builds on that (protocol 10, config 10):
+
+| Feature | How | Safety |
+|---|---|---|
+| Story flags | Both change handlers hooked: every flag change our game makes is seen. Flags turning on travel (FLAGS, ON) and trigger-kind flags that fire travel as PULSE; the partner applies them with `trySetBool` (else `requestSetFlag`) or `setTrigger` | Flags never travel *off*: a flag goes off only when a game loads an older state (a death, a checkpoint), which must not undo the partner's world; it is news again when it next turns on. While the partner's cutscene plays here, their flags wait for it to end (our copy sets its own start and end flags at its own time). Muting, echo suppression and the 400/s budget stay |
+| Flag words | The full copy uses the save/load pair (now found). Live diffs carry only bits that turned on and are applied variable by variable through `_Group[]`; the live flag-table reload (`exp_table_reload`) is gone | A joining client still takes over the host's whole table |
+| Cutscenes for both (default on) | `procPayloadPlay` hooked: the payload travels with where it started (CUTSCENE). The partner's game builds the same PayloadPlay and plays it through its own `procPayloadPlay` at once, wherever its player is (a partner more than 30 m away or in another stage is brought over when it ends, not before: travelling first made the partner's copy start seconds late). The transition gate counts a partner in an event anywhere as watching it with us | Never twice: `checkHasDone` (this save played it) and a 0.75 s grace in which the partner's own game may start it itself (the event trigger that started it arrives with it). Dropped in another chapter, after 5 refusals or 60 s. Our replays are not reported back |
+| Skips for both (default on) | Every frame the adapter looks at `_Plays`: a camera whose DoneSkip turned on is reported once (CUTSCENE_SKIP: camera type and ID). The partner's game sets InputSkip on its PlayWork of the same camera - now, or when it starts there within 90 s (a replay that waits for the partner to arrive) | Our applications are not reported back. The partner's game decides with its own `canSkip`: a camera it does not let skip keeps playing |
+| Doors for both (default on) | Every 0.1 s each game looks at the doors within 25 m of its player (by GameObject GUID): open or not, and held by its player. Changes travel as DOORS. The other game sets the same open bits (the door plays its own opening) and `recvGmParam(Guest, hold)`; automatic, elevator and shutter doors get `_ActivateOpen` every frame while the partner holds theirs (as if the partner stood in their sensor); big doors get +1 on `IsAnyOneCloseToDoor`. A player who walks out of range releases it | A door is open in both games while either player keeps it open, and closes in both when neither does. What a game does for the partner never counts as its own player's hold (else the two would keep each other's doors open forever). Everything is released when the partner leaves |
+| Gimmicks (doors, locks, levers, puzzles) | The table is read through `saveGameSaveData` (now found). A partner state is written into a clone of the gimmick's own current SaveData (new arrays; accessory values only where ours has the same kind) and loaded into that one context with `loadSaveDataFromManager`, then `pushDirtyList` so the game saves it | Never `loadGameSaveData` while playing (it clears the manager). A gimmick not set up here yet keeps the state waiting (30 min) and gets it when its area loads. Not while loading or in a cutscene. An object already on screen may show the new state only after its area reloads |
+| Level events for both (default on) | `executeTrigger` hooked: an area trigger our player set off is classified by its GameObject's components; an event travels as TRIGGER (GUID, name hash, play-once, chapter, stage, position). The partner's game, if its player is within 40 m in the same stage (or gets there, playable, within 20 s), finds the same trigger, marks it done the way InteractManager does and runs it with its own player | Only area triggers whose GameObject has an event component (portrayal, camera shot, mini demo, message, sound, flag, cutscene…) and no gimmick (`Gm*`, `Custom*`: doors, ladders, traps, levers) and no denied setting (deaths, inventory, item hand-outs, saves, game mode, tutorials), also checked in each portrayal's callees - and checked again by the receiving game with its own data. A partner far away is never forced: their game runs the event itself when their player walks in, so nothing that moves objects or colliders is skipped. Both setting it off at once is one event |
+
+### 3.12 Giving items to the partner
+
+A command of the game's own attache case moves an item from one player's case to the
+other's. What re4.exe does (addresses of this build):
+
+| Area | Member (address) | Finding |
+|---|---|---|
+| Command list | `InventoryManager.getItemCommandMenu(GetCommandMenuArgs {Item, SlotType, ...})` (0x142344820) | Builds a `Dictionary<ItemCommandType, Boolean>` (shown, enabled) with `Insert`; its only caller is `ItemWindowGuiState_AttacheCaseSelectCommand.onEnter` (0x1423733e0), which hands it to the case's command menu. `ItemCommandType` is fixed (Use 0 ... Store 13 ... WeaponRegist 27); `Store` is never offered by the case |
+| Labels | `ItemCommandGui.drawCommand(cmd, selectable, item)` (0x1429d2760) writes the command's message into `_CommandText` (`via.gui.Text`) | A label can be replaced right after it is drawn (`set_Message`) |
+| Choosing | `ItemWindowGuiState_AttacheCaseSelectCommand.decide` (0x14232f110): reads `_ItemCommandMenuGui.get_CurrSelectedCommandType`, checks `isSelectable`, then switches on the command; a command it has no case for ends in `ItemWindowGuiStateAcBase.transitAttacheCaseDefault` (0x142214b60) | Our command reaches `decide` and the game itself does nothing with it: back to the case |
+| Taking it out | The discard's `AttacheCaseDiscard.onDecided` (0x1428686f0): `CsInventory.remove(Guid)` (0x142c94710) on the controller's `<_CsInventory>`, then `VirtualInventory.remove(Guid)` (0x142a44cd0) on `AttacheCaseManager.<AttacheCaseGuiDataHolder>._Inventory` (the open case GUI) | The same two calls take a given item out |
+| Putting it in | `ChainsawGuiUtil.generateItem(ItemID, count, durability, ammo, ammoCount, bool)` (0x14329e0d0) - the factory gimmicks that hand out items use (`GmPowerOutage.getItem`); `ChainsawGuiUtil.getInventoryControllers(ContextID)` (0x1432a20a0) -> `InventoryController`; `CsInventoryController.add(Item, InventorySlotType)` -> `AddItemResult {ID, AddCount}` | The partner's game makes the item and adds it to its case; AddCount says how many fitted. (`InventoryControllersInfo.pickupItem` would open the "item get" screen, but needs a managed `Action<int>` the mod cannot build) |
+| Item kinds | `ItemIDDefine.getItemType(ItemID)`: Key 0, Ammo 1, Hurb 2, Parts 3, Powder 4, Gun 5, Melee 6, Throwing 7, Durability 8, Treasure 9, CombinableTreasure 10, Money 11... `WeaponItem` carries ammo, parts and upgrade levels | Only Ammo, Hurb, Parts, Powder, Throwing and Treasure travel: an `Item` (ItemID + count) describes them completely |
+
+What the mod does (protocol ITEM_GIVE 35 / ITEM_GIVE_RESULT 36, `give_sync.lua`, `game_give.lua`):
+the "Give to <partner>" entry (`Store` with our label) is added last for a givable item while a
+partner is connected; choosing it takes the whole stack out of the case and sends it. The
+partner's game places it as soon as its case is closed and it is playable, and reports what
+did not fit, which goes back into the giver's case. Items given to a partner who left before
+confirming come back; an item that fits nowhere waits for room (the player is told).
+
+### 3.13 The partner-hit crash and enemies that never spawned (0.9.1)
+
+**Crash.** Windows kept four crash reports of re4.exe 1.5.9.0 from the co-op tests (Oct 11
+18:11, 22:02, Oct 12 01:32, 03:33), all an access violation at the same instruction,
+re4.exe+0x2009480, inside `chainsaw.HitController.playDamageSe(DamageInfo)` (0x142009440):
+
+```
+mov rdx, [r8+0x68]      ; DamageInfo.<AttackUserData>
+mov rax, [rdx]          ; <- crashes when it is null
+call [rax-0x10]+0x20    ; then DamageInfo.<AttackData> (+0x78) is read the same way
+```
+
+It runs inside `callbackDamageHit` whenever the hit character's HitController has a damage
+sound container ([HitController+0x1c8]) - which is why the crash came "from one moment to the
+next". The partner's hits and killing hits (§3.10) were run through `callbackDamageHit` with a
+DamageInfo made by `sdk.create_instance` that carried every value of the original hit but no
+`AttackUserData` / `AttackData` (`chainsaw.collision.AttackUserData` 0x68,
+`AttackHitUserData.AttackData` 0x78, `DamageUserData` 0x70: the attack's and the damaged
+part's data assets). Fix: the game that runs a partner's hit takes those objects from a real hit
+of its own player (by WeaponID; any weapon otherwise; DamageUserData by enemy kind), keeps them
+alive, and puts them into the hit it builds. Until its own player has hit something, a partner's
+hit only changes HP and a partner's kill uses `HitPoint.dead()`. A pre-hook on `playDamageSe`
+skips the sound of any hit we run that still lacks them.
+
+**Second crash: the thrown body.** Oct 12 04:41, in the client: access violation at
+re4.exe+0x37959f8 inside `chainsaw.RagdollUnit.onDamageHit(DamageInfo)` (0x143795890), right
+after the client ran the host's killing hit on a `Ch1c0z0` (an enemy kind its own player had
+never hit, so the hit carried no DamageUserData either):
+
+```
+mov rax, [rsi+0x78]     ; DamageInfo.<AttackData>, +0x34 = how the body is thrown (1/2 point, 5 blast)
+mov rax, [rsi+0x48]     ; ContactInfo.<AttackGameObject>
+mov rcx, [rax+0x20]     ; <- crashes when it is null (its position is the push's origin)
+```
+
+`addForceFromPointForce` (0x1437270e0), called next, reads `DamageInfo.<DamageUserData>` (+0x70)
+`.Parts` (+0xa8, `chainsaw.character.BodyParts`) without a check too. A hit we build had both
+null: AttackGameObject was only kept "if alive", and a fresh DamageInfo has none. Fix: a
+replayed hit's AttackGameObject is our live body (like AttackOwnerObject); its DamageUserData and
+DamageCollidable are the enemy's own, from `HitController.get_Colliders()` →
+`via.physics.Colliders.getColliders(i)` → `Collidable.get_UserData()` (the `Chest` one when
+there is one), else the template of that kind; without one the hit is not run (a kill uses
+`HitPoint.dead()`). A pre-hook on `RagdollUnit.onDamageHit` skips any hit that still lacks
+either (the original would crash; it only adds force).
+
+**Enemies that never spawned.** Erasing an enemy already dead in the partner's world (§3.8)
+used `CharacterContext.eliminate()`: that marks the character's backup eliminated for good -
+the save keeps it - so after the host reloaded a checkpoint (its enemies alive again), or in
+any later session on a save written meanwhile (two copies of the game on one PC share their
+saves), those enemies never spawned again. Erasing now only invalidates the spawn param
+(`invalidateSpawn(true)`), and the client makes it valid again (`invalidateSpawn(false)`) when
+the host's world has the enemy alive again (its checkpoint reload, or its state stream).
+
+**Diagnosis.** Two copies of the game on one PC share `reframework/data`: the copy that
+survived overwrote the crashed one's breadcrumbs. While in a session each copy now writes its
+own (`re4coop_breadcrumb_host.json`, `re4coop_breadcrumb_client.json`, same for the profiler).
+
+### 3.14 Finishers on an enemy the partner's game runs (0.9.1)
+
+**Report.** Player 1 grabbed and killed an enemy that had just appeared; in player 2's game it
+was still alive, chased player 2, and died suddenly a while later.
+
+**Cause.** With shared authority (§3.10) that enemy was run by player 2's game (it was chasing
+player 2); player 1's game showed a puppet - AI head off (`GameObject.UpdateSelf(false)` on the
+head), animation driver off. RE4's finishers are not hits:
+
+- The player's `PlayerBehaviorTreeAction_MFSM_RequestFatal.onStart` (0x142c881b0; also
+  `RequestFatalAO`) calls `PlayerHeadUpdater.requestFatal` (0x141d65b70, stealth kill / grab),
+  `requestKnifeFatal` (0x141d66c00) or `requestStompFatal` (0x141d68730). Those are their only
+  callers (plus `Ch3a8z0HeadUpdater.requestKnifeFatalAO`).
+- `requestFatal` takes the target from the player's `PlayerTargetSelector`
+  (`<LockonTarget>k__BackingField` +0x40, a `CharacterContext`; `_TargetType` +0x74 picks the
+  kind) and hands the request to the target's AI head: `CharacterContext._HeadUpdater` (+0x250),
+  virtual +0x5c8 (attacker, kind).
+- The enemy's behaviour tree then plays it out (`EnemyBehaviorTreeAction_StealthKill`, types
+  Stealth / Fatal, ending in `..._SelfDead` for the villagers) - in the game that updates that
+  head.
+
+On a puppet that head does not update: the request waited while the owner's game ran the
+enemy on, and only when the enemy changed hands (player 1 now clearly closer, after the hold
+time) did player 1's game run it - and the finisher's death was announced late.
+
+**Fix.** A pre-hook on the three `PlayerHeadUpdater` requests reads `get_TargetSelectorDriver()
+.get_LockonTarget()`. If enemy sync may give that enemy to our game (shared authority, or we
+are the host), the puppet's head and animation driver go back on right there, before the
+request reaches the head, and enemy_net takes the enemy over: the host at once, the client
+with ENEMY_CLAIM (its game runs it from that moment; the host hands it over and keeps it with
+the client). The enemy stays with the player doing the finisher for 10 s whoever is closer; if
+both players start one, the host's wins. A death while the client's claim is unanswered is the
+client's to announce. The partner's game shows the finisher on its puppet.
+
+### 3.15 Joining from the title screen, and saves for both (0.9.1)
+
+**Request.** A client joining a host who is already playing, from the title screen or the main
+menu, had to pick *Load Game* or *New Game* itself (the mod only redirected whatever save was
+loaded next into the host's chapter). It should load straight into the host's game; and the
+autosaves and typewriter saves should save both players at the same time.
+
+**How the game saves** (re4.exe, functions carved with `.pdata` and decompiled):
+
+| What | Where | Finding |
+|---|---|---|
+| Slots | `share.AppSaveSlot` | Main story: 0 autosave (`Campaign1001_Auto`), 1-20 the Load Game list (`GameSaveStart`..`GameSaveEnd`), up to 99 reserved (`GameSaveLimit`); 100+ Separate Ways and other modes. `SaveDataManager.isAutoSaveDataIndex` = slot 0 or 100 |
+| Every save | `chainsaw.SaveFlowController.start(Int32, SaveLoadRequestArgs)` (0x14363a5c0) | Its callers: `AutoSaveSetting.triggerProcess` (0x1436477b0, the autosave points: it records the checkpoint, then starts slot 0 or 100 with a new `ChainsawGameSaveRequestArgs`, after `SaveDataManager.setPlayLoadData(false)`), `GameStateInGameChapterChange.startAutoSave` (chapter end), `SaveLoadMenuGuiBehavior.lateUpdateOnActive` (the typewriter, the chosen slot) and the autosave error retry. `share.SaveDataManager.requestStartSaveGameDataFlow` (0x140ab6c60) is a jump to it. It checks the args are a `GameSaveRequestArgs`, queues the request; `onUpdate` (0x143612110) then writes the slot (`enqueueSaveRequest`), builds the slot's `SaveSlotInfo` (chapter, stage, difficulty, purpose...) into `SaveLoadMenuGuiManager` (`addSaveSlotInfo`) and writes the system save. Slot 0/100 only: `IsAutoSaveFlow` and `GuiManager._ContineCount` - 1 |
+| Can save | `SaveDataManager.get_IsBusy` (0x142fa0a50), `checkExcludeGameSave` (0x140ac26b0 -> `isExcludeGameSave` 0x142faa4a0) | Busy unless idle with an empty queue; excluded while quitting or while any registered exclusion delegate says so |
+| Continue | `SaveLoadMenuGuiManager.findContinueSave()` (0x141770390) | The newest file (`getSaveFileDetailList` timestamps) of slots 0-20, as a `gui.SaveSlotInfoDetail` (`IsEmpty` +0x10, `Info` +0x18: `SlotIndex` +0x10, `ChapterID`, `Stage` +0x18...). `getSaveSlotInfoDetail(Int32)` (0x141782c90) builds the same for any slot. The main menu's Continue (`GameStateMainMenu` phases 47-56: CheckGameClearData -> StartLoadLatestsave: `setPlayLoadData(slot == 0, slot)` + `enqueueLoadRequest(slot)` -> EndLoadLatestsave -> Decided) and the game-over Continue (`GameStateGameOver.update`) both load it |
+| Menus | `GameStateMainMenu.onDecidedStoryMenu` (0x141b5c350) | Story menu: Continue (0) -> phase 47; Load Game (1) -> the load screen (37); New Game -> difficulty select |
+| Game intent | `chainsaw.UDSManagerApp` `<RequestGameIntentMode>` +0x10 (MainGame 0), `<_IsRequestGameIntent>` +0x15 | The console "activity" start. With the request on: `GameStateTitle.update` (0x141da2c30) -> `skipStateGameIntent` (0x141d870c0): straight to the main menu state; `GameStateMainMenu.update` (0x141bc2070) / `updateRequestGameIntent` -> `onGameIntentEnterInMainMenu` (0x141b625e0) from any phase but the loading ones: phase 47 (Continue) with the story choice Continue. Decided then does not wait for the menu windows to close, marks the in-game setup `StartFromGameIntent` (it shows the extra-contents notice the story menu would have) and calls `resetRequestGameIntent` (0x142a4c630). A failed load (phases 52-54) goes to GameIntentWait and also resets it |
+
+**Joining from the menus.** A pre-hook on both menu states' `update` asks the session every
+frame; when the client is joining a host who is in game, the mod turns the game intent on once
+(`set_RequestGameIntentMode(0)`, `set__IsRequestGameIntent(true)`) and arms the chapter switch
+(§3.6). The menus run Continue on their own; a post-hook on `findContinueSave` returns
+`getSaveSlotInfoDetail(co-op slot)` instead while that load runs, if that slot holds a save,
+so the client loads its own progress with the host, not the newest file (two copies of the game
+on one PC share their saves). `loadGameSaveData` then goes into the host's chapter, and the join
+goes on as before (world state, warp). No save at all: the player is told to start one.
+
+**Saving for both.** A pre-hook on `SaveFlowController.start` reports every save our game
+starts (SAVE). The partner's game then saves the way an autosave point does
+(`setPlayLoadData(false)`, `requestStartSaveGameDataFlow(slot, new ChainsawGameSaveRequestArgs)`):
+the host into slot 0, the client into its co-op slot (setting, default 20: a list slot, so it
+shows in Load Game and the game describes it). While connected, the client's own autosaves are
+redirected there in the same pre-hook (`args[3]`): its single-player autosave is kept, and two
+copies on one PC never write the same file at once; a typewriter save of the client goes where
+it chose and is then copied to the co-op slot. A save within 10 s of our own counts as the same
+one (both walked through the same autosave point; both changed chapter). A save waits until our
+game can save (playing, no cutscene or loading, not dying, `IsBusy` and `checkExcludeGameSave`
+false; a client also holds the host's world) for up to 90 s. Saves made for the partner are
+never reported back. After a game over, a connected client whose co-op slot holds this
+session's progress gets that slot from `findContinueSave` too.
+
+**Limits.** A save made for the partner keeps our own last checkpoint (the restart point is set
+by the autosave trigger, not by the save): loading it restarts there, and joining puts the
+client next to the host. A redirected autosave skips the slot-0-only `_ContineCount` decrement
+and shows the manual-save icon. Not run in the game yet.
+
 ## 4. Sync architecture
 
 ```
@@ -716,11 +928,11 @@ reaction exists only in the owner's game.
  │  session ─ enemy_net   │   PLAYER (20 Hz, unrel.)  │  session ─ enemy_net   │
  │   items, drops, gate   │   POSE / AVATAR / ACTIONS │   items, drops, gate   │
  │   flag/gimmick/object/ │   ENEMY_STATE (20 Hz)     │   flag/gimmick/object/ │
- │   animal/cutscene sync │   ENEMY_ROSTER, ANIMALS   │   animal/cutscene sync │
- │   travel               │   ENEMY_HIT/DEATH/OWNER   │   travel               │
+ │   animal/cutscene/     │   ENEMY_ROSTER, ANIMALS   │   animal/cutscene/     │
+ │   trigger sync, travel │   ENEMY_HIT/DEATH/OWNER   │   trigger sync, travel │
  │  game / game_world /   │   FLAGS, FLAG_WORDS,      │  game / game_world /   │
  │  game_pause (sdk)      │   GIMMICKS, OBJECTS,      │  game_pause (sdk)      │
- │  puppet (partner model)│   CUTSCENE, WORLD_*       │  puppet (partner model)│
+ │  puppet (partner model)│   CUTSCENE,TRIGGER,WORLD_*│  puppet (partner model)│
  │ re4coop_net.dll        │   CHAT/NOTIFY/HELLO       │ re4coop_net.dll        │
  └────────────────────────┘                           └────────────────────────┘
 ```
@@ -753,9 +965,10 @@ reaction exists only in the owner's game.
   * Each player rolls their own loot from every enemy that dies in their game (§3.7).
 * **Animals: the host's** (§3.9). The client's copies of the host's animals near both players
   follow them, AI off the game's update; deaths cross both ways.
-* **World: event + state replication** (§3.6): scenario flags by GUID through the game's own
-  setter, gimmick records by ContextID, breakables and animal deaths by GameObject GUID,
-  cutscenes by timeline event ID. Both sides can change the world (the client has to open doors
+* **World: event + state replication** (§3.6, §3.11): scenario flags by GUID through the
+  game's own setter (on only), gimmick records by ContextID, breakables and animal deaths by
+  GameObject GUID, cutscenes as the game's own PayloadPlay, level event triggers by GameObject
+  GUID and name hash. Both sides can change the world (the client has to open doors
   too); the host's state is what a joining or reloading client takes over.
 * **No pauses in co-op** (§3.6): menu pauses freeze nothing while hosting or connected.
 * **Key items exist once** (§3.2, §3.3): whoever picks one up keeps it, and the partner's copy
@@ -834,7 +1047,7 @@ joint.
 different chapters, and when no pose arrived for 3 s. If the game unloads the copy with an area,
 it is rebuilt.
 
-### 4.2 Known limitations (v0.9)
+### 4.2 Known limitations (v0.9.1)
 
 * v0.6 crashed in game; v0.7 removes the causes we found (§3.7), but has not been run in game
   yet. After a crash, `re4coop_breadcrumb.json` names the last thing the mod did.
@@ -864,11 +1077,20 @@ it is rebuilt.
 * Sounds the engine plays without going through the reflected `trigger` methods are not
   replayed. Thrown grenades, projectiles, bullet impacts and blood happen only in the thrower's
   game.
-* Cutscenes are not started in the partner's game unless the experimental switch is on; the
-  transition gate and the flags bring both players through them.
+* Cutscene and event trigger sync (§3.11) have not run in the game yet. The game members they
+  use were read in re4.exe's code, not probed by name, but whether a PayloadPlay built by the
+  mod and a trigger run with the partner's player behave like the game's own is unproven.
+  A skip follows the partner's game's own skip rules. Events that change items, kill, save or
+  switch modes never run for the partner; their flags still cross. A gimmick state the partner
+  changed is applied to the gimmick's record at once; whether an object already on screen
+  redraws it before its area reloads depends on that object.
 * A checkpoint reload (death, Retry) happens only in that player's game.
-* Joining from another chapter, and following the host into the next one, need a save load
-  (any save, or *Continue*); the automatic game-over reload is experimental.
+* Joining from another chapter while playing, and following the host into the next one, need a
+  save load (any save, or *Continue*); the automatic game-over reload is experimental. Joining
+  from the title screen or the main menu loads on its own (§3.15); with no save at all the
+  player has to start one.
+* Saves for both (§3.15): a save made for the partner restarts at that game's own last
+  checkpoint; a partner's save that cannot be made within 90 s is dropped.
 * The partner's loot rolls are confirmed only by the research log so far: if `drop_calls`
   shows another argument layout than §3.7 describes, the *loot* line in *Diagnostics* stays at
   "waiting for the first enemy drop" and nobody gets extra loot.
@@ -879,9 +1101,10 @@ it is rebuilt.
 
 ## 5. Roadmap
 
-1. **In-game validation of v0.9** with the checklist in [TESTING.md](TESTING.md), enemies
+1. **In-game validation of v0.9.1** with the checklist in [TESTING.md](TESTING.md), enemies
    first (steps 12-14: `enemy_uid`, `enemy_puppet`, `hit_values`, `hit_apply`, `enemy_motion`,
-   `enemy_erase`, `enemy_backups`), then the profiler's
+   `enemy_erase`, `enemy_backups`), the shared world's events (flags, cutscenes, event
+   triggers: `flag_hooks`, `cutscene_hooks`, `trigger_hooks`), then the profiler's
    numbers, the breadcrumb file after any crash, `drop_calls` in the research log, and the
    experimental features one at a time.
 2. Enemy positions through `CharacterContext.setTransform` (the game's own character teleport)

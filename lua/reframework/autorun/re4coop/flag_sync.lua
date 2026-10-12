@@ -1,21 +1,33 @@
 -- Scenario flag synchronisation. RE4's story progress lives in chainsaw.ScenarioFlagManager:
 -- thousands of GUID-addressed bits (objectives, map reveals, unlocked doors, one-time
 -- events, collected items, animals killed, cutscenes watched...). Keeping these bits equal
--- on both machines is what makes the two games "the same world".
+-- on both machines is what makes the two games "the same world": level triggers, portrayals
+-- (the game's scripted sequences), cutscenes and spawners all react to flags turning on, so a
+-- flag one player's event sets makes the same things happen in the partner's game.
 --
 -- Two paths:
---   * Events: the adapter hooks the flag setters and reports each change by GUID. They are
---     batched into FLAGS messages and applied on the other side through the game's own
---     requestSetFlag, so everything that reacts to a flag reacts on both machines.
+--   * Events: the adapter sees every flag change the game makes (the value-changed events of
+--     GlobalUserDataManager, docs/RESEARCH.md 3.11) and reports flags that turned on, and
+--     trigger-kind flags that fired. They are batched into FLAGS messages and applied on the
+--     other side through the game's own setter, so everything that reacts to a flag reacts on
+--     both machines.
 --   * Words: the whole flag state, as 32-bit words per flag group. Used for the full copy a
---     joining client receives from the host, and as the live path when the setter hooks are
---     not available (diffs of the words every few seconds, sent as set/clear masks).
+--     joining client receives from the host, and as the live path when the event hooks are
+--     not available (diffs of the words every few seconds: bits that turned on).
 --
--- Flags that flip back and forth quickly (per-machine state such as "player is in this
--- room") are muted for a while so the two games do not fight over them.
+-- Flags only ever travel *on*. In normal play the game never clears a scenario flag; flags go
+-- back off only when a game loads an older state (a checkpoint after a death), and that must
+-- never undo the partner's world.
+--
+-- Flags that flip back and forth quickly (per-machine state) are muted for a while so the two
+-- games do not fight over them. While the partner's cutscene plays here (cutscene_sync), the
+-- partner's flags wait (hold/release): our copy of the cutscene sets its own start and end
+-- flags at its own time, and what the partner's end flags start must not begin in our game
+-- before our cutscene has ended.
 --
 -- Adapter contract (world):
 --   world:flag_set(guid, value) -> bool        world:flag_check(guid) -> bool|nil
+--   world:flag_pulse(guid) -> bool             (fires a trigger-kind flag)
 --   world:flag_hooks_active() -> bool
 --   world:flag_words_snapshot() -> { [group_name] = {u32, ...} } | nil
 --   world:flag_words_apply(group_name, word_index0, set_mask, clear_mask) -> bool
@@ -31,6 +43,7 @@ local MUTE_TIME = 60.0
 local FLUSH_INTERVAL = 0.05
 local WORDS_INTERVAL = 5.0     -- reading the whole flag table is not free: only now and then
 local FULL_TIMEOUT = 20.0
+local HOLD_MAX = 600.0         -- a hold never outlives this (a cutscene that never ended for us)
 
 -- opts: { role, protocol, settings, send(bytes, reliable), log(fmt, ...) }
 function FlagSync.new(opts)
@@ -45,7 +58,7 @@ function FlagSync.new(opts)
 end
 
 function FlagSync:reset()
-    self.pending = {}        -- ordered list of {guid, value}
+    self.pending = {}        -- ordered list of {guid, value, pulse}
     self.last_local = {}     -- guid -> last value seen locally (ours or applied from the partner)
     self.pending_index = {}  -- guid -> index in pending
     self.last_flush = -math.huge
@@ -57,8 +70,10 @@ function FlagSync:reset()
     self.expect = {}         -- "group|word" -> {set=mask, clear=mask} changes we caused
     self.last_words = -math.huge
     self.full_parts = {}     -- sync_id -> {chunks=n, got={}, groups={}}
+    self.hold_until = nil    -- partner flags wait until this time (or release())
+    self.held = {}           -- ordered list of {guid, value, pulse} received while holding
     self.counters = { sent = 0, received = 0, applied = 0, muted = 0, words_sent = 0, words_applied = 0,
-        full_applied = 0 }
+        full_applied = 0, pulses = 0, held = 0 }
 end
 
 function FlagSync:enabled()
@@ -97,29 +112,66 @@ function FlagSync:is_muted(key, now)
 end
 
 -------------------------------------------------------------------------------
+-- Holding the partner's flags (while their cutscene plays here)
+-------------------------------------------------------------------------------
+
+function FlagSync:hold(now, seconds)
+    self.hold_until = now + math.min(seconds or HOLD_MAX, HOLD_MAX)
+end
+
+function FlagSync:holding(now)
+    if self.hold_until == nil then return false end
+    if now >= self.hold_until then
+        self.hold_until = nil
+        return false
+    end
+    return true
+end
+
+-- Applies everything that waited, in arrival order.
+function FlagSync:release(now, world)
+    self.hold_until = nil
+    if #self.held == 0 then return end
+    local held = self.held
+    self.held = {}
+    self:apply_flags(held, now, world)
+end
+
+-------------------------------------------------------------------------------
 -- Event path (GUIDs)
 -------------------------------------------------------------------------------
 
--- The local game set or cleared a flag (adapter hook).
-function FlagSync:on_local_flag(guid, value, now)
+-- The local game turned a flag on (value = true) or off (false), or fired a trigger-kind flag
+-- (pulse). Flags going off are local (a reload) and never sent, but the flag is news again the
+-- next time it turns on.
+function FlagSync:on_local_flag(guid, value, now, pulse)
     if not self:enabled() or self.applying then return false end
     guid = self.P.normalize_guid(guid)
     if guid == nil then return false end
     value = value and true or false
-    -- Games often re-set a flag to the value it already has (every frame, every load):
-    -- only real changes count.
-    if self.last_local[guid] == value then return false end
-    self.last_local[guid] = value
+    if not value and not pulse then
+        self.last_local[guid] = false
+        return false
+    end
     local rec = self.remote_applied[guid]
-    if rec ~= nil and rec.value == value and now - rec.time < ECHO_WINDOW then
-        return false -- our own application of the partner's change
+    if pulse then
+        if rec ~= nil and now - rec.time < ECHO_WINDOW then return false end -- the partner's pulse we fired
+    else
+        -- Games often re-set a flag to the value it already has (every frame, every load):
+        -- only real changes count.
+        if self.last_local[guid] == true then return false end
+        self.last_local[guid] = true
+        if rec ~= nil and rec.value == true and now - rec.time < ECHO_WINDOW then
+            return false -- our own application of the partner's change
+        end
     end
     if not self:note_change(guid, now) then return false end
     local i = self.pending_index[guid]
     if i ~= nil then
-        self.pending[i].value = value
+        self.pending[i].value = true
+        self.pending[i].pulse = self.pending[i].pulse or pulse or nil
     else
-        self.pending[#self.pending + 1] = { guid = guid, value = value }
+        self.pending[#self.pending + 1] = { guid = guid, value = true, pulse = pulse or nil }
         self.pending_index[guid] = #self.pending
     end
     return true
@@ -136,26 +188,44 @@ function FlagSync:flush(now)
     self.pending_index = {}
 end
 
-function FlagSync:on_flags(m, now, world)
-    if not self:enabled() then return end
-    for _, f in ipairs(m.flags) do
-        if f.guid ~= nil then
-            self.counters.received = self.counters.received + 1
-            if self:note_change(f.guid, now) then
+-- Applies the partner's flags (list of {guid, value, pulse}). Clears are ignored: a partner
+-- whose game went back to an older state must not take ours with it.
+function FlagSync:apply_flags(list, now, world)
+    for _, f in ipairs(list) do
+        if f.guid ~= nil and (f.value or f.pulse) and self:note_change(f.guid, now) then
+            if f.pulse then
+                self.applying = true
+                local ok = world:flag_pulse(f.guid)
+                self.applying = false
+                if ok then self.counters.pulses = self.counters.pulses + 1 end
+                self.remote_applied[f.guid] = { value = true, time = now }
+            else
                 local cur = world:flag_check(f.guid)
-                if cur ~= f.value then
+                if cur ~= true then
                     self.applying = true
-                    local ok = world:flag_set(f.guid, f.value)
+                    local ok = world:flag_set(f.guid, true)
                     self.applying = false
                     if ok then
                         self.counters.applied = self.counters.applied + 1
                     end
                 end
-                self.remote_applied[f.guid] = { value = f.value, time = now }
-                self.last_local[f.guid] = f.value
+                self.remote_applied[f.guid] = { value = true, time = now }
+                self.last_local[f.guid] = true
             end
         end
     end
+end
+
+function FlagSync:on_flags(m, now, world)
+    if not self:enabled() then return end
+    self.counters.received = self.counters.received + #m.flags
+    if self:holding(now) then
+        for _, f in ipairs(m.flags) do self.held[#self.held + 1] = f end
+        self.counters.held = self.counters.held + #m.flags
+        return
+    end
+    if #self.held > 0 then self:release(now, world) end -- a hold that just ran out: in order
+    self:apply_flags(m.flags, now, world)
 end
 
 -------------------------------------------------------------------------------
@@ -178,7 +248,8 @@ function FlagSync:expect_change(group, word, set, clear)
     e.clear = (e.clear | clear) & ~set
 end
 
--- Diffs the local words against the last snapshot; returns delta groups for FLAG_WORDS.
+-- Diffs the local words against the last snapshot; returns delta groups for FLAG_WORDS
+-- (bits that turned on only).
 function FlagSync:diff_words(snap, now)
     local base = self.baseline
     local out = {}
@@ -189,16 +260,15 @@ function FlagSync:diff_words(snap, now)
             for i = 1, #words do
                 local o, n = old[i] or 0, words[i]
                 if o ~= n then
-                    local set, clear = n & ~o, o & ~n
+                    local set = n & ~o
                     local k = word_key(name, i - 1)
                     local e = self.expect[k]
                     if e ~= nil then
                         set = set & ~e.set
-                        clear = clear & ~e.clear
                         self.expect[k] = nil
                     end
-                    if (set ~= 0 or clear ~= 0) and self:note_change(k, now) then
-                        changes[#changes + 1] = { word = i - 1, set = set, clear = clear }
+                    if set ~= 0 and self:note_change(k, now) then
+                        changes[#changes + 1] = { word = i - 1, set = set, clear = 0 }
                     end
                 end
             end
@@ -311,10 +381,10 @@ function FlagSync:on_flag_words(m, now, world)
     for _, g in ipairs(m.groups) do
         for _, c in ipairs(g.changes) do
             local k = word_key(g.name, c.word)
-            if self:note_change(k, now) then
-                self:expect_change(g.name, c.word, c.set, c.clear)
+            if c.set ~= 0 and self:note_change(k, now) then
+                self:expect_change(g.name, c.word, c.set, 0)
                 self.applying = true
-                local ok = world:flag_words_apply(g.name, c.word, c.set, c.clear)
+                local ok = world:flag_words_apply(g.name, c.word, c.set, 0)
                 self.applying = false
                 if ok then
                     self.counters.words_applied = self.counters.words_applied + 1
@@ -333,6 +403,7 @@ function FlagSync:tick(now, world)
     end
     self:flush(now)
     self:words_tick(now, world)
+    if #self.held > 0 and not self:holding(now) then self:release(now, world) end
     for guid, rec in pairs(self.remote_applied) do
         if now - rec.time > ECHO_WINDOW then self.remote_applied[guid] = nil end
     end
@@ -353,7 +424,7 @@ end
 function FlagSync:summary()
     local muted = 0
     for _ in pairs(self.muted) do muted = muted + 1 end
-    return { counters = self.counters, muted_now = muted }
+    return { counters = self.counters, muted_now = muted, holding = self.hold_until ~= nil and #self.held or nil }
 end
 
 return FlagSync

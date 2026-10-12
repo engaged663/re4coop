@@ -27,6 +27,17 @@ local TOP_SPANS = 12
 Perf.PERF_FILE = "re4coop_perf.json"
 Perf.CRUMB_FILE = "re4coop_breadcrumb.json"
 
+-- Two copies of the game on one PC share reframework/data: while in a session each writes its
+-- own files (re4coop_breadcrumb_host.json / _client.json), so the one that crashed keeps its own.
+function Perf.file_name(base, tag)
+    if tag == nil or tag == "" then return base end
+    return (base:gsub("%.json$", "_" .. tag .. ".json"))
+end
+
+function Perf:set_tag(tag)
+    self.tag = tag
+end
+
 -- opts: { clock = function() -> seconds, json = { dump_file }, version = <string>,
 --         settings = <live config (profiler, perf_file)>, calls = function() -> game call count,
 --         wall = function() -> <date string> }
@@ -187,7 +198,7 @@ function Perf:write_file(now)
         frame_avg_ms = r.frame_avg_ms, frame_max_ms = r.frame_max_ms, spikes_per_s = r.spikes / r.window,
         fps = r.fps, game_calls_per_s = r.game_calls_per_s, spans = top(r.spans, 40),
     }
-    return (pcall(self.json.dump_file, Perf.PERF_FILE, data))
+    return (pcall(self.json.dump_file, Perf.file_name(Perf.PERF_FILE, self.tag), data))
 end
 
 -------------------------------------------------------------------------------
@@ -227,7 +238,7 @@ function Perf:flush_crumbs(now)
         perf = self.result and top(self.result.spans, 8) or nil,
     }
     self.crumb_writes = self.crumb_writes + 1
-    return (pcall(self.json.dump_file, Perf.CRUMB_FILE, data))
+    return (pcall(self.json.dump_file, Perf.file_name(Perf.CRUMB_FILE, self.tag), data))
 end
 
 -- The script is unloading on purpose: say so, so the file does not look like a crash.

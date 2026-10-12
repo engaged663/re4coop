@@ -62,8 +62,17 @@ T.run("partner_entering_the_same_event_releases", function()
     T.eq(g:run(0.1), nil, "both in the event: go")
 end)
 
-T.run("partner_in_another_event_far_away_is_not_ready", function()
+T.run("partner_watching_far_away_is_ready_with_cutscene_sync", function()
+    -- With cutscene sync the partner's game plays our cutscene at once, wherever they are:
+    -- nobody is frozen while they would travel.
     local g = make()
+    g.s.event = true
+    g.s.partner_event = true
+    g.s.partner_stage = 43410
+    g.s.partner_pos = { x = 200, y = 0, z = 0 }
+    T.eq(g:run(2), nil, "their copy plays: go")
+    -- Without it, an event of theirs elsewhere is another cutscene: wait for them.
+    g = make({ sync_cutscenes = false })
     g.s.event = true
     g.s.partner_event = true
     g.s.partner_stage = 43410

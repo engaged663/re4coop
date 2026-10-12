@@ -55,16 +55,23 @@ local function fake_world(game)
         return { chapter = g.chapter, stage = g.stage, pos = g.pos, yaw = 0, playable = true, loading = false }
     end
     function w:flag_set(guid, v) self.flags[guid] = v return true end
+    function w:flag_pulse(guid) self.pulsed = guid return true end
     function w:flag_check(guid) return self.flags[guid] or false end
     function w:flag_hooks_active() return true end
     function w:flag_words_snapshot() return nil end
     function w:gimmicks_snapshot() return nil end
     function w:objects_scan() return nil end
     function w:cutscene_playing() return self.playing end
-    function w:cutscene_play(id, method)
-        self.played[#self.played + 1] = { id = id, method = method }
-        self.playing = id
+    function w:cutscene_done() return false end
+    function w:cutscene_play(ev)
+        self.played[#self.played + 1] = ev
+        self.playing = true
         return true
+    end
+    function w:trigger_run(ev)
+        self.triggers_run = (self.triggers_run or 0) + 1
+        self.last_trigger = ev
+        return "run"
     end
     function w:preload_stage() return true end
     function w:warp(stage, pos)
@@ -253,23 +260,56 @@ T.run("cross_stage_teleport_uses_the_games_warp", function()
 end)
 
 T.run("partners_cutscene_plays_here_too", function()
-    local s, net, clock, _, world = make("client", { settings = { sync_cutscenes = true } })
+    local s, net, clock, _, world = make("client")
     net.push(player_msg(0.1, 21100, 40200, { x = 2, y = 0, z = 0 }))
-    net.push(P.encode_cutscene({ id = 20130, method = "requestPlay", chapter = 21100, stage = 40200,
+    net.push(P.encode_cutscene({ camera = P.CAMERA.TIMELINE, id = 20130, screen = 3, owner_code = 77,
+        end_portrayal = 5, start_flags = { { group = 1, index = 2 } }, chapter = 21100, stage = 40200,
         pos = { x = 2, y = 0, z = 0 }, flags = P.CUTSCENE_FLAGS.LOCAL_TRIGGER }))
-    for i = 1, 5 do
+    for i = 1, 30 do
         clock.t = i * 0.1
         s:update()
     end
-    T.eq(world.played[1] and world.played[1].id, 20130, "same cutscene played")
-    T.eq(world.played[1].method, "requestPlay", "through the same request")
+    T.eq(world.played[1] and world.played[1].id, 20130, "same cutscene played (on by default)")
+    T.eq(world.played[1].owner_code, 77, "the whole payload")
+    T.eq(world.played[1].start_flags[1].index, 2, "with its flags")
+    -- While it plays here, the partner's flags wait; when it ends they go through.
+    local g = "0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9"
+    net.push(P.encode_flags({ { guid = g, value = true } })[1])
+    clock.t = 3.1
+    s:update()
+    T.check(world.flags[g] == nil, "partner flag waits for our copy of the cutscene")
+    world.playing = nil
+    clock.t = 3.2
+    s:update()
+    T.eq(world.flags[g], true, "applied once it ended")
     -- And ours goes to the partner.
-    world.cb.on_cutscene(10157, "requestPlay")
+    world.cb.on_cutscene({ camera = 1, id = 10157, screen = 0, start_flags = {}, end_flags = {}, coords = {} })
     local m
     for _, x in ipairs(net.sent) do
         if x.data:byte(1) == P.T.CUTSCENE then m = P.decode(x.data) end
     end
     T.eq(m and m.id, 10157, "our cutscene announced")
+    T.eq(m.stage, 40200, "with where we are")
+end)
+
+T.run("partners_event_trigger_runs_here_and_ours_is_sent", function()
+    local s, net, clock, game, world = make("client")
+    net.push(player_msg(0.1, 21100, 40200, { x = 2, y = 0, z = 0 }))
+    net.push(P.encode_trigger({ guid = "0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9", hash = 99, trigger_type = 1, once = true,
+        chapter = game.chapter, stage = game.stage, pos = { x = game.pos.x + 3, y = game.pos.y, z = game.pos.z } }))
+    for i = 1, 30 do
+        clock.t = i * 0.1
+        s:update()
+    end
+    T.eq(world.triggers_run, 1, "the partner's event ran here")
+    T.eq(world.last_trigger.hash, 99, "the same trigger")
+    world.cb.on_trigger({ guid = "11111111-2222-3333-4444-555555555555", hash = 7, trigger_type = 1, once = true })
+    local m
+    for _, x in ipairs(net.sent) do
+        if x.data:byte(1) == P.T.TRIGGER then m = P.decode(x.data) end
+    end
+    T.eq(m and m.hash, 7, "ours announced")
+    T.eq(m.chapter, game.chapter, "with our chapter")
 end)
 
 T.run("host_answers_world_requests", function()
@@ -425,6 +465,52 @@ T.run("disconnect_restores_ai_on_the_game_thread", function()
     T.eq(game.ai_restored, 0, "not from the render thread")
     s:update()
     T.eq(game.ai_restored, 1, "on the next game frame")
+end)
+
+-- The game's save system for the save tests: slots written; save_now reports through the
+-- session the way the save hook does.
+local function with_saves(s, game, clock)
+    game.saved = {}
+    function game:save_can() return true end
+    function game:save_now(slot)
+        self.saved[#self.saved + 1] = slot
+        s.save_sync:on_local_save(slot, clock.t, true, slot)
+        return true
+    end
+end
+
+T.run("a_partners_save_makes_our_game_save", function()
+    local s, net, clock, game = make("host")
+    with_saves(s, game, clock)
+    net.push(P.encode_save({ kind = P.SAVE_KIND.MANUAL }))
+    for _ = 1, 30 do
+        clock.t = clock.t + 0.1
+        s:update()
+    end
+    T.eq(game.saved[1], 0, "the host saved into its autosave")
+    T.eq(#game.saved, 1, "once")
+    T.eq(net.sent_types()[P.T.SAVE], nil, "that save is not reported back")
+    T.check(told(s, "Saved with"), "told")
+end)
+
+T.run("the_client_saves_with_the_host_once_it_holds_the_hosts_world", function()
+    local s, net, clock, game = make("client")
+    with_saves(s, game, clock)
+    s.world_synced = false -- still taking over the host's world
+    net.push(P.encode_save({ kind = P.SAVE_KIND.AUTO }))
+    for _ = 1, 30 do
+        clock.t = clock.t + 0.1
+        s:update()
+    end
+    T.eq(#game.saved, 0, "not before the host's world is ours")
+    s.world_synced = true
+    for _ = 1, 30 do
+        clock.t = clock.t + 0.1
+        s:update()
+    end
+    T.eq(game.saved[1], 20, "into the co-op slot")
+    T.eq(#game.saved, 1, "once")
+    T.check(s:status().saves ~= nil, "in the status")
 end)
 
 T.run("shutdown_restores_everything", function()

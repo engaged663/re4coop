@@ -74,6 +74,9 @@ function Overlay.draw_hud(game, status, messages, now, model)
         if status.partner_distance then
             line = line .. ("  |  %.0f m"):format(status.partner_distance)
         end
+        if status.partner_distance and status.compatible then
+            line = line .. ("  |  %s: teleport"):format(status.teleport_key_name or "F6")
+        end
         if not status.compatible then
             line = line .. "  |  VERSION MISMATCH"
         elseif model ~= nil and model.state == "loading" then

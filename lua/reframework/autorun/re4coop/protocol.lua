@@ -3,8 +3,8 @@
 
 local P = {}
 
-P.VERSION = 9            -- bump on any incompatible change to the layouts below
-P.MOD_VERSION = "0.9.0"
+P.VERSION = 10           -- bump on any incompatible change to the layouts below
+P.MOD_VERSION = "0.9.1"
 P.MAX_PAYLOAD = 1188     -- re4coop_net.max_payload(): biggest message one datagram carries
 
 P.T = {
@@ -23,11 +23,11 @@ P.T = {
     -- 15 was the old ENEMY_HIT (protocols 5-8)
     ITEM_DROPPED = 16,  -- retired in 0.7 (each player rolls their own loot); still decoded, ignored
     -- 17 was ENEMY_CLIENT (protocols 6-8)
-    FLAGS = 18,         -- reliable, both directions: scenario flags that changed, by GUID
+    FLAGS = 18,         -- reliable, both directions: scenario flags that turned on (or pulsed), by GUID
     FLAG_WORDS = 19,    -- reliable, both directions: scenario flag bits per group (full copy or masks)
     GIMMICKS = 20,      -- reliable, both directions: gimmick save states (doors, locks, levers...)
     OBJECTS = 21,       -- reliable, both directions: breakables/animals destroyed, by GameObject GUID
-    CUTSCENE = 22,      -- reliable, both directions: a cutscene (timeline event) started
+    CUTSCENE = 22,      -- reliable, both directions: a cutscene started (the game's own PayloadPlay)
     WORLD_REQUEST = 23, -- reliable, client -> host: send me your whole world state
     WORLD_DONE = 24,    -- reliable, host -> client: end of a full world state transfer
     ENEMY_GRAVE = 25,   -- reliable, host -> client: every enemy dead in the host's world (full list)
@@ -38,7 +38,17 @@ P.T = {
     ENEMY_DEATH = 29,   -- reliable, both directions: an enemy the sender owns died (or the host's world reset)
     ENEMY_OWNER = 30,   -- reliable, host -> client: who owns which enemy (ownership epochs)
     ENEMY_ROSTER = 31,  -- unreliable, ~5 Hz, client -> host: the host's enemies the client has a copy of
+    TRIGGER = 32,       -- reliable, both directions: the sender's player set off a level event trigger
+    CUTSCENE_SKIP = 33, -- reliable, both directions: the sender's player skipped a cutscene
+    DOORS = 34,         -- reliable, both directions: doors near the sender that opened, closed or are held open
+    ITEM_GIVE = 35,     -- reliable, both directions: an item the sender's player gave the receiver
+    ITEM_GIVE_RESULT = 36, -- reliable, both directions: how much of a given item did not fit
+    ENEMY_CLAIM = 37,   -- reliable, client -> host: the client's player started a finisher on this enemy
+    SAVE = 38,          -- reliable, both directions: the sender's game saved (the receiver's game saves too)
 }
+
+-- SAVE: what kind of save the sender's game made.
+P.SAVE_KIND = { AUTO = 1, MANUAL = 2 }
 
 P.PLAYER_FLAGS = {
     DEAD = 1,
@@ -137,6 +147,20 @@ P.WORLD = {
 
 P.CUTSCENE_FLAGS = {
     LOCAL_TRIGGER = 1, -- started by the sender's own game (not a replay of ours)
+}
+
+-- What a CUTSCENE carries: chainsaw.ClapperboardMediator.CameraType of the request.
+P.CAMERA = { TIMELINE = 1, MOVIE = 2 }
+P.MAX_CUTSCENE_FLAGS = 48  -- start and end flags each (ScenarioFlagManager.FlagInfo group/index pairs)
+P.MAX_CUTSCENE_COORDS = 8  -- player placements of a movie (PlayerCoordSetting.Pack)
+
+-- FLAGS entry values.
+P.FLAG_VALUE = { OFF = 0, ON = 1, PULSE = 2 } -- PULSE: a trigger-kind variable fired once
+
+-- TRIGGER flags.
+P.TRIGGER_FLAGS = {
+    ONCE = 1, -- the trigger succeeds once (InteractTrigger.SucceedType.Once): it is done afterwards
+    HEAD = 2, -- it was set off by the player's head GameObject (else the body)
 }
 
 P.ITEM_FLAGS = {
@@ -652,7 +676,7 @@ function P.encode_animals(time, animals)
     return out
 end
 
--- flags = { {guid="xxxxxxxx-....", value=bool}, ... } -> array of messages
+-- flags = { {guid="xxxxxxxx-....", value=bool, pulse=bool|nil}, ... } -> array of messages
 function P.encode_flags(flags)
     local out = {}
     local i = 1
@@ -663,7 +687,8 @@ function P.encode_flags(flags)
         for k = i, last do
             local b = P.guid_to_bytes(flags[k].guid)
             if b ~= nil then
-                parts[#parts + 1] = b .. string.pack("<B", flags[k].value and 1 or 0)
+                local v = flags[k].pulse and P.FLAG_VALUE.PULSE or (flags[k].value and P.FLAG_VALUE.ON or P.FLAG_VALUE.OFF)
+                parts[#parts + 1] = b .. string.pack("<B", v)
                 n = n + 1
             end
         end
@@ -792,11 +817,120 @@ function P.encode_objects(events)
     return out
 end
 
--- m = { id (chainsaw.TimelineEventDefine.ID), method, chapter, stage, pos={x,y,z}|nil, flags }
+-- A cutscene request as the game itself describes it for a remote player
+-- (chainsaw.ClapperboardMediator.PayloadPlay), plus where the sender was:
+-- m = { camera (P.CAMERA), id, screen, owner_code (u32; 0xFFFFFFFF none), end_portrayal (u32),
+--       start_flags = { {group, index}, ... }, end_flags = {...},
+--       coords = { {kind, pos={x,y,z}, rot_y, reset_camera, only_npc, only_pc}, ... } (movies),
+--       chapter, stage, pos={x,y,z}|nil, flags }
+local CUTSCENE_HEAD = "<BBi4i4I4I4i4i4fffB"
+local COORD = "<i4ffffBBB"
+
+local function pack_flag_infos(list)
+    local n = math.min(#(list or {}), P.MAX_CUTSCENE_FLAGS)
+    local parts = { string.pack("<B", n) }
+    for i = 1, n do
+        parts[#parts + 1] = string.pack("<i4i4", clamp_i32(list[i].group), clamp_i32(list[i].index))
+    end
+    return table.concat(parts)
+end
+
+local function unpack_flag_infos(data, off)
+    local n
+    n, off = string.unpack("<B", data, off)
+    local list = {}
+    for i = 1, n do
+        local g, idx
+        g, idx, off = string.unpack("<i4i4", data, off)
+        list[i] = { group = g, index = idx }
+    end
+    return list, off
+end
+
 function P.encode_cutscene(m)
     local pos = m.pos or { x = 0, y = 0, z = 0 }
-    return string.pack("<Bi4s1i4i4fffB", P.T.CUTSCENE, clamp_i32(m.id), (m.method or ""):sub(1, 255),
-        clamp_i32(m.chapter or -1), clamp_i32(m.stage or -1), pos.x, pos.y, pos.z, m.flags or 0)
+    local parts = {
+        string.pack(CUTSCENE_HEAD, P.T.CUTSCENE, (m.camera or P.CAMERA.TIMELINE) & 0xFF, clamp_i32(m.id),
+            clamp_i32(m.screen or 0), clamp_u32(m.owner_code or 0xFFFFFFFF), clamp_u32(m.end_portrayal or 0),
+            clamp_i32(m.chapter or -1), clamp_i32(m.stage or -1), pos.x, pos.y, pos.z, m.flags or 0),
+        pack_flag_infos(m.start_flags),
+        pack_flag_infos(m.end_flags),
+    }
+    local coords = m.coords or {}
+    local nc = math.min(#coords, P.MAX_CUTSCENE_COORDS)
+    parts[#parts + 1] = string.pack("<B", nc)
+    for i = 1, nc do
+        local c = coords[i]
+        local p = c.pos or { x = 0, y = 0, z = 0 }
+        parts[#parts + 1] = string.pack(COORD, clamp_i32(c.kind), p.x, p.y, p.z, c.rot_y or 0,
+            c.reset_camera and 1 or 0, c.only_npc and 1 or 0, c.only_pc and 1 or 0)
+    end
+    return table.concat(parts)
+end
+
+-- m = { guid (the trigger's GameObject), hash (InteractTrigger.get_Hash), trigger_type, once, head,
+--       chapter, stage, pos={x,y,z}|nil }
+local TRIGGER_FMT = "<Bc16I4BBi4i4fff"
+
+function P.encode_trigger(m)
+    local b = P.guid_to_bytes(m.guid)
+    if b == nil then return nil end
+    local pos = m.pos or { x = 0, y = 0, z = 0 }
+    local flags = 0
+    if m.once then flags = flags | P.TRIGGER_FLAGS.ONCE end
+    if m.head then flags = flags | P.TRIGGER_FLAGS.HEAD end
+    return string.pack(TRIGGER_FMT, P.T.TRIGGER, b, clamp_u32(m.hash), (m.trigger_type or 0) & 0xFF, flags,
+        clamp_i32(m.chapter or -1), clamp_i32(m.stage or -1), pos.x, pos.y, pos.z)
+end
+
+-- m = { seq, item_id (chainsaw.ItemID), count, durability (-1 = none) }
+function P.encode_item_give(m)
+    return string.pack("<BI4I4i4i4", P.T.ITEM_GIVE, clamp_u32(m.seq), clamp_u32(m.item_id), clamp_i32(m.count or 1),
+        clamp_i32(m.durability or -1))
+end
+
+-- m = { seq, returned }
+function P.encode_item_give_result(m)
+    return string.pack("<BI4i4", P.T.ITEM_GIVE_RESULT, clamp_u32(m.seq), clamp_i32(m.returned or 0))
+end
+
+-- Client -> host: the client's player started a finisher (stealth kill, grab, knife finish,
+-- stomp) on the host's enemy `net_id`, known to it at ownership epoch `epoch`: the client's
+-- game must run that enemy now. m = { net_id, epoch }
+function P.encode_enemy_claim(m)
+    return string.pack("<BI2B", P.T.ENEMY_CLAIM, (m.net_id or 0) & 0xFFFF, (m.epoch or 0) & 0xFF)
+end
+
+-- The sender's game saved (P.SAVE_KIND): the receiver's game saves too. m = { kind }
+function P.encode_save(m)
+    return string.pack("<BB", P.T.SAVE, (m.kind or P.SAVE_KIND.AUTO) & 0xFF)
+end
+
+-- doors = { {guid, open=bool, hold=bool, attr=byte}, ... } -> array of messages
+P.MAX_DOORS_PER_MESSAGE = 60
+function P.encode_doors(doors)
+    local out = {}
+    local i = 1
+    while i <= #doors do
+        local last = math.min(#doors, i + P.MAX_DOORS_PER_MESSAGE - 1)
+        local parts, n = {}, 0
+        for k = i, last do
+            local d = doors[k]
+            local b = P.guid_to_bytes(d.guid)
+            if b ~= nil then
+                parts[#parts + 1] = b .. string.pack("<BB", (d.open and 1 or 0) | (d.hold and 2 or 0), (d.attr or 0) & 0xFF)
+                n = n + 1
+            end
+        end
+        out[#out + 1] = string.pack("<BB", P.T.DOORS, n) .. table.concat(parts)
+        i = last + 1
+    end
+    return out
+end
+
+-- m = { camera (P.CAMERA), id }
+function P.encode_cutscene_skip(m)
+    return string.pack("<BBi4", P.T.CUTSCENE_SKIP, (m.camera or P.CAMERA.TIMELINE) & 0xFF, clamp_i32(m.id))
 end
 
 function P.encode_world_request(sync_id, what)
@@ -1188,7 +1322,7 @@ decoders[P.T.FLAGS] = function(data)
         local guid = P.guid_from_bytes(data:sub(off, off + 15))
         local value = string.unpack("<B", data, off + 16)
         off = off + 17
-        flags[i] = { guid = guid, value = value ~= 0 }
+        flags[i] = { guid = guid, value = value ~= P.FLAG_VALUE.OFF, pulse = value == P.FLAG_VALUE.PULSE }
     end
     return { flags = flags }
 end
@@ -1268,8 +1402,67 @@ decoders[P.T.OBJECTS] = function(data)
 end
 
 decoders[P.T.CUTSCENE] = function(data)
-    local _, id, method, chapter, stage, x, y, z, flags = string.unpack("<Bi4s1i4i4fffB", data)
-    return { id = id, method = method, chapter = chapter, stage = stage, pos = { x = x, y = y, z = z }, flags = flags }
+    local _, camera, id, screen, owner_code, end_portrayal, chapter, stage, x, y, z, flags, off =
+        string.unpack(CUTSCENE_HEAD, data)
+    local m = { camera = camera, id = id, screen = screen, owner_code = owner_code, end_portrayal = end_portrayal,
+        chapter = chapter, stage = stage, pos = { x = x, y = y, z = z }, flags = flags }
+    m.start_flags, off = unpack_flag_infos(data, off)
+    m.end_flags, off = unpack_flag_infos(data, off)
+    local nc
+    nc, off = string.unpack("<B", data, off)
+    m.coords = {}
+    for i = 1, nc do
+        local kind, cx, cy, cz, rot_y, reset, only_npc, only_pc
+        kind, cx, cy, cz, rot_y, reset, only_npc, only_pc, off = string.unpack(COORD, data, off)
+        m.coords[i] = { kind = kind, pos = { x = cx, y = cy, z = cz }, rot_y = rot_y, reset_camera = reset ~= 0,
+            only_npc = only_npc ~= 0, only_pc = only_pc ~= 0 }
+    end
+    return m
+end
+
+decoders[P.T.TRIGGER] = function(data)
+    local _, b, hash, trigger_type, flags, chapter, stage, x, y, z = string.unpack(TRIGGER_FMT, data)
+    local F = P.TRIGGER_FLAGS
+    return { guid = P.guid_from_bytes(b), hash = hash, trigger_type = trigger_type,
+        once = (flags & F.ONCE) ~= 0, head = (flags & F.HEAD) ~= 0,
+        chapter = chapter, stage = stage, pos = { x = x, y = y, z = z } }
+end
+
+decoders[P.T.ITEM_GIVE] = function(data)
+    local _, seq, item_id, count, durability = string.unpack("<BI4I4i4i4", data)
+    return { seq = seq, item_id = item_id, count = count, durability = durability }
+end
+
+decoders[P.T.ENEMY_CLAIM] = function(data)
+    local _, net_id, epoch = string.unpack("<BI2B", data)
+    return { net_id = net_id, epoch = epoch }
+end
+
+decoders[P.T.SAVE] = function(data)
+    local _, kind = string.unpack("<BB", data)
+    return { kind = kind }
+end
+
+decoders[P.T.ITEM_GIVE_RESULT] = function(data)
+    local _, seq, returned = string.unpack("<BI4i4", data)
+    return { seq = seq, returned = returned }
+end
+
+decoders[P.T.DOORS] = function(data)
+    local _, n = string.unpack("<BB", data)
+    local doors, off = {}, 3
+    for i = 1, n do
+        local guid = P.guid_from_bytes(data:sub(off, off + 15))
+        local flags, attr = string.unpack("<BB", data, off + 16)
+        off = off + 18
+        doors[i] = { guid = guid, open = (flags & 1) ~= 0, hold = (flags & 2) ~= 0, attr = attr }
+    end
+    return { doors = doors }
+end
+
+decoders[P.T.CUTSCENE_SKIP] = function(data)
+    local _, camera, id = string.unpack("<BBi4", data)
+    return { camera = camera, id = id }
 end
 
 decoders[P.T.WORLD_REQUEST] = function(data)

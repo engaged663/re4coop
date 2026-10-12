@@ -31,41 +31,54 @@ end
 T.run("probes_find_the_world_api", function()
     local w, game = fresh()
     local caps = game:capabilities()
-    for _, name in ipairs({ "flags", "flag_words", "gimmicks", "objects", "cutscenes", "warp", "chapter_switch" }) do
+    for _, name in ipairs({ "flags", "flag_words", "gimmicks", "objects", "cutscenes", "triggers", "warp", "chapter_switch" }) do
         T.check(caps[name] and caps[name].ok, name .. " capability: " .. tostring(caps[name] and caps[name].detail))
     end
     T.eq(w.flag_set_m.name, "requestSetFlag", "flag setter")
     T.eq(w.flag_check_m.name, "checkFlag", "flag check")
-    T.eq(w.cs_play_ms[1].name, "requestPlay", "simple cutscene request preferred")
-    T.eq(#w.cs_play_ms, 1, "a request with a complex parameter is not replayable")
-    for _, i in ipairs(w.cs_hook_ms) do
-        T.check(i.name ~= "requestPreloadPlay", "a preload is not a cutscene start")
-        T.check(i.name ~= "isPlaying", "queries are not hooked")
-        T.check(i.name ~= "requestStop", "stops are not hooked")
-    end
-    for _, i in ipairs(w.flag_hook_ms) do
-        T.check(i.name ~= "setFlagWatch", "only real flag setters are hooked")
-    end
-    T.eq(#w.flag_hook_ms, 1, "requestSetFlag hooked")
+    T.eq(w.var_set_m.name, "trySetBool", "any flag set by GUID")
+    T.eq(w.var_find_m.name, "findVariable", "any flag found by GUID")
+    T.eq(#w.flag_event_ms, 2, "both change handlers (scenario and common flags)")
+    T.eq(w.flag_save_m.name, "saveGameSaveData", "save found although declared with share.SaveDataBase")
+    T.eq(w.flag_load_m.name, "loadGameSaveData", "load found although declared with share.SaveDataBase")
+    T.eq(w.cs_proc_m.name, "procPayloadPlay", "cutscenes through their PayloadPlay")
+    T.eq(w.trig_exec_m.name, "executeTrigger", "triggers through executeTrigger")
 end)
 
-T.run("flag_hooks_report_game_changes_but_not_ours", function()
+T.run("every_flag_change_is_reported_but_not_ours", function()
     local w, game, world = fresh()
     local seen = {}
-    w:install_hooks({ on_flag = function(g, v) seen[#seen + 1] = { g, v } end })
+    w:install_hooks({ on_flag = function(g, v, pulse) seen[#seen + 1] = { g, v, pulse } end })
     T.eq(game:capabilities().flag_hooks.ok, true, "hooks installed")
-    mock.game_set_flag(G1, true)
+    mock.game_set_flag(G1, true) -- game code: Variable.set_Bool
     T.eq(#seen, 1, "game change reported")
     T.eq(seen[1][1], G1, "guid text")
     T.eq(seen[1][2], true, "value")
     T.eq(w:flag_check(G1), true, "flag is set")
-    T.check(w:flag_set(G2, true), "set through requestSetFlag")
-    T.eq(#seen, 1, "our own set is not reported")
+    world.singletons["chainsaw.ScenarioFlagManager"]:call("requestSetFlag", mock.guid_value(G2), true)
+    T.eq(#seen, 2, "requestSetFlag goes through the same change event")
+    mock.game_set_flag(G2, false)
+    T.eq(#seen, 3, "a flag going off is reported too (flag_sync keeps it to itself)")
+    T.eq(seen[3][2], false, "as off")
+    T.check(w:flag_set(G2, true), "set through GlobalUserDataManager.trySetBool")
+    T.eq(#seen, 3, "our own set is not reported")
     T.eq(w:flag_check(G2), true, "applied")
     T.eq(world.flag_groups[2].words[1], 0x80000000, "bit 31 of the second group")
-    mock.game_set_flag(G1, false)
-    T.eq(seen[2][2], false, "clears are reported too")
     T.eq(world.watch_calls, nil, "the flag watcher decoy was never called")
+    -- A trigger-kind flag fires once: reported as a pulse, and fired here as one.
+    local G3 = "33333333-2222-3333-4444-555555555555"
+    mock.add_flag(G3, 1, 9, { kind = 16 })
+    mock.game_pulse_flag(G3)
+    T.eq(seen[4][1], G3, "pulse reported")
+    T.eq(seen[4][3], true, "as a pulse")
+    T.check(w:flag_pulse(G3), "fired here")
+    T.eq(world.pulses[#world.pulses], G3, "through setTrigger")
+    T.eq(#seen, 4, "our own pulse is not reported")
+    -- Common flags (outside the scenario groups) come through their own handler.
+    local G4 = "44444444-2222-3333-4444-555555555555"
+    mock.add_flag(G4, 2, 3, { common = true })
+    mock.game_set_flag(G4, true)
+    T.eq(seen[5][1], G4, "common flag reported")
 end)
 
 T.run("flag_hooks_are_idle_without_a_partner_and_never_flood", function()
@@ -76,8 +89,8 @@ T.run("flag_hooks_are_idle_without_a_partner_and_never_flood", function()
     mock.game_set_flag(G1, true)
     T.eq(seen, 0, "no partner: the hook does nothing")
     w:set_active(true)
-    for i = 1, 500 do mock.game_set_flag(G1, i % 2 == 0) end -- a game re-setting a flag every frame
-    T.eq(seen, 400, "at most 400 setter calls a second are read")
+    for i = 1, 900 do mock.game_set_flag(G1, i % 2 == 0) end -- a game flipping a flag every frame
+    T.eq(seen, 400, "at most 400 change events a second are read")
     T.eq(w:flag_hooks_active(), false, "word diffs take over meanwhile")
     T.check(game:capabilities().flag_hooks.detail:find("busy") ~= nil, "shown in Diagnostics")
     world.now = 6
@@ -86,7 +99,7 @@ T.run("flag_hooks_are_idle_without_a_partner_and_never_flood", function()
     T.eq(seen, 401, "and report again")
 end)
 
-T.run("flag_words_snapshot_and_full_apply", function()
+T.run("flag_words_snapshot_full_apply_and_live_bits", function()
     local w, _, world = fresh()
     world.flag_groups[1].words = { 7, 8, 9, 10 }
     local snap = w:flag_words_snapshot()
@@ -96,17 +109,20 @@ T.run("flag_words_snapshot_and_full_apply", function()
         "full apply")
     T.eq(world.flag_groups[1].words[3], 0xFFFFFFFF, "word written back through loadGameSaveData")
     T.eq(world.flag_groups[1].words[1], 1, "first word")
-    -- Live word changes reload the whole flag table: experimental, off by default.
-    w:flag_words_apply("Chapter", 0, 0x10, 0)
+    -- Live word changes go flag by flag (no table reload while playing): bits turning on only.
+    local seen = 0
+    w:install_hooks({ on_flag = function() seen = seen + 1 end })
+    world.flag_groups[2].words = { 0, 0 }
+    mock.game_set_flag(G1, true)
+    seen = 0
+    local loads = world.flag_loads
+    w:flag_words_apply("Chapter", 0, 0x80000000, 0)
+    w:flag_words_apply("Main", 0, 0, 0x20)
     w:update()
-    T.eq(world.flag_groups[2].words[1], 0, "not applied while the experimental switch is off")
-    T.eq(w.table_reloads_skipped, 1, "counted")
-    w.game.settings.exp_table_reload = true
-    w:flag_words_apply("Chapter", 0, 0x10, 0)
-    w:flag_words_apply("Main", 1, 0, 0x2)
-    w:update()
-    T.eq(world.flag_groups[2].words[1], 0x10, "queued set applied")
-    T.eq(world.flag_groups[1].words[2], 0, "queued clear applied")
+    T.eq(world.flag_groups[2].words[1], 0x80000000, "bit 31 of Chapter turned on through its variable")
+    T.eq(mock.flag_value(G1), true, "a clear from the partner is never applied")
+    T.eq(world.flag_loads, loads, "no flag table reload")
+    T.eq(seen, 0, "and not reported back")
 end)
 
 T.run("gimmick_table_snapshot_and_apply", function()
@@ -121,20 +137,28 @@ T.run("gimmick_table_snapshot_and_apply", function()
     T.eq(item.detected, true, "detected")
     T.eq(item.acc[1].kind, 1, "float accessory")
     T.eq(item.acc[2].value, 9, "uint accessory")
-    -- Change it and add one the local table does not have yet.
+    -- Change it, and one this game has not set up yet.
     local changed = { ctx = item.ctx, attr = "\9\9\9\9", triggers = { { id = 77, done = 1 }, { id = 78, done = 1 } },
-        detected = false, acc = { { kind = 2, value = 3 } } }
+        detected = false, acc = { { kind = 1, value = 0.75 }, { kind = 1, value = 3 } } }
     local added = { ctx = { category = 1, kind = 1, group = 11, index = 2 }, attr = "\5", triggers = {}, detected = true, acc = {} }
     T.check(w:gimmicks_apply({ changed, added }), "applied")
-    T.eq(world.gimmick_loads, 1, "one load call")
+    T.eq(world.gimmick_loads, nil, "never the game's whole-table load (it clears the manager)")
+    T.eq(world.gimmick_context_loads, 1, "one context loaded the partner's state")
     local g = world.gimmick_table["1:1:10:0"]
     T.eq(#g.attr, 4, "attr resized")
     T.eq(g.attr[1], 9, "attr value")
     T.eq(#g.triggers, 2, "triggers")
     T.eq(g.detected, false, "detected cleared")
-    T.eq(g.acc[1].value, 3, "accessory")
-    T.check(world.gimmick_table["1:1:11:2"] ~= nil, "new record created")
-    T.eq(world.gimmick_table["1:1:11:2"].attr[1], 5, "new record's attr")
+    T.eq(g.acc[1].value, 0.75, "accessory value")
+    T.eq(g.acc[2].value, 9, "an accessory of another kind here stays ours")
+    T.eq(w.counters.gimmicks_waiting, 1, "the other one waits for its gimmick")
+    -- Its area loads: the gimmick is set up and takes the partner's state.
+    world.gimmick_contexts["1:1:11:2"] = true
+    world.now = (world.now or 0) + 5
+    w:update()
+    T.check(world.gimmick_table["1:1:11:2"] ~= nil, "applied once set up")
+    T.eq(world.gimmick_table["1:1:11:2"].attr[1], 5, "its attr")
+    T.eq(w.counters.gimmicks_waiting, 0, "nothing waits")
 end)
 
 T.run("large_gimmick_tables_are_read_over_several_frames", function()
@@ -268,23 +292,232 @@ T.run("animals_the_host_reads_and_the_client_follows", function()
     T.eq(w:animal_puppet(C2.owner.guid, true), false, "and cannot become a puppet")
 end)
 
-T.run("cutscene_hooks_play_and_current_id", function()
+T.run("cutscenes_are_read_and_played_as_the_games_own_payload", function()
     local w, _, world = fresh()
     local seen = {}
-    w:install_hooks({ on_cutscene = function(id, m) seen[#seen + 1] = { id, m } end })
-    mock.start_cutscene(10157)
+    w:install_hooks({ on_cutscene = function(ev) seen[#seen + 1] = ev end })
+    -- The game plays a story cutscene "once": its PayloadPlay goes through procPayloadPlay.
+    mock.start_cutscene(10157, { screen = 3, start_flags = { { group = 0, index = 5 } },
+        end_flags = { { group = 1, index = 31 } }, owner = 0x1234, end_portrayal = 0xABCD })
     T.eq(#seen, 1, "the game's cutscene reported")
-    T.eq(seen[1][1], 10157, "id")
-    T.eq(seen[1][2], "requestPlay", "method")
-    T.eq(w:cutscene_playing(), 10157, "current id read")
-    world.timeline_preloads = world.preloaded_events
-    world.singletons["chainsaw.TimelineEventManager"]:call("requestPreloadPlay", 20130)
-    T.eq(#seen, 1, "a preload is not reported")
+    local ev = seen[1]
+    T.eq(ev.camera, P.CAMERA.TIMELINE, "timeline camera")
+    T.eq(ev.id, 10157, "id")
+    T.eq(ev.screen, 3, "screen")
+    T.eq(ev.owner_code, 0x1234, "data owner")
+    T.eq(ev.end_portrayal, 0xABCD, "next scripted step")
+    T.eq(#ev.start_flags, 1, "start flag")
+    T.eq(ev.start_flags[1].group, 0, "group")
+    T.eq(ev.start_flags[1].index, 5, "index")
+    T.eq(ev.end_flags[1].index, 31, "end flag")
+    T.eq(w:cutscene_playing(), true, "playing")
+    T.eq(w:cutscene_done(1, 10157), true, "recorded as seen")
+    T.eq(mock.start_cutscene(10157), 0, "the game never plays it twice")
     mock.end_cutscene()
     T.check(w:cutscene_playing() == nil, "not playing")
-    T.check(w:cutscene_play(20130, "requestPlay"), "replayed")
-    T.eq(world.played_events[#world.played_events], 20130, "the game played it")
-    T.eq(#seen, 1, "our replay is not reported as a local trigger")
+    -- The partner's cutscene: the same payload through our own procPayloadPlay.
+    T.eq(w:cutscene_done(1, 20130), false, "not seen yet")
+    local ok = w:cutscene_play({ camera = 1, id = 20130, screen = 3, owner_code = 0x55, end_portrayal = 0x77,
+        start_flags = { { group = 1, index = 31 } }, end_flags = { { group = 0, index = 5 } } })
+    T.check(ok, "played")
+    local rec = world.played[#world.played]
+    T.eq(rec.id, 20130, "the game played it")
+    T.eq(rec.screen, 3, "on the same screen")
+    T.eq(rec.owner, 0x55, "with the same data owner")
+    T.eq(rec.end_portrayal, 0x77, "and next step")
+    T.eq(rec.start_flags[1].index, 31, "start flags as FlagInfo[]")
+    T.eq(rec.end_flags[1].index, 5, "end flags as FlagInfo[]")
+    T.eq(world.flag_groups[2].words[1], 0x80000000, "our game set its own start flag")
+    T.eq(#seen, 1, "our replay is not reported as a local cutscene")
+    T.eq(w:cutscene_done(1, 20130), true, "now seen here too")
+    mock.end_cutscene()
+    -- A movie keeps where it puts the players.
+    T.check(w:cutscene_play({ camera = 2, id = 5, coords = { { kind = 1, pos = { x = 3, y = 0, z = 0 }, rot_y = 1.5,
+        reset_camera = true } } }), "movie played")
+    rec = world.played[#world.played]
+    T.eq(rec.camera, 2, "movie")
+    T.eq(rec.coords[1].kind, 1, "player kind")
+    T.near(rec.coords[1].x, 3, 1e-6, "position")
+    T.near(rec.coords[1].rot_y, 1.5, 1e-6, "facing")
+end)
+
+T.run("cutscene_skips_are_seen_and_applied_like_the_skip_button", function()
+    local w, game, world = fresh()
+    local skips = {}
+    w:install_hooks({ on_cutscene_skip = function(ev) skips[#skips + 1] = ev end })
+    w:set_active(true)
+    T.eq(game:capabilities().cutscene_skips.ok, true, "PlayWork skip fields found")
+    -- Our player skips a cutscene: reported once.
+    mock.start_cutscene(100)
+    mock.press_skip()
+    mock.update_cutscene_skip() -- procSkip: DoneSkip
+    w:update()
+    w:update()
+    T.eq(#skips, 1, "reported once")
+    T.eq(skips[1].camera, 1, "camera type")
+    T.eq(skips[1].id, 100, "camera id")
+    mock.update_cutscene_skip() -- it ends after its fade
+    T.eq(world.current_cutscene, nil, "over")
+    -- The partner's skip here: through the same input, and not reported back.
+    mock.start_cutscene(200)
+    T.eq(w:cutscene_skip(1, 999), "missing", "not that cutscene")
+    T.eq(w:cutscene_skip(1, 200), "skipped", "skip requested")
+    mock.update_cutscene_skip()
+    w:update()
+    mock.update_cutscene_skip()
+    T.eq(world.skips, 2, "skipped by the game")
+    T.eq(#skips, 1, "our application is not reported")
+    -- A cutscene the game does not let skip keeps playing.
+    world.unskippable = true
+    mock.start_cutscene(300)
+    w:cutscene_skip(1, 300)
+    mock.update_cutscene_skip()
+    mock.update_cutscene_skip()
+    T.check(world.current_cutscene ~= nil, "still playing")
+end)
+
+T.run("doors_are_read_and_held_open_for_the_partner", function()
+    local w, game, world = fresh()
+    T.eq(game:capabilities().doors.ok, true, "GmDoor keep-open slots found")
+    local GD = "dddddddd-1111-0000-0000-000000000001"
+    local door = mock.make_door(GD, { x = 3, y = 0, z = 0 })
+    mock.make_door("dddddddd-1111-0000-0000-000000000002", { x = 300, y = 0, z = 0 }) -- far away
+    local near = w:doors_near({ x = 0, y = 0, z = 0 }, 25)
+    T.check(near[GD] ~= nil, "the near door")
+    T.eq(near["dddddddd-1111-0000-0000-000000000002"], nil, "not the far one")
+    T.eq(near[GD].open, false, "closed")
+    -- Our player opens it and stands in it.
+    mock.player_at_door(door, true)
+    mock.update_doors()
+    world.now = 5 -- a later look
+    near = w:doors_near({ x = 0, y = 0, z = 0 }, 25)
+    T.eq(near[GD].open, true, "open")
+    T.eq(near[GD].hold, true, "held by our player")
+    T.eq(near[GD].attr & 1, 1, "open bit")
+    mock.player_at_door(door, false)
+    mock.update_doors()
+    T.eq(door.__fields._Routine, 0, "it closes once we walk on")
+    -- The partner opens it in their game and stands in it: it opens here and stays open.
+    T.eq(w:door_apply(GD, { open = true, hold = true, attr = 3 }), "done", "applied")
+    mock.update_doors()
+    T.eq(door.__fields._Routine, 1, "opened here")
+    T.eq(door.ctx.attr[1], 3, "with the partner's side")
+    for _ = 1, 5 do mock.update_doors() end
+    T.eq(door.__fields._Routine, 1, "and held open by the Guest slot")
+    -- They walk on: it closes here too.
+    w:door_apply(GD, { open = true, hold = false, attr = 3 })
+    mock.update_doors()
+    T.eq(door.__fields._Routine, 0, "closed")
+    -- A partner holding a door when the session ends never leaves it stuck open.
+    w:door_apply(GD, { open = true, hold = true, attr = 1 })
+    mock.update_doors()
+    w:doors_release()
+    mock.update_doors()
+    T.eq(door.__fields._Routine, 0, "released")
+    T.eq(w:door_apply("dddddddd-1111-0000-0000-0000000000ff", { open = true }), "missing", "not loaded here")
+end)
+
+T.run("automatic_and_big_doors_are_held_open_for_the_partner", function()
+    local w, _, world = fresh()
+    local GA, GE, GB = "dddddddd-2222-0000-0000-000000000001", "dddddddd-2222-0000-0000-000000000002",
+        "dddddddd-2222-0000-0000-000000000003"
+    local auto = mock.make_auto_door(GA, { x = 2, y = 0, z = 0 })
+    local elevator = mock.make_auto_door(GE, { x = 4, y = 0, z = 0 }, "chainsaw.GmElevatorDoor")
+    local big = mock.make_big_door(GB, { x = 6, y = 0, z = 0 })
+    local origin = { x = 0, y = 0, z = 0 }
+    local near = w:doors_near(origin, 25)
+    T.check(near[GA] and near[GE] and near[GB], "all three kinds found")
+    -- Our player walks through the automatic door: it opens and we hold it.
+    auto.sensor = true
+    mock.update_doors()
+    world.now = 3
+    near = w:doors_near(origin, 25)
+    T.eq(near[GA].open, true, "automatic door open")
+    T.eq(near[GA].hold, true, "held by our player")
+    auto.sensor = false
+    -- The partner walks into the elevator door in their game: ours opens and stays open.
+    w:door_apply(GE, { open = true, hold = true })
+    for _ = 1, 30 do
+        w:update()
+        mock.update_doors()
+    end
+    T.eq(elevator.__fields._Rno0, 1, "elevator door held open for the partner (3 s)")
+    near = w:doors_near(origin, 25)
+    T.eq(near[GE].hold, false, "and never reported back as held by us")
+    w:door_apply(GE, { open = true, hold = false })
+    for _ = 1, 15 do
+        w:update()
+        mock.update_doors()
+    end
+    T.eq(elevator.__fields._Rno0, 0, "closes after its wait once they left")
+    -- A big double door open in both games: the partner close to it keeps ours open.
+    big.__fields._Routine = 3
+    w:door_apply(GB, { open = true, hold = true })
+    mock.update_doors()
+    T.eq(big.__fields._Routine, 3, "big door held open")
+    T.eq(big.__fields.IsAnyOneCloseToDoor, 1, "through its 'someone close' count")
+    T.eq(w:doors_near(origin, 25)[GB].hold, false, "not reported back as ours")
+    w:door_apply(GB, { open = true, hold = true })
+    T.eq(big.__fields.IsAnyOneCloseToDoor, 1, "counted once")
+    w:doors_release()
+    mock.update_doors()
+    T.eq(big.__fields.IsAnyOneCloseToDoor, 0, "released when the partner leaves")
+    T.eq(big.__fields._Routine, 0, "and it closes")
+end)
+
+T.run("event_triggers_are_reported_and_run_with_our_player", function()
+    local w, game, world = fresh()
+    game:read_player_state() -- knows our player's GameObjects
+    local reported = {}
+    w:install_hooks({ on_trigger = function(ev) reported[#reported + 1] = ev end })
+    local GT = "cccccccc-0000-0000-0000-000000000001"
+    local ran = {}
+    local t = mock.make_trigger(GT, "Area_VillageAmbush", { components = { "chainsaw.GmPortrayalAreaHit",
+        "chainsaw.SetFlagSettings" }, process = function(target) ran[#ran + 1] = target end })
+    -- Our player walks in: the interaction update marks it done and runs it.
+    T.check(mock.activate_trigger(t, world.player.body), "the game ran it")
+    w:update()
+    T.eq(#reported, 1, "reported")
+    T.eq(reported[1].guid, GT, "by its GameObject's GUID")
+    T.eq(reported[1].hash, mock.name_hash("Area_VillageAmbush"), "and its name hash")
+    T.eq(reported[1].once, true, "play once")
+    T.eq(reported[1].head, false, "set off by the body")
+    -- Not reported: an NPC setting it off, a key trigger, gimmicks that are not pure events.
+    local t2 = mock.make_trigger("cccccccc-0000-0000-0000-000000000002", "Area_Other", { once = false })
+    mock.activate_trigger(t2, mock.make_go("ch2a1z0_body"))
+    local door = mock.make_trigger("cccccccc-0000-0000-0000-000000000003", "Door_Open", { key = true,
+        components = { "chainsaw.GmDoorBase" } })
+    mock.activate_trigger(door, world.player.body)
+    local pit = mock.make_trigger("cccccccc-0000-0000-0000-000000000004", "Area_Pitfall", {
+        components = { "chainsaw.GmPortrayalAreaHit", "chainsaw.GmPitfall" } })
+    mock.activate_trigger(pit, world.player.body)
+    local death = mock.make_trigger("cccccccc-0000-0000-0000-000000000005", "Area_FallDeath", {
+        components = { "chainsaw.GmPortrayalAreaHit", "chainsaw.PortrayalSettings" }, callees = { "chainsaw.PlDieSettings.Param" } })
+    mock.activate_trigger(death, world.player.body)
+    local item = mock.make_trigger("cccccccc-0000-0000-0000-000000000006", "Area_GiveKey", {
+        components = { "chainsaw.GmPortrayalAreaHit", "chainsaw.InventorySettings" } })
+    mock.activate_trigger(item, world.player.body)
+    w:update()
+    T.eq(#reported, 1, "only the pure event")
+    T.eq(w.counters.trigger_not_event, 3, "a trap, a deadly portrayal and an item hand-out ruled out")
+
+    -- The partner's trigger here: found by GUID and name hash, marked done, run with our player.
+    t.trigger.__fields["<Done>k__BackingField"] = 0
+    ran = {}
+    T.eq(w:trigger_run(reported[1]), "run", "run")
+    T.eq(ran[1], world.player.body, "with our player")
+    T.eq(t.trigger.__fields["<Done>k__BackingField"], 1, "marked done the way the game marks it")
+    T.eq(#reported, 1, "our run is not reported back")
+    T.eq(w:trigger_run(reported[1]), "done", "never twice")
+    -- Whatever the partner sends, our game only runs what is an event trigger here too.
+    item.trigger.__fields["<Done>k__BackingField"] = 0
+    T.eq(w:trigger_run({ guid = "cccccccc-0000-0000-0000-000000000006", hash = mock.name_hash("Area_GiveKey") }),
+        "refused", "an item hand-out is refused")
+    T.eq(item.trigger.__fields["<Done>k__BackingField"], 0, "and left as it was")
+    door.trigger.__fields["<Done>k__BackingField"] = 0
+    T.eq(w:trigger_run({ guid = "cccccccc-0000-0000-0000-000000000003", hash = mock.name_hash("Door_Open") }),
+        "refused", "a key trigger is refused")
+    T.eq(w:trigger_run({ guid = "cccccccc-0000-0000-0000-0000000000ff", hash = 1 }), "missing", "not loaded here")
 end)
 
 T.run("location_preload_warp_and_fallback", function()
@@ -352,7 +585,8 @@ T.run("missing_world_types_disable_features_quietly", function()
     T.check(w:flag_check(G1) == nil, "check unknown")
     T.check(w:flag_words_snapshot() == nil, "no snapshot")
     T.check(w:gimmicks_snapshot() == nil, "no gimmicks")
-    T.eq(w:cutscene_play(1, "x"), false, "no replay")
+    T.eq(w:cutscene_play({ camera = 1, id = 1 }), false, "no replay")
+    T.eq(w:trigger_run({ guid = G1, hash = 1 }), "missing", "no triggers")
     T.eq(w:arm_chapter_switch(21200), false, "no chapter switch")
     w:install_hooks({})
     T.eq(caps.flag_hooks.ok, false, "no hooks")

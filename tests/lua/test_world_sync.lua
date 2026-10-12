@@ -1,11 +1,13 @@
--- Flag, gimmick, object and cutscene synchronisation between two simulated games (host and
--- client), every message going through the real protocol encoder/decoder.
+-- Flag, gimmick, object, cutscene and event trigger synchronisation between two simulated
+-- games (host and client), every message going through the real protocol encoder/decoder.
 local T = require("testlib")
 local P = require("re4coop.protocol")
 local FlagSync = require("re4coop.flag_sync")
 local GimmickSync = require("re4coop.gimmick_sync")
 local ObjectSync = require("re4coop.object_sync")
 local CutsceneSync = require("re4coop.cutscene_sync")
+local TriggerSync = require("re4coop.trigger_sync")
+local DoorSync = require("re4coop.door_sync")
 
 local function guid(i)
     return ("%08x-1111-2222-3333-%012x"):format(i, i)
@@ -14,20 +16,32 @@ end
 -- A fake game world implementing the world adapter contracts.
 local function make_world(name)
     local w = { name = name, flags = {}, set_calls = 0, hooks_active = true, groups = { Main = { 0, 0, 0 }, Side = { 0 } },
-        gimmicks = {}, objects = {}, stage = 100, playing = nil, played = {}, applied_objects = {} }
+        gimmicks = {}, objects = {}, stage = 100, playing = nil, played = {}, done = {}, own = {}, applied_objects = {},
+        pulses = {}, triggers = {}, trigger_log = {} }
 
-    -- Flags by GUID. The setter "fires the game's hook", like requestSetFlag would.
+    -- Flags by GUID. Like the game's setters, a set runs the change event (and so the hook);
+    -- only flags turning on (or pulsing) are reported, as the adapter does.
     function w:flag_set(g, v)
         self.set_calls = self.set_calls + 1
+        local was = self.flags[g]
         self.flags[g] = v
-        if self.on_flag then self.on_flag(g, v) end
+        if self.on_flag and v and not was then self.on_flag(g, true) end
+        return true
+    end
+    function w:flag_pulse(g)
+        self.pulses[#self.pulses + 1] = g
+        if self.on_flag then self.on_flag(g, true, true) end
         return true
     end
     function w:flag_check(g) return self.flags[g] or false end
     function w:flag_hooks_active() return self.hooks_active end
     function w:game_sets_flag(g, v) -- the game itself
+        local was = self.flags[g]
         self.flags[g] = v
-        if self.on_flag then self.on_flag(g, v) end
+        if self.on_flag and (v or was) then self.on_flag(g, v) end
+    end
+    function w:game_pulses_flag(g)
+        if self.on_flag then self.on_flag(g, true, true) end
     end
 
     -- Flag words.
@@ -41,7 +55,7 @@ local function make_world(name)
     function w:flag_words_apply(group, word, set, clear)
         local g = self.groups[group]
         if g == nil or g[word + 1] == nil then return false end
-        g[word + 1] = (g[word + 1] | set) & ~clear
+        g[word + 1] = g[word + 1] | set -- like the adapter: bits turning on only
         return true
     end
     function w:flag_words_apply_full(groups)
@@ -106,13 +120,54 @@ local function make_world(name)
         return "done"
     end
 
-    -- Cutscenes.
+    -- Cutscenes: the game plays a "play once" cutscene through its PayloadPlay; our replays
+    -- of the partner's payloads are not reported (the adapter's hook knows its own calls).
+    local function key(ev) return (ev.camera or 1) .. ":" .. ev.id end
     function w:cutscene_playing() return self.playing end
-    function w:cutscene_play(id, method)
-        self.played[#self.played + 1] = { id = id, method = method }
-        self.playing = id
-        if self.on_cutscene then self.on_cutscene(id, method) end -- the hook fires on our own call
+    function w:cutscene_done(camera, id) return self.done[(camera or 1) .. ":" .. id] == true end
+    function w:cutscene_play(ev)
+        if self.refuse_cutscenes then return false, "refused" end
+        self.played[#self.played + 1] = ev
+        self.playing, self.playing_key = true, key(ev)
+        self.done[key(ev)] = true
         return true
+    end
+    function w:game_plays_cutscene(ev) -- the game itself (a trigger, a gimmick...)
+        if self.done[key(ev)] then return false end
+        self.own[#self.own + 1] = ev
+        self.playing, self.playing_key = true, key(ev)
+        self.done[key(ev)] = true
+        if self.on_cutscene then self.on_cutscene(ev) end
+        return true
+    end
+    -- Skips: the game skips the playing camera (InputSkip) unless it cannot be skipped.
+    function w:cutscene_skip(camera, id)
+        if not self.playing or self.playing_key ~= (camera or 1) .. ":" .. id then return "missing" end
+        self.skips = self.skips or {}
+        self.skips[#self.skips + 1] = self.playing_key
+        self.playing, self.playing_key = nil, nil
+        return "skipped"
+    end
+    function w:player_skips() -- our player skips the playing cutscene
+        local k = self.playing_key
+        self.playing, self.playing_key = nil, nil
+        local camera, id = k:match("^(%d+):(%d+)$")
+        if self.on_skip then self.on_skip({ camera = tonumber(camera), id = tonumber(id) }) end
+    end
+
+    -- Level triggers: { [guid..":"..hash] = { once, done, runs, not_event } } loaded here.
+    function w:add_trigger(g, hash, once, not_event)
+        self.triggers[g .. ":" .. hash] = { once = once ~= false, done = false, runs = 0, not_event = not_event }
+    end
+    function w:trigger_run(ev)
+        local t = self.triggers[ev.guid .. ":" .. ev.hash]
+        if t == nil then return "missing" end
+        if t.once and t.done then return "done" end
+        if t.not_event then return "refused" end
+        t.done = t.once
+        t.runs = t.runs + 1
+        self.trigger_log[#self.trigger_log + 1] = "run " .. ev.guid
+        return "run"
     end
 
     return w
@@ -148,8 +203,8 @@ end
 
 local function flag_pair(settings)
     local pair = make_pair(FlagSync, settings)
-    pair.host_world.on_flag = function(g, v) pair.host:on_local_flag(g, v, pair.now) end
-    pair.client_world.on_flag = function(g, v) pair.client:on_local_flag(g, v, pair.now) end
+    pair.host_world.on_flag = function(g, v, pulse) pair.host:on_local_flag(g, v, pair.now, pulse) end
+    pair.client_world.on_flag = function(g, v, pulse) pair.client:on_local_flag(g, v, pair.now, pulse) end
     pair.tick = function(p)
         p.host:tick(p.now, p.host_world)
         p.client:tick(p.now, p.client_world)
@@ -170,18 +225,58 @@ T.run("flags_replicate_both_ways_without_echo", function()
     T.eq(pair.host.counters.sent + pair.client.counters.sent, 2, "nothing bounces back later")
 end)
 
-T.run("flags_clear_and_repeated_sets", function()
+T.run("flags_only_ever_travel_on", function()
     local pair = flag_pair()
     pair.host_world:game_sets_flag(guid(3), true)
     pair:step(3, pair.tick)
+    T.eq(pair.client_world.flags[guid(3)], true, "on replicated")
+    -- The host's game goes back to a checkpoint: its flags go off. The client's stay.
     pair.host_world:game_sets_flag(guid(3), false)
     pair:step(3, pair.tick)
-    T.eq(pair.client_world.flags[guid(3)], false, "clear replicated")
+    T.eq(pair.client_world.flags[guid(3)], true, "a reload never undoes the partner's world")
+    -- ...and when the host's game sets it again, it is news again (but already set here).
     local applied = pair.client.counters.applied
-    pair.host_world:flag_set(guid(9), true)
-    pair.client_world.flags[guid(9)] = true -- partner already has it
+    pair.host_world:game_sets_flag(guid(3), true)
     pair:step(3, pair.tick)
+    T.eq(pair.host.counters.sent, 2, "sent again after it went off and on")
     T.eq(pair.client.counters.applied, applied, "no redundant set when equal")
+end)
+
+T.run("pulsed_flags_fire_in_the_partners_game", function()
+    local pair = flag_pair()
+    pair.host_world:game_pulses_flag(guid(4)) -- a trigger-kind flag fires
+    pair:step(3, pair.tick)
+    T.eq(pair.client_world.pulses[1], guid(4), "fired there")
+    T.eq(pair.client.counters.pulses, 1, "counted")
+    T.eq(pair.client.counters.sent, 0, "not fired back")
+    pair.now = pair.now + 6
+    pair.host_world:game_pulses_flag(guid(4))
+    pair:step(3, pair.tick)
+    T.eq(#pair.client_world.pulses, 2, "every time it fires")
+end)
+
+T.run("partner_flags_wait_while_their_cutscene_plays_here", function()
+    local pair = flag_pair()
+    pair.client:hold(pair.now)
+    pair.host_world:game_sets_flag(guid(11), true) -- the host's cutscene ended: its end flag
+    pair:step(3, pair.tick)
+    T.eq(pair.client_world.flags[guid(11)], nil, "held while our copy of the cutscene plays")
+    T.eq(pair.client:summary().holding, 1, "shown as waiting")
+    pair.client:release(pair.now, pair.client_world)
+    T.eq(pair.client_world.flags[guid(11)], true, "applied when it ended")
+    -- A hold never lasts forever.
+    pair.client:hold(pair.now, 1)
+    pair.host_world:game_sets_flag(guid(12), true)
+    pair:step(30, pair.tick)
+    T.eq(pair.client_world.flags[guid(12)], true, "released by the timeout")
+    -- A hold that runs out just as more flags arrive: the waiting ones first, none forgotten.
+    pair.client:hold(pair.now, 1)
+    pair.client:on_flags({ flags = { { guid = guid(13), value = true } } }, pair.now, pair.client_world)
+    pair.now = pair.now + 2
+    pair.client:on_flags({ flags = { { guid = guid(14), value = true } } }, pair.now, pair.client_world)
+    T.eq(pair.client_world.flags[guid(13)], true, "the held flag applied")
+    T.eq(pair.client_world.flags[guid(14)], true, "and the new one")
+    T.eq(pair.client:summary().holding, nil, "nothing left waiting")
 end)
 
 T.run("repeated_sets_of_the_same_value_are_not_resent", function()
@@ -196,17 +291,19 @@ end)
 
 T.run("oscillating_flags_are_muted", function()
     local pair = flag_pair()
-    for i = 1, 12 do
+    for i = 1, 16 do
         pair.host_world:game_sets_flag(guid(5), i % 2 == 0)
         pair:step(2, pair.tick)
     end
     T.check(pair.host.counters.muted >= 1, "flag muted after flapping")
     local sent = pair.host.counters.sent
+    pair.host_world:game_sets_flag(guid(5), false)
     pair.host_world:game_sets_flag(guid(5), true)
     pair:step(2, pair.tick)
     T.eq(pair.host.counters.sent, sent, "muted flag not sent")
     pair.now = pair.now + 61
     pair.host_world:game_sets_flag(guid(5), false)
+    pair.host_world:game_sets_flag(guid(5), true)
     pair:step(2, pair.tick)
     T.eq(pair.host.counters.sent, sent + 1, "unmuted after the mute time")
 end)
@@ -245,9 +342,9 @@ T.run("word_deltas_when_setter_hooks_are_missing", function()
     local sent = pair.host.counters.words_sent + pair.client.counters.words_sent
     pair:step(20, pair.tick)
     T.eq(pair.host.counters.words_sent + pair.client.counters.words_sent, sent, "no echo")
-    pair.host_world.groups.Main[2] = 0x4 -- clear bit 0
+    pair.host_world.groups.Main[2] = 0x4 -- clear bit 0 (the host reloaded)
     pair:step(10, pair.tick)
-    T.eq(pair.client_world.groups.Main[2], 0x4, "cleared bit arrived")
+    T.eq(pair.client_world.groups.Main[2], 0x5, "a cleared bit is never applied")
 end)
 
 -------------------------------------------------------------------------------
@@ -484,14 +581,22 @@ local function cutscene_pair()
     pair.travel = { requests = {}, busy_flag = false }
     function pair.travel:request(t) self.requests[#self.requests + 1] = t self.busy_flag = true return true end
     function pair.travel:busy() return self.busy_flag end
+    pair.replays = {}
+    local function on_replay(who) return function(started) pair.replays[#pair.replays + 1] = { who, started } end end
+    pair.host = CutsceneSync.new({ role = "host", protocol = P, settings = {}, on_replay = on_replay("host"),
+        send = function(b) table.insert(pair.to_client, b) end })
+    pair.client = CutsceneSync.new({ role = "client", protocol = P, settings = {}, on_replay = on_replay("client"),
+        send = function(b) table.insert(pair.to_host, b) end })
     pair.deliver = function(self)
         local tc, th = self.to_client, self.to_host
         self.to_client, self.to_host = {}, {}
         for _, b in ipairs(tc) do self.client:on_message(assert(P.decode(b)), self.now) end
         for _, b in ipairs(th) do self.host:on_message(assert(P.decode(b)), self.now) end
     end
-    pair.host_world.on_cutscene = function(id, m) pair.host:on_local_start(id, m, pair.now, pair.host_loc) end
-    pair.client_world.on_cutscene = function(id, m) pair.client:on_local_start(id, m, pair.now, pair.client_loc) end
+    pair.host_world.on_cutscene = function(ev) pair.host:on_local_start(ev, pair.now, pair.host_loc) end
+    pair.client_world.on_cutscene = function(ev) pair.client:on_local_start(ev, pair.now, pair.client_loc) end
+    pair.host_world.on_skip = function(ev) pair.host:on_local_skip(ev, pair.now) end
+    pair.client_world.on_skip = function(ev) pair.client:on_local_skip(ev, pair.now) end
     pair.tick = function(p)
         p.host:tick(p.now, p.host_world, p.host_loc, p.travel)
         p.client:tick(p.now, p.client_world, p.client_loc, p.travel)
@@ -499,48 +604,384 @@ local function cutscene_pair()
     return pair
 end
 
+local CHURCH = { camera = 1, id = 20130, screen = 3, owner_code = 0x1234, end_portrayal = 0xAB,
+    start_flags = { { group = 0, index = 5 } }, end_flags = { { group = 2, index = 9 } } }
+
 T.run("cutscene_plays_for_both_once", function()
     local pair = cutscene_pair()
-    pair.host_world:cutscene_play(10157, "requestPlay") -- host walks into the trigger
-    pair:step(5, pair.tick)
+    pair.host_world:game_plays_cutscene({ camera = 1, id = 10157 }) -- host walks into the trigger
+    pair:step(25, pair.tick)
     T.eq(#pair.client_world.played, 1, "client plays it")
     T.eq(pair.client_world.played[1].id, 10157, "same cutscene")
-    T.eq(pair.client_world.played[1].method, "requestPlay", "same method")
     T.eq(pair.host.counters.sent, 1, "host announced once")
     T.eq(pair.client.counters.sent, 0, "client's replay is not announced back")
-    T.eq(#pair.host_world.played, 1, "host not asked to replay its own cutscene")
+    T.eq(#pair.host_world.played, 0, "host not asked to replay its own cutscene")
+end)
+
+T.run("the_partners_payload_plays_here_whole", function()
+    local pair = cutscene_pair()
+    pair.host_world:game_plays_cutscene(CHURCH)
+    pair:step(25, pair.tick)
+    local ev = pair.client_world.played[1]
+    T.check(ev ~= nil, "played")
+    T.eq(ev.screen, 3, "same screen")
+    T.eq(ev.owner_code, 0x1234, "same data owner (continues its scripted sequence here)")
+    T.eq(ev.end_portrayal, 0xAB, "same next step")
+    T.eq(ev.start_flags[1].index, 5, "start flags (set by our copy)")
+    T.eq(ev.end_flags[1].group, 2, "end flags (set by our copy when it ends)")
+    T.eq(pair.replays[1][1], "client", "the session hears the replay start (partner flags wait)")
+    T.eq(pair.replays[1][2], true, "started")
+    pair.client_world.playing = nil -- it ends here
+    pair:step(2, pair.tick)
+    T.eq(pair.replays[2][2], false, "and end (partner flags go through)")
 end)
 
 T.run("cutscene_triggered_by_both_is_one_cutscene", function()
     local pair = cutscene_pair()
-    pair.host_world:cutscene_play(20130, "requestPlay")
-    pair.client_world:cutscene_play(20130, "requestPlay")
-    pair:step(10, pair.tick)
-    T.eq(#pair.host_world.played, 1, "host played it once")
-    T.eq(#pair.client_world.played, 1, "client played it once")
+    pair.host_world:game_plays_cutscene(CHURCH)
+    pair.client_world:game_plays_cutscene(CHURCH)
+    pair:step(25, pair.tick)
+    T.eq(#pair.host_world.played, 0, "host played only its own")
+    T.eq(#pair.client_world.played, 0, "client played only its own")
 end)
 
-T.run("partner_far_away_travels_first", function()
+T.run("a_cutscene_our_game_starts_by_itself_meanwhile_is_not_played_twice", function()
+    local pair = cutscene_pair()
+    pair.host_world:game_plays_cutscene(CHURCH)
+    pair:step(1, pair.tick)
+    -- The host's trigger arrived too and our game started the same cutscene itself.
+    pair.client_world:game_plays_cutscene(CHURCH)
+    pair:step(25, pair.tick)
+    T.eq(#pair.client_world.played, 0, "no second copy")
+end)
+
+T.run("a_cutscene_this_save_already_saw_is_skipped", function()
+    local pair = cutscene_pair()
+    pair.client_world.done["1:20130"] = true
+    pair.host_world:game_plays_cutscene(CHURCH)
+    pair:step(25, pair.tick)
+    T.eq(#pair.client_world.played, 0, "never twice in one save")
+    T.eq(pair.client.counters.already_seen, 1, "counted")
+end)
+
+T.run("partner_far_away_watches_at_once_and_joins_afterwards", function()
     local pair = cutscene_pair()
     pair.client_loc.stage = 200
-    pair.host_world:cutscene_play(20130, "requestPlay")
+    pair.host_world:game_plays_cutscene(CHURCH)
+    pair:step(2, pair.tick) -- 0.1 s
+    T.eq(#pair.client_world.played, 1, "played at once, without travelling first")
+    T.eq(#pair.travel.requests, 0, "no travel before it")
+    pair:step(20, pair.tick)
+    T.eq(#pair.travel.requests, 0, "nor while it plays")
+    pair.client_world.playing = nil -- it ends
+    pair:step(2, pair.tick)
+    T.eq(#pair.travel.requests, 1, "then the client joins the host")
+    T.eq(pair.travel.requests[1].stage, 100, "in the host's stage")
+end)
+
+T.run("partner_nearby_starts_after_a_short_grace", function()
+    local pair = cutscene_pair()
+    pair.host_world:game_plays_cutscene(CHURCH)
+    pair:step(2, pair.tick)
+    T.eq(#pair.client_world.played, 0, "its own game may start it first")
+    pair:step(6, pair.tick) -- 0.4 s
+    T.eq(#pair.client_world.played, 1, "played within a third of a second")
+    pair.client_world.playing = nil
     pair:step(3, pair.tick)
-    T.eq(#pair.travel.requests, 1, "client asked to travel")
-    T.eq(pair.travel.requests[1].stage, 100, "to the host's stage")
-    T.eq(#pair.client_world.played, 0, "not played while travelling")
-    pair.travel.busy_flag = false
-    pair.client_loc.stage = 100
-    pair:step(3, pair.tick)
-    T.eq(#pair.client_world.played, 1, "played after arriving")
+    T.eq(#pair.travel.requests, 0, "no travel: it was there")
 end)
 
 T.run("cutscene_in_another_chapter_is_dropped", function()
     local pair = cutscene_pair()
     pair.client_loc.chapter = 22200
-    pair.host_world:cutscene_play(30000, "requestPlay")
-    pair:step(5, pair.tick)
+    pair.host_world:game_plays_cutscene({ camera = 1, id = 30000 })
+    pair:step(25, pair.tick)
     T.eq(#pair.client_world.played, 0, "not replayed")
     T.eq(pair.client.counters.dropped, 1, "dropped with a reason")
+end)
+
+T.run("a_refused_replay_is_retried_then_dropped", function()
+    local pair = cutscene_pair()
+    pair.client_world.refuse_cutscenes = true
+    pair.host_world:game_plays_cutscene(CHURCH)
+    pair:step(40, pair.tick)
+    T.eq(pair.client.counters.dropped, 1, "dropped after a few tries")
+    T.eq(#pair.replays, 0, "no replay started")
+end)
+
+T.run("skipping_a_cutscene_skips_it_for_both", function()
+    local pair = cutscene_pair()
+    pair.host_world:game_plays_cutscene({ camera = 1, id = 300 })
+    pair:step(30, pair.tick) -- the client plays it too
+    T.eq(pair.client_world.playing_key, "1:300", "both watch it")
+    pair.host_world:player_skips()
+    pair:step(3, pair.tick)
+    T.eq(pair.client_world.skips and pair.client_world.skips[1], "1:300", "skipped in the client's game")
+    T.eq(pair.client.counters.skips_applied, 1, "counted")
+    T.eq(pair.client.counters.skips_sent, 0, "not sent back")
+    T.eq(pair.host.counters.skips_received, 0, "no echo")
+end)
+
+T.run("a_skip_reaches_a_cutscene_that_starts_later", function()
+    local pair = cutscene_pair()
+    pair.client_world.playing = true -- the client's game is busy with another cutscene
+    pair.host_world:game_plays_cutscene({ camera = 1, id = 301 })
+    pair:step(3, pair.tick)
+    pair.host_world:player_skips() -- the host skips before the client's copy started
+    pair:step(3, pair.tick)
+    T.eq(pair.client:summary().skips_waiting, 1, "the skip waits for the cutscene")
+    pair.client_world.playing = nil -- the other one ends
+    pair:step(30, pair.tick)
+    T.eq(#pair.client_world.played, 1, "the client's copy started")
+    T.eq(pair.client_world.skips and pair.client_world.skips[1], "1:301", "and was skipped at once")
+    -- A skip for a cutscene that never plays here is forgotten.
+    pair.client:on_skip({ camera = 1, id = 999 }, pair.now)
+    pair.now = pair.now + 100
+    pair:step(2, pair.tick)
+    T.eq(pair.client:summary().skips_waiting, nil, "forgotten")
+end)
+
+T.run("skips_can_be_switched_off", function()
+    local pair = cutscene_pair()
+    pair.client.settings.sync_skips = false
+    pair.host_world:game_plays_cutscene({ camera = 1, id = 302 })
+    pair:step(30, pair.tick)
+    pair.host_world:player_skips()
+    pair:step(3, pair.tick)
+    T.eq(pair.client_world.skips, nil, "the client watches it to the end")
+end)
+
+-------------------------------------------------------------------------------
+-- Event triggers
+-------------------------------------------------------------------------------
+
+local function trigger_pair(settings)
+    local pair = make_pair(TriggerSync, settings)
+    pair.host_loc = { chapter = 21100, stage = 100, pos = { x = 0, y = 0, z = 0 }, playable = true }
+    pair.client_loc = { chapter = 21100, stage = 100, pos = { x = 5, y = 0, z = 0 }, playable = true }
+    pair.deliver = function(self)
+        local tc, th = self.to_client, self.to_host
+        self.to_client, self.to_host = {}, {}
+        for _, b in ipairs(tc) do self.client:on_message(assert(P.decode(b)), self.now) end
+        for _, b in ipairs(th) do self.host:on_message(assert(P.decode(b)), self.now) end
+    end
+    pair.tick = function(p)
+        p.host:tick(p.now, p.host_world, p.host_loc)
+        p.client:tick(p.now, p.client_world, p.client_loc)
+    end
+    return pair
+end
+
+local AMBUSH = { guid = guid(500), hash = 0xC0FFEE, trigger_type = 1, once = true }
+
+T.run("an_event_trigger_runs_in_the_partners_game_too", function()
+    local pair = trigger_pair()
+    pair.client_world:add_trigger(AMBUSH.guid, AMBUSH.hash, true)
+    pair.host:on_local_trigger(AMBUSH, pair.now, pair.host_loc) -- the host walks into the area
+    pair:step(3, pair.tick)
+    T.eq(pair.client_world.trigger_log[1], "run " .. guid(500), "run in the client's game")
+    T.eq(pair.client.counters.run, 1, "counted")
+    -- The client's own player walks in later: done, nothing happens twice.
+    T.eq(pair.client_world:trigger_run(AMBUSH), "done", "done here now")
+    T.eq(pair.host.counters.sent, 1, "sent once")
+end)
+
+T.run("a_far_partners_game_keeps_the_event_for_when_its_player_gets_there", function()
+    local pair = trigger_pair()
+    pair.client_loc.pos = { x = 200, y = 0, z = 0 }
+    pair.client_world:add_trigger(AMBUSH.guid, AMBUSH.hash, true)
+    pair.host:on_local_trigger(AMBUSH, pair.now, pair.host_loc)
+    pair:step(3, pair.tick)
+    T.eq(#pair.client_world.trigger_log, 0, "not run from 200 m away")
+    pair.now = pair.now + 21
+    pair:step(2, pair.tick)
+    T.eq(pair.client.counters.missed, 1, "missed")
+    local t = pair.client_world.triggers[AMBUSH.guid .. ":" .. AMBUSH.hash]
+    T.eq(t.done, false, "never marked done: the client's game runs it when its player walks in")
+    T.eq(pair.client:summary().queued, 0, "nothing left waiting")
+end)
+
+T.run("a_partner_who_gets_there_in_time_runs_it", function()
+    local pair = trigger_pair()
+    pair.client_loc.stage, pair.client_loc.pos = 300, { x = 200, y = 0, z = 0 }
+    pair.host:on_local_trigger(AMBUSH, pair.now, pair.host_loc)
+    pair:step(10, pair.tick)
+    T.eq(#pair.client_world.trigger_log, 0, "elsewhere")
+    pair.client_loc.stage, pair.client_loc.pos = 100, { x = 10, y = 0, z = 0 } -- the client arrives
+    pair:step(10, pair.tick)
+    T.eq(#pair.client_world.trigger_log, 0, "its area is not loaded yet")
+    pair.client_world:add_trigger(AMBUSH.guid, AMBUSH.hash, true)
+    pair.now = pair.now + 2
+    pair:step(2, pair.tick)
+    T.eq(pair.client_world.trigger_log[1], "run " .. guid(500), "run once loaded")
+end)
+
+T.run("a_trigger_that_is_no_event_in_our_game_is_refused", function()
+    local pair = trigger_pair()
+    pair.client_world:add_trigger(AMBUSH.guid, AMBUSH.hash, true, true)
+    pair.host:on_local_trigger(AMBUSH, pair.now, pair.host_loc)
+    pair:step(3, pair.tick)
+    T.eq(#pair.client_world.trigger_log, 0, "not run")
+    T.eq(pair.client.counters.refused, 1, "refused once, not retried")
+    T.eq(pair.client:summary().queued, 0, "nothing left waiting")
+end)
+
+T.run("a_trigger_without_our_location_is_not_sent", function()
+    local pair = trigger_pair()
+    T.eq(pair.host:on_local_trigger(AMBUSH, pair.now, nil), false, "nowhere")
+    T.eq(pair.host.counters.sent, 0, "not sent")
+end)
+
+T.run("a_partner_in_a_cutscene_runs_the_event_when_playable", function()
+    local pair = trigger_pair()
+    pair.client_loc.playable = false
+    pair.client_world:add_trigger(AMBUSH.guid, AMBUSH.hash, true)
+    pair.host:on_local_trigger(AMBUSH, pair.now, pair.host_loc)
+    pair:step(10, pair.tick)
+    T.eq(#pair.client_world.trigger_log, 0, "waits")
+    pair.client_loc.playable = true
+    pair:step(15, pair.tick)
+    T.eq(pair.client_world.trigger_log[1], "run " .. guid(500), "runs once playable")
+end)
+
+T.run("both_setting_it_off_is_one_event", function()
+    local pair = trigger_pair()
+    pair.host_world:add_trigger(AMBUSH.guid, AMBUSH.hash, true)
+    pair.client_world:add_trigger(AMBUSH.guid, AMBUSH.hash, true)
+    pair.host:on_local_trigger(AMBUSH, pair.now, pair.host_loc)
+    pair.client:on_local_trigger(AMBUSH, pair.now, pair.client_loc)
+    pair:step(5, pair.tick)
+    T.eq(#pair.client_world.trigger_log, 0, "client ran it itself only")
+    T.eq(#pair.host_world.trigger_log, 0, "host ran it itself only")
+    T.eq(pair.host.counters.dupes + pair.client.counters.dupes, 2, "recognised as the same event")
+end)
+
+T.run("another_chapter_drops_it", function()
+    local pair = trigger_pair()
+    pair.client_loc.chapter = 22100
+    pair.client_world:add_trigger(AMBUSH.guid, AMBUSH.hash, true)
+    pair.host:on_local_trigger(AMBUSH, pair.now, pair.host_loc)
+    pair:step(3, pair.tick)
+    T.eq(#pair.client_world.trigger_log, 0, "not applied")
+    T.eq(pair.client.counters.dropped, 1, "dropped")
+end)
+
+-------------------------------------------------------------------------------
+-- Doors
+-------------------------------------------------------------------------------
+
+-- A game's doors as GmDoor behaves: open bit -> opens; closes when neither slot keeps it open.
+local function door_world(loaded)
+    local w = { doors = {} }
+    for _, g in ipairs(loaded) do w.doors[g] = { open = false, attr = 0, host = false, guest = false, pos = { x = 0, y = 0, z = 0 } } end
+    function w:doors_near(pos, radius)
+        local out = {}
+        for g, d in pairs(self.doors) do
+            local dx = d.pos.x - pos.x
+            if math.abs(dx) <= radius then out[g] = { open = d.open, hold = d.host, attr = d.attr } end
+        end
+        return out
+    end
+    function w:door_apply(g, st)
+        local d = self.doors[g]
+        if d == nil then return "missing" end
+        d.guest = st.hold and true or false
+        if st.open and not d.open then d.attr = st.attr | 1 end
+        return "done"
+    end
+    function w:doors_release() for _, d in pairs(self.doors) do d.guest = false end end
+    function w:update() -- the game's door logic
+        for _, d in pairs(self.doors) do
+            if not d.open and (d.attr & 1) ~= 0 then d.open = true
+            elseif d.open and not d.host and not d.guest then d.open, d.attr = false, d.attr & 0xFE end
+        end
+    end
+    return w
+end
+
+local DOOR = guid(700)
+
+local function door_pair()
+    local pair = make_pair(DoorSync)
+    pair.host_world, pair.client_world = door_world({ DOOR }), door_world({ DOOR })
+    pair.host_pos, pair.client_pos = { x = 0, y = 0, z = 0 }, { x = 0, y = 0, z = 0 }
+    pair.tick = function(p)
+        p.host_world:update()
+        p.client_world:update()
+        p.host:tick(p.now, p.host_world, p.host_pos)
+        p.client:tick(p.now, p.client_world, p.client_pos)
+    end
+    return pair
+end
+
+T.run("a_door_opened_by_one_player_opens_and_stays_open_for_both", function()
+    local pair = door_pair()
+    pair:step(4, pair.tick)
+    T.eq(pair.host.counters.sent, 0, "closed doors are not news")
+    -- The client opens the door and walks through it.
+    local cd = pair.client_world.doors[DOOR]
+    cd.host, cd.attr = true, 2 | 1
+    pair:step(6, pair.tick)
+    local hd = pair.host_world.doors[DOOR]
+    T.eq(hd.open, true, "open in the host's game")
+    T.eq(hd.attr & 2, 2, "on the same side")
+    pair:step(40, pair.tick)
+    T.eq(hd.open, true, "and it stays open while the client is in it")
+    T.eq(cd.open, true, "the client's too")
+    -- The client walks on: it closes in both games.
+    cd.host = false
+    pair:step(10, pair.tick)
+    T.eq(cd.open, false, "closed for the client")
+    T.eq(hd.open, false, "and for the host")
+end)
+
+T.run("a_door_stays_open_while_either_player_is_in_it", function()
+    local pair = door_pair()
+    local cd, hd = pair.client_world.doors[DOOR], pair.host_world.doors[DOOR]
+    cd.host, cd.attr = true, 1
+    pair:step(6, pair.tick)
+    hd.host = true -- the host steps into the open door too
+    cd.host = false -- the client walks on
+    pair:step(20, pair.tick)
+    T.eq(cd.open, true, "the client's door stays open: the host is in it")
+    T.eq(hd.open, true, "the host's too")
+    hd.host = false
+    pair:step(10, pair.tick)
+    T.eq(cd.open and hd.open, false, "closed once nobody is in it")
+end)
+
+T.run("a_partner_walking_away_from_an_open_door_releases_it", function()
+    local pair = door_pair()
+    local cd, hd = pair.client_world.doors[DOOR], pair.host_world.doors[DOOR]
+    cd.host, cd.attr = true, 1
+    pair:step(6, pair.tick)
+    T.eq(hd.open, true, "open for the host")
+    pair.client_pos = { x = 200, y = 0, z = 0 } -- the client runs off (the door leaves its range)
+    cd.host = true -- its game still thinks it holds it
+    pair:step(6, pair.tick)
+    T.eq(hd.guest, false, "the host's door is no longer held for the client")
+end)
+
+T.run("a_door_not_loaded_yet_waits_a_little", function()
+    local pair = door_pair()
+    pair.host_world.doors[DOOR] = nil -- the host has not loaded that area
+    local cd = pair.client_world.doors[DOOR]
+    cd.host, cd.attr = true, 1
+    pair:step(6, pair.tick)
+    T.eq(pair.host:summary().queued, 1, "waiting")
+    pair.host_world.doors[DOOR] = { open = false, attr = 0, host = false, guest = false, pos = { x = 0, y = 0, z = 0 } }
+    pair:step(12, pair.tick)
+    T.eq(pair.host_world.doors[DOOR].open, true, "opened once loaded")
+    T.eq(pair.host:summary().queued, 0, "nothing waits")
+end)
+
+T.run("doors_can_be_switched_off", function()
+    local pair = door_pair()
+    pair.host.settings.sync_doors = false
+    local cd = pair.client_world.doors[DOOR]
+    cd.host, cd.attr = true, 1
+    pair:step(6, pair.tick)
+    T.eq(pair.host_world.doors[DOOR].open, false, "not applied")
 end)
 
 T.finish()
