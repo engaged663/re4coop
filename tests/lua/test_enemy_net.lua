@@ -128,6 +128,7 @@ local function make_world(id_base)
         self.puppet[id] = on or nil
         return true
     end
+    function w:enemy_is_puppet(id) return self.puppet[id] == true end
     function w:enemy_set_transform(id, pos, rot)
         local e = self:get(id)
         if not e then return false end
@@ -339,6 +340,21 @@ T.run("each_enemy_goes_to_the_game_of_the_player_it_is_closer_to", function()
     local s = pair.client:summary()
     T.eq(s.run_here, 1, "the client runs one")
     T.eq(s.run_by_partner, 2, "and shows two")
+end)
+
+T.run("a_puppet_switched_back_on_behind_the_syncs_back_is_switched_off_again", function()
+    local pair = make_pair()
+    pair.host_player = { x = -20, y = 0, z = 0 }
+    pair.client_player = { x = 30, y = 0, z = 0 }
+    local h, c = standard_level(pair)
+    pair:step(6)
+    T.eq(pair.client_world.puppet[c.a.id], true, "the client's A follows the host's")
+    -- The game adapter runs A's own AI again by itself (a refused finisher, a head linked again).
+    pair.client_world.puppet[c.a.id] = nil
+    pair:step(2)
+    T.eq(pair.client_world.puppet[c.a.id], true, "A is a puppet again: its own AI does not run in both games")
+    T.eq(pair.client:summary().counters.puppet_lost, 1, "counted")
+    T.eq(owner_of(pair, h.a), HOST, "still the host's")
 end)
 
 T.run("host_authority_keeps_every_enemy_with_the_host", function()

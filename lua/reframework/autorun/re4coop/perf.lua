@@ -205,7 +205,8 @@ end
 -- Breadcrumbs
 -------------------------------------------------------------------------------
 
--- Records what the mod is about to do. urgent = rare and risky (write the file now).
+-- Records what the mod is about to do. urgent = rare and risky (write the file now, at most
+-- 20 times a second); "now" = write it even right after another write (the step may crash).
 function Perf:crumb(step, detail, urgent)
     local now = self.clock()
     local ring = self.crumbs
@@ -218,12 +219,14 @@ function Perf:crumb(step, detail, urgent)
         if #ring > CRUMB_RING then table.remove(ring, 1) end
     end
     self.crumb_dirty = true
-    if urgent then self:flush_crumbs(now) end
+    if urgent then self:flush_crumbs(now, urgent == "now") end
 end
 
-function Perf:flush_crumbs(now)
+-- always: write even right after the last write (the step about to run may crash the game:
+-- a crumb kept for a later frame would be lost with it).
+function Perf:flush_crumbs(now, always)
     if not self.crumb_dirty or self.json == nil then return false end
-    if now - self.last_crumb_write < CRUMB_MIN_GAP then return false end -- written on a later frame
+    if not always and now - self.last_crumb_write < CRUMB_MIN_GAP then return false end -- written on a later frame
     self.last_crumb_write = now
     self.crumb_dirty = false
     local recent = {}

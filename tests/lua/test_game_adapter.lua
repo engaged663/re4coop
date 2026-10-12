@@ -734,6 +734,36 @@ T.run("a_killing_hit_from_the_partner_never_throws_a_body_without_its_data", fun
     T.eq(world.native_crashes, 0, "still no crash")
 end)
 
+T.run("a_destroyed_game_object_is_never_asked_for_its_transform", function()
+    -- get_Transform on a destroyed GameObject throws inside the game (InvalidOperationException
+    -- in REFramework's log), and REFramework's clean-up after it upsets the VM's temporary
+    -- objects. Liveness is read from memory once the layout is known.
+    local game, world = fresh_game()
+    game:read_player_state()
+    T.eq(game.go_tf_off, 0x18, "the GameObject layout is found on the player's body")
+    T.check(game:capabilities().go_layout.ok, "go_layout capability")
+    local box = mock.make_go("box")
+    T.check(game:go_alive(box), "alive")
+    mock.destroy(box)
+    mock.exceptions = 0
+    T.eq(game:go_alive(box), false, "destroyed")
+    T.eq(game:transform_of(box), nil, "no transform")
+    T.eq(mock.exceptions, 0, "and the game never threw")
+end)
+
+T.run("objects_we_hand_to_the_game_hold_an_engine_reference_for_a_while", function()
+    local game, world = fresh_game()
+    clock_now = 100
+    local o = mock.new("chainsaw.ChainsawGameSaveRequestArgs")
+    local before = mock.add_refs or 0
+    T.eq(game:hold(o, 5.0), o, "returned")
+    T.eq((mock.add_refs or 0) - before, 1, "add_ref: an engine reference")
+    T.eq(#game.held_objects, 1, "kept")
+    clock_now = 106
+    game:hold(mock.new("chainsaw.ChainsawGameSaveRequestArgs"), 5.0)
+    T.eq(#game.held_objects, 1, "the first one let go after its time (REFramework releases it with the wrapper)")
+end)
+
 T.run("a_finisher_on_a_puppet_switches_it_back_on_at_once", function()
     -- A stealth kill / grab / knife finish goes to the enemy's AI head, which a puppet has
     -- switched off: when the sync allows it, the head is back on before the request reaches it.

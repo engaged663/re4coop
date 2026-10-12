@@ -562,8 +562,11 @@ function Game:find_game_object(name)
     return scene and self:call(scene, "findGameObject(System.String)", name) or nil
 end
 
+-- The transform of a GameObject that still exists (never asks a destroyed one: see go_alive).
 function Game:transform_of(go)
-    return go and self:call(go, "get_Transform") or nil
+    if not go then return nil end
+    if self.go_tf_off and not self:go_alive(go) then return nil end
+    return self:call(go, "get_Transform")
 end
 
 function Game:name_of(go)
@@ -584,9 +587,77 @@ function Game:alive(component)
     return ok and alive == true
 end
 
+-- A via.GameObject keeps its via.Transform at a fixed offset, and the transform keeps its
+-- owner GameObject at 0x10, cleared when the object is destroyed. Asking a destroyed
+-- GameObject for get_Transform throws System.InvalidOperationException inside the game, and
+-- REFramework's clean-up after a game exception can upset the VM's temporary objects (a crash
+-- in the game's own code later in the frame). So the layout is found once on a live object
+-- (the player's body) and liveness is read from memory from then on.
+local GO_TRANSFORM_OFFSETS = { 0x18, 0x20, 0x28, 0x30, 0x38 }
+
+function Game:calibrate_go_layout(go)
+    if self.go_tf_off ~= nil or go == nil then return end
+    local tf = self:call(go, "get_Transform")
+    local tfa, goa = address_of(tf), address_of(go)
+    if tfa == nil or goa == nil or tf.read_qword == nil then return end
+    for _, off in ipairs(GO_TRANSFORM_OFFSETS) do
+        local ok, v = pcall(go.read_qword, go, off)
+        if ok and v == tfa then
+            local okb, back = pcall(tf.read_qword, tf, 0x10)
+            if okb and back == goa then
+                self.go_tf_off = off
+                self:cap("go_layout", true, ("GameObject transform at +0x%x"):format(off))
+                return
+            end
+        end
+    end
+    self.go_tf_off = false
+    self:cap("go_layout", false, "GameObject transform not found: liveness through get_Transform")
+end
+
+local function go_alive_native(go, off)
+    local goa = go:get_address()
+    local tf = go:read_qword(off)
+    if tf == nil or tf == 0 or not sdk.is_managed_object(tf) then return false end
+    local tfo = sdk.to_managed_object(tf)
+    return tfo ~= nil and tfo:read_qword(0x10) == goa
+end
+
+-- An object we create (sdk.create_instance) and hand to the game starts with no reference
+-- of the engine's own: REFramework counts it only on the Lua side (a "local" object). If the
+-- game stores it and lets go of it again while still using it (a DamageInfo during a hit), the
+-- engine frees it in the middle of the call and its memory is reused - the game's next
+-- temporary objects get overwritten (crash in WindManager.attachWindSettingEffect after a
+-- killing hit, docs/RESEARCH.md 3.16). add_ref() gives it an engine reference, which REFramework
+-- drops again once Lua forgets the object: we keep it for `seconds`.
+local HOLD_MAX = 256
+
+function Game:hold(obj, seconds)
+    if obj == nil then return nil end
+    pcall(obj.add_ref, obj)
+    local now = self.clock()
+    local held = self.held_objects
+    if held == nil then
+        held = {}
+        self.held_objects = held
+    end
+    for i = #held, 1, -1 do
+        if held[i].till <= now then table.remove(held, i) end
+    end
+    if #held >= HOLD_MAX then table.remove(held, 1) end
+    held[#held + 1] = { obj = obj, till = now + (seconds or 5.0) }
+    return obj
+end
+
 -- A GameObject is usable while its transform is alive (a destroyed GameObject has none).
 function Game:go_alive(go)
     if not go then return false end
+    local off = self.go_tf_off
+    if off then
+        self.n_calls = self.n_calls + 3
+        local ok, alive = pcall(go_alive_native, go, off)
+        return ok and alive == true
+    end
     return self:alive(self:call(go, "get_Transform"))
 end
 
@@ -985,6 +1056,7 @@ function Game:read_player_state()
     local st = { pos = pos, id = address_of(ctx) }
     local body = self:call(ctx, "get_BodyGameObject")
     self:remember_player_objects(body, self:call(ctx, "get_HeadGameObject"))
+    if self.go_tf_off == nil and body ~= nil then self:calibrate_go_layout(body) end
     local transform = body and self:call(body, "get_Transform")
     if transform ~= nil then
         st.rot = q4(self:call(transform, "get_Rotation"))

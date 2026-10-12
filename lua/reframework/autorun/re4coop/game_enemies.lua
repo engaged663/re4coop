@@ -49,6 +49,7 @@ local HIT_OBJECT_FIELDS = {
     { "DamageCollidable", "clear" },
 }
 local CHEST = 1 -- chainsaw.character.BodyParts.Chest: the part a replayed hit lands on
+local HIT_HOLD = 5.0 -- seconds a DamageInfo we built keeps an engine reference after the hit (Game:hold)
 -- DamageInfo values that only mean something in the game that made them are not copied.
 local HIT_FIELD_EXCLUDE = { "serial", "unique", "handle", "address", "pointer", "ptr", "frame", "time" }
 local HIT_VALUE_TYPES = {
@@ -332,6 +333,11 @@ function M.install(Game, H)
         self.puppets[id] = { go = head, upd = upd, drivers = drivers }
         self:cap("enemy_puppet", true, ("head off, %d animation driver(s) off"):format(#drivers))
         return true
+    end
+
+    -- Whether enemy `id` is a puppet here (its AI head and animation driver off by us).
+    function Game:enemy_is_puppet(id)
+        return self.puppets[id] ~= nil
     end
 
     -- The enemy runs on its own again: its animation driver back on, its head back on (or
@@ -899,6 +905,7 @@ function M.install(Game, H)
     function Game:build_hit(info, fields)
         local okC, d = pcall(sdk.create_instance, DAMAGE_INFO)
         if not okC or d == nil then return nil end
+        d = self:hold(d, HIT_HOLD) -- the game frees an unreferenced DamageInfo mid-hit (see Game:hold)
         self:write_damage_fields(d, fields)
         if not self:sanitize_damage_info(d, info.body) then return nil end
         local t = self.hit_templates
@@ -949,7 +956,7 @@ function M.install(Game, H)
             self:cap("hit_apply", false, "cannot build a DamageInfo")
             return false
         end
-        self.perf:crumb("enemy.apply_hit", info.kind, true)
+        self.perf:crumb("enemy.apply_hit", info.kind, "now")
         local ok = self:run_hit(id, d)
         if ok then
             self.last_hits[id] = hit.fields
@@ -974,7 +981,7 @@ function M.install(Game, H)
         local ctx = info and self.enemy_ctx[id]
         local hp = ctx and self:call(ctx, "get_HitPoint")
         if hp == nil then return false end
-        self.perf:crumb("enemy.kill", info.kind, true)
+        self.perf:crumb("enemy.kill", info.kind, "now")
         self:restore_puppet(id) -- its death needs its AI and animation driver
         if fields ~= nil and #fields > 0 and self.settings.enemy_kill_with_hit ~= false then
             local d = self:build_hit(info, fields)

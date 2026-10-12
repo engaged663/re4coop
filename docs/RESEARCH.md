@@ -918,6 +918,49 @@ by the autosave trigger, not by the save): loading it restarts there, and joinin
 client next to the host. A redirected autosave skips the slot-0-only `_ContineCount` decrement
 and shows the manual-save icon. Not run in the game yet.
 
+### 3.16 The crash after a partner's killing hit, and enemies that ran their own AI (0.9.1)
+
+**Report.** The client's game (a session over a VPN) crashed: `c0000005` at re4.exe+0x326e37f.
+The breadcrumbs ended 50 ms before it, with no hit step.
+
+**Stack** (minidump `re4.exe.22596.dmp`, read with a small parser: exception thread, ASLR
+base from the module list, return addresses on the stack named from `.pdata` and the dump):
+REFramework (dinput8.dll, our Lua) -> `HitController.callbackDamageHit` ->
+`Ch1c0BodyHitDriverCommon.onHitDamage` -> `Ch1c0z0HeadUpdater.onHitDamage` ->
+`EnemyHeadUpdater.onHitDamage` -> `Ch1c0HeadUpdaterCommon.onDead` -> `onPartsBreak` ->
+`Ch1c0BodyUpdaterCommon.requestPartsBreak` -> `triggerPartsBreakEffect` ->
+`EPVStandard.requestEffect` -> `EffectManager.createEffectAutoDestroy` ->
+`WindManager.attachWindSettingEffect(AfterCreateEffectInfo)` (0x14326e050). It walks the new
+effect's `Transform.get_Children()`; the enumerator (`r14`) had a zero header when its
+`MoveNext` was called: freed memory. Every object of that call (`0x123dbdc11b0`, `…5fb0`,
+`…ba30`, `…bae0`, `…c470`) sat side by side in the engine's per-thread heap of short-lived
+objects.
+
+**Cause.** The killing hit was ours (a partner's kill run here, §3.13): a `DamageInfo` made
+with `sdk.create_instance` and never given an engine reference. REFramework counts such a new
+object only on the Lua side (`detail::add_ref`: a reference count <= 0 is a "local" object,
+tracked in an ephemeral table); its documentation asks for `add_ref()` on what
+`create_instance` returns. On a death the game stores the DamageInfo and lets go of it again,
+which frees an object no one else holds - in the middle of the hit, so the effect code's next
+temporary objects took its memory. Separately, REFramework's log showed
+`System.InvalidOperationException` in `via.GameObject.get_Transform` several times in the two
+minutes before: `Game:go_alive` asked destroyed GameObjects (broken crates, animals) for their
+transform, and the game threw.
+
+**Fix.**
+- `Game:hold(obj, seconds)`: `add_ref()` (an engine reference, dropped again by REFramework
+  once Lua lets go of the object) and keep it for a while: the hit's DamageInfo (5 s), the
+  save request (120 s), the warp's StageIdentifier and the game-over request.
+- `Game:go_alive` reads liveness from memory: the GameObject's transform pointer (offset found
+  once on the player's body, +0x18 expected) and the transform's owner pointer (+0x10, cleared
+  when destroyed). `transform_of` and the animal lookup ask a GameObject for its transform only
+  when it is alive. Without a matching layout it falls back to `get_Transform`.
+- Breadcrumbs: `enemy.apply_hit` and `enemy.kill` are written even right after another write
+  (`"now"`), so a crash in a hit always leaves its step.
+- Enemy sync: a puppet the game adapter switched back on by itself (a finisher, a head the game
+  linked again) is switched off again on the next control pass (`enemy_is_puppet`), instead of
+  running its own AI in both games.
+
 ## 4. Sync architecture
 
 ```

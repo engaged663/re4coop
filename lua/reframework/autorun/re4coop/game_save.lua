@@ -160,6 +160,7 @@ function M.install(Game, H)
         if sdm == nil then return nil, "no save system" end
         local ok, args = pcall(sdk.create_instance, SAVE_ARGS)
         if not ok or args == nil then return nil, "cannot create the save request" end
+        args = self:hold(args, 120.0) -- queued by the save flow: alive until the save is written (Game:hold)
         self:call(sdm, "setPlayLoadData(System.Boolean)", false)
         self.save_mirroring = true
         local before = self.save_counters and self.save_counters.saves or 0

@@ -1094,7 +1094,11 @@ end
 function World:animal(guid)
     local o = self.object_index[guid]
     if o == nil or not o.animal then return nil end
-    if o.tf == nil then o.tf = R.call(o.go, "get_Transform") or false end
+    if o.tf == nil then
+        -- Never ask a destroyed GameObject for its transform (the game throws; see Game:go_alive).
+        if self.game ~= nil and self.game.go_alive ~= nil and not self.game:go_alive(o.go) then return nil end
+        o.tf = R.call(o.go, "get_Transform") or false
+    end
     if not o.tf then return nil end
     if self.game ~= nil and self.game.alive ~= nil and not self.game:alive(o.tf) then return nil end
     return o
@@ -1869,7 +1873,7 @@ function World:warp(stage, pos, yaw)
             local pref, loc = split_stage(stage)
             self:crumb("world.warp", tostring(stage), true)
             local ok = pcall(function()
-                local sid = sdk.create_instance("chainsaw.StageIdentifier")
+                local sid = self.game:hold(sdk.create_instance("chainsaw.StageIdentifier"), 10.0)
                 sid:call("setup(chainsaw.LocID, chainsaw.StageID, chainsaw.AreaID)", loc, stage, 0)
                 cm:call("requestWarp(chainsaw.ContextID, System.Nullable`1<via.vec3>, System.Nullable`1<via.Quaternion>, chainsaw.StageIdentifier)",
                     ctx:get_field("_ID"), npos, nrot, sid)
@@ -1904,7 +1908,7 @@ function World:trigger_reload()
     if mediator == nil then return false end
     self:crumb("world.trigger_reload", nil, true)
     local ok = pcall(function()
-        local req = sdk.create_instance("chainsaw.GameOverRequest")
+        local req = self.game:hold(sdk.create_instance("chainsaw.GameOverRequest"), 30.0)
         mediator:call("requestGameOver", req)
     end)
     return ok

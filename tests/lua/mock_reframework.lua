@@ -197,7 +197,11 @@ local next_address = 0x10000
 
 function Managed:get_type_definition() return classes[self.__type] end
 function Managed:get_address() return self.__addr end
-function Managed:add_ref() self.__refs = (self.__refs or 0) + 1 return self end
+function Managed:add_ref()
+    self.__refs = (self.__refs or 0) + 1
+    M.add_refs = (M.add_refs or 0) + 1
+    return self
+end
 function Managed:add_ref_permanent() self.__permanent = true return self end
 function Managed:release() self.__refs = (self.__refs or 0) - 1 end
 function Managed:call(name, ...)
@@ -221,6 +225,8 @@ function Managed:read_qword(offset)
     if offset == 0x10 and self.owner and self.owner.__type == "via.GameObject" then
         return self.owner.destroyed and 0 or self.owner.__addr
     end
+    -- A GameObject keeps its transform at 0x18 (the pointer stays after a destroy).
+    if offset == 0x18 and self.__type == "via.GameObject" and self.transform then return self.transform.__addr end
     return 0
 end
 
@@ -545,7 +551,14 @@ function M.install(opts)
     class("via.GameObject", "System.Object", {
         get_Name = { 0, function(self) return self.name end },
         set_Name = { 1, function(self, name) self.name = name end },
-        get_Transform = { 0, function(self) return self.transform end },
+        get_Transform = { 0, function(self)
+            -- The game throws System.InvalidOperationException for a destroyed GameObject.
+            if self.destroyed then
+                M.exceptions = (M.exceptions or 0) + 1
+                error("System.InvalidOperationException: get_Transform of a destroyed GameObject")
+            end
+            return self.transform
+        end },
         ["getComponent(System.Type)"] = { 1, function(self, t)
             for _, c in ipairs(self.components) do
                 if classes[c.__type]:is_a(t.name) then return c end
@@ -694,6 +707,14 @@ function M.install(opts)
                     error("access violation in RagdollUnit.onDamageHit (null AttackGameObject/DamageUserData)")
                 end
                 world.ragdoll_parts = info.data.DamageUserData.__fields.Parts
+                -- On a death the game stores the DamageInfo and lets go of it again (the parts
+                -- break effect, re4.exe crash of 2026-10-12): one with no reference of its own
+                -- (made with sdk.create_instance, no add_ref) is freed mid-hit, and the game's
+                -- next temporary objects take its memory (WindManager.attachWindSettingEffect).
+                if not info.engine_owned and (info.__refs or 0) <= 0 then
+                    world.native_crashes = world.native_crashes + 1
+                    error("access violation in WindManager.attachWindSettingEffect (DamageInfo freed mid-hit)")
+                end
             end
             self.received = self.received or {}
             self.received[#self.received + 1] = { damage = info.data.Damage, wince = info.data.Wince,
@@ -1634,6 +1655,7 @@ function M.hit(enemy, damage, wince, attacker)
         AttackUserData = new("chainsaw.collision.AttackUserData", { weapon = 4000 }),
         AttackData = new("chainsaw.collision.AttackHitUserData.AttackData", { weapon = 4000 }),
         DamageUserData = new("chainsaw.collision.DamageUserData") } })
+    info.engine_owned = true -- the game's own hit holds its DamageInfo
     M.component(enemy.body, "chainsaw.HitController"):call("callbackDamageHit", info)
     return info
 end

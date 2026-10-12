@@ -197,7 +197,7 @@ function EnemyNet:reset()
         taken_over = 0, handed_over = 0, hits_sent = 0, hits_forwarded = 0, hits_received = 0, hits_applied = 0,
         hits_fallback = 0, hits_bounced = 0, hits_unmatched = 0, damage_reported = 0, hp_applied = 0, hp_failed = 0,
         deaths_sent = 0, deaths_received = 0, kills_applied = 0, erased = 0, late_kills = 0, buried = 0,
-        graves_sent = 0, graves_received = 0, moves = 0, anims = 0, puppet_switches = 0, held = 0, retired = 0,
+        graves_sent = 0, graves_received = 0, moves = 0, anims = 0, puppet_switches = 0, puppet_lost = 0, held = 0, retired = 0,
         fatals = 0, claims_sent = 0, claims_granted = 0, claims_refused = 0 }
 end
 
@@ -550,11 +550,17 @@ end
 -- Puppets
 -------------------------------------------------------------------------------
 
--- Our copy's own AI and animation driver off (a puppet of the partner's) or on.
+-- Our copy's own AI and animation driver off (a puppet of the partner's) or on. A puppet the
+-- game adapter switched back on by itself (a death it ran, a finisher, a head the game linked
+-- again) is switched off again: otherwise its own AI would run in both games.
 function EnemyNet:set_puppet(game, id, on)
     local l = self.locals[id]
     if l == nil or game == nil then return end
     if on then
+        if l.puppet and game.enemy_is_puppet ~= nil and not game:enemy_is_puppet(id) then
+            l.puppet = nil
+            self.counters.puppet_lost = (self.counters.puppet_lost or 0) + 1
+        end
         if not l.puppet and game.enemy_set_puppet ~= nil and game:enemy_set_puppet(id, true) then
             l.puppet = true
             self.counters.puppet_switches = self.counters.puppet_switches + 1
