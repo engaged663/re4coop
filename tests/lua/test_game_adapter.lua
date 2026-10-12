@@ -734,6 +734,30 @@ T.run("a_killing_hit_from_the_partner_never_throws_a_body_without_its_data", fun
     T.eq(world.native_crashes, 0, "still no crash")
 end)
 
+T.run("a_kill_from_the_partners_game_never_mutilates", function()
+    -- The client crashed three times (re4.exe+0x326e37f) when the host killed a villager: our
+    -- replayed killing hit drew a head burst and its break effect crashed in
+    -- WindManager.attachWindSettingEffect. Replayed hits only react and kill now.
+    local game, world = fresh_game()
+    game:set_active(true)
+    game:read_player_state()
+    T.check(game:capabilities().no_mutilation.ok, "no_mutilation capability")
+    local list = game:list_enemies()
+    mock.hit(world.enemies[1], 0, 0) -- attack data known
+    game:take_hit_events()
+    world.head_burst = true
+    local fields = { { h = P.hash("Wince"), t = P.HIT_VALUE.F32, v = 44 } }
+    T.check(game:enemy_kill(list[2].id, fields), "killed")
+    T.eq(world.native_crashes, 0, "no crash")
+    T.eq(world.enemies[2].hp, 0, "dead, from the killing hit")
+    T.eq(world.parts_broken, 0, "no head burst")
+    T.check((game.hit_stats.mutilations_skipped or 0) >= 1, "the burst was skipped")
+    -- Our own player's killing hit bursts heads as always.
+    mock.hit(world.enemies[1], 1000, 0)
+    T.eq(world.parts_broken, 1, "our own kill still mutilates")
+    T.eq(world.native_crashes, 0, "and does not crash")
+end)
+
 T.run("a_destroyed_game_object_is_never_asked_for_its_transform", function()
     -- get_Transform on a destroyed GameObject throws inside the game (InvalidOperationException
     -- in REFramework's log), and REFramework's clean-up after it upsets the VM's temporary

@@ -72,6 +72,9 @@ How it works and why: [docs/RESEARCH.md](docs/RESEARCH.md). Wire format: [docs/P
   changes hands. With *Who runs enemies: host* only the host is attacked.
 * Ragdolls, effects the enemies spawn themselves and grab reactions are simulated in each game
   on its own and can look different.
+* Your partner's hits and kills make the enemy react and die in your game, but never burst its
+  head or break a limb there (the break effect of a replayed hit crashed the game); your own
+  hits mutilate as always.
 * The partner's model is a visual copy: it does not collide and your bullets pass through it.
 * Thrown grenades, bullet impacts and blood on enemies happen only in the thrower's/shooter's
   game. Sounds the engine plays internally (outside the reflected `trigger` calls) may not be

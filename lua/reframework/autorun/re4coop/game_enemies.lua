@@ -780,7 +780,65 @@ function M.install(Game, H)
                 end
             end, function(retval) return retval end)
         end
+        self:install_mutilation_guard()
         self:damage_schema()
+    end
+
+    -- No mutilation from a hit we run (a partner's hit, or the killing hit of a death the
+    -- partner's game decided): only its reaction and the death. On a death the villagers draw
+    -- lots for a head burst (lotteryBreakHead) and break the part (onPartsBreak ->
+    -- requestPartsBreak -> triggerPartsBreakEffect): run from our replayed killing hit, the
+    -- break effect crashed the game in WindManager.attachWindSettingEffect (re4.exe+0x326e37f,
+    -- three times, docs/RESEARCH.md 3.16). Our own player's hits mutilate as always.
+    -- { type, method, returns a Boolean }. Never a method whose code is a shared stub
+    -- (CharacterHeadUpdater.onPartsBreak is the empty method of tens of thousands of types).
+    local MUTILATION_METHODS = {
+        { "chainsaw.Ch1c0HeadUpdaterCommon", "lotteryBreakHead", true },
+        { "chainsaw.Ch1c0HeadUpdaterCommon", "onPartsBreak", false },
+        { "chainsaw.Ch1c0BodyUpdaterCommon", "requestPartsBreak", false },
+        { "chainsaw.EnemyHeadUpdater", "onPartsBreak", false },
+        { "chainsaw.CharacterBodyUpdater", "onPartsBreak", false },
+        { "chainsaw.Ch1d4z0HeadUpdater", "onPartsBreak", false },
+        { "chainsaw.Ch1d4z0BodyUpdater", "onPartsBreak", false },
+    }
+
+    local function method_function(m)
+        local ok, fn = pcall(function() return m:get_function() end)
+        return ok and fn or nil
+    end
+
+    function Game:install_mutilation_guard()
+        local game = self
+        local stub
+        do
+            local ch = find_type("chainsaw.CharacterHeadUpdater")
+            local okS, sm = pcall(function() return ch and ch:get_method("onPartsBreak") end)
+            stub = okS and sm and method_function(sm) or nil
+        end
+        local seen, hooked = {}, 0
+        for _, spec in ipairs(MUTILATION_METHODS) do
+            local td = find_type(spec[1])
+            local okM, m = pcall(function() return td and td:get_method(spec[2]) end)
+            local fn = okM and m and method_function(m) or nil
+            if okM and m ~= nil and (fn == nil or (fn ~= stub and not seen[fn])) then
+                if fn ~= nil then seen[fn] = true end
+                local returns_bool, skipped = spec[3], false
+                if pcall(sdk.hook, m, function()
+                    skipped = false
+                    if game.replaying and game.settings.enemy_replay_mutilation ~= true then
+                        skipped = true
+                        game.hit_stats.mutilations_skipped = (game.hit_stats.mutilations_skipped or 0) + 1
+                        return sdk.PreHookResult.SKIP_ORIGINAL
+                    end
+                end, function(retval)
+                    local was = skipped
+                    skipped = false
+                    if was and returns_bool then return sdk.to_ptr(0) end -- false: no head burst
+                    return retval
+                end) then hooked = hooked + 1 end
+            end
+        end
+        self:cap("no_mutilation", hooked > 0, ("%d parts-break method(s) guarded on replayed hits"):format(hooked))
     end
 
     -- Hits the local player landed on enemies since the last call:

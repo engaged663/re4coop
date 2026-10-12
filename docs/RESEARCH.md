@@ -936,18 +936,31 @@ effect's `Transform.get_Children()`; the enumerator (`r14`) had a zero header wh
 `…ba30`, `…bae0`, `…c470`) sat side by side in the engine's per-thread heap of short-lived
 objects.
 
-**Cause.** The killing hit was ours (a partner's kill run here, §3.13): a `DamageInfo` made
-with `sdk.create_instance` and never given an engine reference. REFramework counts such a new
-object only on the Lua side (`detail::add_ref`: a reference count <= 0 is a "local" object,
-tracked in an ephemeral table); its documentation asks for `add_ref()` on what
-`create_instance` returns. On a death the game stores the DamageInfo and lets go of it again,
-which frees an object no one else holds - in the middle of the hit, so the effect code's next
-temporary objects took its memory. Separately, REFramework's log showed
+**Cause.** The killing hit was ours (a partner's kill run here, §3.13). First suspect: the
+`DamageInfo` made with `sdk.create_instance` had no engine reference (REFramework counts such a
+new object only on the Lua side - `detail::add_ref`: a reference count <= 0 is a "local"
+object - and its documentation asks for `add_ref()` on what `create_instance` returns). That
+was fixed (below), but the client crashed twice more at the same address, each time when the
+host killed a villager: the breadcrumbs, now written in time, end with `enemy.ai restore` and
+`enemy.kill` (`Ch1c0z0Context`), and the second stack shows the way in:
+`Ch1c0HeadUpdaterCommon.onDead` -> `lotteryBreakHead` (0x14197b0b0, the head-burst draw of a
+death) -> `onPartsBreak` -> `requestPartsBreak` -> the break effect. Why the break effect of a
+replayed killing hit leaves the effect's children list freed is not known (the copy had been a
+puppet until that frame; the heap is not in the minidump). Separately, REFramework's log showed
 `System.InvalidOperationException` in `via.GameObject.get_Transform` several times in the two
 minutes before: `Game:go_alive` asked destroyed GameObjects (broken crates, animals) for their
 transform, and the game threw.
 
 **Fix.**
+- No mutilation from a hit we run (the partner's hits and the killing hit of a death the
+  partner's game decided): while `Game.replaying`, pre-hooks skip
+  `Ch1c0HeadUpdaterCommon.lotteryBreakHead` (answers false), `Ch1c0HeadUpdaterCommon.onPartsBreak`,
+  `Ch1c0BodyUpdaterCommon.requestPartsBreak`, `EnemyHeadUpdater.onPartsBreak`,
+  `CharacterBodyUpdater.onPartsBreak` and `Ch1d4z0Head/BodyUpdater.onPartsBreak` - each with
+  code of its own (`CharacterHeadUpdater.onPartsBreak` is 0x1400ae850, the empty method of
+  ~60,000 methods, and is never hooked). The hit still makes its reaction and the death. Our own
+  player's hits mutilate as always; in the partner's game a puppet stays whole. *Experimental →*
+  `enemy_replay_mutilation` brings it back.
 - `Game:hold(obj, seconds)`: `add_ref()` (an engine reference, dropped again by REFramework
   once Lua lets go of the object) and keep it for a while: the hit's DamageInfo (5 s), the
   save request (120 s), the warp's StageIdentifier and the game-over request.

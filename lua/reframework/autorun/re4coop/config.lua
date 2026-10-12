@@ -98,6 +98,7 @@ Config.DEFAULTS = {
     travel_reload = false,       -- load the partner's chapter by triggering game over -> Continue
     stage_travel = false,        -- teleports to another stage preload it and use the game's warp
     exp_force_routine = false,   -- break objects by forcing their state machine into a "broken" state
+    enemy_replay_mutilation = false, -- the partner's hits (and kills) may also burst heads and break limbs here (crashed the game)
 }
 
 -- Keys that take their (new) default once when a config saved before that config version is

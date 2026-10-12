@@ -707,13 +707,12 @@ function M.install(opts)
                     error("access violation in RagdollUnit.onDamageHit (null AttackGameObject/DamageUserData)")
                 end
                 world.ragdoll_parts = info.data.DamageUserData.__fields.Parts
-                -- On a death the game stores the DamageInfo and lets go of it again (the parts
-                -- break effect, re4.exe crash of 2026-10-12): one with no reference of its own
-                -- (made with sdk.create_instance, no add_ref) is freed mid-hit, and the game's
-                -- next temporary objects take its memory (WindManager.attachWindSettingEffect).
-                if not info.engine_owned and (info.__refs or 0) <= 0 then
-                    world.native_crashes = world.native_crashes + 1
-                    error("access violation in WindManager.attachWindSettingEffect (DamageInfo freed mid-hit)")
+                -- A villager's death draws lots for a head burst (Ch1c0HeadUpdaterCommon.onDead ->
+                -- lotteryBreakHead -> onPartsBreak -> Ch1c0BodyUpdaterCommon.requestPartsBreak).
+                local hu = M.new("chainsaw.Ch1c0HeadUpdaterCommon", { body = M.new("chainsaw.Ch1c0BodyUpdaterCommon") })
+                local burst = hu:call("lotteryBreakHead", info)
+                if burst == true or (type(burst) == "number" and burst ~= 0) then
+                    hu:call("onPartsBreak", info, 0, 0)
                 end
             end
             self.received = self.received or {}
@@ -726,6 +725,31 @@ function M.install(opts)
                 ctx.hp = math.max(0, ctx.hp - (info.data.Damage or 0))
             end
         end, { "chainsaw.HitController.DamageInfo" } },
+    })
+    -- Parts breaks (heads bursting, limbs): the break effect of a hit the mod ran crashed the
+    -- game in WindManager.attachWindSettingEffect (re4.exe+0x326e37f, 2026-10-12).
+    world.head_burst = false -- what the death lottery draws
+    world.parts_broken = 0
+    class("chainsaw.CharacterHeadUpdater", "System.Object", {
+        onPartsBreak = { 3, function() end, { "chainsaw.HitController.DamageInfo", "chainsaw.character.BodyParts",
+            "chainsaw.character.BodyPartsSide" } },
+    })
+    class("chainsaw.Ch1c0BodyUpdaterCommon", "System.Object", {
+        requestPartsBreak = { 5, function(_, info)
+            if not info.engine_owned then
+                world.native_crashes = world.native_crashes + 1
+                error("access violation in WindManager.attachWindSettingEffect (parts break of a replayed hit)")
+            end
+            world.parts_broken = world.parts_broken + 1
+        end, { "chainsaw.HitController.DamageInfo", "chainsaw.character.BodyParts", "chainsaw.character.BodyPartsSide",
+            "System.Boolean", "System.Boolean" } },
+    })
+    class("chainsaw.Ch1c0HeadUpdaterCommon", "chainsaw.CharacterHeadUpdater", {
+        lotteryBreakHead = { 1, function() return world.head_burst end, { "chainsaw.HitController.DamageInfo" },
+            { ret = "System.Boolean" } },
+        onPartsBreak = { 3, function(self, info, parts, side)
+            self.body:call("requestPartsBreak", info, parts, side, false, false)
+        end, { "chainsaw.HitController.DamageInfo", "chainsaw.character.BodyParts", "chainsaw.character.BodyPartsSide" } },
     })
     -- Random drops and spawning items.
     class("chainsaw.Item", "System.Object", {

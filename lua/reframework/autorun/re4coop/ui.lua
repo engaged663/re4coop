@@ -272,6 +272,7 @@ local function draw_options(settings)
         checkbox(settings, "stage_travel", "Teleports to another area preload it and use the game's warp")
         checkbox(settings, "travel_reload", "Load the partner's chapter automatically (game over -> Continue)")
         checkbox(settings, "exp_force_routine", "Break objects by forcing their state machine")
+        checkbox(settings, "enemy_replay_mutilation", "Your partner's hits and kills also burst heads and break limbs in your game (crashed the game)")
         imgui.tree_pop()
     end
 end
