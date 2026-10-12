@@ -134,8 +134,11 @@ When the client reports a copy (ENEMY_ROSTER), the host assigns an owner right a
 with `enemy_authority = "shared"` the game of the player the enemy is closer to, otherwise the
 host. Later an enemy changes hands when the other player has been at least 3 m closer for
 0.75 s and the enemy has been with its owner for 2.5 s (the player who hit it in the last 3 s
-counts 4 m closer); a partner who is down or in a cutscene gets none, a client farther than 80 m
-neither. The old owner stops at once, the new one continues from the latest state it received
+counts 4 m closer; while both players hit it within 3 s it stays where it is); a partner who is
+down or in a cutscene gets none, a client farther than 80 m neither. The hit values of
+ENEMY_HIT / ENEMY_DEATH also carry the attack's AttackData values (hashed `AttackData.<field>`)
+and the body part and side it hit (`DamageUserData.Parts`, `DamageUserData.PartsSide`); the
+owner decides whether the hit kills (`HitController.checkKill`). The old owner stops at once, the new one continues from the latest state it received
 (position extrapolated by the velocity, HP never raised).
 
 Joining: once the client is in the host's chapter it sends WORLD_REQUEST; the host answers

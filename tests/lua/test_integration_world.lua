@@ -33,8 +33,11 @@ local ganado = mock.make_character("chainsaw.Ch1c0z0Context", { x = 20, y = 0, z
 -- the host killed in an earlier session (eliminated in its save; alive in the client's).
 local VILLAGER_ID = { category = 0, kind = 0, group = 12, index = 501 }
 local KILLED_ID = { category = 0, kind = 0, group = 12, index = 502 }
+-- ...and one alive in the host's world that the client's save had dead (its game never spawns it).
+local SAVED_DEAD_ID = { category = 0, kind = 0, group = 12, index = 503 }
 local villager = mock.make_character("chainsaw.Ch1c0z0Context", { x = 30, y = 0, z = 30 }, 100, VILLAGER_ID)
-world.enemies = { ganado, villager }
+local survivor = mock.make_character("chainsaw.Ch1c0z0Context", { x = 12, y = 0, z = -8 }, 100, SAVED_DEAD_ID)
+world.enemies = { ganado, villager, survivor }
 mock.add_backup(KILLED_ID, true)
 local crow = mock.make_object("chainsaw.GmCrow", CROW, { x = 3, y = 0, z = 0 }, 0)
 local door = mock.make_door(G_DOOR_GO, { x = 2, y = 0, z = 2 })
@@ -101,6 +104,14 @@ function client_game:list_enemies()
     return out
 end
 function client_game:enemy_set_hp(id, hp) self.enemies[id].hp = math.max(1, hp) return true end
+-- Its spawn param validated and permitted: the game spawns it at its spawn point.
+function client_game:enemy_revive(uid)
+    self.revives = (self.revives or 0) + 1
+    if uid ~= mock.context_code(SAVED_DEAD_ID) or self.enemies[4] ~= nil then return "missing" end
+    self.enemies[4] = { id = 4, kind = "chainsaw.Ch1c0z0Context", uid = uid, pos = { x = 40, y = 0, z = -40 }, yaw = 0,
+        hp = 100, max_hp = 100, alive = true }
+    return "spawning"
+end
 function client_game:enemy_kill(id) self.enemies[id].hp, self.enemies[id].alive = 0, false return true end
 function client_game:enemy_erase(id) self.enemies[id].erased = true return true end
 function client_game:enemy_set_transform(id, pos, rot)
@@ -277,6 +288,14 @@ T.run("enemies_by_level_identity", function()
     villager.hp = 0
     ok = T.wait_until(function() return not client_game.enemies[2].alive or client_game.enemies[2].erased end, step, 5)
     T.check(ok, "the kill crossed by level ID")
+    -- The villager the client's save had dead is alive in the host's world: it appears for the
+    -- client too and follows the host's.
+    ok = T.wait_until(function()
+        local e = client_game.enemies[4]
+        return e ~= nil and math.abs(e.pos.x - 12) < 0.05 and math.abs(e.pos.z + 8) < 0.05
+    end, step, 8)
+    T.check(ok, "spawned in the client's game, where the host's is")
+    T.eq(client.enemy_net.counters.revived, 1, "paired with the host's (one enemy, run by one game)")
 end)
 
 T.run("a_client_reload_takes_the_hosts_world_again", function()

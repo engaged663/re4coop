@@ -148,6 +148,17 @@ local function make_world(id_base)
         self.hidden[id] = (not on) or nil
         return true
     end
+    -- Spawning an enemy our game never spawned (its level spawn param, by uid): spawnable[uid]
+    -- = { kind, pos } when the spawn param is loaded here.
+    w.spawnable, w.revives = {}, {}
+    function w:enemy_revive(uid)
+        self.revives[#self.revives + 1] = uid or false
+        local sp = self.spawnable[uid]
+        if sp == nil then return "missing" end
+        self.spawnable[uid] = nil
+        self:spawn(sp.kind, sp.pos.x, sp.pos.y, sp.pos.z, 100, uid)
+        return "spawning"
+    end
     -- The save's eliminated enemies, read over several calls like the real backup table.
     function w:scan_eliminated()
         if self.save_dead == nil then return true, {} end
@@ -205,7 +216,8 @@ local function make_pair(settings)
             for i = #events, 1, -1 do events[i] = nil end
         end
         sync:tick(self.now, world:list(function(id) return sync:wants_state(id) end), world,
-            { local_pos = me, partner_pos = partner, partner_busy = self.partner_busy })
+            { local_pos = me, partner_pos = partner, partner_busy = self.partner_busy,
+                loading = sync == self.client and self.client_loading or nil })
         sync:frame(self.now, world)
     end
 
@@ -421,6 +433,66 @@ T.run("the_player_who_hits_an_enemy_draws_it", function()
         pair:step(1)
     end
     T.eq(owner_of(pair, h), CLIENT, "the shooter's game runs it")
+end)
+
+T.run("an_enemy_both_players_shoot_stays_where_it_is", function()
+    -- Two players taking turns at one enemy: the last shooter's advantage (and players moving
+    -- around it) made it change hands again and again, and every change cut its reaction short.
+    local pair = make_pair()
+    pair.host_player = { x = -5, y = 0, z = 0 }
+    pair.client_player = { x = 5, y = 0, z = 0 }
+    local h = pair.host_world:spawn(GANADO, 0, 0, 0, 100000, 0x4111)
+    local c = pair.client_world:spawn(GANADO, 0, 0, 0, 100000, 0x4111)
+    pair:step(5)
+    T.eq(owner_of(pair, h), HOST, "the host's")
+    local changes = pair.host.counters.owner_changes
+    local function fight(rounds)
+        for _ = 1, rounds do
+            for _ = 1, 25 do
+                pair:player_hit("client", c, 1)
+                pair:step(1)
+            end
+            for _ = 1, 25 do
+                pair:player_hit("host", h, 1)
+                pair:step(1)
+            end
+        end
+    end
+    fight(2)
+    pair.client_player = { x = 1, y = 0, z = 0 } -- the client steps right up to it
+    fight(4)
+    T.eq(owner_of(pair, h), HOST, "kept by the same game")
+    T.eq(pair.host.counters.owner_changes, changes, "never changed hands during the fight")
+    -- The fight is over: distance decides again.
+    pair:step(120)
+    T.eq(owner_of(pair, h), CLIENT, "the near player's game runs it once the fight is over")
+    -- A fight, and the client is suddenly far away (fell, travelled): the host takes it anyway.
+    fight(1)
+    pair.client_player = { x = 200, y = 0, z = 0 }
+    for _ = 1, 30 do -- still shooting at it from afar: the fight goes on
+        pair:player_hit("client", c, 1)
+        pair:step(1)
+    end
+    T.eq(owner_of(pair, h), HOST, "a player out of range never keeps it")
+end)
+
+T.run("the_reaction_to_a_partners_hit_goes_out_at_once", function()
+    local pair = make_pair({ enemy_authority = "host", snapshot_hz = 2 })
+    local h, c = standard_level(pair)
+    pair:step(10)
+    -- Right after one of the host's regular states (the next is half a second away).
+    for _ = 1, 20 do
+        if pair.host.last_state_send == pair.now then break end
+        pair:step(1)
+    end
+    local early = pair.host.counters.states_early or 0
+    pair:player_hit("client", c.a, 10)
+    pair:step(1) -- the client sends it; the host runs it
+    h.a.layers = { { bank = 100, id = 9, frame = 0, speed = 1 } } -- its reaction
+    pair:step(1)
+    T.eq((pair.host.counters.states_early or 0) - early, 1, "the host sent its state without waiting")
+    T.eq(c.a.played[1].id, 9, "the shooter sees the reaction at once")
+    T.check((pair.client.counters.fresh_anims or 0) > 0, "not one interpolation delay later")
 end)
 
 T.run("a_partner_who_is_down_or_in_a_cutscene_gets_no_enemies", function()
@@ -810,6 +882,94 @@ T.run("host_authority_never_runs_a_finisher_in_the_clients_game", function()
     pair:step(3)
     T.eq(owner_of(pair, h.a), HOST, "still the host's")
     T.eq(pair.client.counters.claims_sent, 0, "nothing claimed")
+end)
+
+T.run("a_host_enemy_the_clients_save_had_dead_appears_for_the_client", function()
+    -- The client loaded a save in which these villagers had died: its game never spawns them,
+    -- while they are alive in the host's world. The host's world decides: they appear.
+    local pair = make_pair()
+    pair.host_player = { x = 0, y = 0, z = -5 }
+    pair.client_player = { x = 0, y = 0, z = -30 }
+    local h = pair.host_world:spawn(GANADO, 4, 0, 0, 100, 0x5101)
+    pair.client_world.spawnable[0x5101] = { kind = GANADO, pos = { x = 0, y = 0, z = 0 } }
+    pair:step(10)
+    T.eq(#pair.client_world.revives, 0, "not at once (it may still spawn by itself)")
+    pair:step(30)
+    T.eq(#pair.client_world.revives, 1, "then the client's game is asked to spawn it")
+    local c = pair.client_world.enemies[1]
+    T.eq(c and c.uid, 0x5101, "it spawned")
+    pair:step(20)
+    T.eq(net_of(pair.client, c), net_of(pair.host, h), "paired with the host's")
+    T.eq(owner_of(pair, h), HOST, "the host's player is closer: the host runs it")
+    T.eq(pair.client_world.puppet[c.id], true, "the client's copy follows it")
+    T.near(c.pos.x, 4, 0.05, "where the host's is")
+    T.eq(pair.client.counters.spawn_spawning, 1, "spawned once")
+    pair:step(100)
+    T.eq(#pair.client_world.revives, 1, "never asked again")
+end)
+
+T.run("an_enemy_spawned_for_the_hosts_world_starts_where_the_hosts_is", function()
+    -- The client is the closer player: its game runs the enemy it just spawned - from where the
+    -- host's enemy is and with its HP, not from its own spawn point.
+    local pair = make_pair()
+    pair.host_player = { x = 0, y = 0, z = -20 }
+    pair.client_player = { x = 3, y = 0, z = 2 }
+    local h = pair.host_world:spawn(GANADO, 5, 0, 5, 100, 0x5151)
+    pair.host_world:damage(h, 35)
+    pair.client_world.spawnable[0x5151] = { kind = GANADO, pos = { x = -30, y = 0, z = 40 } }
+    pair:step(60)
+    local c = pair.client_world.enemies[1]
+    T.eq(c and c.uid, 0x5151, "spawned")
+    T.eq(owner_of(pair, h), CLIENT, "the client's game runs it")
+    T.near(c.pos.x, 5, 0.5, "from where the host's was")
+    T.near(c.pos.z, 5, 0.5, "in every axis")
+    T.eq(c.hp, 65, "with the HP it had there")
+    T.near(h.pos.x, 5, 0.5, "the host's copy did not jump to a spawn point")
+end)
+
+T.run("the_client_never_spawns_what_it_has_or_just_killed", function()
+    local pair = make_pair()
+    pair.client_player = { x = 0, y = 0, z = -5 }
+    -- Its corpse is still here.
+    local h1 = pair.host_world:spawn(GANADO, 0, 0, 0, 100, 0x5201)
+    local c1 = pair.client_world:spawn(GANADO, 0, 0, 0, 100, 0x5201)
+    c1.hp, c1.alive = 0, false
+    -- It died here a moment ago and its body is gone already; the host has not heard yet.
+    local h2 = pair.host_world:spawn(GANADO, 6, 0, 0, 100, 0x5202)
+    local c2 = pair.client_world:spawn(GANADO, 6, 0, 0, 100, 0x5202)
+    -- A host enemy without a level identity (spawned at runtime).
+    pair.host_world:spawn(DOG, 3, 0, 3, 100, nil)
+    pair:step(10)
+    pair.drop_to_host = true
+    pair.client_world:damage(c2, 100)
+    pair:step(2)
+    pair.client_world:remove(c2)
+    pair.drop_to_host = nil -- (its death report was lost)
+    pair.client_world.spawnable[0x5201] = { kind = GANADO, pos = { x = 0, y = 0, z = 0 } }
+    pair.client_world.spawnable[0x5202] = { kind = GANADO, pos = { x = 6, y = 0, z = 0 } }
+    pair:step(100)
+    T.eq(#pair.client_world.revives, 0, "nothing spawned")
+    T.check(h1.alive and h2.alive, "(still alive on the host)")
+end)
+
+T.run("the_client_spawns_nothing_far_away_while_loading_or_when_switched_off", function()
+    local pair = make_pair({ enemy_spawn_missing = false })
+    pair.host_world:spawn(GANADO, 0, 0, 0, 100, 0x5301)
+    pair.client_world.spawnable[0x5301] = { kind = GANADO, pos = { x = 0, y = 0, z = 0 } }
+    pair:step(60)
+    T.eq(#pair.client_world.revives, 0, "switched off")
+    pair.settings.enemy_spawn_missing = nil
+    pair.client_player = { x = 0, y = 0, z = 300 }
+    pair:step(60)
+    T.eq(#pair.client_world.revives, 0, "out of reach")
+    pair.client_player = { x = 0, y = 0, z = -5 }
+    pair.client_loading = true
+    pair:step(60)
+    T.eq(#pair.client_world.revives, 0, "not while our area loads")
+    pair.client_loading = nil
+    pair:step(60)
+    T.eq(#pair.client_world.revives, 1, "then it is spawned")
+    T.eq(#pair.host_world.revives, 0, "the host never spawns the client's enemies: its world decides")
 end)
 
 T.run("dead_stays_dead_for_enemies_that_spawn_later", function()

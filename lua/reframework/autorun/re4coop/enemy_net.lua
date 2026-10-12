@@ -61,6 +61,8 @@
 --   game:enemy_get_hp(id) -> number|nil
 --   game:enemy_kill(id, fields|nil) -> bool         (dies with its own logic; with the killing hit if given)
 --   game:enemy_erase(id) -> bool                    (optional: removed without a death)
+--   game:enemy_revive(uid) -> "spawning"|"forgotten"|"missing"|"dead_here"
+--                                                    (optional, client: spawn a host enemy our game has not)
 --   game:enemy_restore_spawns(uid|nil) -> n          (optional: undo enemy_erase - alive again)
 --   game:enemy_apply_hit(id, hit) -> bool           (optional: runs a partner's hit through the game's hit code)
 --   game:enemy_last_hit(id) -> fields|nil           (optional: the values of the last hit it took)
@@ -101,7 +103,13 @@ local OWN_MARGIN = 3.0         -- metres the other player must be closer by befo
 local OWN_HOLD = 0.75          -- seconds that must last
 local OWN_MIN = 2.5            -- seconds an enemy stays with its owner at least
 local HIT_BIAS = 4.0           -- metres of advantage for the player who hit it last...
-local HIT_BIAS_TIME = 3.0      -- ...within this many seconds
+local HIT_BIAS_TIME = 3.0      -- ...within this many seconds, unless both did (a shared fight: it
+                               -- stays where it is - each change of hands cut its reaction short)
+local FRESH_ANIM = 1.5         -- seconds after our hit in which a puppet plays the owner's newest animation
+local MISSING_AFTER = 1.5      -- client: a host enemy our game has not spawned for this long is spawned here
+local REVIVE_RETRY = 3.0       -- seconds between attempts to spawn the same one
+local REVIVE_PER_TICK = 4
+local DIED_HERE_GUARD = 15.0   -- an enemy that died in our game is not spawned again for this long
 local OWN_MAX_RANGE = 80.0     -- a player farther than this from the enemy never gets it
 local FATAL_HOLD = 10.0        -- seconds an enemy stays with the player finishing it (stealth kill, grab...)
 local CLAIM_WAIT = 1.5         -- client: seconds a claimed enemy runs here before the host's answer
@@ -189,6 +197,8 @@ function EnemyNet:reset()
     self.grave = {}         -- client: uid -> time it was buried
     self.grave_count = 0
     self.dead_net = {}      -- client: net id -> time (host deaths of enemies without a uid)
+    self.died_here = {}     -- uid -> time it died in our game (never spawned again right away)
+    self.revived = {}       -- client: uid -> time we asked our game to spawn it for the host's world
     self.grave_scan = nil
     self.corpse_guard_until = nil
     self.reloaded = nil
@@ -312,7 +322,8 @@ end
 
 -- A shared enemy: { net_id, uid|nil, kind_hash, spawn, owner, epoch (0 = never assigned),
 -- local_id, interp, newest (the partner's latest state), updated, ack (owner: the last of the
--- partner's hits applied), pending ({seq, time}: our last forwarded hit), last_hit {who, time} }
+-- partner's hits applied), pending ({seq, time}: our last forwarded hit), last_hit {who, time},
+-- hit_at { [owner] = time }: the last hit of each player }
 function EnemyNet:new_net(net_id, uid, kind_hash, spawn)
     local net = { net_id = net_id, uid = uid, kind_hash = kind_hash, spawn = spawn, owner = self.P.OWNER.HOST,
         epoch = 0, ack = 0 }
@@ -486,12 +497,16 @@ function EnemyNet:decide_owners(now, game, players)
         local has_copy = r ~= nil and now - r.time <= ROSTER_STALE and r.alive
         if e ~= nil and e.alive then
             local desired = P.OWNER.HOST
+            -- Only distance (and the last hitter) wants a change: a shared fight keeps the owner.
+            local by_choice = false
+            local contested = self:contested(net, now)
             if has_copy and shared then
                 local dh, dc = dist(e.pos, host_pos), dist(e.pos, client_pos)
                 local lh = net.last_hit
                 if lh ~= nil and now - lh.time <= HIT_BIAS_TIME then
                     if lh.who == P.OWNER.HOST then dh = dh - HIT_BIAS else dc = dc - HIT_BIAS end
                 end
+                by_choice = dc <= OWN_MAX_RANGE
                 if dc > OWN_MAX_RANGE then
                     desired = P.OWNER.HOST
                 elseif net.epoch == 0 then
@@ -505,7 +520,8 @@ function EnemyNet:decide_owners(now, game, players)
             -- A finisher in progress keeps the enemy with the player doing it.
             local f = net.fatal
             if f ~= nil and now >= f.till then net.fatal, f = nil, nil end
-            if f ~= nil and (f.who == P.OWNER.HOST or has_copy) then desired = f.who end
+            if f ~= nil and (f.who == P.OWNER.HOST or has_copy) then desired, by_choice = f.who, false end
+            if by_choice and contested and net.epoch ~= 0 then desired = net.owner end
             if net.epoch == 0 then
                 if has_copy then
                     -- First assignment, at once. The client's copy may have been fought already
@@ -686,6 +702,14 @@ function EnemyNet:apply_anims(now, game)
         if l ~= nil and l.puppet and net.interp ~= nil and not self:runs_here(net) then
             local age = net.interp:age(now)
             local st = age ~= nil and age < REMOTE_STALE and net.interp:sample(now) or nil
+            -- Just after our own hit: its reaction as soon as it arrives, not one interpolation
+            -- delay later (the position keeps its smooth, delayed track).
+            local mine = net.hit_at and net.hit_at[self.me]
+            if st ~= nil and mine ~= nil and now - mine <= FRESH_ANIM and net.newest ~= nil
+                and net.newest.layers ~= nil and #net.newest.layers > 0 then
+                st = { layers = net.newest.layers }
+                self.counters.fresh_anims = (self.counters.fresh_anims or 0) + 1
+            end
             if st ~= nil and st.layers ~= nil and #st.layers > 0 and game:enemy_set_anim(id, st.layers) then
                 self.counters.anims = self.counters.anims + 1
             end
@@ -829,6 +853,7 @@ function EnemyNet:update_deaths(now, game, local_pos)
         local l = self.locals[id]
         local net = l.net_id and self.nets[l.net_id]
         local was_alive = l.was_alive
+        if was_alive == true and not e.alive and e.uid ~= nil then self.died_here[e.uid] = now end
         if was_alive == true and not e.alive and not l.self_killed and not l.death_sent then
             -- It died in our world. Ours to decide: the owner's death, or (no owner yet) a death
             -- in a game that ran it, or one our player's finisher took over (claimed: the host's
@@ -863,7 +888,18 @@ function EnemyNet:next_seq()
 end
 
 function EnemyNet:note_hit(net, who, now)
-    if net ~= nil then net.last_hit = { who = who, time = now } end
+    if net == nil then return end
+    net.last_hit = { who = who, time = now }
+    net.hit_at = net.hit_at or {}
+    net.hit_at[who] = now
+end
+
+-- Both players hit it within HIT_BIAS_TIME: a shared fight.
+function EnemyNet:contested(net, now)
+    local h = net.hit_at
+    if h == nil then return false end
+    local a, b = h[self.P.OWNER.HOST], h[self.P.OWNER.CLIENT]
+    return a ~= nil and b ~= nil and now - a <= HIT_BIAS_TIME and now - b <= HIT_BIAS_TIME
 end
 
 -- Damage our puppet took that the owner must apply (no hit of ours explains it: an explosion,
@@ -990,6 +1026,8 @@ function EnemyNet:on_partner_hit(m, now, game)
             self.predicted[m.seq] = nil
         end
         self:apply_hit(game, id, e, m, now)
+        -- Its reaction goes out with the next tick, not after the state interval.
+        if net ~= nil then self.state_due = true end
         if net ~= nil and not m.bounce then net.ack = m.seq end
         if net ~= nil and m.bounce then net.pending = nil end
     elseif net ~= nil and not m.bounce then
@@ -1120,9 +1158,15 @@ end
 function EnemyNet:send_states(now)
     local hz = self.settings.snapshot_hz or 20
     local interval = 1.0 / hz
-    if now - self.last_state_send < interval then return end
+    if now - self.last_state_send < interval and not self.state_due then return end
     -- Keep the rate exact (not slowed down by the frame rate), without bursts after a gap.
-    self.last_state_send = (now - self.last_state_send >= 2 * interval) and now or (self.last_state_send + interval)
+    if self.state_due and now - self.last_state_send < interval then
+        self.last_state_send = now
+        self.counters.states_early = (self.counters.states_early or 0) + 1
+    else
+        self.last_state_send = (now - self.last_state_send >= 2 * interval) and now or (self.last_state_send + interval)
+    end
+    self.state_due = nil
     local entries = {}
     for _, net in pairs(self.nets) do
         local id = net.local_id
@@ -1190,8 +1234,10 @@ function EnemyNet:client_on_state(r, remote_time, now, game)
     self:push_state(net, remote_time, now, r)
 end
 
--- Client: pair the host's enemies with ours (by uid, else by kind and spawn point).
-function EnemyNet:pair_remote()
+-- Client: pair the host's enemies with ours (by uid, else by kind and spawn point). One our
+-- game spawned for the host's world starts where the host's is (its HP follows as for any:
+-- the owner change or the host's state).
+function EnemyNet:pair_remote(game)
     local taken = {}
     for id, l in pairs(self.locals) do
         if l.net_id ~= nil and self.nets[l.net_id] ~= nil then taken[id] = true end
@@ -1217,8 +1263,63 @@ function EnemyNet:pair_remote()
         if id ~= nil then
             self:pair(net, id)
             taken[id] = true
+            if net.uid ~= nil and self.revived[net.uid] ~= nil then
+                self.revived[net.uid] = nil
+                self:place_revived(net, id, game)
+            end
         end
     end
+end
+
+-- Client: the host's enemies our game has not spawned at all - our save says they died (a
+-- save from another session), we erased them, or their spawn was never permitted here (a
+-- trigger only the host's player crossed). The host's world decides which enemies exist:
+-- after MISSING_AFTER our game is asked to spawn them (game:enemy_revive); they pair by uid
+-- and follow the host's like any other. Only level enemies (a uid), within reach of our
+-- player, never one whose body or corpse we still have, nor one that just died here.
+function EnemyNet:spawn_missing(now, game, local_pos)
+    if game == nil or game.enemy_revive == nil or self.settings.enemy_spawn_missing == false then return end
+    for uid, t in pairs(self.died_here) do
+        if now - t > DIED_HERE_GUARD then self.died_here[uid] = nil end
+    end
+    for uid, t in pairs(self.revived) do
+        if now - t > 30 then self.revived[uid] = nil end -- never showed up
+    end
+    local budget = REVIVE_PER_TICK
+    for _, net in pairs(self.nets) do
+        local st = net.newest
+        local wanted = net.uid ~= nil and net.local_id == nil and net.owner == self.P.OWNER.HOST and st ~= nil
+            and net.updated ~= nil and now - net.updated < REMOTE_STALE and self.id_of_uid[net.uid] == nil
+            and self.died_here[net.uid] == nil
+        if not wanted then
+            net.missing_since = nil
+        else
+            net.missing_since = net.missing_since or now
+            if budget > 0 and now - net.missing_since >= MISSING_AFTER and now >= (net.revive_at or 0)
+                and (local_pos == nil or dist(st.pos, local_pos) <= OWN_MAX_RANGE) then
+                budget = budget - 1
+                net.revive_at = now + REVIVE_RETRY
+                local r = game:enemy_revive(net.uid)
+                local key = "spawn_" .. tostring(r)
+                self.counters[key] = (self.counters[key] or 0) + 1
+                if r == "spawning" then self.revived[net.uid] = now end
+                if r == "spawning" or r == "forgotten" then
+                    self.log("enemy %s: alive in the host's world but not in ours - spawning it", tostring(net.net_id))
+                end
+            end
+        end
+    end
+end
+
+function EnemyNet:place_revived(net, id, game)
+    local e, st = self.by_id[id], net.newest
+    if e == nil or st == nil or game == nil then return end
+    if game.enemy_set_transform ~= nil and game:enemy_set_transform(id, st.pos, st.rot) then
+        e.pos, e.rot = copy3(st.pos), st.rot
+        local l = self.locals[id]
+        if l ~= nil then l.prev_pos = copy3(st.pos) end
+    end
+    self.counters.revived = (self.counters.revived or 0) + 1
 end
 
 function EnemyNet:send_roster(now)
@@ -1373,8 +1474,9 @@ function EnemyNet:on_local_reload()
     end
 end
 
--- players = { local_pos={x,y,z}|nil, partner_pos={x,y,z}|nil }: where both players are
--- (ownership, and how an enemy dead in the partner's world goes).
+-- players = { local_pos={x,y,z}|nil, partner_pos={x,y,z}|nil, partner_busy, loading (our area
+-- is loading), other_region (the partner is in another region) }: where both players are
+-- (ownership, how an enemy dead in the partner's world goes, spawning the partner's enemies).
 function EnemyNet:tick(now, enemies, game, players)
     self.last_tick = now
     local local_pos = players and players.local_pos or nil
@@ -1420,7 +1522,8 @@ function EnemyNet:tick(now, enemies, game, players)
         for net_id, t in pairs(self.dead_net) do
             if now - t > 60 then self.dead_net[net_id] = nil end
         end
-        self:pair_remote()
+        self:pair_remote(game)
+        if not (players and (players.loading or players.other_region)) then self:spawn_missing(now, game, local_pos) end
     end
 
     self:update_deaths(now, game, local_pos)

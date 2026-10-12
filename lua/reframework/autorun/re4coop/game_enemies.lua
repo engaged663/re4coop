@@ -15,7 +15,13 @@
 --     pre-hook reads every primitive value of the DamageInfo (found by reflection, so nothing
 --     about its layout is hard-coded), and for a puppet makes sure our game cannot kill it (the
 --     owner decides). A partner's hit is run through the same callback with those values.
---   * Deaths: HitPoint.dead() (or HP 0), preceded by the killing hit when we have it;
+--   * Reactions and deaths are the AI's (docs/RESEARCH.md 3.20): CharacterHeadUpdater.onHitDamage
+--     takes the HP, chooses the reaction from the hit's AttackData (_AttackType, _AttackPower,
+--     _Option) and the body part of its DamageUserData, and starts the death only for a hit
+--     with IsKill set. So a hit we run carries the shooter's attack values and body part, and
+--     its IsKill is decided by our game's HitPoint (HitController.checkKill).
+--   * Deaths: the killing hit (with IsKill); HitPoint.dead() / HP 0 only when no hit can be built
+--     (then the AI is asked to die at once: entryDeadAction);
 --     erasing = CharacterSpawnParam.invalidateSpawn(true), undone when the partner's world
 --     brings the enemy back (never CharacterContext.eliminate(): that one is permanent and ends
 --     up in the save).
@@ -48,7 +54,14 @@ local HIT_OBJECT_FIELDS = {
     { "DamageGameObject", "target" }, { "ChildHitController", "comp" }, { "AttackCollidable", "clear" },
     { "DamageCollidable", "clear" },
 }
-local CHEST = 1 -- chainsaw.character.BodyParts.Chest: the part a replayed hit lands on
+local CHEST = 1 -- chainsaw.character.BodyParts.Chest: where a hit without a body part lands
+local ATTACK_DATA = "chainsaw.collision.AttackHitUserData.AttackData"
+-- The values a hit carries besides its DamageInfo's (hashed like them, with these names): every
+-- primitive value of its AttackData - what the enemy's reaction is chosen from - and the body
+-- part its DamageUserData stands for.
+local AD_PREFIX = "AttackData."
+local PART_KEY, SIDE_KEY = "DamageUserData.Parts", "DamageUserData.PartsSide"
+local MAX_ATTACK_CLONES = 32 -- AttackData copies kept per template (one per kind of partner attack)
 local HIT_HOLD = 5.0 -- seconds a DamageInfo we built keeps an engine reference after the hit (Game:hold)
 -- DamageInfo values that only mean something in the game that made them are not copied.
 local HIT_FIELD_EXCLUDE = { "serial", "unique", "handle", "address", "pointer", "ptr", "frame", "time" }
@@ -97,7 +110,8 @@ function M.install(Game, H)
         self.hit_events = {}
         self.fatal_events = {} -- enemies our player started a finisher on (see on_local_fatal)
         self.hit_stats = { seen = 0, by_player = 0, other_owner = 0, not_enemy = 0, clamped = 0, applied = 0,
-            apply_failed = 0, kills_with_hit = 0, fields = 0 }
+            apply_failed = 0, kills_with_hit = 0, fields = 0, attack_clones = 0, parts_matched = 0,
+            kill_decided = 0, deaths_forced = 0 }
         self.anim_stats = { changes = 0, seeks = 0, speeds = 0, failed = 0 }
         self.elim_scan = nil
     end
@@ -594,26 +608,87 @@ function M.install(Game, H)
         return self.dmg_schema
     end
 
-    -- Every value of a DamageInfo as { {h, t, v}, ... }.
+    -- The primitive values of an attack's AttackData (its reaction type and power, options,
+    -- dead type...; not its Nullable values and object references): { list, by_hash }, hashed
+    -- with AD_PREFIX.
+    function Game:attack_schema()
+        if self.ad_schema ~= nil then return self.ad_schema or nil end
+        local td = find_type(ATTACK_DATA)
+        local ok, fields = pcall(function() return td:get_fields() end)
+        if td == nil or not ok then
+            self.ad_schema = false
+            return nil
+        end
+        local list, by_hash = {}, {}
+        for _, f in ipairs(fields or {}) do
+            local okn, name = pcall(f.get_name, f)
+            if okn and name ~= nil and not field_is_static(f) then
+                local ft = field_type_name(f) or ""
+                local tag = HIT_VALUE_TYPES[ft]
+                if tag == nil and not ft:find("Nullable", 1, true) then
+                    local ftd = find_type(ft)
+                    local okE, isenum = pcall(function() return ftd ~= nil and ftd:is_a("System.Enum") end)
+                    if okE and isenum then tag = P.HIT_VALUE.I32 end
+                end
+                if tag ~= nil then
+                    local entry = { name = name, hash = P.hash(AD_PREFIX .. name), tag = tag }
+                    list[#list + 1] = entry
+                    by_hash[entry.hash] = entry
+                end
+            end
+        end
+        table.sort(list, function(a, b) return a.name < b.name end)
+        self.ad_schema = { list = list, by_hash = by_hash }
+        return self.ad_schema
+    end
+
+    local function read_value(obj, f, out)
+        local ok, v = pcall(obj.get_field, obj, f.name)
+        if not ok or v == nil then return end
+        if f.tag == P.HIT_VALUE.VEC3 then
+            if type(v) == "userdata" or type(v) == "table" then
+                out[#out + 1] = { h = f.hash, t = f.tag, v = { x = v.x or 0, y = v.y or 0, z = v.z or 0 } }
+            end
+        elseif f.tag == P.HIT_VALUE.BOOL then
+            out[#out + 1] = { h = f.hash, t = f.tag, v = v == true }
+        elseif type(v) == "number" then
+            out[#out + 1] = { h = f.hash, t = f.tag, v = v }
+        end
+    end
+
+    -- Every value of a hit as { {h, t, v}, ... }: its DamageInfo's, its AttackData's and the
+    -- body part it landed on.
     function Game:read_damage_fields(info)
         local schema = self:damage_schema()
         if schema == nil then return nil end
         local out = {}
-        for _, f in ipairs(schema.list) do
-            local ok, v = pcall(info.get_field, info, f.name)
-            if ok and v ~= nil then
-                if f.tag == P.HIT_VALUE.VEC3 then
-                    if type(v) == "userdata" or type(v) == "table" then
-                        out[#out + 1] = { h = f.hash, t = f.tag, v = { x = v.x or 0, y = v.y or 0, z = v.z or 0 } }
-                    end
-                elseif f.tag == P.HIT_VALUE.BOOL then
-                    out[#out + 1] = { h = f.hash, t = f.tag, v = v == true }
-                elseif type(v) == "number" then
-                    out[#out + 1] = { h = f.hash, t = f.tag, v = v }
-                end
+        for _, f in ipairs(schema.list) do read_value(info, f, out) end
+        -- (the body part before the attack's values: a message carries P.MAX_HIT_FIELDS at most)
+        local du = self:call(info, "get_DamageUserData")
+        if du ~= nil then
+            local okP, parts = pcall(du.get_field, du, "Parts")
+            local okS, side = pcall(du.get_field, du, "PartsSide")
+            if okP and tonumber(parts) ~= nil then
+                out[#out + 1] = { h = P.hash(PART_KEY), t = P.HIT_VALUE.I32, v = tonumber(parts) }
+            end
+            if okS and tonumber(side) ~= nil then
+                out[#out + 1] = { h = P.hash(SIDE_KEY), t = P.HIT_VALUE.I32, v = tonumber(side) }
             end
         end
+        local ad = self:call(info, "get_AttackData")
+        local ads = ad ~= nil and self:attack_schema() or nil
+        if ads ~= nil then
+            for _, f in ipairs(ads.list) do read_value(ad, f, out) end
+        end
         return out
+    end
+
+    local function value_of(fields, key)
+        local h = P.hash(key)
+        for _, f in ipairs(fields or {}) do
+            if f.h == h then return f.v end
+        end
+        return nil
     end
 
     function Game:write_damage_fields(info, fields)
@@ -670,6 +745,7 @@ function M.install(Game, H)
         local owner = self:call(info, "get_AttackOwnerObject")
         if not self.player_objects[address_of(owner) or false] then
             stats.other_owner = stats.other_owner + 1
+            self:remember_hit_template(info, true)
             return
         end
         stats.by_player = stats.by_player + 1
@@ -946,7 +1022,44 @@ function M.install(Game, H)
                 stale()
             end
         end
+        if tpl == nil and t.other ~= nil then
+            if usable(t.other) then tpl = t.other else t.other = nil stale() end
+        end
         return tpl
+    end
+
+    -- The AttackData a partner's hit runs with: a copy of the template's (AttackData.doDeepCopy:
+    -- every value and reference, the game's own copy) carrying the shooter's attack values - its
+    -- reaction type and power above all, which the template's weapon may not share (a shotgun
+    -- blast replayed with pistol data made only a flinch). One copy per kind of attack, kept
+    -- with its template (never released: see keep). Falls back to the template's own.
+    function Game:attack_data_for(tpl, fields)
+        local ads = self:attack_schema()
+        if ads == nil then return tpl.ad end
+        local mine, keyparts = {}, {}
+        for _, f in ipairs(fields or {}) do
+            local s = ads.by_hash[f.h]
+            if s ~= nil and s.tag == f.t and f.t ~= P.HIT_VALUE.VEC3 then
+                mine[#mine + 1] = { s = s, v = f.v }
+                keyparts[#keyparts + 1] = ("%d=%s"):format(f.h, tostring(f.v))
+            end
+        end
+        if #mine == 0 then return tpl.ad end
+        table.sort(keyparts)
+        local key = table.concat(keyparts, ",")
+        tpl.clones = tpl.clones or { n = 0 }
+        local c = tpl.clones[key]
+        if c ~= nil then return c end
+        if tpl.clones.n >= MAX_ATTACK_CLONES then return tpl.ad end
+        local okC, ad = pcall(sdk.create_instance, ATTACK_DATA)
+        if not okC or ad == nil then return tpl.ad end
+        ad = self:keep(ad)
+        if ad == nil or not pcall(ad.call, ad, "doDeepCopy", tpl.ad) then return tpl.ad end
+        for _, m in ipairs(mine) do pcall(ad.set_field, ad, m.s.name, m.v) end
+        tpl.clones[key] = ad
+        tpl.clones.n = tpl.clones.n + 1
+        self.hit_stats.attack_clones = self.hit_stats.attack_clones + 1
+        return ad
     end
 
     -- Keeps a managed object alive while we hold it (REFramework releases what nothing refers to).
@@ -962,14 +1075,21 @@ function M.install(Game, H)
     end
 
     -- Remembers the attack data of a real hit by our player (by weapon; the latest one too),
-    -- with the types they had, to check them again before each use (still_valid).
-    function Game:remember_hit_template(info)
+    -- with the types they had, to check them again before each use (still_valid). `other`:
+    -- another character's hit, kept only as a last resort (a partner's kill must run as a hit
+    -- even before our player has hit anything: it is what makes the enemy die at once).
+    function Game:remember_hit_template(info, other)
+        local t = self.hit_templates
+        if other and t.other ~= nil then return end
         local au = self:call(info, "get_AttackUserData")
         local ad = self:call(info, "get_AttackData")
         if au == nil or ad == nil then return end
-        local t = self.hit_templates
         local tpl = { au = self:keep(au), ad = self:keep(ad), au_type = type_name_of(au), ad_type = type_name_of(ad) }
         if tpl.au == nil or tpl.ad == nil or tpl.au_type == nil or tpl.ad_type == nil then return end
+        if other then
+            t.other = tpl
+            return
+        end
         local weapon = tonumber(self:call(info, "get_WeaponID"))
         if weapon ~= nil then t.by_weapon[weapon] = tpl end
         t.any = tpl
@@ -981,23 +1101,35 @@ function M.install(Game, H)
     end
 
     -- One of the enemy's own damage colliders (its HitController's Colliders) and its
-    -- DamageUserData - the chest one when there is one: collider, user data | nil.
-    function Game:enemy_damage_collider(info)
+    -- DamageUserData: the one of body part `part` (and side `side`) the shooter hit - the part
+    -- takes the hit's Break damage and picks the reaction (a head shot staggers, a knee shot
+    -- drops to the knee) - else the chest, else the first: collider, user data, matched | nil.
+    function Game:enemy_damage_collider(info, part, side)
         local hc = info.body and self:get_component(info.body, "chainsaw.HitController")
         local cols = hc and self:call(hc, "get_Colliders")
         local n = cols and tonumber(self:call(cols, "getCollidersCount")) or 0
-        local first_col, first_ud
+        local best, best_score = nil, -1
         for i = 0, math.min(n, 128) - 1 do
             local col = self:call(cols, "getColliders", i)
             local ud = col and self:call(col, "get_UserData")
             local tname = ud and self:still_valid(ud) and type_name_of(ud) or nil
             if tname ~= nil and tname:find("DamageUserData", 1, true) then
                 local okP, parts = pcall(ud.get_field, ud, "Parts")
-                if okP and tonumber(parts) == CHEST then return col, ud end
-                first_col, first_ud = first_col or col, first_ud or ud
+                local okS, s = pcall(ud.get_field, ud, "PartsSide")
+                parts = okP and tonumber(parts) or nil
+                s = okS and tonumber(s) or nil
+                local score = 0
+                if part ~= nil and parts == part then
+                    score = (side == nil or s == side) and 4 or 3
+                elseif parts == CHEST then
+                    score = 2
+                end
+                if score > best_score then best, best_score = { col, ud }, score end
+                if score == 4 then break end
             end
         end
-        return first_col, first_ud
+        if best == nil then return nil, nil, false end
+        return best[1], best[2], best_score >= 3
     end
 
     -- A fresh DamageInfo carrying a hit's values (nil if one cannot be built: no live attacker,
@@ -1017,16 +1149,19 @@ function M.install(Game, H)
             self.hit_stats.no_template = (self.hit_stats.no_template or 0) + 1
             return nil
         end
-        if not (pcall(d.call, d, "set_AttackUserData", tpl.au) and pcall(d.call, d, "set_AttackData", tpl.ad)) then
+        local ad = self:attack_data_for(tpl, fields)
+        if not (pcall(d.call, d, "set_AttackUserData", tpl.au) and pcall(d.call, d, "set_AttackData", ad)) then
             return nil
         end
         if self:call(d, "get_AttackUserData") == nil or self:call(d, "get_AttackData") == nil then return nil end
         -- The enemy's own collider and damage data, read from it now: never kept from an earlier
         -- hit (the game frees an enemy kind's data with its resource).
-        local col, du = self:enemy_damage_collider(info)
+        local part, side = value_of(fields, PART_KEY), value_of(fields, SIDE_KEY)
+        local col, du, matched = self:enemy_damage_collider(info, part, side)
         if du ~= nil then
             pcall(d.call, d, "set_DamageCollidable", col)
             pcall(d.call, d, "set_DamageUserData", du)
+            if matched then self.hit_stats.parts_matched = self.hit_stats.parts_matched + 1 end
         end
         if self:call(d, "get_DamageUserData") == nil or self:call(d, "get_AttackGameObject") == nil then
             self.hit_stats.no_damage_data = (self.hit_stats.no_damage_data or 0) + 1
@@ -1046,8 +1181,26 @@ function M.install(Game, H)
         return ok
     end
 
+    -- Whether `damage` kills enemy `id` in our game - the game's own rule (HitController.checkKill
+    -- -> HitPoint.checkDead: not while NoDamage, Immortal or NoDeath; HP - damage <= 0), or nil.
+    function Game:enemy_check_kill(id, damage)
+        local info = self:live_enemy(id)
+        local hc = info and info.body and self:get_component(info.body, "chainsaw.HitController")
+        local r = hc and self:call(hc, "checkKill", damage)
+        if type(r) == "boolean" then return r end
+        local ctx = self.enemy_ctx[id]
+        local hp = ctx and self:call(ctx, "get_HitPoint")
+        r = hp and self:call(hp, "checkDead", damage)
+        if type(r) == "boolean" then return r end
+        return nil
+    end
+
     -- Runs the partner's hit on our enemy (we own it): the same values its game computed, so
-    -- the same damage and the same reaction. hit = { damage, fields, critical }.
+    -- the same damage and the same reaction. hit = { damage, fields, critical }. Whether it
+    -- kills is ours to say: the AI starts a death only for a hit marked IsKill, and the
+    -- shooter's game marked it against its own copy's HP. A kill it had marked that does not
+    -- kill here would make the enemy die with HP left; one it did not mark that takes our last
+    -- HP left the enemy walking with no HP for seconds (the AI only notices later).
     function Game:enemy_apply_hit(id, hit)
         local info = self:live_enemy(id)
         if info == nil or hit.fields == nil or #hit.fields == 0 then return false end
@@ -1056,6 +1209,10 @@ function M.install(Game, H)
             self.hit_stats.apply_failed = self.hit_stats.apply_failed + 1
             self:cap("hit_apply", false, "cannot build a DamageInfo")
             return false
+        end
+        local kill = self:enemy_check_kill(id, tonumber(self:call(d, "get_Damage")) or 0)
+        if kill ~= nil and pcall(d.call, d, "set_IsKill", kill) then
+            self.hit_stats.kill_decided = self.hit_stats.kill_decided + 1
         end
         self.perf:crumb("enemy.apply_hit", info.kind, "now")
         local ok = self:run_hit(id, d)
@@ -1084,9 +1241,12 @@ function M.install(Game, H)
         if hp == nil then return false end
         self.perf:crumb("enemy.kill", info.kind, "now")
         self:restore_puppet(id) -- its death needs its AI and animation driver
-        if fields ~= nil and #fields > 0 and self.settings.enemy_kill_with_hit ~= false then
-            local d = self:build_hit(info, fields)
+        if self.settings.enemy_kill_with_hit ~= false then
+            -- Without the partner's values: a plain killing hit, from in front of it.
+            local plain = fields == nil or #fields == 0
+            local d = self:build_hit(info, plain and {} or fields)
             if d ~= nil then
+                if plain then self:aim_plain_hit(d, info) end
                 local cur = tonumber(self:call(hp, "get_CurrentHitPoint")) or 0
                 pcall(d.call, d, "set_Damage", math.floor(cur) + 1)
                 pcall(d.call, d, "set_IsKill", true)
@@ -1099,11 +1259,38 @@ function M.install(Game, H)
                 end
             end
         end
+        local dead = false
         if self.kill_method ~= nil then
             local m = self:method(hp, self.kill_method)
-            if m ~= nil and pcall(m.call, m, hp) then return true end
+            dead = m ~= nil and pcall(m.call, m, hp)
         end
-        return self:write_hp(hp, 0)
+        if not dead then dead = self:write_hp(hp, 0) end
+        -- HitPoint.dead() only zeroes the HP: the AI would notice seconds later and the enemy
+        -- walked on meanwhile. Its death action now (the one many enemies' onDead request).
+        if dead then self:force_death(id) end
+        return dead
+    end
+
+    -- A plain killing hit's direction and point: at the enemy's chest, pushing it backwards.
+    function Game:aim_plain_hit(d, info)
+        local pos = info.pos
+        if pos == nil then return end
+        local q = info.rot or { x = 0, y = 0, z = 0, w = 1 }
+        -- The enemy's forward axis (local +Z rotated by q).
+        local fx = 2 * (q.x * q.z + q.w * q.y)
+        local fz = 1 - 2 * (q.x * q.x + q.y * q.y)
+        pcall(d.call, d, "set_Position", Vector3f.new(pos.x, pos.y + 1.2, pos.z))
+        pcall(d.call, d, "set_DamageDir", Vector3f.new(-fx, 0, -fz))
+    end
+
+    -- The AI starts its death now (CharacterHeadUpdater.entryDeadAction: requests the death
+    -- action of its action table).
+    function Game:force_death(id)
+        local ctx = self.enemy_ctx[id]
+        local upd = ctx and self:call(ctx, "get_HeadUpdater")
+        if upd ~= nil and self:head_linked(upd) and pcall(upd.call, upd, "entryDeadAction") then
+            self.hit_stats.deaths_forced = self.hit_stats.deaths_forced + 1
+        end
     end
 
     -- Removes an enemy that is already dead in the partner's world: its spawn param's
@@ -1147,6 +1334,54 @@ function M.install(Game, H)
         end
         if n > 0 then self.perf:crumb("enemy.restore_spawns", tostring(n)) end
         return n
+    end
+
+    -- A chainsaw.ContextID for a ContextID code (its constructor from a code), or nil.
+    function Game:context_id_of(code)
+        local okC, id = pcall(sdk.create_instance, "chainsaw.ContextID")
+        if not okC or id == nil then return nil end
+        if not pcall(id.call, id, ".ctor(System.UInt32)", code) and not pcall(id.call, id, "setCode", code) then
+            return nil
+        end
+        return id
+    end
+
+    -- The partner's world (the host's) has enemy `uid` alive, but our game never spawned it
+    -- (docs/RESEARCH.md 3.21). A level enemy is spawned by its CharacterSpawnParam once its
+    -- StatusFlag has Permitted|Readied|Activated and not Invalidated (updateSpawn);
+    -- isNextSpawn reads the character's save backup first and, if it is eliminated (our save:
+    -- it died here), invalidates the spawn param for good. So: the save's death is forgotten
+    -- (the backup removed from CharacterBackupDB - the enemy comes back fresh, as the level
+    -- places it), an invalidated spawn param is validated again, and one the level has not
+    -- permitted yet here (a trigger only the host's player crossed) is permitted; the game's own
+    -- update spawns it. Returns "spawning", "forgotten" (no spawn param here - its area is not
+    -- loaded: it spawns when it is), "missing" or "dead_here" (a character of ours that died).
+    function Game:enemy_revive(uid)
+        local cm = singleton(CHARACTER_MANAGER)
+        local id = cm and self:context_id_of(uid)
+        if id == nil then return "missing" end
+        local ctx = self:call(cm, "getContextRef", id)
+        if ctx ~= nil and self:call(ctx, "get_IsEliminated") == true then return "dead_here" end
+        local forgot = false
+        local db = self:call(cm, "get_CharacterBackupDB")
+        if db ~= nil and self:call(db, "ContainsKey", uid) == true then
+            local b = self:call(db, "get_Item", uid)
+            if b ~= nil and self:call(b, "get_IsEliminated") == true then
+                forgot = pcall(db.call, db, "System.Collections.Generic.IDictionary<TKey,TValue>.Remove(System.UInt32)", uid)
+            end
+        end
+        local sp = self:call(cm, "getSpawnParamRef", id)
+        if sp == nil or not self:alive(sp) then
+            if forgot then self.perf:crumb("enemy.revive", "forgotten", true) end
+            return forgot and "forgotten" or "missing"
+        end
+        self.perf:crumb("enemy.revive", tostring(uid), true)
+        local flags = tonumber(self:call(sp, "get_StatusFlag")) or 0
+        if flags & 8 ~= 0 then pcall(sp.call, sp, "invalidateSpawn", false) end
+        if flags & 1 == 0 then pcall(sp.call, sp, "permitSpawn", true) end
+        self.erased_spawns[uid] = nil
+        self:cap("enemy_revive", true, "spawn param validated and permitted (save deaths forgotten)")
+        return "spawning"
     end
 
     -- Host: the uids of every enemy our save has eliminated. The game keeps the state of every

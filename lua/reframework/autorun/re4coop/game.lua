@@ -102,6 +102,15 @@ local TRANSLATE_HINTS = { "root", "hip", "cog", "pelvis", "waist", "center", "ce
 -- spawned body into a pure visual that only our pose stream moves.
 local PUPPET_DISABLE = { "chainsaw.", "app.", "via.behaviortree.", "via.physics.", "via.motion.Motion",
     "via.motion.Ik", "via.motion.Look", "via.navigation.", "via.dynamics.", "via.gui.", "via.ai." }
+-- A spawned copy never renders a view of its own: a scoped weapon's prefab carries the scope's
+-- camera (chainsaw.ScopeController: _CameraRef, _WeaknessCameraGameObject) with its
+-- via.render.RenderOutput and post effects (CustomFilter, DepthOfField, LDRPostProcess,
+-- ToneMapping, VolumetricFogControl). With its controller off the camera kept rendering the
+-- scope's view onto the screen of the partner's game. Every component of a GameObject holding
+-- a camera, and every render output, is switched off.
+local PUPPET_CAMERA = "via.Camera"
+local PUPPET_NO_RENDER = { "via.render.RenderOutput" }
+local SCOPE_CONTROLLER = "chainsaw.ScopeController"
 
 local ARG_KIND = {
     ["System.UInt32"] = P.ARG.U32, ["System.UInt16"] = P.ARG.U32, ["System.Byte"] = P.ARG.U32,
@@ -919,17 +928,51 @@ end
 -- keeping rendering, sound and effect components. Returns how many were disabled.
 function Game:sanitize(tree)
     local disabled = 0
+    local cameras = {}
     for _, node in ipairs(tree) do
-        for _, comp in ipairs(self:components(node.go)) do
+        local comps = self:components(node.go)
+        local has_camera = false
+        for _, comp in ipairs(comps) do
+            if type_name_of(comp) == PUPPET_CAMERA then has_camera = true end
+        end
+        if has_camera then cameras[#cameras + 1] = node.go end
+        for _, comp in ipairs(comps) do
             local tname, td = type_name_of(comp)
-            if tname ~= nil and starts_with_any(tname, PUPPET_DISABLE) and not self:mirror_kind_of(td) then
+            if tname ~= nil and (starts_with_any(tname, PUPPET_NO_RENDER)
+                or (starts_with_any(tname, PUPPET_DISABLE) and not self:mirror_kind_of(td))) then
+                if tname == SCOPE_CONTROLLER then
+                    -- Its scope cameras may live outside this hierarchy (once it has run).
+                    for _, f in ipairs({ "_CameraRef", "_WeaknessCameraRef" }) do
+                        local okC, cam = pcall(comp.get_field, comp, f)
+                        local cgo = okC and cam ~= nil and self:call(cam, "get_GameObject") or nil
+                        if cgo ~= nil then cameras[#cameras + 1] = cgo end
+                    end
+                    local okR, ref = pcall(comp.get_field, comp, "_WeaknessCameraGameObject")
+                    local rgo = okR and ref ~= nil and self:call(ref, "get_Target") or nil
+                    if rgo ~= nil then cameras[#cameras + 1] = rgo end
+                end
                 if pcall(comp.call, comp, "set_Enabled", false) then
                     disabled = disabled + 1
                 end
             end
         end
     end
+    for _, go in ipairs(cameras) do
+        disabled = disabled + self:silence_camera(go)
+    end
+    if #cameras > 0 then self:cap("puppet_cameras", true, ("%d camera object(s) switched off"):format(#cameras)) end
     return disabled
+end
+
+-- A camera GameObject of a spawned copy: every component off, and it no longer updates.
+function Game:silence_camera(go)
+    local n = 0
+    for _, comp in ipairs(self:components(go)) do
+        if self:call(comp, "get_Enabled") ~= false and pcall(comp.call, comp, "set_Enabled", false) then n = n + 1 end
+    end
+    pcall(go.call, go, "set_UpdateSelf", false)
+    self.puppet_cameras = (self.puppet_cameras or 0) + 1
+    return n
 end
 
 function Game:prefab_exists(path)

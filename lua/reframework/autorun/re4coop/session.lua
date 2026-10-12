@@ -1179,14 +1179,18 @@ function Session:players_info(now)
     local remote = self.interp:sample(now)
     local age = self.interp:age(now)
     if local_pos == nil then return nil end
-    if remote == nil or age == nil or age > 2.0 then return { local_pos = local_pos } end
+    -- (our area still loading: no enemy is spawned for the partner's world)
+    local loc = self.local_loc
+    local loading = loc ~= nil and (loc.loading == true or loc.playable == false)
+    if remote == nil or age == nil or age > 2.0 then return { local_pos = local_pos, loading = loading } end
     if remote.stage ~= nil and self.local_stage ~= nil and remote.stage // 1000 ~= self.local_stage // 1000 then
-        return { local_pos = local_pos } -- another region: the partner is not near our enemies
+        -- another region: the partner is not near our enemies
+        return { local_pos = local_pos, loading = loading, other_region = true }
     end
     -- A partner who is down or watching a cutscene cannot fight: enemies stay with us.
     local flags = remote.flags or 0
     local busy = (flags & (P.PLAYER_FLAGS.DEAD | P.PLAYER_FLAGS.CUTSCENE)) ~= 0
-    return { local_pos = local_pos, partner_pos = remote.pos, partner_busy = busy }
+    return { local_pos = local_pos, partner_pos = remote.pos, partner_busy = busy, loading = loading }
 end
 
 -- No-pause: while hosting or connected, menus do not freeze the world (see game_pause.lua).

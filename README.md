@@ -82,7 +82,15 @@ How it works and why: [docs/RESEARCH.md](docs/RESEARCH.md). Wire format: [docs/P
   is set in its final position when its area loads instead.
 * Your partner's hits and kills make the enemy react and die in your game, but never burst its
   head or break a limb there (the break effect of a replayed hit crashed the game); your own
-  hits mutilate as always.
+  hits mutilate as always. The reaction is the one of your partner's weapon and of the body part
+  they hit (0.9.1, not run in the game yet). An enemy you both shoot stays with one game until
+  the fight pauses.
+* Scoped weapons (0.9.1, not run in the game yet): your partner's rifle is only a model in your
+  game - its scope never renders its view on your screen.
+* The host's world decides which enemies exist (0.9.1, not run in the game yet): an enemy alive
+  for the host that the client's game never spawned - the client's save had it dead, or only the
+  host triggered it - appears for the client too, where the host's is. Enemies the game creates
+  on the fly (no level identity) still appear only where they spawned.
 * The partner's model is a visual copy: it does not collide and your bullets pass through it.
 * Thrown grenades, bullet impacts and blood on enemies happen only in the thrower's/shooter's
   game. Sounds the engine plays internally (outside the reflected `trigger` calls) may not be

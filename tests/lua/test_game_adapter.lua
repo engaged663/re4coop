@@ -873,6 +873,166 @@ T.run("a_death_from_the_partners_game_comes_with_its_killing_hit", function()
     T.eq(e1.hp, 0, "dead")
 end)
 
+-- The values the partner's game read from a hit of its player (game inactive here: nothing is
+-- kept or sent by our hook), landed on a throwaway character.
+local function partner_hit_fields(game, damage, opts)
+    local dummy = mock.make_character("chainsaw.Ch1c0z0Context", { x = 50, y = 0, z = 50 }, 10000)
+    local was = game.active
+    game.active = false
+    local info = mock.hit(dummy, damage, 7, nil, opts)
+    game.active = was
+    return game:read_damage_fields(info)
+end
+
+T.run("whether_a_partners_hit_kills_is_decided_by_our_hp", function()
+    -- The AI starts a death only for a hit marked IsKill (CharacterHeadUpdater.onHitDamage),
+    -- and the shooter's game marked it against its own copy's HP. A hit that took our last HP
+    -- unmarked left the enemy walking with no HP for seconds; a marked one that did not kill
+    -- here would play a death with HP left.
+    local game, world = fresh_game()
+    game:set_active(true)
+    game:read_player_state()
+    local list = game:list_enemies()
+    mock.hit(world.enemies[1], 0, 0) -- attack data known
+    game:take_hit_events()
+    local e2, id2 = world.enemies[2], list[2].id
+    -- The shooter's copy had more HP: not a kill there. It is one here.
+    local fields = partner_hit_fields(game, 300)
+    for _, f in ipairs(fields) do
+        if f.h == P.hash("IsKill") then f.v = false end
+    end
+    T.check(game:enemy_apply_hit(id2, { damage = 300, fields = fields }), "run")
+    T.eq(e2.hp, 0, "its last HP")
+    T.eq(e2.dying, "hit", "and it dies at once, from the hit")
+    T.eq(e2.walking_dead, nil, "never walking on with no HP")
+    -- The other way round: marked a kill there, but it has HP left here.
+    local e1, id1 = world.enemies[1], list[1].id
+    e1.hp = 100
+    fields = partner_hit_fields(game, 40)
+    for _, f in ipairs(fields) do
+        if f.h == P.hash("IsKill") then f.v = true end
+    end
+    T.check(game:enemy_apply_hit(id1, { damage = 40, fields = fields }), "run")
+    T.eq(e1.hp, 60, "HP left")
+    T.eq(e1.dying, nil, "so no death")
+    T.check(e1.reaction ~= nil, "a damage reaction instead")
+    -- An enemy that cannot die now (NoDeath: mid-grab, scripted) never gets a kill.
+    e1.no_death = true
+    fields = partner_hit_fields(game, 500)
+    T.check(game:enemy_apply_hit(id1, { damage = 500, fields = fields }), "run")
+    T.eq(e1.hp, 1, "the game keeps its last HP")
+    T.eq(mock.component(e1.body, "chainsaw.HitController").received[3].kill, false, "not marked a kill")
+    T.eq(game.hit_stats.kill_decided, 3, "decided here each time")
+end)
+
+T.run("a_partners_hit_carries_its_attack_and_the_body_part_it_hit", function()
+    -- The reaction is chosen from the hit's AttackData (attack type and power) and its body
+    -- part. Our template is our pistol; the partner fired a shotgun at the head and a rifle at
+    -- the right leg.
+    local game, world = fresh_game()
+    game:set_active(true)
+    game:read_player_state()
+    local list = game:list_enemies()
+    local pistol = mock.hit(world.enemies[1], 0, 0, nil, { weapon = 4000, attack_type = 1, power = 2 })
+    game:take_hit_events()
+    local e2, id2 = world.enemies[2], list[2].id
+    local hc = mock.component(e2.body, "chainsaw.HitController")
+    local shotgun = partner_hit_fields(game, 30, { weapon = 4100, attack_type = 4, power = 0, part = 0 })
+    T.check(game:enemy_apply_hit(id2, { damage = 30, fields = shotgun }), "run")
+    local r = hc.received[1]
+    T.eq(r.reaction_type, 4, "the shotgun's attack type")
+    T.eq(r.reaction_power, 0, "and its power (heavy)")
+    T.eq(r.part, 0, "on the head, where it hit")
+    T.check(r.attack_data ~= pistol.data.AttackData, "a copy of our attack data, never our own changed")
+    T.eq(r.attack_data.copied_from, pistol.data.AttackData, "copied the game's way (doDeepCopy)")
+    T.eq(pistol.data.AttackData.__fields._AttackType, 1, "ours untouched")
+    T.check(game:enemy_apply_hit(id2, { damage = 30, fields = shotgun }), "again")
+    T.eq(hc.received[2].attack_data, r.attack_data, "the same kind of attack reuses its copy")
+    T.eq(game.hit_stats.attack_clones, 1, "one copy")
+    local rifle = partner_hit_fields(game, 30, { weapon = 4600, attack_type = 1, power = 0, part = 7, side = 2 })
+    T.check(game:enemy_apply_hit(id2, { damage = 30, fields = rifle }), "run")
+    T.eq(hc.received[3].part, 7, "the leg")
+    T.eq(hc.received[3].side, 2, "the right one")
+    T.eq(game.hit_stats.attack_clones, 2, "another kind of attack, another copy")
+    T.eq(game.hit_stats.parts_matched, 3, "every part found")
+    -- A part this enemy does not have: the chest.
+    local odd = partner_hit_fields(game, 30, { part = 13 })
+    T.check(game:enemy_apply_hit(id2, { damage = 30, fields = odd }), "run")
+    T.eq(hc.received[4].part, 1, "on the chest")
+    T.eq(world.native_crashes, 0, "no crash")
+end)
+
+T.run("a_death_without_the_partners_values_plays_at_once", function()
+    -- HitPoint.dead() only zeroes the HP: the enemy walked on until its AI noticed. A death we
+    -- must apply without the killing hit's values runs a plain killing hit; with no attack data
+    -- at all, the AI is told to die (entryDeadAction).
+    local game, world = fresh_game()
+    game:set_active(true)
+    game:read_player_state()
+    local list = game:list_enemies()
+    local e1, e2 = world.enemies[1], world.enemies[2]
+    T.check(game:enemy_kill(list[2].id, nil), "killed without any attack data")
+    T.eq(e2.hp, 0, "no HP")
+    T.eq(e2.dying, "action", "and its death action requested at once")
+    T.eq(game.hit_stats.deaths_forced, 1, "counted")
+    -- Another character's attack (a villager hitting another) is enough to build the hit.
+    local other = mock.make_character("chainsaw.Ch1c0z0Context", { x = 9, y = 0, z = 9 }, 100)
+    mock.hit(e1, 0, 0, other.body)
+    T.check(game:enemy_kill(list[1].id, nil), "killed")
+    T.eq(e1.dying, "hit", "by a plain killing hit")
+    local r = mock.component(e1.body, "chainsaw.HitController").received[2]
+    T.eq(r.kill, true, "marked a kill")
+    T.near(r.pos.y, 1.2, 1e-6, "at its chest")
+    T.near(r.dir.z, -1, 1e-6, "pushing it backwards")
+    T.eq(world.native_crashes, 0, "no crash")
+end)
+
+T.run("an_enemy_our_save_had_dead_is_spawned_again_for_the_hosts_world", function()
+    -- isNextSpawn invalidates the spawn param of an enemy whose save backup says it died; one
+    -- the level has not permitted yet never spawns either. enemy_revive undoes both and the
+    -- game's own update spawns it.
+    local game, world = fresh_game()
+    local dead = { category = 0, kind = 0, group = 4200, index = 3 }
+    local gated = { category = 0, kind = 0, group = 4200, index = 4 }
+    local far = { category = 0, kind = 0, group = 5300, index = 1 }
+    local sp = mock.make_spawn_param(dead, { x = 12, y = 0, z = 0 })
+    mock.add_backup(dead, true)
+    mock.update_spawns()
+    T.eq(sp.invalid, true, "our save says it died: its spawn param invalidated itself")
+    T.eq(#world.enemies, 2, "not spawned")
+    local code = mock.context_code(dead)
+    T.eq(game:enemy_revive(code), "spawning", "revived")
+    T.eq(mock.backup_of(code), nil, "the save's death forgotten")
+    T.eq(sp.invalid, false, "its spawn param valid again")
+    mock.update_spawns()
+    T.eq(#world.enemies, 3, "the game spawned it")
+    local list = game:list_enemies()
+    T.eq(list[3].uid, code, "with its level identity")
+    T.eq(list[3].hp, 100, "fresh, as the level places it")
+    T.check(game:capabilities().enemy_revive.ok, "shown in Diagnostics")
+    -- A spawn the level has not permitted here (a trigger only the host's player crossed).
+    local sp2 = mock.make_spawn_param(gated, { x = 14, y = 0, z = 0 }, { permitted = false })
+    mock.update_spawns()
+    T.eq(#world.enemies, 3, "not permitted: not spawned")
+    T.eq(game:enemy_revive(mock.context_code(gated)), "spawning", "revived")
+    mock.update_spawns()
+    T.eq(sp2.spawned, 1, "spawned once permitted")
+    -- Its area is not loaded here: the save's death is forgotten for when it is.
+    mock.add_backup(far, true)
+    T.eq(game:enemy_revive(mock.context_code(far)), "forgotten", "no spawn param here")
+    T.eq(mock.backup_of(mock.context_code(far)), nil, "but the save will not stop it")
+    T.eq(game:enemy_revive(mock.context_code({ category = 0, kind = 0, group = 6000, index = 9 })), "missing",
+        "unknown everywhere")
+    -- A character of ours that died here: never brought back.
+    world.enemies[3].eliminated = true
+    T.eq(game:enemy_revive(code), "dead_here", "not revived")
+    -- Backups of enemies that did not die are left alone.
+    local alive = { category = 0, kind = 0, group = 4200, index = 8 }
+    mock.add_backup(alive, false)
+    game:enemy_revive(mock.context_code(alive))
+    T.check(mock.backup_of(mock.context_code(alive)) ~= nil, "a living enemy's backup kept")
+end)
+
 T.run("drop_hooks_see_the_games_rolls_and_roll_for_partner_kills", function()
     local game, world = fresh_game()
     game:set_active(true)

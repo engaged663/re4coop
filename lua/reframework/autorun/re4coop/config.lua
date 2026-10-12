@@ -36,6 +36,7 @@ Config.DEFAULTS = {
     enemy_hit_predict = true,   -- your hits on them take HP at once (never the last HP: the owner decides deaths)
     enemy_kill_with_hit = true, -- an enemy the partner's game killed dies here from the same killing hit
     enemy_erase = true,         -- enemies dead in the partner's world that only now spawn here never appear (no corpse)
+    enemy_spawn_missing = true, -- client: enemies alive in the host's world that our game never spawned are spawned
     enemy_interp_delay = 0.1,   -- seconds the partner's enemies are shown in the past (smoothness vs. delay)
     sync_drops = true,        -- every enemy that dies gives each player their own loot roll, also the partner's kills
     sync_animals = true,      -- crows, chickens, fish, bats and rats near the client move as in the host's game

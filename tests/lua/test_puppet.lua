@@ -194,6 +194,30 @@ T.run("holds_the_partners_weapon", function()
     T.eq(#env.puppet:status().weapons, 0, "no weapons")
 end)
 
+T.run("a_scoped_weapon_never_shows_its_scope_view_in_our_game", function()
+    -- The partner carries a scoped rifle: its prefab brings the scope's camera (render output,
+    -- post effects) and the thermal camera the scope references. Here it is only a model: no
+    -- camera of it may render - it showed the scope's view on our screen.
+    local env = setup()
+    env.world.player.weapon.name = "wp4400"
+    env.frames(5)
+    local w = env.puppet.weapons[1]
+    T.check(w ~= nil and w.state == "ready", "weapon ready")
+    T.eq(w.mode, "prefab", "from wp4400.pfb")
+    T.eq(mock.rendering_cameras(), 0, "none of its cameras renders")
+    local function find(name) return mock.find("re4coop_" .. name)[1] or mock.find(name)[1] end
+    local cam_go = find("ScopeCamera")
+    T.eq(mock.component(cam_go, "via.render.RenderOutput").enabled, false, "its render output off")
+    T.eq(mock.component(cam_go, "via.render.ToneMapping").enabled, false, "and its post effects")
+    T.eq(cam_go.update_self, false, "the camera object no longer updates")
+    T.eq(mock.component(find("scope"), "via.render.RenderOutput").enabled, false, "no render output anywhere")
+    T.eq(mock.component(find("ThermalCamera"), "via.Camera").enabled, false,
+        "the camera the scope only references too")
+    T.check(mock.component(find("lens"), "via.render.Mesh").enabled ~= false, "the scope itself is still drawn")
+    T.eq(w.go.draw_self, true, "the rifle is visible")
+    T.check(env.game:capabilities().puppet_cameras.ok, "shown in Diagnostics")
+end)
+
 T.run("replays_sounds_effects_and_shots", function()
     local env = setup()
     env.frames(5)

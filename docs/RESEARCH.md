@@ -1093,6 +1093,133 @@ GameObject GUID (scene data).
 **Not covered yet.** Not run in the game yet. The flag of a lever arrives with the gimmick
 table (every few seconds), not with the sequence.
 
+### 3.20 Enemies that walked on dead, and weak reactions to the partner's shots (0.9.1)
+
+**Report.** An enemy one player killed sometimes kept walking (doing nothing) on the other
+screen and only died seconds later, both ways; a death should cut whatever the enemy was
+doing; enemies reacted weakly to the partner's shots and misbehaved when both players shot.
+
+**How the game reacts to a hit and dies** (re4.exe, carved and decompiled with REA):
+
+* `HitController.callbackDamageHit(DamageInfo)` (0x141f31970) plays the damage sound and
+  effect, then calls the character's registered damage callback.
+* `CharacterHeadUpdater.onHitDamage(DamageInfo)` (0x141202de0): `HitPoint.addDamage(Damage)`;
+  the body part's own HitPoint (`DamageUserData.Parts` +0xa8 / `PartsSide` +0xac) takes the
+  `Break` value and may break (`onPartsBreak`); then **only a hit with `IsKill` (+0xcd) set
+  starts the death** (virtual `onDead`); any other hit gets a damage reaction - even one that
+  took the last HP.
+* `HitPoint.checkDead(damage)` (0x143408bc0): false while NoDamage, Immortal or NoDeath, or
+  already dead; else `HP - damage <= 0`. `HitController.checkKill(damage)` (0x141f3ab30) asks it.
+  `HitPoint.dead()` (0x14028f870) only writes HP 0: no death. `get_IsLive` is `HP > 0`.
+* The reaction comes from the hit's **AttackData**: `getDamageAction` (0x1411ba810) /
+  `EnemyHeadUpdater.findDamageReaction` (0x1413aa640) read `_AttackType` (+0x34),
+  `_AttackPower` (+0x38) and `_Option` (+0x48, bit 8: no reaction) and look the reaction up in
+  the character's table. `AttackData.doDeepCopy(src)` (0x141cf4250) copies every value and
+  reference of `src` into the instance.
+* `onDead` (`CharacterHeadUpdater` 0x1411f61d0, `EnemyHeadUpdater` 0x1413e6f90, villagers
+  `Ch1c0HeadUpdaterCommon` 0x14198ad10) requests the death action, which replaces whatever the
+  enemy was doing. `CharacterHeadUpdater.entryDeadAction()` (0x1411a5f60) requests the death
+  action of the action table; many enemies' `onDead` call it (dogs, Ch1d2/Ch1d4/Ch1f*...).
+
+**What went wrong.**
+1. A partner's hit was run with the `IsKill` the shooter's game had computed against its own
+   copy's HP. When the copies' HP differed (two players shooting, a hit in flight), a hit that
+   took the owner's last HP arrived unmarked: a damage reaction at 0 HP - the enemy walked on
+   until its AI noticed, seconds later, while the other game, told of the death at once,
+   already showed it dead. A marked hit that did not kill here played a death with HP left.
+2. A death applied without a buildable hit fell back to `HitPoint.dead()`: HP 0 and no death.
+3. Every replayed hit carried our own weapon's AttackData (or any weapon's, before our player
+   had used that one) and landed on the chest collider: a shotgun blast replayed as a pistol
+   flinch, head and leg shots lost their stagger and kneel.
+4. With both players shooting, the last shooter's 4 m advantage moved the enemy from game to
+   game, and every change of hands cut its reaction short.
+
+**Fix.**
+1. The game that runs the hit decides the kill: `IsKill = HitController.checkKill(Damage)`
+   (else `HitPoint.checkDead`) before `callbackDamageHit`.
+2. A death always runs as a killing hit when one can be built (without the partner's values: a
+   plain one at the chest, pushing the enemy back), with attack data from our player's hits or,
+   before that, another character's; only without any, `HitPoint.dead()` +
+   `entryDeadAction()`.
+3. A hit carries the primitive values of its AttackData (31, by reflection, hashed as
+   `AttackData.<name>`) and its body part and side (`DamageUserData.Parts/PartsSide`). The owner
+   runs it with a copy of its template's AttackData (`doDeepCopy`) carrying the shooter's
+   values (one copy per kind of attack, kept with its template) on the enemy's collider of the
+   same part and side (else the chest).
+4. While both players hit the enemy within 3 s it stays with its owner (unless a player goes
+   out of range, down, or starts a finisher). The owner sends its state as soon as it ran a
+   partner's hit, and for 1.5 s after its own hit the shooter's puppet plays the owner's newest
+   animation instead of the interpolated one (its position keeps the smooth track).
+
+### 3.21 Host enemies the client's game never spawned (0.9.1)
+
+**Report.** The host could have enemies the client did not see - most of all when the client
+loaded a save in which those enemies had died: the host saw them, the client did not until new
+enemies spawned.
+
+**How the game decides a level enemy exists** (re4.exe, carved and decompiled with REA):
+
+* `CharacterSpawnParam.StatusFlag` (+0x58): Permitted 1, Readied 2, Activated 4, Invalidated 8.
+  `permitSpawn`/`readySpawn`/`activateSpawn`/`invalidateSpawn(bool)` (0x142513710 / 0x142514420 /
+  0x1424a6cf0 / 0x1424edb70) set or clear one bit and call `updateSpawn` (0x142559670), which
+  creates the body and head (`requestCreateBody/Head`, `CharacterLinkCoordinator.requestSpawn`)
+  when the flags are exactly Permitted|Readied|Activated without Invalidated, and destroys them
+  otherwise.
+* `onUpdate` (0x14250ffa0) sets Activated from `isNextSpawn` (0x1424f0410): false when
+  Invalidated or not Permitted; it reads the character's live context
+  (`CharacterManager.getContextRef`: `IsEliminated` +0x5a) or else its save backup
+  (`getBackupData`: `CharacterBackup._IsEliminated` +0x48) and **if it is eliminated it
+  invalidates the spawn param for good**; then the stage must be active (and Readied/addRef on
+  the way).
+* Permitted is given by the level: `CharacterSpawnPointController.permitSpawn` (waves) and five
+  other callers (area and event logic).
+* `CharacterManager.CharacterSpawnParamDB` (+0x68, `Dictionary<UInt32, CharacterSpawnParam>`,
+  read-locked by `getSpawnParamRef(ContextID)` 0x14343a000: `TryGetValue(ContextID.Code)`) and
+  `CharacterBackupDB` (+0x88, `ConcurrentDictionary<UInt32, CharacterBackup>`, with
+  `ContainsKey`, `get_Item` and `IDictionary<TKey,TValue>.Remove(UInt32)`) are keyed by the
+  ContextID code - our enemy uid. `ContextID(UInt32 code)` builds the key object.
+
+So a save in which the client killed an enemy keeps that enemy from ever spawning in the
+client's game, and an enemy whose spawn only the host's player triggered is never permitted
+in the client's.
+
+**Design.** The host's world decides which enemies exist. The client watches the host's
+enemies it receives (ENEMY_STATE): a level enemy (uid) the host runs, alive, within 80 m of the
+client's player, that the client's game has neither alive nor as a corpse and that did not die
+in the client's game in the last 15 s, and that is still missing after 1.5 s, is spawned:
+its save backup is removed if it says the enemy died (the enemy comes back as the level places
+it; the save no longer holds it dead), an invalidated spawn param is validated again and an
+unpermitted one permitted (`invalidateSpawn(false)`, `permitSpawn(true)`); the game's own update
+spawns it. When it shows up it pairs by uid, is moved to where the host's enemy is, and from
+then on is one enemy run by one game like any other. A spawn param that is not loaded (another
+area) only gets the save's death forgotten, so it spawns when its area loads. Not while the
+client's area loads or the host is in another region; at most 4 tries per tick, one every 3 s
+per enemy. *Diagnostics*: `enemy_revive`; the *enemies* counters `spawn_spawning`,
+`spawn_forgotten`, `spawn_missing`, `spawn_dead_here`, `revived`. Setting `enemy_spawn_missing`.
+
+**Not covered.** Enemies the host's game created at runtime (no uid: summoned, scripted
+additions) are still only seen where they spawned. A wave controller on the client may count
+an enemy it did not choose itself. Not run in the game yet.
+
+### 3.22 Scoped weapons on the partner's model (0.9.1)
+
+**Report.** When a player bought or carried a scoped weapon, the partner's game showed the
+scope's view: the weapon copy on the partner's model rendered through its scope.
+
+**Why.** A scoped weapon's prefab carries `chainsaw.ScopeController` (dump: `_CameraRef` and
+`_WeaknessCameraRef` `via.Camera`, `_WeaknessCameraGameObject` `via.GameObjectRef`,
+`_RenderOutputRef` `via.render.RenderOutput`, `_CustomFilterRef`, `_DepthOfField`,
+`_LDRPostProcess`, `_ToneMapping`, `_VolumetricFog`, `_ScopeRTT`): the scope's own camera with
+its render output and post effects. The model's sanitizing switched off every `chainsaw.`
+component - the controller - but left the engine's camera and render output running, and only
+looked three levels deep.
+
+**Fix.** Sanitizing a spawned copy now also switches off every `via.render.RenderOutput`, and
+every component of any GameObject that holds a `via.Camera` (which then stops updating),
+through the whole weapon prefab (8 levels), plus the cameras a ScopeController references
+(`_WeaknessCameraGameObject`, and `_CameraRef`/`_WeaknessCameraRef` once set). The meshes - the
+rifle and its scope - stay drawn. *Diagnostics*: `puppet_cameras`. Not run in the game yet.
+
 ## 4. Sync architecture
 
 ```

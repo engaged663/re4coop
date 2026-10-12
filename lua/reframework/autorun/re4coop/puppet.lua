@@ -514,7 +514,8 @@ function Puppet:finish_weapon(w, go, mode)
         local name = g:name_of(node.go)
         g:claim(node.go, name:find("^re4coop_") and nil or ("re4coop_" .. name))
     end
-    if mode == "prefab" then g:sanitize(tree) end
+    -- (the whole prefab, deeper than what is drawn: a scope's camera sits below the scope)
+    if mode == "prefab" then g:sanitize(g:collect_tree(go, 8)) end
     local nodes = {}
     for _, node in ipairs(tree) do
         w.draw_list[#w.draw_list + 1] = node.go

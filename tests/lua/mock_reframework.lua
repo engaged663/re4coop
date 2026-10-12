@@ -399,6 +399,7 @@ M.PREFAB = {
     ada_body = "_mercenaries/appsystem/character/ch3a8z0/ch3a8z0_body.pfb",
     sg09 = "_chainsaw/appsystem/prefab/weapon/wp4000.pfb",
     sg09_mc = "_mercenaries/appsystem/prefab/weapon/wp4000_mc.pfb",
+    sr1903 = "_chainsaw/appsystem/prefab/weapon/wp4400.pfb",
     muzzle = "_chainsaw/vfx/provider/epv_system/epv_muzzleflash/epve_0015_muzzleflash_0000.pfb",
 }
 
@@ -532,6 +533,14 @@ function M.install(opts)
         get_ResourcePath = { 0, function(self) return self.path end },
         ["ToString()"] = { 0, function(self) return "MeshMaterialResourceHolder[@" .. self.path .. "]" end },
     })
+    -- Cameras and what renders with them (a scope's view).
+    class("via.Camera", "via.Component", {})
+    for _, n in ipairs({ "via.render.RenderOutput", "via.render.ToneMapping", "via.render.DepthOfField" }) do
+        class(n, "via.Component", {})
+    end
+    class("via.GameObjectRef", "System.Object", { get_Target = { 0, function(self) return self.target end } })
+    class("chainsaw.ScopeController", "via.Component", {}, { _CameraRef = "via.Camera",
+        _WeaknessCameraGameObject = "via.GameObjectRef" })
     class("via.render.Mesh", "via.Component", {
         getMesh = { 0, function(self)
             return self.mesh_path and new("via.render.MeshResourceHolder", { path = self.mesh_path }) or nil
@@ -611,14 +620,22 @@ function M.install(opts)
         end, { "System.Int32" } }
     end
     if not opts.no_kill_method then
+        -- HitPoint.dead() (re4.exe 0x14028f870) only zeroes the HP: no death reaction.
         hp_methods.dead = { 0, function(self) self.owner.hp = 0 end }
     end
+    -- HitPoint.checkDead(damage) (0x143408bc0): false while NoDamage, Immortal or NoDeath, or
+    -- already dead; else whether HP - damage <= 0.
+    hp_methods.checkDead = { 1, function(self, d)
+        local c = self.owner
+        if c.no_damage or c.immortal or c.no_death or c.hp <= 0 then return false end
+        return c.hp - math.max(0, d or 0) <= 0
+    end, { "System.Int32" }, { ret = "System.Boolean" } }
     M.hp_field_name = opts.hp_field_name or "<CurrentHitPoint>k__BackingField"
     class("chainsaw.HitPoint", "System.Object", hp_methods,
         opts.no_hp_setter and { [M.hp_field_name] = "System.Int32" } or {})
 
     -- Hits: HitController.callbackDamageHit(DamageInfo) applies damage to its character.
-    local info_fields = { "Damage", "Wince", "Break", "Stopping", "DamageDir", "AttackOwnerObject", "WeaponID",
+    local info_fields = { "Damage", "Wince", "Break", "Stopping", "DamageDir", "Position", "AttackOwnerObject", "WeaponID",
         "IsCritical", "IsKill", "WeaponGameObject", "AttackGameObject", "DamageGameObject", "ChildHitController",
         "AttackCollidable", "DamageCollidable", "AttackUserData", "AttackData", "DamageUserData" }
     local info_methods = {
@@ -652,10 +669,27 @@ function M.install(opts)
         DamageCollidable = "via.physics.Collidable", AttackUserData = "chainsaw.collision.AttackUserData",
         AttackData = "chainsaw.collision.AttackHitUserData.AttackData", DamageUserData = "chainsaw.collision.DamageUserData" })
     class("chainsaw.collision.AttackUserData", "System.Object", {})
-    class("chainsaw.collision.AttackHitUserData.AttackData", "System.Object", {})
-    class("chainsaw.collision.DamageUserData", "System.Object", {}, { Parts = "chainsaw.character.BodyParts" })
+    -- An attack's data: what the enemy's reaction is chosen from (EnemyHeadUpdater.
+    -- findDamageReaction reads _AttackType, _AttackPower and _Option). doDeepCopy(src) copies
+    -- src into it (0x141cf4250).
+    enum("chainsaw.character.AttackType", { None = 0, Shot = 1, Slash = 2, Blow = 4, Explosion = 5 })
+    enum("chainsaw.character.AttackPower", { Heavy = 0, Midle = 1, Light = 2 })
+    enum("chainsaw.HitManager.AttackOption", { None = 0, NoReaction = 8 })
+    enum("chainsaw.character.BodyParts", { Head = 0, Chest = 1, Thigh = 7 })
+    enum("chainsaw.character.BodyPartsSide", { Center = 0, Left = 1, Right = 2 })
+    class("chainsaw.collision.AttackHitUserData.AttackData", "System.Object", {
+        doDeepCopy = { 1, function(self, src)
+            for k, v in pairs(src.__fields) do self.__fields[k] = v end
+            self.weapon = src.weapon
+            self.copied_from = src
+        end, { "chainsaw.collision.AttackHitUserData.AttackData" } },
+    }, { _AttackType = "chainsaw.character.AttackType", _AttackPower = "chainsaw.character.AttackPower",
+        _Option = "chainsaw.HitManager.AttackOption", _Damage = "System.Int32",
+        _Wince = "System.Nullable`1<System.Single>", _AttackToEnemyUserData = "chainsaw.AttackToEnemyUserData" })
+    class("chainsaw.collision.DamageUserData", "System.Object", {},
+        { Parts = "chainsaw.character.BodyParts", PartsSide = "chainsaw.character.BodyPartsSide" })
     class("chainsaw.collision.EnemyDamageUserData", "chainsaw.collision.DamageUserData", {},
-        { Parts = "chainsaw.character.BodyParts" })
+        { Parts = "chainsaw.character.BodyParts", PartsSide = "chainsaw.character.BodyPartsSide" })
     class("chainsaw.collision.PressUserData", "System.Object", {})
     -- A character's colliders (HitController.get_Colliders): each with its user data.
     class("via.physics.Collider", "System.Object", {
@@ -690,6 +724,10 @@ function M.install(opts)
     -- A head's updater: linked to its character (Context) while in use, unlinked in the pool.
     class("chainsaw.HeadUpdater", "via.Component", {
         get_Context = { 0, function(self) return self.context end },
+        -- CharacterHeadUpdater.entryDeadAction (0x1411a5f60): requests the death action.
+        entryDeadAction = { 0, function(self)
+            if self.context ~= nil then self.context.dying = self.context.dying or "action" end
+        end },
     })
     class("chainsaw.HitController", "via.Component", {
         get_DamageOwner = { 0, function(self) return self.damage_owner end },
@@ -704,6 +742,10 @@ function M.install(opts)
             world.damage_sounds = (world.damage_sounds or 0) + 1
         end, { "chainsaw.HitController.DamageInfo" } },
         get_Colliders = { 0, function(self) return self.colliders end },
+        -- HitController.checkKill(damage) (0x141f3ab30): the character's HitPoint.checkDead.
+        checkKill = { 1, function(self, d)
+            return self.ctx ~= nil and self.ctx.hitpoint:call("checkDead", d) or false
+        end, { "System.Int32" }, { ret = "System.Boolean" } },
         callbackDamageHit = { 1, function(self, info)
             self:call("playDamageSe", info)
             local ctx = self.ctx
@@ -723,14 +765,31 @@ function M.install(opts)
                     hu:call("onPartsBreak", info, 0, 0)
                 end
             end
-            self.received = self.received or {}
-            self.received[#self.received + 1] = { damage = info.data.Damage, wince = info.data.Wince,
+            -- CharacterHeadUpdater.onHitDamage (0x141202de0): the HP (HitPoint.addDamage: never
+            -- below 1 while NoDeath), the body part of the hit's DamageUserData, then the death
+            -- only for a hit marked IsKill - else a damage reaction chosen from its AttackData,
+            -- even when the HP reached 0 (the AI notices that only later: it walks on, dead).
+            local ad = info.data.AttackData
+            local du = info.data.DamageUserData
+            local rec = { damage = info.data.Damage, wince = info.data.Wince,
                 attacker = info.data.AttackOwnerObject, critical = info.data.IsCritical, kill = info.data.IsKill,
-                attack_type = info.data.AttackType, hit_pos = info.data.HitPos, serial = info.data.SerialNo }
+                attack_type = info.data.AttackType, hit_pos = info.data.HitPos, serial = info.data.SerialNo,
+                reaction_type = ad and ad.__fields._AttackType, reaction_power = ad and ad.__fields._AttackPower,
+                attack_data = ad, part = du and du.__fields.Parts, side = du and du.__fields.PartsSide,
+                pos = info.data.Position, dir = info.data.DamageDir }
+            self.received = self.received or {}
+            self.received[#self.received + 1] = rec
             if M.deferred_damage then
                 M.pending_damage = { owner = ctx, amount = info.data.Damage or 0 }
             elseif ctx ~= nil then
-                ctx.hp = math.max(0, ctx.hp - (info.data.Damage or 0))
+                ctx.hp = math.max(ctx.no_death and 1 or 0, ctx.hp - (info.data.Damage or 0))
+                if info.data.IsKill then
+                    ctx.dying = ctx.dying or "hit"
+                elseif ctx.hp <= 0 then
+                    ctx.walking_dead = true
+                else
+                    ctx.reaction = rec
+                end
             end
         end, { "chainsaw.HitController.DamageInfo" } },
     })
@@ -842,12 +901,29 @@ function M.install(opts)
     -- A level spawn param (a component on its own GameObject). invalidateSpawn(true) despawns
     -- its character the way the game's updateSpawn does: the context leaves the enemy list
     -- and its body and head are destroyed.
+    -- StatusFlag: Permitted 1, Readied 2, Activated 4, Invalidated 8 (see M.update_spawns).
     class("chainsaw.CharacterSpawnParam", "via.Component", {
         invalidateSpawn = { 1, function(self, b)
             self.invalid = b
             if b and self.ctx ~= nil then M.despawn(self.ctx) end
         end, { "System.Boolean" } },
+        permitSpawn = { 1, function(self, b) self.permitted = b end, { "System.Boolean" } },
+        get_StatusFlag = { 0, function(self)
+            return (self.permitted ~= false and 1 or 0) | (self.invalid and 8 or 0)
+        end, {}, { ret = "System.Int32" } },
+        get_ContextID = { 0, function(self) return self.id end },
     })
+    -- chainsaw.ContextID built from its code (the constructor ContextID(UInt32 code)).
+    M.context_id_methods = {
+        [".ctor(System.UInt32)"] = { 1, function(self, code) self.code = code end, { "System.UInt32" } },
+        get_Code = { 0, function(self)
+            if self.code ~= nil then return self.code end
+            local f = self.__fields
+            return M.context_code({ category = f._Category, kind = f._Kind, group = f._Group, index = f._Index })
+        end, {}, { ret = "System.UInt32" } },
+    }
+    class("chainsaw.ContextID", "System.Object", M.context_id_methods, { _Category = "chainsaw.ContextID.EntityCategory",
+        _Kind = "System.Byte", _Group = "System.Int32", _Index = "System.Int32" })
     -- CharacterManager.CharacterBackupDB: ContextID code -> CharacterBackup (world.backups).
     class("chainsaw.CharacterBackup", "System.Object", {
         get_IsEliminated = { 0, function(self) return self.eliminated == true end },
@@ -857,12 +933,33 @@ function M.install(opts)
         get_Count = { 0, function(self) return #self.items end },
         get_Item = { 1, function(self, i) return self.items[i + 1] end },
     })
+    local function backup_code(b) return b.id and b.id:call("get_Code") end
+    local function backup_of(code)
+        for i, b in ipairs(world.backups) do
+            if backup_code(b) == code then return b, i end
+        end
+        return nil
+    end
+    M.backup_of = backup_of
     class("System.Collections.Concurrent.ConcurrentDictionary`2<System.UInt32,chainsaw.CharacterBackup>", "System.Object", {
         get_Values = { 0, function()
             local items = {}
             for _, b in ipairs(world.backups) do items[#items + 1] = b end
             return new("System.Collections.ObjectModel.ReadOnlyCollection`1<chainsaw.CharacterBackup>", { items = items })
         end },
+        ContainsKey = { 1, function(_, code) return backup_of(code) ~= nil end, { "System.UInt32" },
+            { ret = "System.Boolean" } },
+        get_Item = { 1, function(_, code)
+            local b = backup_of(code)
+            if b == nil then error("KeyNotFoundException") end
+            return b
+        end, { "System.UInt32" } },
+        ["System.Collections.Generic.IDictionary<TKey,TValue>.Remove(System.UInt32)"] = { 1, function(_, code)
+            local _, i = backup_of(code)
+            if i == nil then return false end
+            table.remove(world.backups, i)
+            return true
+        end, { "System.UInt32" }, { ret = "System.Boolean" } },
     })
     world.backups = world.backups or {}
     local backup_db = new("System.Collections.Concurrent.ConcurrentDictionary`2<System.UInt32,chainsaw.CharacterBackup>")
@@ -882,12 +979,25 @@ function M.install(opts)
     local enemy_list = new("System.Collections.Generic.List`1<chainsaw.EnemyBaseContext>")
     world.enemy_list = enemy_list
 
-    class("chainsaw.CharacterManager", "System.Object", {
+    world.spawn_params = {} -- ContextID code -> spawn param (CharacterManager.CharacterSpawnParamDB)
+    local function live_context(code)
+        for _, e in ipairs(world.enemies or {}) do
+            if e.spawner ~= nil and e.spawner:call("get_Code") == code then return e end
+        end
+        return nil
+    end
+    local character_manager_methods = {
         getPlayerContextRef = { 0, function() return world.player end },
         getPartnerContextRef = { 0, function() return world.partner end },
         get_EnemyContextList = { 0, function() return enemy_list end },
         get_CharacterBackupDB = { 0, function() return backup_db end },
-    })
+        getSpawnParamRef = { 1, function(_, id) return world.spawn_params[id:call("get_Code")] end,
+            { "chainsaw.ContextID" }, { ret = "chainsaw.CharacterSpawnParam" } },
+        getContextRef = { 1, function(_, id) return live_context(id:call("get_Code")) end,
+            { "chainsaw.ContextID" }, { ret = "chainsaw.CharacterContext" } },
+    }
+    M.character_manager_methods = character_manager_methods
+    class("chainsaw.CharacterManager", "System.Object", character_manager_methods)
     class("chainsaw.GuiManager", "System.Object", {
         get_IsPlayingEvent = { 0, function() return world.gui_event end },
     })
@@ -1122,6 +1232,7 @@ function M.install(opts)
         [M.PREFAB.ada_body] = function(pos) return M.build_body_prefab(pos, "ch3a8z0_body") end,
         [M.PREFAB.sg09] = function(pos) return M.build_weapon("wp4000", pos) end,
         [M.PREFAB.sg09_mc] = function(pos) return M.build_weapon("wp4000_mc", pos) end,
+        [M.PREFAB.sr1903] = function(pos) return M.build_scoped_weapon("wp4400", pos) end,
         [M.PREFAB.muzzle] = function(pos)
             local go = M.make_go("epve_0015_muzzleflash", { wpos = vec(pos.x, pos.y, pos.z) })
             world.flashes = (world.flashes or 0) + 1
@@ -1603,8 +1714,10 @@ function M.make_character(type_name, pos, hp, spawner)
     local function collider(ud) return new("via.physics.Collider", { user_data = ud }) end
     M.add_component(body, "chainsaw.HitController", { ctx = ctx, colliders = new("via.physics.Colliders", { list = {
         collider(new("chainsaw.collision.PressUserData")),
-        collider(new("chainsaw.collision.EnemyDamageUserData", { __fields = { Parts = 0 } })),
-        collider(new("chainsaw.collision.EnemyDamageUserData", { __fields = { Parts = 1 } })),
+        collider(new("chainsaw.collision.EnemyDamageUserData", { __fields = { Parts = 0, PartsSide = 0 } })),
+        collider(new("chainsaw.collision.EnemyDamageUserData", { __fields = { Parts = 1, PartsSide = 0 } })),
+        collider(new("chainsaw.collision.EnemyDamageUserData", { __fields = { Parts = 7, PartsSide = 1 } })),
+        collider(new("chainsaw.collision.EnemyDamageUserData", { __fields = { Parts = 7, PartsSide = 2 } })),
     } }) })
     ctx.body = body
     ctx.head = M.make_go(type_name:match("(Ch%w+)Context") and (type_name:match("(Ch%w+)Context") .. "_head") or "head")
@@ -1628,6 +1741,37 @@ function M.despawn(ctx)
     if ctx.body ~= nil then M.destroy(ctx.body) end
     -- Its head goes back to the pool unlinked: HeadUpdater.Context is null there.
     if ctx.head_updater ~= nil then ctx.head_updater.context = nil end
+end
+
+-- A level enemy's spawn param, registered in CharacterManager.CharacterSpawnParamDB. Its enemy
+-- spawns in M.update_spawns the way CharacterSpawnParam.isNextSpawn / updateSpawn decide:
+-- permitted and not invalidated; a save backup that says it died invalidates the spawn param
+-- for good. opts: { permitted (default true), type_name, hp }.
+function M.make_spawn_param(spawner, pos, opts)
+    opts = opts or {}
+    local sp = new("chainsaw.CharacterSpawnParam", { id = context_id(spawner), spawner = spawner,
+        pos = vec(pos.x, pos.y, pos.z), permitted = opts.permitted ~= false, type_name = opts.type_name or
+        "chainsaw.Ch1c0z0Context", hp = opts.hp or 100, owner = M.make_go("spawner") })
+    M.world.spawn_params[sp.id:call("get_Code")] = sp
+    return sp
+end
+
+-- One update of every spawn param (CharacterSpawnParam.onUpdate).
+function M.update_spawns()
+    for code, sp in pairs(M.world.spawn_params) do
+        if not sp.invalid and sp.permitted and (sp.ctx == nil or sp.ctx.despawned) then
+            local b = M.backup_of(code)
+            if b ~= nil and b.eliminated then
+                sp.invalid = true -- isNextSpawn: dead in the save
+            else
+                local ctx = M.make_character(sp.type_name, sp.pos, sp.hp, sp.spawner)
+                ctx.spawn_param = sp
+                sp.ctx = ctx
+                table.insert(M.world.enemies, ctx)
+                sp.spawned = (sp.spawned or 0) + 1
+            end
+        end
+    end
 end
 
 -- A character backup in CharacterManager.CharacterBackupDB (what the save remembers about a
@@ -1706,6 +1850,48 @@ function M.build_weapon(name, pos)
     return go
 end
 
+-- A scoped rifle's prefab (wp4400 SR M1903): the gun, its scope (chainsaw.ScopeController, with a
+-- render output) and, four levels down, the scope's camera with its render output and post
+-- effects; plus a thermal camera outside the hierarchy that the scope only references
+-- (_WeaknessCameraGameObject).
+-- Any enabled camera renders its view onto the screen (world.rendering_cameras).
+function M.build_scoped_weapon(name, pos)
+    local go = M.build_weapon(name, pos)
+    local scope_go = M.make_go("scope")
+    M.set_parent(scope_go.transform, go.transform)
+    local lens = M.make_go("lens")
+    M.set_parent(lens.transform, scope_go.transform)
+    M.add_component(lens, "via.render.Mesh")
+    local holder = M.make_go("camera_holder")
+    M.set_parent(holder.transform, lens.transform)
+    local cam_go = M.make_go("ScopeCamera")
+    M.set_parent(cam_go.transform, holder.transform)
+    local cam = M.add_component(cam_go, "via.Camera")
+    M.add_component(cam_go, "via.render.RenderOutput")
+    M.add_component(cam_go, "via.render.ToneMapping")
+    M.add_component(cam_go, "via.render.DepthOfField")
+    local thermal = M.make_go("ThermalCamera", { wpos = vec(pos.x, pos.y, pos.z) })
+    local tcam = M.add_component(thermal, "via.Camera")
+    local ref = new("via.GameObjectRef", { target = thermal })
+    -- (_CameraRef is only set once the scope runs: null in a fresh prefab)
+    M.add_component(scope_go, "chainsaw.ScopeController", { __fields = { _WeaknessCameraGameObject = ref } })
+    -- The scope's own picture, rendered for its lens.
+    M.add_component(scope_go, "via.render.RenderOutput")
+    M.world.cameras = M.world.cameras or {}
+    table.insert(M.world.cameras, cam)
+    table.insert(M.world.cameras, tcam)
+    return go
+end
+
+-- The cameras that render a view right now (enabled, on an updating GameObject).
+function M.rendering_cameras()
+    local n = 0
+    for _, cam in ipairs(M.world.cameras or {}) do
+        if cam.enabled ~= false and cam.owner.update_self ~= false and not cam.owner.destroyed then n = n + 1 end
+    end
+    return n
+end
+
 -- A pickup (chainsaw.DropItem) lying in the scene. Destroying its GameObject removes it.
 function M.make_drop_item(item_id, pos, context, count)
     local go = M.make_go("item_" .. tostring(item_id), { wpos = vec(pos.x, pos.y, pos.z) })
@@ -1753,19 +1939,27 @@ function M.fatal(enemy, request)
     return head:call(request)
 end
 
--- `attacker` (default: the player's body) hits `enemy`: the game builds a DamageInfo and
--- calls the victim's HitController.callbackDamageHit (hooks run around it).
-function M.hit(enemy, damage, wince, attacker)
+-- `attacker` (default: the player's body) hits `enemy`: the game builds a DamageInfo - marked
+-- IsKill when it kills (HitController.checkKill) - and calls the victim's
+-- HitController.callbackDamageHit (hooks run around it). opts: { weapon, attack_type (the
+-- AttackData's _AttackType, default Shot), power (_AttackPower, default Light), part, side }.
+function M.hit(enemy, damage, wince, attacker, opts)
+    opts = opts or {}
     local owner = attacker or (M.world.player and M.world.player.body)
+    local weapon = opts.weapon or 4000
+    local hc = M.component(enemy.body, "chainsaw.HitController")
     local info = new("chainsaw.HitController.DamageInfo", { data = {
         Damage = damage, Wince = wince or 10, Break = 0, Stopping = 0, DamageDir = vec(0, 0, -1),
-        AttackOwnerObject = owner, AttackGameObject = owner or M.make_go("shot"), WeaponID = 4000, IsCritical = false,
-        IsKill = false, AttackType = 0, HitPos = vec(0, 1.6, 0), SerialNo = 777,
-        AttackUserData = new("chainsaw.collision.AttackUserData", { weapon = 4000 }),
-        AttackData = new("chainsaw.collision.AttackHitUserData.AttackData", { weapon = 4000 }),
-        DamageUserData = new("chainsaw.collision.DamageUserData") } })
+        AttackOwnerObject = owner, AttackGameObject = owner or M.make_go("shot"), WeaponID = weapon, IsCritical = false,
+        IsKill = hc:call("checkKill", damage), AttackType = 0, HitPos = vec(0, 1.6, 0), SerialNo = 777,
+        AttackUserData = new("chainsaw.collision.AttackUserData", { weapon = weapon }),
+        AttackData = new("chainsaw.collision.AttackHitUserData.AttackData", { weapon = weapon, __fields = {
+            _AttackType = opts.attack_type or 1, _AttackPower = opts.power or 2, _Option = 0, _Damage = damage,
+            _Wince = wince or 10 } }),
+        DamageUserData = new("chainsaw.collision.DamageUserData", { __fields = { Parts = opts.part or 1,
+            PartsSide = opts.side or 0 } }) } })
     info.engine_owned = true -- the game's own hit holds its DamageInfo
-    M.component(enemy.body, "chainsaw.HitController"):call("callbackDamageHit", info)
+    hc:call("callbackDamageHit", info)
     return info
 end
 
@@ -1867,7 +2061,7 @@ function M.install_world(world, opts)
         ["ToString()"] = { 0, function(self) return self.text end, {}, { ret = "System.String" } },
     })
     M.value_types["System.Guid"] = true
-    class("chainsaw.ContextID", "System.Object", {}, { _Category = "chainsaw.ContextID.EntityCategory",
+    class("chainsaw.ContextID", "System.Object", M.context_id_methods, { _Category = "chainsaw.ContextID.EntityCategory",
         _Kind = "System.Byte", _Group = "System.Int32", _Index = "System.Int32" })
     class("via.vec3", "System.Object", {})
     class("via.Quaternion", "System.Object", {})
@@ -2368,6 +2562,8 @@ function M.install_world(world, opts)
         getPartnerContextRef = { 0, function() return world.partner end },
         get_EnemyContextList = { 0, function() return world.enemy_list end },
         get_CharacterBackupDB = { 0, function() return backup_db end },
+        getSpawnParamRef = M.character_manager_methods.getSpawnParamRef,
+        getContextRef = M.character_manager_methods.getContextRef,
         isActive = { 1, function(_, stage) return world.active_stages ~= nil and world.active_stages[stage] == true end },
         [WARP] = { 4, function(_, id, npos, nrot, sid)
             local function value(n, t)
