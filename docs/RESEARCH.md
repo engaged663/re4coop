@@ -974,6 +974,125 @@ transform, and the game threw.
   linked again) is switched off again on the next control pass (`enemy_is_puppet`), instead of
   running its own AI in both games.
 
+### 3.17 Attack data the game had freed (0.9.1)
+
+**Report.** A crash at 16:35:46 on one of the engine's own worker threads (re4.exe+0x39e73be,
+inside the runtime's object code, no game method in the stack; REFramework wrote
+`reframework_crash.dmp`). Five minutes earlier REFramework's log had caught an access
+violation (`VMContext: Caught exception code c0000005`) inside our call to
+`chainsaw.collision.HitInfo.set_DamageUserData`.
+
+**Cause.** That setter (0x1400b7a90, the shared setter of a field at +0x70) adds a reference to
+the new value (0x1439d6ed0) before storing it: the value was a freed object, so the add wrote
+into memory the engine had given to something else - the later crash in its own threads is the
+likely consequence. The value came from `hit_templates`: data kept (with `add_ref`) from an
+earlier hit of our player - the weapon's AttackUserData / AttackData and, per enemy kind, the
+DamageUserData - used for every hit we run. They belong to resources (the weapon's, the enemy
+kind's) that the game frees when it unloads them, whatever references we hold.
+
+**Fix.**
+- The damage data of a hit we run comes only from the enemy's own colliders, read at that
+  moment; the per-kind cache is gone. No damage data: no hit is built (the HP and the death go
+  through the fallbacks).
+- Attack data templates record their types; before each use `still_valid` checks that the
+  object is still a managed object (`sdk.is_managed_object`) of that type, and drops the
+  template if not (the latest template and any other weapon's are tried next; our player's next
+  hit gives fresh ones). The enemy's collider data is checked the same way.
+- Kept objects are never let go of (`refs` only grows): releasing one the game freed would be
+  another write into freed memory.
+
+### 3.18 Traps (0.9.1)
+
+**Request.** Every kind of trap in sync.
+
+**The traps of the game** (types from the dump; behaviour from re4.exe, carved and decompiled):
+
+| Trap | Type | How it works | In co-op |
+|---|---|---|---|
+| Bear trap | `chainsaw.GmLegHoldTrap` (`GmOMUnitBase`) | `_Routine` +0x90 / `_Rno` +0x94: Wait 0, Bite 1, Close 2, Closed 3, Hide 4, NpcBite 5, Rescue 6, OpenByEm 7. `initializeGimmick` (0x14196c4c0) starts it Closed when its gimmick flag is set. `onHitDamage` (0x141997070): open + enough break power -> Close (writes routine 2 / rno 0). `updateGimmick` (0x141a13450) Close: snap motion, sound, `setGmFlag(true)`, then Closed; Bite (0x141a0a270) holds the victim and ends in Closed **without** the flag. `requestSetClosed()` (0x140783760): Closed + flag. `requestOpenByEm()` (0x1407844c0): flag off, OpenByEm -> Wait. `onChangeGmFlag` only sends a notice | Synced |
+| Villagers' bear traps | the same `GmLegHoldTrap`s, pooled | `Ch1c0z0LegHoldTrapManager` / `CustomLevel_Ch1c0z0LegHoldTrapConveyor`: a list of level trap ContextIDs (`TrapContextID`) reserved (`requestGetLegHoldTrapID`, `useLegHoldTrap`, `notifyTrapUse`); the villager carries an `EmShellLegHoldTrapDummy` (a rigid body, `setDrop`) | Closing/re-arming synced (level GUIDs); the placement is not |
+| Sensor bomb (laser trip mine) | `chainsaw.GmSensorBomb` | `_Routine`: Wait 0, Bomb 1, ReleaseReady 2, Release 3, Done 4, Hide 5. `initializeGimmick` (0x1424ed450) starts it Done when flagged. `onHitDamage` (0x1425034a0) sets the flag; Wait (0x14255b050) turns a set flag into Bomb (explosion attack, sound, effect: 0x1425499f0) | Synced |
+| Spike wall, drills, falling floors, laser rooms, ice axes, the trapped dog | `GmWallTrap`, `GmDrillTrap(_cp11)`, `GmFallingFloorTrap(2)`, `GmCountDownFallingFloor`, `GmAbyssFallingFloor`, `GmLaserTrap`, `GmQTELaserTrap(2/3)`, `GmIceAxeTrapControll`, `GmDogCaughtInTrap` | Started by the level's own triggers and scripted sequences (`initInteractTrigger`, `GmOption*` from portrayals); several set their gimmick flag at the end (`GmWallTrap.updateGimmick`, `GmLaserTrap.onActivate`/`onInActivate`, `GmCountDownFallingFloor.onEnd`...) | Each player's own game runs them when its player walks in; their saved state crosses through the gimmick table (§3.11) |
+
+`GmBase.setGmFlag(Boolean, InteractTrigger, InteractActionArgs)` (0x141602d40) is the gimmick
+flag of every gimmick: when the value changes it writes attribute 0 of the GimmickContext
+(`pushAttr`) and calls the virtual `onChangeGmFlag` (557 call sites).
+
+**Design.** Each game watches the traps within 60 m of its player (scene components by
+GameObject GUID, rescanned every 2 s; `_Routine` read 5 times a second) and reports a bear trap
+that closed (open -> any of Bite/Close/Closed/NpcBite/Rescue) or opened again, and a sensor
+bomb that went off (armed -> Bomb/Done) - TRAPS. The partner's game applies it through the
+trap's own code: a bear trap gets Close with `_Rno` 0 - exactly what a shot writes, so it
+snaps with its sound and saves its flag; re-armed: `requestOpenByEm()`; a sensor bomb gets
+`setGmFlag(true)` and goes off from its own Wait on the next update. A trap not loaded there
+waits for its area (30 min); a report older than 20 s, and the snapshot of every closed or
+gone trap a joining partner gets, are applied without playing them (`requestSetClosed()`;
+the bomb straight to Done, then flagged). What the partner's report makes our trap do is not
+reported back. Paired by GameObject GUID (scene data).
+
+**Not covered yet.** The villagers' trap placement (the pooled trap is moved and shown in the
+villager's owner game only); the scripted traps beyond their saved state. Not run in the game
+yet.
+
+### 3.19 Mechanisms: levers, big doors, valves, shelves, carts (0.9.1)
+
+**Request.** Objects that move with an in-game camera shot in sync: big doors that open with a
+short scene, a lever that opens a big door, the cart pushed out of the way, the shelf moved to
+reach the next area, the chapter 2 valve that opens the door to Leon's equipment, and every
+similar object.
+
+**Before.** Only their saved state crossed (gimmick table, §3.11): the partner's game knew the
+lever was pulled, but an object already loaded on the partner's screen kept its old pose until
+its area loaded again - the door stayed shut, the shelf and the cart stayed in the way.
+
+**How the game moves them** (re4.exe, carved and decompiled with REA):
+
+* `chainsaw.PortrayalSettings.call(UInt32 keyhash, InteractTrigger, InteractActionArgs)`
+  (0x142158ad0) is the scripted-sequence engine of a gimmick: it runs the parameter sets with
+  that key (`_CalleePlay`: motions, the in-game camera, sounds, effects, other gimmicks' options,
+  flags). Both other overloads, `call(String, InteractTrigger, InteractActionArgs)`
+  (0x1409e48c0) and `call(String key, GameObject)` (0x1409e7ed0), hash the key and end in it.
+  The game calls it with no trigger and no args itself: `GmLever.onUsed` (0x14396b630) and
+  `GmLever.setUsed` (0x143986170) do `setGmFlag(true)`, then `call(key, null, null)`.
+* `initializeGimmick` of a gimmick that loads already used calls
+  `PortrayalSettings.makeFinish(key)` (`GmLever.initializeGimmick` 0x14393f570): the sequence's
+  end pose without playing it. This is what a partner far away gets when the area loads.
+* 263 gimmick types own a `PortrayalSettings`: `GmLever`, `GmLeverKeep`, `GmPowerSupplyLever`,
+  `GmBigDoor`, `GmBigDoorLock`/`Padlock`, `GmHoldHandle` (the valves and cranks), `GmShelves`,
+  `GmFallenShelf`, `GmStandFallenShelf`, `GmSlideGate`, `GmDrawbridge`,
+  `GmCorrelatedShutterBase`, `GmWindmill`, `GmBrokenGate`... Some play it from their flag:
+  `GmShelves.onChangeGmFlag` (0x1435fd3b0), `GmPortrayal.onChangeGmFlag` (0x1408b24d0).
+  `GmLever.onGimmickOccupiedExcludeAcceptCh` (0x143957f90) keeps the partner's own player off
+  a lever while it is in use.
+* The pushed cart and shelf are `chainsaw.GmPushMove`, which has no portrayal: its gimmick flag
+  is `IsMoved`. `onAcceptExecute` (0x141fa4af0), once the push is accepted:
+  `setGmMotion(MotMove)` (0x142020be0), `moveEffectorShape(_Move)` (moves the AI map
+  blocker along), `setGmFlag(true)`. `initializeGimmick` (0x141f97690), when flagged:
+  `setGmMotion(MotMoved)` and the blocker moved. Its camera shot is a Clapperboard
+  (PayloadPlay), which the cutscene sync already plays for both (§3.11).
+* `PlMinorDemoSettings` in a sequence only turns the player toward the object; no player
+  needed.
+
+**Design.** Two hooks, both only recording. `PortrayalSettings.call(UInt32, ...)` records the
+gimmick's GameObject GUID and the key; `GmBase.setGmFlag(true)` on a `GmPushMove` not moved yet
+records a push. Each frame they become MECHANISMS (a sequence our game started while our area
+was loading is the area setting itself up and is not sent). A portrayal is shared only when
+its GameObject (or its parent) has a gimmick that is not deny-listed - doors, traps,
+breakables and animals have their own sync; ladders, windows, jumps, item boxes, the
+workbench, saving, mounted guns and vehicles are the player's own action - and its parameter
+sets run nothing deny-listed; a portrayal with no gimmick is an event, which the level event sync handles (§3.11). The
+partner's game plays the same sequence on the same object, the game's own way:
+`call(key, null, null)` like `GmLever.onUsed`; a push gets what `onAcceptExecute` does without
+the player (`MotMove`, the blocker, the flag). Never twice: for 15 s a sequence the partner's
+report started is not reported back, and the same sequence our game starts itself (its own
+reaction to the flag gimmick_sync brought) is skipped (`SKIP_ORIGINAL`); a partner's report
+of a sequence our game started in the last 15 s is not played. An object not loaded waits 10 s
+for its area, then its saved state finishes it when the area loads (`makeFinish`). Paired by
+GameObject GUID (scene data).
+
+**Not covered yet.** Not run in the game yet. The flag of a lever arrives with the gimmick
+table (every few seconds), not with the sequence.
+
 ## 4. Sync architecture
 
 ```

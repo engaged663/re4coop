@@ -45,7 +45,23 @@ P.T = {
     ITEM_GIVE_RESULT = 36, -- reliable, both directions: how much of a given item did not fit
     ENEMY_CLAIM = 37,   -- reliable, client -> host: the client's player started a finisher on this enemy
     SAVE = 38,          -- reliable, both directions: the sender's game saved (the receiver's game saves too)
+    TRAPS = 39,         -- reliable, both directions: traps that went off in the sender's game (bear traps, sensor bombs)
+    MECHANISMS = 40,    -- reliable, both directions: a gimmick's scripted sequence / a pushed object moved in the sender's game
 }
+
+-- MECHANISMS: what moved. PORTRAYAL: PortrayalSettings.call(key) on that GameObject; PUSH: a
+-- GmPushMove (cart, shelf) was pushed.
+P.MECH_KIND = { PORTRAYAL = 1, PUSH = 2 }
+P.MAX_MECHS_PER_MESSAGE = 50
+
+-- TRAPS: the kind of trap and what happened to it.
+P.TRAP_KIND = { LEG_HOLD = 1, SENSOR_BOMB = 2 }
+P.TRAP_EVENT = {
+    FIRED = 1,    -- a bear trap snapped shut / a sensor bomb went off (the receiver's plays it)
+    REARMED = 2,  -- a bear trap was opened again (by a villager)
+    SPENT = 3,    -- already closed / gone before (a joining partner): set without playing it
+}
+P.MAX_TRAPS_PER_MESSAGE = 60
 
 -- SAVE: what kind of save the sender's game made.
 P.SAVE_KIND = { AUTO = 1, MANUAL = 2 }
@@ -906,6 +922,48 @@ function P.encode_save(m)
     return string.pack("<BB", P.T.SAVE, (m.kind or P.SAVE_KIND.AUTO) & 0xFF)
 end
 
+-- mechs = { {guid, kind, key}, ... } -> array of messages
+function P.encode_mechanisms(mechs)
+    local out = {}
+    local i = 1
+    while i <= #mechs do
+        local last = math.min(#mechs, i + P.MAX_MECHS_PER_MESSAGE - 1)
+        local parts, n = {}, 0
+        for k = i, last do
+            local m = mechs[k]
+            local b = P.guid_to_bytes(m.guid)
+            if b ~= nil then
+                parts[#parts + 1] = b .. string.pack("<BI4", (m.kind or 0) & 0xFF, (m.key or 0) & 0xFFFFFFFF)
+                n = n + 1
+            end
+        end
+        if n > 0 then out[#out + 1] = string.pack("<BB", P.T.MECHANISMS, n) .. table.concat(parts) end
+        i = last + 1
+    end
+    return out
+end
+
+-- traps = { {guid, kind, event}, ... } -> array of messages
+function P.encode_traps(traps)
+    local out = {}
+    local i = 1
+    while i <= #traps do
+        local last = math.min(#traps, i + P.MAX_TRAPS_PER_MESSAGE - 1)
+        local parts, n = {}, 0
+        for k = i, last do
+            local t = traps[k]
+            local b = P.guid_to_bytes(t.guid)
+            if b ~= nil then
+                parts[#parts + 1] = b .. string.pack("<BB", (t.kind or 0) & 0xFF, (t.event or 0) & 0xFF)
+                n = n + 1
+            end
+        end
+        if n > 0 then out[#out + 1] = string.pack("<BB", P.T.TRAPS, n) .. table.concat(parts) end
+        i = last + 1
+    end
+    return out
+end
+
 -- doors = { {guid, open=bool, hold=bool, attr=byte}, ... } -> array of messages
 P.MAX_DOORS_PER_MESSAGE = 60
 function P.encode_doors(doors)
@@ -1458,6 +1516,30 @@ decoders[P.T.DOORS] = function(data)
         doors[i] = { guid = guid, open = (flags & 1) ~= 0, hold = (flags & 2) ~= 0, attr = attr }
     end
     return { doors = doors }
+end
+
+decoders[P.T.MECHANISMS] = function(data)
+    local _, n = string.unpack("<BB", data)
+    local mechs, off = {}, 3
+    for i = 1, n do
+        local guid = P.guid_from_bytes(data:sub(off, off + 15))
+        local kind, key = string.unpack("<BI4", data, off + 16)
+        off = off + 21
+        mechs[i] = { guid = guid, kind = kind, key = key }
+    end
+    return { mechs = mechs }
+end
+
+decoders[P.T.TRAPS] = function(data)
+    local _, n = string.unpack("<BB", data)
+    local traps, off = {}, 3
+    for i = 1, n do
+        local guid = P.guid_from_bytes(data:sub(off, off + 15))
+        local kind, event = string.unpack("<BB", data, off + 16)
+        off = off + 18
+        traps[i] = { guid = guid, kind = kind, event = event }
+    end
+    return { traps = traps }
 end
 
 decoders[P.T.CUTSCENE_SKIP] = function(data)

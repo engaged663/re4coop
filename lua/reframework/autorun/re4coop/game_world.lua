@@ -51,6 +51,9 @@ local FLAG_INFO = "chainsaw.ScenarioFlagManager.FlagInfo"
 local COORD_PACK = "chainsaw.PlayerCoordSetting.Pack"
 local TRIGGER_WORK = "chainsaw.InteractTrigger.Work"
 local HOLDER = "chainsaw.InteractHolder"
+local PORTRAYAL = "chainsaw.PortrayalSettings"
+local PUSH_MOVE = "chainsaw.GmPushMove"
+local MECH_ECHO = 15.0 -- seconds: the partner's mechanism is not played twice here, nor reported back
 local CHARACTER_MANAGER = "chainsaw.CharacterManager"
 local CAMPAIGN = "chainsaw.CampaignManager"
 local GUI_MANAGER = "chainsaw.GuiManager"
@@ -169,6 +172,10 @@ function World.new(game, log)
     self.flag_groups = nil   -- group name -> ScenarioFlagManager.Group (per manager)
     self.trigger_events = {} -- triggers our player set off this frame (hook), classified in update()
     self.trigger_owner_info = {} -- GameObject GUID -> {event, why}: what kind of trigger owner it is
+    self.mech_events = {}    -- portrayals / pushes our game started this frame (hooks), classified later
+    self.mech_remote = {}    -- "guid:key" -> time: the partner's mechanism we just played here
+    self.mech_owner_info = {} -- GameObject GUID -> {gimmick, why}: what a portrayal's GameObject is
+    self.applying_mech = false
     self.counters = { flag_events = 0, cutscene_events = 0, trigger_events = 0, trigger_not_event = 0,
         skip_events = 0, gimmicks_applied = 0, gimmicks_waiting = 0 }
     self.gim_waiting = {}    -- ctx_key -> {item, since}: partner gimmicks whose context is not set up here yet
@@ -218,6 +225,9 @@ function World:on_reload()
     self.flag_groups = nil
     self.trigger_events = {}
     self.trigger_owner_info = {}
+    self.mech_events = {}
+    self.mech_remote = {}
+    self.mech_owner_info = {}
     self.skips_seen = {}
     self.doors = {}
     self.doors_at = nil
@@ -306,6 +316,11 @@ function World:probe()
         if r:type(name) ~= nil then self.object_types[#self.object_types + 1] = name end
     end
     self:cap("objects", #self.object_types > 0, ("%d object types"):format(#self.object_types))
+    local trap_types = 0
+    for name in pairs(World.TRAP_KINDS) do
+        if r:type(name) ~= nil then trap_types = trap_types + 1 end
+    end
+    self:cap("traps", trap_types > 0, ("%d trap types (bear trap, sensor bomb)"):format(trap_types))
     -- Animals: a gimmick's state machine (GmBase.updateGimmick) runs from its GimmickCore, and
     -- GimmickManager updates the cores registered with registerMove. A client's copy of a host
     -- animal leaves that list while it follows the host.
@@ -429,6 +444,46 @@ function World:install_hooks(callbacks)
         end)
     end
     self:cap("trigger_hooks", trig_hooked, trig_hooked and "executeTrigger hooked" or "not hooked")
+
+    -- Mechanisms (docs/RESEARCH.md 3.19): every scripted sequence a gimmick starts
+    -- (PortrayalSettings.call - all its overloads end in the UInt32 one) and a pushed object
+    -- that moved (GmBase.setGmFlag(true) on a GmPushMove). Only recorded here; classified in
+    -- report_mechanisms. A sequence the partner's game just started here and our own game now
+    -- starts again (its own reaction to the same flags) is not played twice.
+    local mech_hooked = 0
+    local port_call = r:find_method(PORTRAYAL, function(i)
+        return i.name == "call" and #i.params == 3 and i.params[1] == "System.UInt32" end)
+    if port_call ~= nil and r:hook(port_call, function(args)
+        if not self.active then return end
+        local this = R.arg_obj(args[2])
+        if this == nil then return end
+        local key = (sdk.to_int64(args[3]) or 0) & 0xFFFFFFFF
+        if self.applying_mech or self.applying_trigger or self.applying_cutscene then return end
+        if next(self.mech_remote) ~= nil then
+            local go = R.call(this, "get_GameObject")
+            local guid = go and R.game_object_guid(go)
+            local t = guid and self.mech_remote[guid .. ":" .. key]
+            if t ~= nil and self:now() - t < MECH_ECHO then
+                self.counters.mech_doubles = (self.counters.mech_doubles or 0) + 1
+                return sdk.PreHookResult.SKIP_ORIGINAL
+            end
+        end
+        if #self.mech_events < 64 then
+            self.mech_events[#self.mech_events + 1] = { kind = 1, comp = this, key = key }
+        end
+    end) then mech_hooked = mech_hooked + 1 end
+    local set_flag = r:find_method("chainsaw.GmBase", function(i) return i.name == "setGmFlag" and #i.params == 3 end)
+    if set_flag ~= nil and r:hook(set_flag, function(args)
+        if not self.active or self.applying_mech then return end
+        if (sdk.to_int64(args[3]) or 0) & 1 == 0 then return end
+        local this = R.arg_obj(args[2])
+        if this == nil or R.type_name(this) ~= PUSH_MOVE then return end
+        if R.call(this, "getGmFlag") == true then return end -- already moved
+        if #self.mech_events < 64 then
+            self.mech_events[#self.mech_events + 1] = { kind = 2, comp = this, key = 0 }
+        end
+    end) then mech_hooked = mech_hooked + 1 end
+    self:cap("mechanisms", mech_hooked == 2, ("%d of 2 hooked (PortrayalSettings.call, GmBase.setGmFlag)"):format(mech_hooked))
 
     -- Chapter switch: rewrite the chapter of the next save load when armed.
     if self.load_save_m ~= nil then
@@ -1499,6 +1554,122 @@ function World:cutscene_skip(camera, id)
 end
 
 -------------------------------------------------------------------------------
+-- Traps (docs/RESEARCH.md 3.18)
+--   chainsaw.GmLegHoldTrap (bear trap), _Routine: Wait 0, Bite 1, Close 2, Closed 3, Hide 4,
+--     NpcBite 5, Rescue 6, OpenByEm 7. Its gimmick flag (GmBase.setGmFlag, attribute 0 of its
+--     GimmickContext) is "closed": initializeGimmick starts a flagged trap Closed. onHitDamage
+--     (shot while open) writes Close with _Rno 0; Close plays the snap, its sound and sets the
+--     flag, then becomes Closed. requestSetClosed() goes straight to Closed and sets the flag;
+--     requestOpenByEm() (a villager re-arming it) clears the flag and opens it.
+--   chainsaw.GmSensorBomb (laser trip bomb), _Routine: Wait 0, Bomb 1, ReleaseReady 2,
+--     Release 3, Done 4, Hide 5. Wait watches its gimmick flag: once set (shot: onHitDamage,
+--     or the laser crossed) it goes to Bomb (explosion, attack, sound) and Done; a bomb loaded
+--     flagged starts Done.
+-------------------------------------------------------------------------------
+
+local TRAP_SCAN_INTERVAL = 2.0
+World.TRAP_KINDS = { ["chainsaw.GmLegHoldTrap"] = 1, ["chainsaw.GmSensorBomb"] = 2 } -- P.TRAP_KIND
+local LEG_HOLD_STATE = { [0] = "open", [7] = "open", [1] = "closed", [2] = "closed", [3] = "closed",
+    [5] = "closed", [6] = "closed", [4] = "hidden" }
+local SENSOR_STATE = { [0] = "armed", [2] = "armed", [3] = "armed", [1] = "gone", [4] = "gone", [5] = "hidden" }
+local LEG_HOLD_CLOSE, LEG_HOLD_CLOSED = 2, 3
+local SENSOR_WAIT, SENSOR_DONE = 0, 4
+
+-- The traps of the loaded areas, by GameObject GUID (scene data: the same on both PCs).
+function World:traps_refresh(now)
+    if self.traps_at ~= nil and now - self.traps_at < TRAP_SCAN_INTERVAL then return end
+    self.traps_at = now
+    local scene = self:scene()
+    if scene == nil then return end
+    local traps = {}
+    for tname, kind in pairs(World.TRAP_KINDS) do
+        local t = self.r:typeof(tname)
+        if t ~= nil then
+            R.each(R.call(scene, "findComponents(System.Type)", t) or R.call(scene, "findComponents", t), function(comp)
+                local go = R.call(comp, "get_GameObject")
+                local guid = go and R.game_object_guid(go)
+                if guid ~= nil and traps[guid] == nil then
+                    local old = self.traps and self.traps[guid]
+                    traps[guid] = { comp = comp, go = go, kind = kind, pos = old and old.pos or position_of(go) }
+                end
+            end)
+        end
+    end
+    self.traps = traps
+end
+
+function World:trap_state(t)
+    local routine = R.number(R.get(t.comp, "_Routine"))
+    if routine == nil then return nil end
+    local states = t.kind == 2 and SENSOR_STATE or LEG_HOLD_STATE
+    return states[routine], routine
+end
+
+local function trap_list(self, filter)
+    local out = {}
+    for guid, t in pairs(self.traps or {}) do
+        if filter == nil or filter(t) then
+            local state = self:trap_state(t)
+            if state ~= nil then out[guid] = { kind = t.kind, state = state } end
+        end
+    end
+    return out
+end
+
+-- The traps within `radius` of `pos`: { [guid] = {kind, state} }.
+function World:traps_near(pos, radius)
+    if pos == nil then return nil end
+    self:traps_refresh(self:now())
+    return trap_list(self, function(t) return t.pos ~= nil and dist3(t.pos, pos) <= radius end)
+end
+
+-- Every trap loaded: { [guid] = {kind, state} }.
+function World:traps_all()
+    self:traps_refresh(self:now())
+    return trap_list(self)
+end
+
+-- The partner's trap event on our trap, through the trap's own mechanisms.
+-- event: 1 fired (play it), 2 re-armed, 3 spent (set without playing it). "done" | "skip" | "missing"
+function World:trap_apply(guid, kind, event)
+    self:traps_refresh(self:now())
+    local t = self.traps and self.traps[guid]
+    if t == nil or (self.game and self.game.go_alive and not self.game:go_alive(t.go)) then return "missing" end
+    local state, routine = self:trap_state(t)
+    if state == nil then return "missing" end
+    if state == "hidden" then return "skip" end
+    self:crumb("world.trap_apply", ("%d/%d"):format(kind or 0, event or 0), true)
+    self.applying = true
+    local ok = false
+    if t.kind == 1 then
+        if event == 2 then
+            if routine == LEG_HOLD_CLOSED then ok = pcall(function() t.comp:call("requestOpenByEm") end) end
+        elseif state == "open" then
+            if event == 1 then
+                -- What a shot does (onHitDamage): Close from its first step - the snap, its sound,
+                -- the "closed" flag - then Closed.
+                ok = R.set(t.comp, "_Rno", 0) and R.set(t.comp, "_Routine", LEG_HOLD_CLOSE)
+            else
+                ok = pcall(function() t.comp:call("requestSetClosed") end)
+            end
+        end
+    elseif t.kind == 2 and routine == SENSOR_WAIT then
+        if event == 3 then
+            -- Gone without going off: Done (its laser and model put away), flagged for the save.
+            ok = R.set(t.comp, "_Rno", 0) and R.set(t.comp, "_Routine", SENSOR_DONE)
+        else
+            ok = true
+        end
+        -- The flag: a waiting bomb goes off on its next update (Wait -> Bomb), like when shot.
+        if ok then ok = pcall(function() t.comp:call("setGmFlag", true, nil, nil) end) end
+    end
+    self.applying = false
+    if not ok then return "skip" end
+    self.counters.traps_applied = (self.counters.traps_applied or 0) + 1
+    return "done"
+end
+
+-------------------------------------------------------------------------------
 -- Doors
 -------------------------------------------------------------------------------
 
@@ -1708,6 +1879,145 @@ function World:portrayal_callee_denied(owner)
         end
     end)
     return bad
+end
+
+-------------------------------------------------------------------------------
+-- Mechanisms (docs/RESEARCH.md 3.19): levers, big doors and their locks, valves and cranks,
+-- shelves, gates, bridges, lifts... A gimmick's scripted sequence - the object moving, the
+-- in-game camera shot, the sounds, the flags - is a portrayal: PortrayalSettings.call(key,
+-- trigger, args) on the gimmick. The game calls them with no trigger itself (GmLever.onUsed,
+-- setUsed), and initializeGimmick puts them in their finished state (makeFinish) when the
+-- gimmick loads already used. A pushed cart or shelf (GmPushMove) moves through its own
+-- motion (MotWait -> MotMove -> MotMoved) and its gimmick flag.
+-------------------------------------------------------------------------------
+
+World.MECH_KIND = { PORTRAYAL = 1, PUSH = 2 }
+
+-- Gimmicks whose sequences never cross: another sync handles them (doors, traps, breakables,
+-- animals), or they are the player's own action (ladders, windows, jumps, item boxes, the
+-- workbench, saving, mounted guns and vehicles).
+World.MECH_DENY = {}
+for _, n in ipairs({ "GmDoor", "GmKickOpenDoor", "GmAutoDoor", "GmAutoDoorMotion", "GmElevatorDoor",
+    "GmTimingShutter", "GmLegHoldTrap", "GmSensorBomb", "GmPortrayalAreaHit", "GmLadderBase", "GmLeaningLadder",
+    "GmUprightLadder", "GmFoldableLadder", "GmWindow", "GmWindowBoard", "GmCh1d2z0HedgeJump", "GmCoopJump2",
+    "GmCoopMoveUp", "GmPlayerMoveMotion", "GmItemBox", "GmWorkbench", "GmWeaponUpgrade", "GmSofa", "GmMultiUse",
+    "GmMedalLocker", "GmSavePoint", "GmSaveLoadWoodBox", "GmInstalledMachineGun", "GmAntiAircraftGun",
+    "GmCannon", "GmCannonV2", "GmTurretShooterHandle", "GmBoat", "GmJetSki", "GmHookShot", "GmCatapult" }) do
+    World.MECH_DENY["chainsaw." .. n] = true
+end
+for _, n in ipairs(World.OBJECT_TYPES) do World.MECH_DENY[n] = true end
+
+local GM_BASE = "chainsaw.GmBase"
+
+-- The gimmick on `go` (or its parent): component, type name.
+function World:gimmick_on(go)
+    local found, name
+    for _ = 1, 2 do
+        if go == nil then break end
+        R.each(R.call(go, "get_Components"), function(c)
+            local ok, isa = pcall(function() return c:get_type_definition():is_a(GM_BASE) end)
+            if ok and isa then
+                found, name = c, R.type_name(c)
+                return true
+            end
+        end)
+        if found ~= nil then break end
+        local tf = R.call(go, "get_Transform")
+        local parent = tf and R.call(tf, "get_Parent")
+        go = parent and R.call(parent, "get_GameObject")
+    end
+    return found, name
+end
+
+-- Whether a portrayal on GameObject `go` (GUID `guid`) may play in the partner's game:
+-- {ok, why} - it belongs to a gimmick, not a denied one, and runs nothing denied.
+function World:mechanism_owner(go, guid)
+    local info = self.mech_owner_info[guid]
+    if info ~= nil then return info end
+    local _, gname = self:gimmick_on(go)
+    if gname == nil then
+        info = { ok = false, why = "no gimmick" }
+    elseif World.MECH_DENY[gname] then
+        info = { ok = false, why = gname }
+    else
+        local bad = self:portrayal_callee_denied(go)
+        info = bad and { ok = false, why = bad } or { ok = true, gimmick = gname }
+    end
+    self.mech_owner_info[guid] = info
+    return info
+end
+
+-- The mechanisms our game started since the last call: { {guid, kind, key, gimmick}, ... }.
+function World:take_mechanism_events()
+    if #self.mech_events == 0 then return nil end
+    local events = self.mech_events
+    self.mech_events = {}
+    local out = {}
+    for _, e in ipairs(events) do
+        local go = R.call(e.comp, "get_GameObject")
+        local guid = go and R.game_object_guid(go)
+        if guid ~= nil then
+            if e.kind == World.MECH_KIND.PUSH then
+                out[#out + 1] = { guid = guid, kind = e.kind, key = 0, gimmick = PUSH_MOVE }
+            else
+                local info = self:mechanism_owner(go, guid)
+                if info.ok then
+                    out[#out + 1] = { guid = guid, kind = e.kind, key = e.key, gimmick = info.gimmick }
+                else
+                    self.counters.mech_not_shared = (self.counters.mech_not_shared or 0) + 1
+                    self.last_mech_not_shared = info.why
+                end
+            end
+        end
+    end
+    return out
+end
+
+-- The partner's mechanism here, through the gimmick's own code. "done" | "skip" | "missing"
+function World:mechanism_apply(ev)
+    local scene = self:scene()
+    local g = self.r:guid_value(ev.guid)
+    if scene == nil or g == nil then return "missing" end
+    local go = R.call(scene, "findGameObject(System.Guid)", g)
+    if go == nil or (self.game and self.game.go_alive and not self.game:go_alive(go)) then return "missing" end
+    local now = self:now()
+    for k, t in pairs(self.mech_remote) do
+        if now - t > MECH_ECHO then self.mech_remote[k] = nil end
+    end
+    local ok = false
+    if ev.kind == World.MECH_KIND.PUSH then
+        local push = self.game and self.game:get_component(go, PUSH_MOVE)
+        if push == nil then return "missing" end
+        if R.call(push, "getGmFlag") == true then return "skip" end -- already moved here
+        self:crumb("world.mech_push", ev.guid, true)
+        self.applying_mech = true
+        -- What onAcceptExecute does once the player's push is accepted, without the player:
+        -- the move motion, the AI map's blocker moved along, the "moved" flag.
+        ok = pcall(function()
+            local td = push:get_type_definition()
+            local mot = td:get_field("MotMove"):get_data(nil)
+            push:call("setGmMotion", mot)
+            local move = push:get_field("_Move")
+            if move ~= nil then push:call("moveEffectorShape", move) end
+            push:call("setGmFlag", true, nil, nil)
+        end)
+        self.applying_mech = false
+    else
+        local info = self:mechanism_owner(go, ev.guid)
+        if not info.ok then return "skip" end
+        local port = self.game and self.game:get_component(go, PORTRAYAL)
+        if port == nil then return "missing" end
+        self:crumb("world.mech_portrayal", ("%s:%d"):format(ev.guid, ev.key or 0), true)
+        self.mech_remote[ev.guid .. ":" .. ev.key] = now
+        self.applying_mech = true
+        ok = pcall(function()
+            port:call("call(System.UInt32, chainsaw.InteractTrigger, chainsaw.InteractActionArgs)", ev.key, nil, nil)
+        end)
+        self.applying_mech = false
+    end
+    if not ok then return "skip" end
+    self.counters.mech_applied = (self.counters.mech_applied or 0) + 1
+    return "done"
 end
 
 -- Reports the event triggers our player set off since the last frame (queued by the hook).

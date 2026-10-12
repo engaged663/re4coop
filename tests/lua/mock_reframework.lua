@@ -628,7 +628,15 @@ function M.install(opts)
     }
     for _, f in ipairs(info_fields) do
         info_methods["get_" .. f] = { 0, function(self) return self.data[f] end }
-        info_methods["set_" .. f] = { 1, function(self, v) self.data[f] = v end }
+        info_methods["set_" .. f] = { 1, function(self, v)
+            -- Setting an object field adds a reference to the new value: one the game already
+            -- freed (resource data unloaded with its area) is an access violation (2026-10-12).
+            if type(v) == "table" and v.destroyed then
+                world.native_crashes = world.native_crashes + 1
+                error("access violation in HitInfo.set_" .. f .. " (freed object)")
+            end
+            self.data[f] = v
+        end }
     end
     -- The fields, the way the type database lists them: primitive values, vectors, an enum,
     -- object references, a value that only means something in one game (SerialNo), and a
@@ -1425,6 +1433,83 @@ function M.update_gimmicks()
     end
 end
 
+-- One update of every trap in the scene (GmLegHoldTrap / GmSensorBomb.updateGimmick, reduced
+-- to what the sync relies on).
+function M.update_traps()
+    for _, c in ipairs(M.world.components["chainsaw.GmLegHoldTrap"] or {}) do
+        local f = c.__fields
+        if not c.owner.destroyed then
+            if f._Routine == 2 then -- Close: the snap and its sound, the flag, then Closed
+                if f._Rno == 0 then
+                    M.world.trap_sounds = M.world.trap_sounds + 1
+                    c.flag = true
+                    f._Rno = 1
+                else
+                    f._Routine, f._Rno = 3, 0
+                end
+            elseif f._Routine == 1 then -- Bite: holds whoever stepped in, then Closed (no flag)
+                f._Routine, f._Rno = 3, 0
+            elseif f._Routine == 7 then -- OpenByEm: open again
+                f._Routine, f._Rno = 0, 0
+            end
+        end
+    end
+    for _, c in ipairs(M.world.components["chainsaw.GmSensorBomb"] or {}) do
+        local f = c.__fields
+        if not c.owner.destroyed then
+            if f._Routine == 0 and c.flag then -- Wait watches the flag: Bomb
+                f._Routine, f._Rno = 1, 0
+            elseif f._Routine == 1 then -- the explosion, then Done
+                M.world.explosions = M.world.explosions + 1
+                f._Routine, f._Rno = 4, 0
+            end
+        end
+    end
+end
+
+-- A mechanism in the scene: a GameObject (scene GUID) with a gimmick of `gimmick_type` and its
+-- PortrayalSettings. on_call(key) is what the sequence does (e.g. open a door).
+function M.make_mechanism(guid, gimmick_type, on_call, callees)
+    local go = M.make_go(gimmick_type:match("([^.]+)$"))
+    go.guid = guid
+    local gimmick = M.add_component(go, gimmick_type)
+    local list = {}
+    for _, c in ipairs(callees or {}) do list[#list + 1] = new(c) end
+    local param = new("chainsaw.PortrayalSettings.Param", { __fields = { _CalleePlay = typed_array("System.Object", list) } })
+    local settings = new("chainsaw.OptionSettings`1<chainsaw.PortrayalSettings.Param>", { __fields = {
+        _Params = typed_array("chainsaw.PortrayalSettings.Param", { param }) } })
+    local port = M.add_component(go, "chainsaw.PortrayalSettings", { __fields = { _Params = settings }, on_call = on_call })
+    return { go = go, gimmick = gimmick, port = port }
+end
+
+-- The game plays a sequence of that mechanism (a player used it).
+function M.play_portrayal(mech, key)
+    mech.port:call("call(System.UInt32, chainsaw.InteractTrigger, chainsaw.InteractActionArgs)", key, nil, nil)
+end
+
+-- A cart / shelf the player can push (GmPushMove), not moved yet.
+function M.make_push(guid)
+    local go = M.make_go("GmPushMove")
+    go.guid = guid
+    local comp = M.add_component(go, "chainsaw.GmPushMove", { motion = 100, __fields = { _Move = vec(0, 0, 3) } })
+    return comp
+end
+
+-- The player pushes it: GmPushMove.onAcceptExecute (motion, blocker, flag).
+function M.push(comp)
+    comp:call("setGmMotion", 101)
+    comp:call("moveEffectorShape", comp.__fields._Move)
+    comp:call("setGmFlag", true, nil, nil)
+end
+
+-- A bear trap or sensor bomb in the scene with that GameObject GUID (routine 0: open / armed).
+function M.make_trap(type_name, guid, pos, routine, flagged)
+    local comp = M.make_object(type_name, guid, pos, routine or 0)
+    comp.__fields._Rno = 0
+    comp.flag = flagged == true
+    return comp
+end
+
 -- ClapperboardMediator.procSkip: a skip input on a camera that can be skipped skips it; it
 -- ends a frame later (after its fade).
 function M.update_cutscene_skip()
@@ -2142,7 +2227,14 @@ function M.install_world(world, opts)
     class("chainsaw.PortrayalSettings.Param", "System.Object", {}, { _CalleePlay = "System.Object", _CalleeEnd = "System.Object" })
     class("chainsaw.OptionSettings`1<chainsaw.PortrayalSettings.Param>", "System.Object", {},
         { _Params = "chainsaw.PortrayalSettings.Param[]" })
-    class("chainsaw.PortrayalSettings", "via.Component", {}, { _Params = "chainsaw.OptionSettings`1<chainsaw.PortrayalSettings.Param>" })
+    -- A gimmick's scripted sequence (docs/RESEARCH.md 3.19): call(key, trigger, args) plays it.
+    world.portrayals = {}
+    class("chainsaw.PortrayalSettings", "via.Component", {
+        ["call(System.UInt32, chainsaw.InteractTrigger, chainsaw.InteractActionArgs)"] = { 3, function(self, key)
+            world.portrayals[#world.portrayals + 1] = { guid = self.owner and self.owner.guid, key = key }
+            if self.on_call then self.on_call(key) end
+        end, { "System.UInt32", "chainsaw.InteractTrigger", "chainsaw.InteractActionArgs" } },
+    }, { _Params = "chainsaw.OptionSettings`1<chainsaw.PortrayalSettings.Param>" })
     for _, n in ipairs({ "GmPortrayalAreaHit", "SetFlagSettings", "ClapperboardSettings", "SoundCallSettings",
         "GmDoorBase", "GmPitfall", "PlDieSettings", "InventorySettings", "CustomLevel_DropAshleyItem" }) do
         class("chainsaw." .. n, "via.Component", {})
@@ -2307,7 +2399,23 @@ function M.install_world(world, opts)
     class("chainsaw.GimmickCore", "via.Component", {}, { _HasRegisteredMove = "System.Boolean" })
     class("chainsaw.GmBase", "via.Component", {
         get_Core = { 0, function(self) return self.core end },
+        -- The gimmick flag (attribute 0 of its context); a change runs onChangeGmFlag.
+        setGmFlag = { 3, function(self, v)
+            if (self.flag == true) ~= (v == true) then
+                self.flag = v == true
+                if self.on_flag then self.on_flag(self.flag) end
+            end
+        end, { "System.Boolean", "chainsaw.InteractTrigger", "chainsaw.InteractActionArgs" } },
+        getGmFlag = { 0, function(self) return self.flag == true end },
     })
+    -- A pushed cart or shelf: its motion (MotWait / MotMove / MotMoved) and the AI map blocker.
+    local push = class("chainsaw.GmPushMove", "chainsaw.GmBase", {
+        setGmMotion = { 1, function(self, m) self.motion = m end, { "System.UInt32" } },
+        moveEffectorShape = { 1, function(self, v) self.effector_moved = v end, { "via.vec3" } },
+    }, { _Move = "via.vec3" })
+    push.static_values = { MotWait = 100, MotMove = 101, MotMoved = 102 }
+    class("chainsaw.GmLever", "chainsaw.GmBase", {})
+    class("chainsaw.GmShelves", "chainsaw.GmBase", {})
     class("chainsaw.GmWoodBoxBase", "chainsaw.GmBase", {}, { _Routine = "chainsaw.GmWoodBoxBase.RoutineType" })
     class("chainsaw.GmWoodBox", "chainsaw.GmWoodBoxBase", {})
     class("chainsaw.GmAnimal", "chainsaw.GmBase", {
@@ -2317,6 +2425,31 @@ function M.install_world(world, opts)
         set_Routine = { 1, function(self, v) self.__fields._Routine = v end, { "chainsaw.GmCrow.RoutineType" } },
     }, { _Routine = "chainsaw.GmCrow.RoutineType" })
     class("chainsaw.GmBottle", "chainsaw.GmBase", {})
+    -- Traps (re4.exe, docs/RESEARCH.md 3.18), stepped by M.update_traps the way their
+    -- updateGimmick runs: the gimmick flag (GmBase.setGmFlag) is attribute 0 of the context.
+    world.trap_sounds, world.explosions = 0, 0
+    local function set_flag(self, v)
+        if (self.flag == true) ~= (v == true) then self.flag = v == true end
+    end
+    local gm_flag = {
+        setGmFlag = { 3, function(self, v) set_flag(self, v) end,
+            { "System.Boolean", "chainsaw.InteractTrigger", "chainsaw.InteractActionArgs" } },
+        getGmFlag = { 0, function(self) return self.flag == true end },
+    }
+    local leg = { requestSetClosed = { 0, function(self)
+        self.__fields._Routine, self.__fields._Rno = 3, 0
+        set_flag(self, true)
+    end }, requestOpenByEm = { 0, function(self)
+        set_flag(self, false)
+        self.__fields._Routine, self.__fields._Rno = 7, 0
+    end } }
+    for k, v in pairs(gm_flag) do leg[k] = v end
+    class("chainsaw.GmLegHoldTrap", "chainsaw.GmBase", leg, { _Routine = "chainsaw.GmLegHoldTrap.RoutineType",
+        _Rno = "System.Int32" })
+    local bomb = {}
+    for k, v in pairs(gm_flag) do bomb[k] = v end
+    class("chainsaw.GmSensorBomb", "chainsaw.GmBase", bomb, { _Routine = "chainsaw.GmSensorBomb.RoutineType",
+        _Rno = "System.Int32" })
     -- Doors (re4.exe, docs/RESEARCH.md 3.11): bit 0 of the context's first attribute = open;
     -- _NeedKeepOpenSelf[0] = our player keeps it open, [1] = the other player
     -- (recvGmParam); it closes by itself once neither does.

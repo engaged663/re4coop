@@ -716,7 +716,7 @@ T.run("a_killing_hit_from_the_partner_never_throws_a_body_without_its_data", fun
     local list = game:list_enemies()
     mock.hit(world.enemies[1], 0, 0) -- attack data known
     game:take_hit_events()
-    game.hit_templates.by_kind = {}  -- but never this kind
+    -- (enemy damage data comes from its own colliders, never from an earlier hit)
     local fields = { { h = P.hash("Wince"), t = P.HIT_VALUE.F32, v = 44 } }
     local e2 = world.enemies[2]
     T.check(game:enemy_kill(list[2].id, fields), "killed")
@@ -732,6 +732,36 @@ T.run("a_killing_hit_from_the_partner_never_throws_a_body_without_its_data", fun
     T.eq(#hc1.received, 1, "not through the hit code (only our own earlier hit)")
     T.eq(e1.hp, 0, "through HitPoint.dead()")
     T.eq(world.native_crashes, 0, "still no crash")
+end)
+
+T.run("attack_data_the_game_freed_is_never_handed_back_to_it", function()
+    -- 16:30:32: an access violation inside HitInfo.set_DamageUserData (the setter adds a
+    -- reference to the value) - data kept from an earlier hit, freed by the game with its
+    -- resource; the engine crashed in its own threads minutes later.
+    local game, world = fresh_game()
+    game:set_active(true)
+    game:read_player_state()
+    local list = game:list_enemies()
+    local info = mock.hit(world.enemies[1], 0, 0) -- our hit: attack data kept as a template
+    game:take_hit_events()
+    local fields = { { h = P.hash("Wince"), t = P.HIT_VALUE.F32, v = 44 } }
+    T.check(game:enemy_apply_hit(list[2].id, { fields = fields }), "a partner's hit runs with it")
+    -- The area unloads: the weapon's attack data is gone.
+    info.data.AttackUserData.destroyed = true
+    T.eq(game:enemy_apply_hit(list[2].id, { fields = fields }), false, "not run with freed data")
+    T.eq(world.native_crashes, 0, "no access violation")
+    T.check((game.hit_stats.stale_templates or 0) >= 1, "the stale template is dropped")
+    -- Our next hit gives fresh data.
+    mock.hit(world.enemies[1], 0, 0)
+    game:take_hit_events()
+    T.check(game:enemy_apply_hit(list[2].id, { fields = fields }), "runs again with fresh data")
+    -- An enemy whose own damage data is gone: no hit built.
+    local hc = mock.component(world.enemies[2].body, "chainsaw.HitController")
+    for _, col in ipairs(hc.colliders.list) do
+        if col.user_data then col.user_data.destroyed = true end
+    end
+    game:enemy_apply_hit(list[2].id, { fields = fields })
+    T.eq(world.native_crashes, 0, "still no access violation")
 end)
 
 T.run("a_kill_from_the_partners_game_never_mutilates", function()

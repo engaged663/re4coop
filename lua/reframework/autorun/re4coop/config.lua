@@ -46,6 +46,8 @@ Config.DEFAULTS = {
     sync_gimmicks = true,     -- gimmick states: locks, keys used, levers, shutters, puzzles
     sync_objects = true,      -- breakables and animals: crates, barrels, pots, crows, chickens...
     sync_doors = true,        -- a door is open in both games while either player keeps it open
+    sync_traps = true,        -- bear traps that close and sensor bombs that go off do so in both games
+    sync_mechanisms = true,   -- levers, big doors, valves, shelves, carts...: what one player moves moves in both games
     give_items = true,        -- "Give to <partner>" in the attache case's item commands
     give_label = "Give to %s", -- its text (%s = the partner's name)
     sync_object_states = false, -- experimental: also mirror other state changes of those objects

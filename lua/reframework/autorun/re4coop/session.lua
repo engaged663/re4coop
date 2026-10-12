@@ -28,6 +28,8 @@ local FlagSync = require("re4coop.flag_sync")
 local GimmickSync = require("re4coop.gimmick_sync")
 local ObjectSync = require("re4coop.object_sync")
 local DoorSync = require("re4coop.door_sync")
+local TrapSync = require("re4coop.trap_sync")
+local MechanismSync = require("re4coop.mechanism_sync")
 local GiveSync = require("re4coop.give_sync")
 local SaveSync = require("re4coop.save_sync")
 local AnimalSync = require("re4coop.animal_sync")
@@ -98,10 +100,11 @@ local DEFER = {
     [P.T.ENEMY_CLAIM] = true,
     [P.T.FLAGS] = true, [P.T.FLAG_WORDS] = true, [P.T.GIMMICKS] = true, [P.T.OBJECTS] = true,
     [P.T.CUTSCENE] = true, [P.T.CUTSCENE_SKIP] = true, [P.T.TRIGGER] = true, [P.T.WORLD_REQUEST] = true, [P.T.WORLD_DONE] = true,
+    [P.T.TRAPS] = true, [P.T.MECHANISMS] = true,
 }
 
 local SYNC_NAMES = { "enemy_net", "drop_sync", "flag_sync", "gimmick_sync", "object_sync", "animal_sync",
-    "cutscene_sync", "trigger_sync", "door_sync" }
+    "cutscene_sync", "trigger_sync", "door_sync", "trap_sync", "mechanism_sync" }
 
 function Session.new(opts)
     local self = setmetatable({}, Session)
@@ -301,6 +304,8 @@ function Session:make_syncs()
     self.gimmick_sync = GimmickSync.new(base)
     self.object_sync = ObjectSync.new(base)
     self.door_sync = DoorSync.new(base)
+    self.trap_sync = TrapSync.new(base)
+    self.mechanism_sync = MechanismSync.new(base)
     local animal_opts = {}
     for k, v in pairs(base) do animal_opts[k] = v end
     -- Animal deaths go through the breakables' channel (OBJECTS) right away.
@@ -840,6 +845,8 @@ function Session:status()
         if self.cutscene_sync then st.cutscenes = self.cutscene_sync:summary() end
         if self.trigger_sync then st.triggers = self.trigger_sync:summary() end
         if self.door_sync then st.doors = self.door_sync:summary() end
+        if self.trap_sync then st.traps = self.trap_sync:summary() end
+        if self.mechanism_sync then st.mechanisms = self.mechanism_sync:summary() end
         if self.give_sync then
             st.gives = self.give_sync:summary()
             st.give_waiting = self.give_sync:waiting_items()
@@ -1066,6 +1073,10 @@ function Session:handle_message(data, now)
         if self.cutscene_sync and self.world then self.cutscene_sync:on_message(m, now) end
     elseif m.type == T.DOORS then
         if self.door_sync and self.world then self.door_sync:on_message(m, now, self.world) end
+    elseif m.type == T.TRAPS then
+        if self.trap_sync and self.world then self.trap_sync:on_message(m, now, self.world) end
+    elseif m.type == T.MECHANISMS then
+        if self.mechanism_sync and self.world then self.mechanism_sync:on_message(m, now) end
     elseif m.type == T.TRIGGER then
         if self.trigger_sync and self.world then self.trigger_sync:on_message(m, now) end
     elseif self.avatar_rx:on_message(m, now) then
@@ -1218,6 +1229,10 @@ function Session:update_world(now)
     self.cutscene_sync:tick(now, world, self.local_loc, self.travel)
     self.trigger_sync:tick(now, world, self:event_location())
     self.door_sync:tick(now, world, self:fresh_local_pos(now))
+    self.trap_sync:tick(now, world, self:fresh_local_pos(now))
+    local loc = self.local_loc
+    self.mechanism_sync:tick(now, world, self:fresh_local_pos(now) ~= nil
+        and (loc == nil or (not loc.loading and loc.playable ~= false)), loc ~= nil and loc.loading == true)
 
     local partner = self:partner_location()
     if self.role == "client" and self.sync_on_join and partner ~= nil and self.local_loc ~= nil then

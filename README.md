@@ -42,6 +42,8 @@ through the campaign together on a LAN, or over the internet with a forwarded po
 | **Cutscenes for both** | A cutscene or movie one player's game starts plays in the partner's game too: the game's own description of it (camera, flags it sets, the scripted sequence it continues, where it puts the players) is sent and played by the partner's game exactly as if their player had started it, **at once, wherever the partner is**: a partner who was far away watches it right away and is brought next to you when it ends. Never twice: a cutscene that save already played is skipped. **Skipping it skips it for both** (in the partner's game the same way its own skip button does) |
 | **Scripted events for both** | When a player walks into an area that starts an event (a camera shot, a voice line, objects that move, a scene), the partner's game runs the same event with its own player if they are nearby. A partner far away gets it from their own game when they walk in, as always. Only pure events travel: doors, items, traps, deaths, saves and tutorials never run for the other player |
 | **Doors that match** | A door your partner opens swings open in your game at once and stays open while they are in it, and closes in both games when neither of you is - normal and kick-open doors (RE4's own two-player door slots), automatic and elevator doors, timed shutters and big double doors |
+| **Levers, big doors, valves, shelves, carts for both** | When a player pulls a lever, turns a valve, opens a big door, moves a shelf or pushes the cart out of the way, the object moves in your partner's game too, with its in-game camera shot - no more door that stays shut or shelf that stays in the way on the other screen. If your partner is far away, it is already open/moved when they get there |
+| **Traps for both** | A bear trap that bites someone or is shot shut snaps shut in your partner's game too (with its own snap and sound), and opens again there when a villager re-arms it. A sensor bomb (laser trip mine) that is shot or set off goes off in both games - the explosion hurts whoever stands next to it in each game. Traps your partner already closed or set off before you joined are closed or gone in yours |
 | **Breakables and animals** | Break a crate, a barrel or a pot, shoot a crow: it breaks or dies in your partner's game too (animals fall dead, they don't vanish), and stays that way for an area they only reach later. Crows, chickens, fish, bats and rats near both players move as in the host's game: the same crow takes off and lands the same way on both screens |
 | **No pauses in co-op** | While you host or are connected, the inventory, map, files and pause menu no longer freeze the world (the partner keeps playing). Cutscenes, loading screens, saving at a typewriter and the merchant still pause. Back to normal when you leave |
 | **Join where the host is** | Joining takes over the host's world state (flags, doors, broken objects) and puts you next to the host. **Join from the title screen or the main menu and your game loads straight into the host's game**: no "load a save or start a new one" - it loads your co-op save (or, the first time, your latest save) into the host's chapter on its own, through the game's own Continue. In another chapter while playing, load any save (or *Continue*) and the game goes into the host's chapter |
@@ -72,6 +74,12 @@ How it works and why: [docs/RESEARCH.md](docs/RESEARCH.md). Wire format: [docs/P
   changes hands. With *Who runs enemies: host* only the host is attacked.
 * Ragdolls, effects the enemies spawn themselves and grab reactions are simulated in each game
   on its own and can look different.
+* Traps (0.9.1, not run in the game yet): bear traps and sensor bombs are in sync. A bear trap
+  a villager places appears only in the game that runs that villager; spike walls, drills,
+  falling floors and laser rooms run in each player's game when that player walks in.
+* Mechanisms (0.9.1, not run in the game yet): a lever, big door, valve, shelf or cart moved by
+  one player moves in the other's game with its camera shot. An object your partner is not near
+  is set in its final position when its area loads instead.
 * Your partner's hits and kills make the enemy react and die in your game, but never burst its
   head or break a limb there (the break effect of a replayed hit crashed the game); your own
   hits mutilate as always.
@@ -186,7 +194,7 @@ plugin/tests/          native transport tests + Lua test runner
 lua/reframework/autorun/re4coop.lua   entry script (REFramework autoloads it)
 lua/reframework/autorun/re4coop/      protocol, session, enemy_net, animal_sync, items_sync,
                                       drop_sync, gate, flag_sync, gimmick_sync, object_sync,
-                                      cutscene_sync, trigger_sync, door_sync, give_sync, save_sync, travel,
+                                      cutscene_sync, trigger_sync, door_sync, trap_sync, mechanism_sync, give_sync, save_sync, travel,
                                       pause_policy, interp, config, ui, overlay, perf (profiler,
                                       crash breadcrumbs),
                                       game (RE4 adapter: player, prefabs, sound mirror, HP,

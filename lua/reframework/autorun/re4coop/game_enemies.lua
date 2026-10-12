@@ -90,7 +90,9 @@ function M.install(Game, H)
         -- The attack data of our own player's real hits (docs/RESEARCH.md 3.13): a hit we run
         -- for the partner needs them - HitController.playDamageSe dereferences
         -- DamageInfo.AttackUserData without a check (a null one crashed the game).
-        self.hit_templates = { by_weapon = {}, any = nil, by_kind = {}, refs = {} }
+        -- `refs` only grows: a kept object is never let go of (REFramework would release it, and
+        -- one the game freed with its resource must never be released again - see still_valid).
+        self.hit_templates = { by_weapon = {}, any = nil, refs = {} }
         self.erased_spawns = {} -- uid (or "id:<id>") -> spawn param we invalidated (enemy_erase)
         self.hit_events = {}
         self.fatal_events = {} -- enemies our player started a finisher on (see on_local_fatal)
@@ -671,7 +673,7 @@ function M.install(Game, H)
             return
         end
         stats.by_player = stats.by_player + 1
-        self:remember_hit_template(info, self.enemy_info[id] and self.enemy_info[id].kind)
+        self:remember_hit_template(info)
         local ctx = self.enemy_ctx[id]
         local hp_obj = ctx and self:call(ctx, "get_HitPoint")
         local hp = hp_obj and tonumber(self:call(hp_obj, "get_CurrentHitPoint")) or nil
@@ -902,6 +904,51 @@ function M.install(Game, H)
         return true
     end
 
+    -- A kept engine object is still the object we kept: a managed object of the same type. The
+    -- game frees resource data (a weapon's attack data, an enemy kind's damage data) with its
+    -- resource, whatever references we hold: handing such a pointer to a setter made the game
+    -- add a reference to freed memory (an access violation in HitInfo.set_DamageUserData, and a
+    -- crash in the engine's own threads a few minutes later; docs/RESEARCH.md 3.17).
+    function Game:still_valid(obj, type_name)
+        local a = address_of(obj)
+        if a == nil then return false end
+        local ok, managed = pcall(sdk.is_managed_object, a)
+        if not ok or not managed then return false end
+        return type_name == nil or type_name_of(obj) == type_name
+    end
+
+    -- The attack data to put in a hit we run: the template of `weapon`, else the latest one,
+    -- else any other still valid. Templates no longer valid are dropped (their objects stay in
+    -- `refs`, never released).
+    function Game:hit_template(weapon)
+        local t = self.hit_templates
+        local function usable(tpl)
+            return tpl ~= nil and self:still_valid(tpl.au, tpl.au_type) and self:still_valid(tpl.ad, tpl.ad_type)
+        end
+        local function stale()
+            self.hit_stats.stale_templates = (self.hit_stats.stale_templates or 0) + 1
+        end
+        local tpl = weapon ~= nil and t.by_weapon[weapon] or nil
+        if tpl ~= nil and not usable(tpl) then
+            t.by_weapon[weapon], tpl = nil, nil
+            stale()
+        end
+        if tpl == nil and t.any ~= nil then
+            if usable(t.any) then tpl = t.any else t.any = nil stale() end
+        end
+        if tpl == nil then
+            for w, other in pairs(t.by_weapon) do
+                if usable(other) then
+                    tpl, t.any = other, other
+                    break
+                end
+                t.by_weapon[w] = nil
+                stale()
+            end
+        end
+        return tpl
+    end
+
     -- Keeps a managed object alive while we hold it (REFramework releases what nothing refers to).
     function Game:keep(obj)
         local a = address_of(obj)
@@ -914,20 +961,18 @@ function M.install(Game, H)
         return refs[a]
     end
 
-    -- Remembers the attack data of a real hit by our player (by weapon), and the damage data of
-    -- the kind of enemy it hit.
-    function Game:remember_hit_template(info, kind)
+    -- Remembers the attack data of a real hit by our player (by weapon; the latest one too),
+    -- with the types they had, to check them again before each use (still_valid).
+    function Game:remember_hit_template(info)
         local au = self:call(info, "get_AttackUserData")
         local ad = self:call(info, "get_AttackData")
         if au == nil or ad == nil then return end
         local t = self.hit_templates
-        local tpl = { au = self:keep(au), ad = self:keep(ad) }
-        if tpl.au == nil or tpl.ad == nil then return end
+        local tpl = { au = self:keep(au), ad = self:keep(ad), au_type = type_name_of(au), ad_type = type_name_of(ad) }
+        if tpl.au == nil or tpl.ad == nil or tpl.au_type == nil or tpl.ad_type == nil then return end
         local weapon = tonumber(self:call(info, "get_WeaponID"))
         if weapon ~= nil then t.by_weapon[weapon] = tpl end
-        t.any = t.any or tpl
-        local du = self:call(info, "get_DamageUserData")
-        if kind ~= nil and du ~= nil then t.by_kind[kind] = self:keep(du) end
+        t.any = tpl
         self:cap("hit_templates", true, ("attack data of %d weapon(s)"):format((function()
             local n = 0
             for _ in pairs(t.by_weapon) do n = n + 1 end
@@ -945,7 +990,7 @@ function M.install(Game, H)
         for i = 0, math.min(n, 128) - 1 do
             local col = self:call(cols, "getColliders", i)
             local ud = col and self:call(col, "get_UserData")
-            local tname = ud and type_name_of(ud)
+            local tname = ud and self:still_valid(ud) and type_name_of(ud) or nil
             if tname ~= nil and tname:find("DamageUserData", 1, true) then
                 local okP, parts = pcall(ud.get_field, ud, "Parts")
                 if okP and tonumber(parts) == CHEST then return col, ud end
@@ -966,9 +1011,8 @@ function M.install(Game, H)
         d = self:hold(d, HIT_HOLD) -- the game frees an unreferenced DamageInfo mid-hit (see Game:hold)
         self:write_damage_fields(d, fields)
         if not self:sanitize_damage_info(d, info.body) then return nil end
-        local t = self.hit_templates
         local weapon = tonumber(self:call(d, "get_WeaponID"))
-        local tpl = weapon ~= nil and t.by_weapon[weapon] or t.any
+        local tpl = self:hit_template(weapon)
         if tpl == nil then
             self.hit_stats.no_template = (self.hit_stats.no_template or 0) + 1
             return nil
@@ -977,14 +1021,13 @@ function M.install(Game, H)
             return nil
         end
         if self:call(d, "get_AttackUserData") == nil or self:call(d, "get_AttackData") == nil then return nil end
-        -- The enemy's own collider and damage data; else what a hit of ours on its kind had.
+        -- The enemy's own collider and damage data, read from it now: never kept from an earlier
+        -- hit (the game frees an enemy kind's data with its resource).
         local col, du = self:enemy_damage_collider(info)
         if du ~= nil then
             pcall(d.call, d, "set_DamageCollidable", col)
-        else
-            du = info.kind and t.by_kind[info.kind]
+            pcall(d.call, d, "set_DamageUserData", du)
         end
-        if du ~= nil then pcall(d.call, d, "set_DamageUserData", du) end
         if self:call(d, "get_DamageUserData") == nil or self:call(d, "get_AttackGameObject") == nil then
             self.hit_stats.no_damage_data = (self.hit_stats.no_damage_data or 0) + 1
             return nil

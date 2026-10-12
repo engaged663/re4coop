@@ -219,6 +219,8 @@ local function draw_options(settings)
         checkbox(settings, "sync_triggers", "A scripted event one player walks into also runs for the partner")
         checkbox(settings, "sync_gimmicks", "Doors, locks, levers, puzzles")
         checkbox(settings, "sync_doors", "Doors swing open and stay open in both games while either player is in them")
+        checkbox(settings, "sync_traps", "Traps: a bear trap that snaps shut or a sensor bomb that goes off does so in both games")
+        checkbox(settings, "sync_mechanisms", "Mechanisms: levers, big doors, valves, shelves, carts... move in both games, with their in-game camera")
         checkbox(settings, "give_items", "'Give to partner' in the attache case's item commands")
         checkbox(settings, "sync_objects", "Breakables and animal deaths (crates, barrels, crows...)")
         checkbox(settings, "sync_object_states", "Experimental: other state changes of those objects")
@@ -395,6 +397,8 @@ local function draw_diagnostics(session, game, session_status, puppet, perf)
             end
             sync_line("gimmicks", session_status.gimmicks)
             sync_line("doors", session_status.doors)
+            sync_line("traps", session_status.traps)
+            sync_line("mechanisms", session_status.mechanisms)
             sync_line("items given", session_status.gives)
             if session_status.saves then
                 local sv = session_status.saves
