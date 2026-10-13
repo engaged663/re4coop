@@ -242,6 +242,7 @@ function Game:on_reload()
     self.perf:crumb("game.reload", nil, true)
     -- Pooled heads and bodies can outlive a checkpoint reload: never leave one switched off.
     self:reload_enemies()
+    self:reload_ashley()
     self.drop_events = {}
     self.pickup_cache = {}
     self.pickup_objects = {}
@@ -2367,6 +2368,13 @@ function Game:is_key_down(vk)
     return ok and down == true
 end
 
+-- Whether the game window has the focus (re4coop_net.window_focused; true when unknown).
+function Game:window_focused()
+    if re4coop_net == nil or re4coop_net.window_focused == nil then return true end
+    local ok, focused = pcall(re4coop_net.window_focused)
+    return not ok or focused ~= false
+end
+
 -------------------------------------------------------------------------------
 -- World info
 -------------------------------------------------------------------------------
@@ -2931,6 +2939,11 @@ require("re4coop.game_enemies").install(Game, {
     singleton = singleton, find_type = find_type, address_of = address_of, type_name_of = type_name_of,
     v3 = v3, q4 = q4, dist = dist, field_type_name = field_type_name, field_is_static = field_is_static,
     type_hierarchy = type_hierarchy, context_id_table = context_id_table, CHARACTER_MANAGER = CHARACTER_MANAGER,
+})
+
+require("re4coop.game_ashley").install(Game, {
+    singleton = singleton, address_of = address_of, type_name_of = type_name_of, v3 = v3, q4 = q4,
+    CHARACTER_MANAGER = CHARACTER_MANAGER,
 })
 
 require("re4coop.game_give").install(Game, { singleton = singleton, find_type = find_type })

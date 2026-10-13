@@ -34,6 +34,8 @@ local GiveSync = require("re4coop.give_sync")
 local SaveSync = require("re4coop.save_sync")
 local AnimalSync = require("re4coop.animal_sync")
 local CutsceneSync = require("re4coop.cutscene_sync")
+local AshleySync = require("re4coop.ashley_sync")
+local PurposeSync = require("re4coop.purpose_sync")
 local TriggerSync = require("re4coop.trigger_sync")
 local Travel = require("re4coop.travel")
 local Perf = require("re4coop.perf")
@@ -70,6 +72,11 @@ local RELOAD_GAP = 2.0          -- seconds without a player that mean the game (
 local MAX_DEFERRED = 4000
 local SETTLE_AFTER_LOAD = 1.0   -- seconds in game before queued world/enemy messages are applied
 local STATUS_MAX_AGE = 0.1      -- status_cached(): seconds a computed status is reused
+local TAP_MAX = 1.0             -- seconds: the Ashley key held longer than this is not a tap
+local TAP_SETTLE = 0.25         -- seconds after the release the game must still have the focus
+-- Keys that, pressed while the Ashley key (Alt) is held, make it part of a shortcut
+-- (Alt+Tab, Alt+F4, Alt+Enter, Alt+Esc) rather than a switch.
+local SHORTCUT_KEYS = { 0x09, 0x73, 0x0D, 0x1B }
 
 local function dist3(a, b)
     local dx, dy, dz = a.x - b.x, a.y - b.y, a.z - b.z
@@ -91,6 +98,9 @@ local OFFLINE_SAFE = {
     [P.T.ITEM_GIVE] = true, [P.T.ITEM_GIVE_RESULT] = true, -- only queued here; placed when in game
     [P.T.SAVE] = true, -- only noted here; our game saves once it can
     [P.T.FRAG] = true, [P.T.AVATAR] = true, [P.T.GEAR] = true, [P.T.POSE] = true, [P.T.ACTIONS] = true,
+    -- Ashley: only her owner, epoch and the partner's latest state are recorded here; our
+    -- game follows them on the next game tick.
+    [P.T.ASHLEY] = true, [P.T.ASHLEY_OWNER] = true, [P.T.ASHLEY_SWITCH] = true,
 }
 
 -- Reliable messages that must not be lost but touch game objects: kept until the game loop
@@ -100,11 +110,11 @@ local DEFER = {
     [P.T.ENEMY_CLAIM] = true,
     [P.T.FLAGS] = true, [P.T.FLAG_WORDS] = true, [P.T.GIMMICKS] = true, [P.T.OBJECTS] = true,
     [P.T.CUTSCENE] = true, [P.T.CUTSCENE_SKIP] = true, [P.T.TRIGGER] = true, [P.T.WORLD_REQUEST] = true, [P.T.WORLD_DONE] = true,
-    [P.T.TRAPS] = true, [P.T.MECHANISMS] = true,
+    [P.T.TRAPS] = true, [P.T.MECHANISMS] = true, [P.T.PURPOSE] = true,
 }
 
 local SYNC_NAMES = { "enemy_net", "drop_sync", "flag_sync", "gimmick_sync", "object_sync", "animal_sync",
-    "cutscene_sync", "trigger_sync", "door_sync", "trap_sync", "mechanism_sync" }
+    "cutscene_sync", "trigger_sync", "door_sync", "trap_sync", "mechanism_sync", "ashley_sync", "purpose_sync" }
 
 function Session.new(opts)
     local self = setmetatable({}, Session)
@@ -232,6 +242,7 @@ end
 function Session.key_name(vk)
     if vk == nil then return "?" end
     if vk >= 0x70 and vk <= 0x7B then return "F" .. (vk - 0x6F) end
+    if vk == 0x12 or vk == 0xA4 or vk == 0xA5 then return "Alt" end
     if (vk >= 0x30 and vk <= 0x39) or (vk >= 0x41 and vk <= 0x5A) then return string.char(vk) end
     return ("key 0x%02X"):format(vk)
 end
@@ -306,6 +317,11 @@ function Session:make_syncs()
     self.door_sync = DoorSync.new(base)
     self.trap_sync = TrapSync.new(base)
     self.mechanism_sync = MechanismSync.new(base)
+    self.purpose_sync = PurposeSync.new(base)
+    local ashley_opts = {}
+    for k, v in pairs(base) do ashley_opts[k] = v end
+    ashley_opts.partner_name = function() return self.partner_name or "your partner" end
+    self.ashley_sync = AshleySync.new(ashley_opts)
     local animal_opts = {}
     for k, v in pairs(base) do animal_opts[k] = v end
     -- Animal deaths go through the breakables' channel (OBJECTS) right away.
@@ -376,6 +392,8 @@ function Session:run_actions(in_game)
             self:request_teleport()
         elseif a.name == "travel" then
             self:travel_to_partner()
+        elseif a.name == "ashley" then
+            if self.ashley_sync and self.partner_connected then self.ashley_sync:request(self.clock()) end
         elseif a.name == "dump" then
             if self.game.dump_types then
                 local ok, runs = self.game:dump_types(a.arg)
@@ -432,6 +450,7 @@ function Session:restore_game()
         self.pause:set_active(false, self.settings.no_pause_mode, false, self.clock())
     end
     if self.game.restore_enemies then self.game:restore_enemies() end
+    if self.game.ashley_restore then self.game:ashley_restore() end
     if self.world and self.world.restore_animals then self.world:restore_animals() end
     if self.world and self.world.disarm_chapter_switch then self.world:disarm_chapter_switch() end
 end
@@ -767,8 +786,49 @@ function Session:key_pressed(vk)
     return down and not was
 end
 
+function Session:game_focused()
+    return self.game.window_focused == nil or self.game:window_focused() ~= false
+end
+
+-- True when the Ashley key was tapped: pressed and released within TAP_MAX seconds, with no
+-- shortcut key (Tab, F4, Enter, Esc) pressed meanwhile, and the game still has the focus
+-- TAP_SETTLE seconds later (REFramework clears its keys when the game loses the focus, so an
+-- Alt+Tab looks like a tap). Alt also zooms a scope: a press while our player aims does not
+-- count.
+function Session:ashley_key_tapped(now)
+    local vk = self.settings.ashley_key
+    if vk == nil or vk <= 0 or self.game.is_key_down == nil then return false end
+    local down = self.game:is_key_down(vk)
+    local t = self.ashley_tap
+    if down then
+        if t == nil then
+            t = { since = now, spoiled = self.local_aiming == true }
+            self.ashley_tap = t
+        end
+        for _, k in ipairs(SHORTCUT_KEYS) do
+            if self.game:is_key_down(k) then t.spoiled = true end
+        end
+        if self.local_aiming then t.spoiled = true end
+        return false
+    end
+    self.ashley_tap = nil
+    if t ~= nil and not t.spoiled and now - t.since <= TAP_MAX and self:game_focused() then
+        self.ashley_tap_at = now
+    end
+    local at = self.ashley_tap_at
+    if at == nil then return false end
+    if not self:game_focused() then
+        self.ashley_tap_at = nil
+    elseif now - at >= TAP_SETTLE then
+        self.ashley_tap_at = nil
+        return true
+    end
+    return false
+end
+
 function Session:handle_hotkeys(now)
     local s = self.settings
+    if self.ashley_sync ~= nil and self:ashley_key_tapped(now) then self.ashley_sync:request(now) end
     local teleport = self:key_pressed(s.teleport_key)
     local snooze = self:key_pressed(s.snooze_key)
     -- The teleport key works at any time; the left-behind prompt only reminds of it.
@@ -837,6 +897,7 @@ function Session:status()
     if self.drop_sync then
         st.drops = self.drop_sync:summary()
     end
+    if self.ashley_sync then st.ashley = self.ashley_sync:summary(now) end
     if self.world ~= nil then
         if self.flag_sync then st.flags = self.flag_sync:summary() end
         if self.gimmick_sync then st.gimmicks = self.gimmick_sync:summary() end
@@ -847,6 +908,7 @@ function Session:status()
         if self.door_sync then st.doors = self.door_sync:summary() end
         if self.trap_sync then st.traps = self.trap_sync:summary() end
         if self.mechanism_sync then st.mechanisms = self.mechanism_sync:summary() end
+        if self.purpose_sync then st.purposes = self.purpose_sync:summary() end
         if self.give_sync then
             st.gives = self.give_sync:summary()
             st.give_waiting = self.give_sync:waiting_items()
@@ -864,6 +926,7 @@ function Session:status()
     st.left_behind = self.left_behind
     st.teleport_key_name = Session.key_name(self.settings.teleport_key)
     st.snooze_key_name = Session.key_name(self.settings.snooze_key)
+    st.ashley_key_name = Session.key_name(self.settings.ashley_key)
     return st
 end
 
@@ -1079,6 +1142,10 @@ function Session:handle_message(data, now)
         if self.mechanism_sync and self.world then self.mechanism_sync:on_message(m, now) end
     elseif m.type == T.TRIGGER then
         if self.trigger_sync and self.world then self.trigger_sync:on_message(m, now) end
+    elseif m.type == T.PURPOSE then
+        if self.purpose_sync and self.world then self.purpose_sync:on_message(m, now) end
+    elseif m.type == T.ASHLEY or m.type == T.ASHLEY_OWNER or m.type == T.ASHLEY_SWITCH then
+        if self.ashley_sync then self.ashley_sync:on_message(m, now) end
     elseif self.avatar_rx:on_message(m, now) then
         return
     elseif self.enemy_net and self.settings.sync_enemies then
@@ -1101,7 +1168,9 @@ function Session:send_player_state(now)
     if reloaded then self:on_reload(now) end
 
     self.last_local_pos = st.pos
+    self.last_local_rot = st.rot
     self.last_local_pos_time = now
+    self.local_aiming = st.aiming and true or false
     self.local_cutscene = st.cutscene and true or false
     self.local_stage = st.stage
     self.local_chapter = st.chapter
@@ -1237,6 +1306,9 @@ function Session:update_world(now)
     local loc = self.local_loc
     self.mechanism_sync:tick(now, world, self:fresh_local_pos(now) ~= nil
         and (loc == nil or (not loc.loading and loc.playable ~= false)), loc ~= nil and loc.loading == true)
+    self.purpose_sync:tick(now, world, { chapter = loc and loc.chapter or self.local_chapter,
+        ready = self:fresh_local_pos(now) ~= nil and not self.local_cutscene
+            and (loc == nil or (not loc.loading and loc.playable ~= false)) })
 
     local partner = self:partner_location()
     if self.role == "client" and self.sync_on_join and partner ~= nil and self.local_loc ~= nil then
@@ -1282,6 +1354,7 @@ function Session:apply_pending_restores()
     elseif self.ai_restore_pending then
         self.ai_restore_pending = false
         if self.game.restore_enemies then self.game:restore_enemies() end
+        if self.game.ashley_restore then self.game:ashley_restore() end
         if self.world and self.world.restore_animals then self.world:restore_animals() end
     end
 end
@@ -1435,6 +1508,21 @@ function Session:update()
     end
 
     if ticked or not s.sync_enemies then self:apply_deferred(now) end
+
+    -- Ashley: one for both games (ashley_sync.lua).
+    if self.ashley_sync then
+        t0 = perf:start()
+        if now - (self.last_ashley_tick or -math.huge) >= 1.0 / 20 then
+            self.last_ashley_tick = now
+            local loc = self.local_loc
+            local loading = loc ~= nil and (loc.loading == true or loc.playable == false)
+            self.ashley_sync:tick(now, self.game, { in_game = in_game and not loading,
+                local_pos = self:fresh_local_pos(now), local_rot = self.last_local_rot,
+                unable = self.local_cutscene or self.local_dead or loading })
+        end
+        if in_game then self.ashley_sync:frame(now, self.game) end
+        perf:stop("update.ashley", t0)
+    end
 
     if self.game.list_pickups and now - self.last_item_tick >= ITEM_TICK_INTERVAL and in_game then
         t0 = perf:start()

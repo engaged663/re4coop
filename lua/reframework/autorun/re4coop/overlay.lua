@@ -93,6 +93,17 @@ function Overlay.draw_hud(game, status, messages, now, model)
     end
     game:draw_text(line, x, y, COLOR_TEXT)
     y = y + 18
+    local ash = status.ashley
+    if status.state == "connected" and ash ~= nil and ash.enabled and (ash.here or ash.partner_has) then
+        local text = ("Ashley follows %s"):format(ash.mine and "you" or (status.partner_name or "partner"))
+        if ash.cooldown > 0 then
+            text = text .. (" - switch in %d s"):format(math.ceil(ash.cooldown))
+        else
+            text = text .. (" - tap %s to switch"):format(status.ashley_key_name or "Alt")
+        end
+        game:draw_text(text, x, y, COLOR_TEXT)
+        y = y + 18
+    end
 
     local prompt = nil
     local gate = status.gate

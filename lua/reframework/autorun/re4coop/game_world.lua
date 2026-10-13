@@ -25,6 +25,12 @@
 --     pushDirtyList); cutscene skips through ClapperboardMediator._Plays (PlayWork.InputSkip /
 --     DoneSkip).
 --   * Found in the game's type database: gimmick _Routine states.
+--   * Read in re4.exe's code too (docs/RESEARCH.md 3.24): GmBase.setGmFlag(value, trigger, args)
+--     writes the gimmick flag and runs the gimmick's own onChangeGmFlag (its reaction: the
+--     item set in its slot, the lock opening, the puzzle solving); a sequence's effects run
+--     through each PortrayalParam's triggerProcess (end effects later, from
+--     PortrayalSettings.Param.onFinish); PurposeManager.updateMainPurpose(PurposeGuiItem)
+--     shows a new objective (only one of higher priority).
 -- Every lookup is cached and every engine call is pcall'ed; missing pieces switch the
 -- corresponding feature off and show up in the Diagnostics panel.
 
@@ -62,6 +68,12 @@ local PREF_SCENE = "chainsaw.PrefectureSceneManager"
 local LOC_SCENE = "chainsaw.LocationSceneManager"
 local ENV_SCENE = "chainsaw.EnvSceneManager"
 local CONTEXT_ID = "chainsaw.ContextID"
+local PURPOSE_MGR = "chainsaw.PurposeManager"
+local PURPOSE_ITEM = "chainsaw.gui.PurposeGuiItem"
+local PORTRAYAL_PARAM = "chainsaw.PortrayalSettings.Param"
+local GM_BASE_TYPE = "chainsaw.GmBase"
+local SET_GM_FLAG = "setGmFlag" -- GmBase.setGmFlag(Boolean, InteractTrigger, InteractActionArgs), its only overload
+local REPLAY_MUTE = 120.0 -- seconds a sequence we replayed keeps its end effects muted (until it finishes)
 
 -- Breakables and animals whose destruction is synchronised.
 World.OBJECT_TYPES = {
@@ -176,8 +188,12 @@ function World.new(game, log)
     self.mech_remote = {}    -- "guid:key" -> time: the partner's mechanism we just played here
     self.mech_owner_info = {} -- GameObject GUID -> {gimmick, why}: what a portrayal's GameObject is
     self.applying_mech = false
+    self.muting = 0          -- > 0: effects of the partner's actions replayed here are muted (mute hooks)
+    self.muted_types = {}    -- "chainsaw.XSettings" -> true: its effects can be muted (or do nothing)
+    self.replayed = {}       -- PortrayalSettings address -> until: sequences we replayed (their end effects muted)
+    self.reacting = false    -- a gimmick reacts to the partner's change (gimmick_react)
     self.counters = { flag_events = 0, cutscene_events = 0, trigger_events = 0, trigger_not_event = 0,
-        skip_events = 0, gimmicks_applied = 0, gimmicks_waiting = 0 }
+        skip_events = 0, gimmicks_applied = 0, gimmicks_waiting = 0, gimmick_reactions = 0, muted_effects = 0 }
     self.gim_waiting = {}    -- ctx_key -> {item, since}: partner gimmicks whose context is not set up here yet
     self.skips_seen = {}     -- PlayWork address -> true: skips already reported
     self.doors = {}          -- GameObject GUID -> {comp, go, pos, kind}: the doors of the loaded areas
@@ -306,6 +322,8 @@ function World:probe()
     self.gim_ctx_load_m = r:find_method(GIM_CONTEXT, function(i)
         return i.name == "loadSaveDataFromManager" and params_are(i, { GIM_SAVE }) end)
     self.gim_dirty_m = r:find_method(GIM, function(i) return i.name == "pushDirtyList" and #i.params == 1 end)
+    -- The gimmick's live object (its GimmickCore), to let it react to the partner's change.
+    self.gim_core_m = r:find_method(GIM, function(i) return i.name == "findGimmick" and params_are(i, { CONTEXT_ID }) end)
     local gim_ok = self.gim_save_m ~= nil and self.gim_find_m ~= nil and self.gim_ctx_load_m ~= nil
     self:cap("gimmicks", gim_ok, gim_ok and "saveGameSaveData / findContext + loadSaveDataFromManager"
         or (self.gim_save_m == nil and "no saveGameSaveData" or "no findContext / loadSaveDataFromManager"))
@@ -364,6 +382,15 @@ function World:probe()
         and r:find_field(GM_DOOR, function(i) return i.name == "_NeedKeepOpenSelf" end) ~= nil
     self:cap("doors", self.door_ok, self.door_ok and "GmDoor Guest slot, GmAutoDoorBase sensor, GmBigDoor count"
         or "no GmDoor keep-open slots")
+
+    -- Objectives (docs/RESEARCH.md 3.24): PurposeManager computes the current objective from
+    -- the game's conditions (flags, items held...) and only ever moves on to one of higher
+    -- priority (updateMainPurpose); the partner's more advanced one is shown through it.
+    self.purpose_update_m = r:find_method(PURPOSE_MGR, function(i)
+        return i.name == "updateMainPurpose" and params_are(i, { PURPOSE_ITEM }) end)
+    self.purpose_ctor_m = r:find_method(PURPOSE_ITEM, function(i) return i.name == ".ctor" and #i.params == 6 end)
+    self:cap("purposes", self.purpose_update_m ~= nil and self.purpose_ctor_m ~= nil,
+        self.purpose_update_m and "PurposeManager.updateMainPurpose" or "no updateMainPurpose")
 
     -- Travel.
     self.warp_m = r:find_method(CHARACTER_MANAGER, function(i) return i.name == "requestWarp" and #i.params == 4 end)
@@ -458,6 +485,17 @@ function World:install_hooks(callbacks)
         local this = R.arg_obj(args[2])
         if this == nil then return end
         local key = (sdk.to_int64(args[3]) or 0) & 0xFFFFFFFF
+        if self.reacting then
+            -- A gimmick reacting to the partner's change plays its own sequence: the partner's
+            -- report of the same sequence (MECHANISMS) must not play it a second time, and its
+            -- end effects stay muted.
+            local go = R.call(this, "get_GameObject")
+            local guid = go and R.game_object_guid(go)
+            if guid ~= nil then self.mech_remote[guid .. ":" .. key] = self:now() end
+            local a = R.address(this)
+            if a ~= nil then self.replayed[a] = self:now() + REPLAY_MUTE end
+            return
+        end
         if self.applying_mech or self.applying_trigger or self.applying_cutscene then return end
         if next(self.mech_remote) ~= nil then
             local go = R.call(this, "get_GameObject")
@@ -484,6 +522,7 @@ function World:install_hooks(callbacks)
         end
     end) then mech_hooked = mech_hooked + 1 end
     self:cap("mechanisms", mech_hooked == 2, ("%d of 2 hooked (PortrayalSettings.call, GmBase.setGmFlag)"):format(mech_hooked))
+    self:install_mute_hooks()
 
     -- Chapter switch: rewrite the chapter of the next save load when armed.
     if self.load_save_m ~= nil then
@@ -507,6 +546,117 @@ function World:install_hooks(callbacks)
                 self:set_field_any(init, "chainsaw.CampaignInitialSetting", "_SpecialJumpSequence", jump)
             end
             self.log(("chapter switch applied: %d (%s)"):format(chapter, tostring(ok1)))
+        end)
+    end
+end
+
+-------------------------------------------------------------------------------
+-- Muting the partner's effects (docs/RESEARCH.md 3.24)
+--
+-- What the partner's player did is replayed here through the game's own code: the gimmick's
+-- reaction, its scripted sequence, a level event. A sequence's parameter sets can also hand out
+-- items, take them, kill the player, end the chapter, start a tutorial or change the game mode
+-- (World.DENY_COMPONENTS). Those effects belong to the player who acted: while we replay, each
+-- such effect's triggerProcess (and makeFinish, where it does something) is skipped. The
+-- effects at the end of a sequence run later (PortrayalSettings.Param.onFinish): a sequence we
+-- replayed keeps them muted until it finishes. An effect type whose methods could not be hooked
+-- is not muted, and a sequence that runs one is still never shared.
+-------------------------------------------------------------------------------
+
+local function method_function(m)
+    local ok, fn = pcall(function() return m:get_function() end)
+    return ok and fn or nil
+end
+
+function World:install_mute_hooks()
+    local r = self.r
+    -- The game's shared empty method: a method that is it does nothing (and must never be
+    -- hooked - thousands of methods share it).
+    local stub_info = r:find_method("chainsaw.PortrayalParam", function(i) return i.name == "makeFinish" end)
+    local stub = stub_info and method_function(stub_info.method) or nil
+    local seen, hooked, harmless = {}, 0, 0
+    local function mute_pre()
+        if self.muting > 0 then
+            self.counters.muted_effects = self.counters.muted_effects + 1
+            return sdk.PreHookResult.SKIP_ORIGINAL
+        end
+    end
+    -- One method: true when it is muted (hooked, or does nothing).
+    local function mute(info)
+        local fn = method_function(info.method)
+        if fn ~= nil and fn == stub then
+            harmless = harmless + 1
+            return true
+        end
+        if fn ~= nil and seen[fn] then return true end -- the same code as a method hooked already
+        if r:hook(info, mute_pre) then
+            if fn ~= nil then seen[fn] = true end
+            hooked = hooked + 1
+            return true
+        end
+        return false
+    end
+    for name in pairs(World.DENY_COMPONENTS) do
+        local pt = name .. ".Param"
+        local play = r:type(pt) and r:find_method(pt, function(i) return i.name == "triggerProcess" and #i.params == 2 end)
+        -- Only an effect whose own triggerProcess is muted counts as muted (an inherited or
+        -- missing one could not be told from the effect itself).
+        if play ~= nil and play.owner == pt and mute(play) then
+            local finish = r:find_method(pt, function(i) return i.name == "makeFinish" and #i.params == 0 end)
+            if finish == nil or finish.owner ~= pt or mute(finish) then self.muted_types[name] = true end
+        end
+    end
+    -- End effects of a sequence we replayed.
+    local finish = r:find_method(PORTRAYAL_PARAM, function(i) return i.name == "onFinish" and #i.params == 0 end)
+    local stack = {}
+    local finish_hooked = finish ~= nil and r:hook(finish, function(args)
+        local muted = false
+        if next(self.replayed) ~= nil then
+            local this = R.arg_obj(args[2])
+            local settings = this and R.get(this, "_Settings")
+            local key = settings and R.address(settings)
+            local until_t = key and self.replayed[key]
+            if until_t ~= nil then
+                self.replayed[key] = nil
+                if self:now() < until_t then muted = true end
+            end
+        end
+        if muted then self.muting = self.muting + 1 end
+        stack[#stack + 1] = muted
+    end, function(retval)
+        local muted = table.remove(stack)
+        if muted then self.muting = math.max(0, self.muting - 1) end
+        return retval
+    end)
+    self:cap("mute_effects", hooked > 0 and finish_hooked,
+        ("%d effect methods muted while replaying, %d do nothing, end effects %s"):format(hooked, harmless,
+            finish_hooked and "muted" or "NOT muted"))
+end
+
+-- Runs fn with the partner's effects muted (see install_mute_hooks).
+function World:muted(fn)
+    self.muting = self.muting + 1
+    local ok, err = pcall(fn)
+    self.muting = math.max(0, self.muting - 1)
+    if not ok then self.log("muted replay failed: " .. tostring(err)) end
+    return ok
+end
+
+-- The PortrayalSettings on `go` and below keep their end effects muted for a while: we are
+-- about to replay their sequence.
+function World:mark_replayed(go)
+    if go == nil then return end
+    local now = self:now()
+    for a, t in pairs(self.replayed) do
+        if now > t then self.replayed[a] = nil end
+    end
+    local nodes = (self.game and self.game.collect_tree) and self.game:collect_tree(go, 3) or { { go = go } }
+    for _, node in ipairs(nodes) do
+        R.each(R.call(node.go, "get_Components"), function(c)
+            if R.type_name(c) == PORTRAYAL then
+                local a = R.address(c)
+                if a ~= nil then self.replayed[a] = now + REPLAY_MUTE end
+            end
         end)
     end
 end
@@ -898,6 +1048,7 @@ function World:apply_gimmick(mgr, it)
     if id == nil then return "failed" end
     local okf, ctx = pcall(self.gim_find_m.method.call, self.gim_find_m.method, mgr, id)
     if not okf or ctx == nil then return "missing" end
+    self:gimmick_react(mgr, id, ctx, it)
     local cur = R.get(ctx, "_SaveCur")
     local data = cur and R.call(cur, "clone") or R.new_instance(GIM_SAVE)
     if data == nil or not self:write_gimmick(data, it) then return "failed" end
@@ -907,6 +1058,58 @@ function World:apply_gimmick(mgr, it)
     if self.gim_dirty_m ~= nil then pcall(self.gim_dirty_m.method.call, self.gim_dirty_m.method, mgr, ctx) end
     self.counters.gimmicks_applied = self.counters.gimmicks_applied + 1
     return "applied"
+end
+
+-- The gimmick's live object here, bound to context `ctx` and set up: GimmickManager.findGimmick
+-- (the GimmickCore registered for the ID) -> its GameObject's GmBase whose Context is `ctx`
+-- (an option, GmOption*, only when there is nothing else). component, type name, GameObject.
+function World:live_gimmick(mgr, id, ctx)
+    if self.gim_core_m == nil then return nil end
+    local okc, core = pcall(self.gim_core_m.method.call, self.gim_core_m.method, mgr, id)
+    if not okc or core == nil then return nil end
+    local go = R.call(core, "get_GameObject")
+    if go == nil then return nil end
+    local ctx_addr = R.address(ctx)
+    local found, name
+    R.each(R.call(go, "get_Components"), function(c)
+        local ok, isa = pcall(function() return c:get_type_definition():is_a(GM_BASE_TYPE) end)
+        if ok and isa and R.address(R.call(c, "get_Context")) == ctx_addr and R.call(c, "get_HasInitialized") ~= false then
+            local tn = R.type_name(c) or ""
+            if found == nil or (name:find("^chainsaw%.GmOption") and not tn:find("^chainsaw%.GmOption")) then
+                found, name = c, tn
+            end
+        end
+    end)
+    return found, name, go
+end
+
+-- The partner set this gimmick (its flag went on there: an item placed in its slot, a lock
+-- opened, a puzzle solved). Writing the partner's record alone changes only the saved state:
+-- an object already on our screen kept its old look, and a gimmick that reacts to a story flag
+-- by itself (GmUseItem.updateGimmick: flag set -> setGmFlag) never did, since its gimmick flag
+-- was already on. So the live gimmick sets its own flag first, the game's way -
+-- GmBase.setGmFlag(true) runs its onChangeGmFlag: the same reaction it has in the partner's
+-- game (the item appears in the slot, the lock opens, the door unlocks) - with the partner's
+-- player's effects muted (items given or taken, deaths, chapter ends: install_mute_hooks).
+-- Never for gimmicks with their own sync or that are a player's own action (World.MECH_DENY,
+-- traps, pushed objects). docs/RESEARCH.md 3.24.
+function World:gimmick_react(mgr, id, ctx, it)
+    if self:setting("gimmick_reactions") == false then return false end
+    if it.attr == nil or (it.attr:byte(1) or 0) == 0 then return false end
+    if R.call(ctx, "getGmFlag") == true then return false end
+    local gm, name, go = self:live_gimmick(mgr, id, ctx)
+    if gm == nil then return false end
+    if World.MECH_DENY[name] or World.TRAP_KINDS[name] or name == PUSH_MOVE then return false end
+    self:crumb("world.gimmick_react", name, true)
+    self:mark_replayed(go)
+    self.reacting, self.applying_mech = true, true
+    local ok = self:muted(function() gm:call(SET_GM_FLAG, true, nil, nil) end)
+    self.reacting, self.applying_mech = false, false
+    if ok then
+        self.counters.gimmick_reactions = self.counters.gimmick_reactions + 1
+        self.last_reaction = name
+    end
+    return ok
 end
 
 local GIMMICK_WAIT = 1800.0 -- how long a partner state waits for its gimmick to be set up here
@@ -1870,7 +2073,7 @@ function World:portrayal_callee_denied(owner)
         for _, list in ipairs({ "_CalleePlay", "_CalleeEnd" }) do
             R.each(R.get(param, list), function(callee)
                 local tn = (R.type_name(callee) or ""):gsub("%.Param$", "")
-                if World.DENY_COMPONENTS[tn] then
+                if World.DENY_COMPONENTS[tn] and not self.muted_types[tn] then
                     bad = tn
                     return true
                 end
@@ -2007,10 +2210,15 @@ function World:mechanism_apply(ev)
         if not info.ok then return "skip" end
         local port = self.game and self.game:get_component(go, PORTRAYAL)
         if port == nil then return "missing" end
+        local played = self.mech_remote[ev.guid .. ":" .. ev.key]
+        if played ~= nil and now - played < MECH_ECHO then
+            return "skip" -- played here already (the gimmick's own reaction to the partner's change)
+        end
         self:crumb("world.mech_portrayal", ("%s:%d"):format(ev.guid, ev.key or 0), true)
         self.mech_remote[ev.guid .. ":" .. ev.key] = now
+        self:mark_replayed(go)
         self.applying_mech = true
-        ok = pcall(function()
+        ok = self:muted(function()
             port:call("call(System.UInt32, chainsaw.InteractTrigger, chainsaw.InteractActionArgs)", ev.key, nil, nil)
         end)
         self.applying_mech = false
@@ -2087,9 +2295,53 @@ function World:trigger_run(ev)
     self:crumb("world.trigger_run", ("%s:%s"):format(tostring(ev.guid), tostring(ev.hash)), true)
     self.applying_trigger = true
     if R.number(R.get(trig, "Succeed")) == SUCCEED_ONCE then pcall(trig.call, trig, "recvDone", 1) end
-    local ok = pcall(trig.call, trig, "execute(via.GameObject, chainsaw.collision.GimmickSensorUserData)", target, nil)
+    self:mark_replayed(owner)
+    local ok = self:muted(function()
+        trig:call("execute(via.GameObject, chainsaw.collision.GimmickSensorUserData)", target, nil)
+    end)
     self.applying_trigger = false
     return ok and "run" or "failed"
+end
+
+-------------------------------------------------------------------------------
+-- Objectives (docs/RESEARCH.md 3.24)
+-------------------------------------------------------------------------------
+
+-- Our current objective: { id (chainsaw.gui.PurposeID), priority, message (GUID), display,
+-- mediate, delay } or nil.
+function World:purpose_read()
+    local pm = self.r:singleton(PURPOSE_MGR)
+    if pm == nil then
+        self:cap("purposes", false, "no PurposeManager instance")
+        return nil
+    end
+    local item = R.call(pm, "get_CurrPurposeItem")
+    if item == nil or R.call(item, "isValid") == false then return nil end
+    local id = R.number(R.call(item, "get_MainPurposeID"))
+    if id == nil or id <= 0 then return nil end
+    return { id = id, priority = R.number(R.call(item, "get_Priority")) or 0,
+        message = R.guid_string(R.call(item, "get_Message")), display = R.number(R.call(item, "get_DisplayTime")) or 0,
+        mediate = R.call(item, "get_IsRequestMediate") == true, delay = R.number(R.call(item, "get_DelayTime")) or 0 }
+end
+
+-- Shows the partner's objective the game's way: a PurposeGuiItem like the one the game builds
+-- from its own conditions, handed to updateMainPurpose (the objective banner shows it; a lower
+-- priority than ours changes nothing). True once it is ours.
+function World:purpose_apply(p)
+    if self.purpose_update_m == nil or self.purpose_ctor_m == nil or p == nil or p.message == nil then return false end
+    local pm = self.r:singleton(PURPOSE_MGR)
+    local g = self.r:guid_value(p.message)
+    if pm == nil or g == nil then return false end
+    local item = R.new_instance(PURPOSE_ITEM)
+    if item == nil then return false end
+    if self.game and self.game.hold then self.game:hold(item, 10.0) end
+    self:crumb("world.purpose", tostring(p.id), true)
+    local ok = pcall(self.purpose_ctor_m.method.call, self.purpose_ctor_m.method, item, p.id, g, p.priority or 0,
+        p.display or 0, p.mediate and true or false, p.delay or 0)
+    if not ok then return false end
+    ok = pcall(self.purpose_update_m.method.call, self.purpose_update_m.method, pm, item)
+    local cur = self:purpose_read()
+    return ok and cur ~= nil and cur.id == p.id
 end
 
 -------------------------------------------------------------------------------

@@ -7,6 +7,10 @@
 #include <exception>
 #include <string>
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 extern "C" {
 #include <lauxlib.h>
 #include <lua.h>
@@ -171,6 +175,21 @@ int l_time(lua_State* L) {
     return 1;
 }
 
+// Whether a window of this process is the foreground window (the player is in the game, not
+// in another program). REFramework clears its key table when the game loses focus, so an
+// Alt+Tab looks like a short Alt press: the Ashley key only counts while we have the focus.
+int l_window_focused(lua_State* L) {
+#ifdef _WIN32
+    DWORD pid = 0;
+    HWND fg = GetForegroundWindow();
+    if (fg != nullptr) GetWindowThreadProcessId(fg, &pid);
+    lua_pushboolean(L, fg != nullptr && pid == GetCurrentProcessId());
+#else
+    lua_pushboolean(L, 1);
+#endif
+    return 1;
+}
+
 int l_max_payload(lua_State* L) {
     lua_pushinteger(L, static_cast<lua_Integer>(net::kMaxPayload));
     return 1;
@@ -279,6 +298,7 @@ const luaL_Reg kFunctions[] = {
     {"local_addresses", l_local_addresses},
     {"time", l_time},
     {"max_payload", l_max_payload},
+    {"window_focused", l_window_focused},
     {"version", l_version},
     {"new_session", l_new_session},
     {nullptr, nullptr},

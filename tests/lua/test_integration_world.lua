@@ -19,6 +19,8 @@ local CRATE = "c0c0c0c0-0000-0000-0000-000000000002"
 local CROW2 = "c0c0c0c0-0000-0000-0000-000000000003" -- a crow both players see fly around
 
 local world = mock.install()
+-- The test runs in a console, not in the game's window: the game "has the focus".
+re4coop_net.window_focused = function() return true end
 world.player = mock.make_player({ x = 0, y = 0, z = 0 })
 world.stage, world.chapter = 40200, 21100
 mock.add_flag(G_DOOR, 1, 3)
@@ -46,7 +48,10 @@ local crow2 = mock.make_object("chainsaw.GmCrow", CROW2, { x = 5, y = 0, z = 5 }
 mock.set_gimmick({ category = 1, kind = 0, group = 40200, index = 5 }, { 0, 0 }, { { id = 1, done = 0 } })
 -- Experimental features this test covers are switched on (config_version 7: a current config).
 mock.files["re4coop.json"] = { player_name = "HostLeon", port = PORT, config_version = 7, sync_cutscenes = true,
-    exp_force_routine = true }
+    exp_force_routine = true, ashley_cooldown = 1.0 }
+-- Ashley, in the host's game next to its player.
+local ashley = mock.make_ashley({ x = 3, y = 0, z = 0 }, 600)
+world.partner = ashley
 
 local function run_entry_script()
     for name in pairs(package.loaded) do
@@ -122,7 +127,37 @@ function client_game:enemy_set_transform(id, pos, rot)
 end
 function client_game:enemy_set_puppet(id, on) self.puppet[id] = on or nil return true end
 function client_game:teleport_player(pos) self.player.pos = pos return true end
-function client_game:is_key_down() return false end
+client_game.keys = {}
+function client_game:is_key_down(vk) return self.keys[vk] == true end
+-- The client's Ashley: her AI (while she is not a puppet) runs to the client's player.
+client_game.ashley = { pos = { x = 82, y = 0, z = 0 }, rot = { x = 0, y = 0, z = 0, w = 1 }, hp = 600, puppet = false,
+    warps = 0 }
+function client_game:ashley_read(full)
+    local a = self.ashley
+    if not a.puppet then
+        local p = self.player.pos
+        local dx, dz = p.x - a.pos.x, p.z - a.pos.z
+        local d = math.sqrt(dx * dx + dz * dz)
+        if d > 1.5 then
+            local step = math.min(0.4, d - 1.5)
+            a.pos = { x = a.pos.x + dx / d * step, y = a.pos.y, z = a.pos.z + dz / d * step }
+        end
+    end
+    return { pos = { x = a.pos.x, y = a.pos.y, z = a.pos.z }, rot = a.rot, hp = a.hp, max_hp = 600, alive = true,
+        busy = false, layers = full and { { bank = 3, id = 40, frame = 1, speed = 1 } } or nil }
+end
+function client_game:ashley_set_puppet(on) self.ashley.puppet = on return true end
+function client_game:ashley_set_transform(pos, rot)
+    self.ashley.pos, self.ashley.rot = { x = pos.x, y = pos.y, z = pos.z }, rot
+    return true
+end
+function client_game:ashley_set_anim() return true end
+function client_game:ashley_set_hp(hp) self.ashley.hp = hp return true end
+function client_game:ashley_warp(pos)
+    self.ashley.warps = self.ashley.warps + 1
+    self.ashley.pos = { x = pos.x, y = pos.y, z = pos.z }
+    return true
+end
 client_game.case = {}
 function client_game:give_receive(id, count)
     self.case[id] = (self.case[id] or 0) + count
@@ -349,6 +384,41 @@ T.run("gimmicks_cross_as_soon_as_the_game_announces_them", function()
     client.settings.gimmick_interval = nil
 end)
 
+T.run("an_item_the_client_places_unlocks_the_hosts_slot_and_its_objective_crosses", function()
+    -- The host's game has the slot on screen; the client's player sets the item in it.
+    local ctx = { category = 1, kind = 0, group = 40200, index = 41 }
+    local guid = "44444444-0000-0000-0000-000000000041"
+    local slot = mock.make_live_gimmick("chainsaw.GmUseItem", ctx, guid, { keys = { [0x55E] = {
+        callees = { "chainsaw.ReduceInventoryItemSettings.Param" }, end_callees = { "chainsaw.InventorySettings.Param" } } } })
+    client.settings.gimmick_interval = 0.5
+    client_world.gimmicks["1:0:40200:41"] = { ctx = ctx, attr = "  ", triggers = {}, detected = false, acc = {} }
+    T.wait_until(function() return false end, step, 1.5) -- the client's game has compared its table
+    client_world.gimmicks["1:0:40200:41"] = { ctx = ctx, attr = " ", triggers = {}, detected = false, acc = {} }
+    local ok = T.wait_until(function() return slot:call("getGmFlag") == true end, step, 5)
+    T.check(ok, "the host's slot is set")
+    local played = 0
+    for _, p in ipairs(world.portrayals) do
+        if p.guid == guid and p.key == 0x55E then played = played + 1 end
+    end
+    T.eq(played, 1, "with its own sequence: the item appears and the lock opens on the host's screen")
+    T.eq(world.items_taken, nil, "nothing taken from the host's player")
+    mock.finish_portrayals()
+    T.eq(world.items_given, nil, "nor handed out to them")
+    client.settings.gimmick_interval = nil
+    -- The client's objective moved on (it holds the item): the host's follows.
+    mock.set_purpose(1101, 10)
+    client_world.purpose = { id = 1103, priority = 30, message = "0000044f-0000-0000-0000-000000000000", display = 3,
+        delay = 0, mediate = false }
+    function client_world:purpose_read() return self.purpose end
+    function client_world:purpose_apply() return false end
+    ok = T.wait_until(function()
+        local cur = world.singletons["chainsaw.PurposeManager"].cur
+        return cur ~= nil and cur.id == 1103
+    end, step, 5)
+    T.check(ok, "the host shows the client's objective")
+    T.eq(world.purpose_banners, 1, "with the objective banner")
+end)
+
 T.run("a_door_the_client_walks_through_opens_and_stays_open_for_the_host", function()
     client_world.door_states[G_DOOR_GO] = { open = true, hold = true, attr = 1 }
     local ok = T.wait_until(function() return door.__fields._Routine == 1 end, step, 5)
@@ -474,6 +544,45 @@ T.run("an_enemy_next_to_the_client_is_run_by_the_clients_game", function()
     client_game.player.pos = { x = 80, y = 0, z = 0 } -- the client walks away again
     ok = T.wait_until(function() return client_game.puppet[1] == true and ganado.head.update_self == true end, step, 6)
     T.check(ok, "back to the host's game")
+end)
+
+local function gap(a, b)
+    local dx, dz = a.x - b.x, a.z - b.z
+    return math.sqrt(dx * dx + dz * dz)
+end
+
+T.run("one_ashley_for_both_and_a_tap_of_alt_sends_her_over", function()
+    local ca = client_game.ashley
+    local ok = T.wait_until(function() return ca.puppet and gap(ca.pos, ashley.pos) < 0.05 end, step, 3)
+    T.check(ok, "the client's Ashley follows the host's (" .. ca.pos.x .. " vs " .. ashley.pos.x .. ")")
+    T.check(ashley.head.update_self ~= false, "the host's game runs her")
+    -- The client's player taps Alt: she goes to the client.
+    client_game.keys[0x12] = true
+    step()
+    client_game.keys[0x12] = false
+    ok = T.wait_until(function() return not ca.puppet and ashley.head.update_self == false end, step, 3)
+    T.check(ok, "the client's game runs her now, the host's is the puppet")
+    T.eq(ca.warps, 1, "taken over far from the client's player: brought next to them")
+    T.eq(ashley.no_damage, true, "the host's game takes no HP from her")
+    T.eq(mock.try_kidnap(ashley), false, "and its enemies cannot grab her")
+    T.eq(mock.component(ashley.body, "via.motion.MotionFsm2").enabled, false, "she plays only the client's animation")
+    client_game.player.pos = { x = 70, y = 0, z = 6 } -- the client walks on; she follows
+    ok = T.wait_until(function() return gap(ashley.pos, ca.pos) < 0.05 and gap(ca.pos, client_game.player.pos) < 1.6 end,
+        step, 4)
+    T.check(ok, "the host sees her follow the client (" .. ashley.pos.x .. ", " .. ashley.pos.z .. ")")
+    T.check(host_messages_contain("Ashley now follows ClientLeon"), "the host is told")
+    -- After the cooldown the host's player taps Alt: she comes back.
+    ok = T.wait_until(function() return client:status().ashley.cooldown == 0 end, step, 3)
+    mock.keys[0x12] = true
+    step()
+    mock.keys[0x12] = false
+    ok = T.wait_until(function() return ca.puppet and ashley.head.update_self == true end, step, 3)
+    T.check(ok, "back with the host")
+    T.eq(ashley.set_transforms, 1, "the game's own teleport brought her to the host's player")
+    T.eq(ashley.no_damage, false, "she takes damage again")
+    ok = T.wait_until(function() return gap(ca.pos, ashley.pos) < 0.05 end, step, 3)
+    T.check(ok, "the client's follows the host's again")
+    client_game.player.pos = { x = 80, y = 0, z = 0 }
 end)
 
 T.run("reset_scripts_keeps_the_session_and_no_pause", function()

@@ -67,6 +67,9 @@ local function make_method(key, nparams, fn, param_types, opts)
         param_types = param_types or {}, static = opts and opts.static or false, ret = opts and opts.ret or nil,
         call = function(self, obj, ...) return invoke(self, obj, ...) end,
         get_name = function(self) return self.name end,
+        -- The method's code: methods sharing code (opts.code, e.g. the game's empty stub) share it.
+        code = opts and opts.code or nil,
+        get_function = function(self) return self.code or tostring(self) end,
         get_num_params = function(self) return self.nparams end,
         is_static = function(self) return self.static end,
         get_return_type = function(self)
@@ -625,6 +628,9 @@ function M.install(opts)
     end
     -- HitPoint.checkDead(damage) (0x143408bc0): false while NoDamage, Immortal or NoDeath, or
     -- already dead; else whether HP - damage <= 0.
+    -- NoDamage (HitPoint +0x19): the character takes no damage.
+    hp_methods.get_NoDamage = { 0, function(self) return self.owner.no_damage == true end, {}, { ret = "System.Boolean" } }
+    hp_methods.set_NoDamage = { 1, function(self, v) self.owner.no_damage = v end, { "System.Boolean" } }
     hp_methods.checkDead = { 1, function(self, d)
         local c = self.owner
         if c.no_damage or c.immortal or c.no_death or c.hp <= 0 then return false end
@@ -781,6 +787,8 @@ function M.install(opts)
             self.received[#self.received + 1] = rec
             if M.deferred_damage then
                 M.pending_damage = { owner = ctx, amount = info.data.Damage or 0 }
+            elseif ctx ~= nil and ctx.no_damage then
+                ctx.ignored_hits = (ctx.ignored_hits or 0) + 1 -- HitPoint.NoDamage
             elseif ctx ~= nil then
                 ctx.hp = math.max(ctx.no_death and 1 or 0, ctx.hp - (info.data.Damage or 0))
                 if info.data.IsKill then
@@ -969,7 +977,24 @@ function M.install(opts)
     class("chainsaw.EnemyBaseContext", "chainsaw.CharacterContext", {})
     class("chainsaw.Ch1c0z0Context", "chainsaw.EnemyBaseContext", {})
     class("chainsaw.Ch1d0z0Context", "chainsaw.EnemyBaseContext", {})
-    class("chainsaw.PartnerBaseContext", "chainsaw.CharacterContext", {})
+    -- A partner (Ashley is CharacterKindID 200030). Her head's action unit sets
+    -- IsPermitKidnapped from ThinkEnable every frame it runs (PartnerNpcActionUpdaterUnit.
+    -- updateKidnapped); enemies grab her only while it is set (M.try_kidnap).
+    class("chainsaw.PartnerBaseContext", "chainsaw.CharacterContext", {
+        get_IsKidnapped = { 0, function(self) return self.kidnapped == true end },
+        get_PartnerState = { 0, function(self) return self.partner_state or 0 end, {}, { ret = "chainsaw.Npc.State" } },
+        get_IsPermitKidnapped = { 0, function(self) return self.permit_kidnapped == true end },
+        set_IsPermitKidnapped = { 1, function(self, v) self.permit_kidnapped = v end, { "System.Boolean" } },
+        get_IsPermitAttacked = { 0, function(self) return self.permit_attacked == true end },
+        set_IsPermitAttacked = { 1, function(self, v) self.permit_attacked = v end, { "System.Boolean" } },
+        -- CharacterContext.setTransform (0x1421f2ef0): the context's transform, passed on to
+        -- its listeners (the body).
+        ["setTransform(via.vec3, via.Quaternion)"] = { 2, function(self, pos, rot)
+            self.pos.x, self.pos.y, self.pos.z = pos.x, pos.y, pos.z
+            if self.body ~= nil then self.body.transform.wrot = quat(rot.x, rot.y, rot.z, rot.w) end
+            self.set_transforms = (self.set_transforms or 0) + 1
+        end, { "via.vec3", "via.Quaternion" } },
+    })
     class("chainsaw.Ch3a8z0Context", "chainsaw.PartnerBaseContext", {}) -- an NPC partner
 
     class("System.Collections.Generic.List`1<chainsaw.EnemyBaseContext>", "System.Object", {
@@ -986,9 +1011,21 @@ function M.install(opts)
         end
         return nil
     end
+    -- CharacterManager.PartnerContextList: world.partners (or the one world.partner).
+    class("System.Collections.Generic.List`1<chainsaw.CharacterContext>", "System.Object", {
+        get_Count = { 0, function(self) return #self.items() end },
+        get_Item = { 1, function(self, i) return self.items()[i + 1] end },
+    })
+    local function partner_list()
+        return new("System.Collections.Generic.List`1<chainsaw.CharacterContext>", { items = function()
+            return world.partners or { world.partner }
+        end })
+    end
+    M.partner_list = partner_list
     local character_manager_methods = {
         getPlayerContextRef = { 0, function() return world.player end },
         getPartnerContextRef = { 0, function() return world.partner end },
+        get_PartnerContextList = { 0, function() return not world.no_partner_list and partner_list() or nil end },
         get_EnemyContextList = { 0, function() return enemy_list end },
         get_CharacterBackupDB = { 0, function() return backup_db end },
         getSpawnParamRef = { 1, function(_, id) return world.spawn_params[id:call("get_Code")] end,
@@ -1580,17 +1617,26 @@ end
 
 -- A mechanism in the scene: a GameObject (scene GUID) with a gimmick of `gimmick_type` and its
 -- PortrayalSettings. on_call(key) is what the sequence does (e.g. open a door).
-function M.make_mechanism(guid, gimmick_type, on_call, callees)
+function M.make_mechanism(guid, gimmick_type, on_call, callees, end_callees)
     local go = M.make_go(gimmick_type:match("([^.]+)$"))
     go.guid = guid
     local gimmick = M.add_component(go, gimmick_type)
-    local list = {}
+    local list, ends = {}, {}
     for _, c in ipairs(callees or {}) do list[#list + 1] = new(c) end
-    local param = new("chainsaw.PortrayalSettings.Param", { __fields = { _CalleePlay = typed_array("System.Object", list) } })
+    for _, c in ipairs(end_callees or {}) do ends[#ends + 1] = new(c) end
+    local param = new("chainsaw.PortrayalSettings.Param", { __fields = { _CalleePlay = typed_array("System.Object", list),
+        _CalleeEnd = typed_array("System.Object", ends) } })
     local settings = new("chainsaw.OptionSettings`1<chainsaw.PortrayalSettings.Param>", { __fields = {
         _Params = typed_array("chainsaw.PortrayalSettings.Param", { param }) } })
     local port = M.add_component(go, "chainsaw.PortrayalSettings", { __fields = { _Params = settings }, on_call = on_call })
     return { go = go, gimmick = gimmick, port = port }
+end
+
+-- Every playing sequence ends (PortrayalSettings.update -> Param.onFinish: the end effects run).
+function M.finish_portrayals()
+    local playing = M.world.playing_params or {}
+    M.world.playing_params = {}
+    for _, param in ipairs(playing) do param:call("onFinish") end
 end
 
 -- The game plays a sequence of that mechanism (a player used it).
@@ -1652,6 +1698,7 @@ function M.run_frame()
     for _, cb in ipairs(M.callbacks.entry) do
         if cb.name == "LateUpdateBehavior" then cb.fn() end
     end
+    M.update_partners()
     M.update_motion()
     for _, cb in ipairs(M.callbacks.entry) do
         if cb.name == "PrepareRendering" then cb.fn() end
@@ -1723,6 +1770,45 @@ function M.make_character(type_name, pos, hp, spawner)
     ctx.head = M.make_go(type_name:match("(Ch%w+)Context") and (type_name:match("(Ch%w+)Context") .. "_head") or "head")
     ctx.head_updater = M.add_component(ctx.head, "chainsaw.HeadUpdater", { context = ctx })
     return ctx
+end
+
+-- Ashley (ch2_a1z0, CharacterKindID 200030) at `pos`.
+M.ASHLEY_KIND = 200030
+function M.make_ashley(pos, hp)
+    local ctx = M.make_character("chainsaw.PartnerBaseContext", pos, hp or 600)
+    ctx.kind_id = M.ASHLEY_KIND
+    ctx.body.name, ctx.head.name = "ch2a1z0_body", "ch2a1z0_head"
+    ctx.think_enable, ctx.permit_kidnapped, ctx.permit_attacked = true, true, true
+    return ctx
+end
+
+-- Every partner whose head runs: she follows the player (up to 0.3 m a frame, stopping 1.5 m
+-- from them), and her action unit sets the grab and attack permissions again.
+function M.update_partners()
+    local w = M.world
+    local player = w.player
+    for _, ctx in ipairs(w.partners or { w.partner }) do
+        if ctx ~= nil and ctx.head ~= nil and ctx.head.update_self ~= false and not ctx.despawned then
+            ctx.ai_frames = (ctx.ai_frames or 0) + 1
+            ctx.permit_kidnapped, ctx.permit_attacked = ctx.think_enable ~= false, true
+            if player ~= nil and not ctx.kidnapped then
+                local dx, dz = player.pos.x - ctx.pos.x, player.pos.z - ctx.pos.z
+                local d = math.sqrt(dx * dx + dz * dz)
+                if d > 1.5 then
+                    local step = math.min(0.3, d - 1.5)
+                    ctx.pos.x, ctx.pos.z = ctx.pos.x + dx / d * step, ctx.pos.z + dz / d * step
+                end
+            end
+        end
+    end
+end
+
+-- An enemy of this game tries to carry her off (Ch1c0NPCTargetDriver_Ch2a1z0.startTarget:
+-- only while IsPermitKidnapped).
+function M.try_kidnap(ctx)
+    if ctx.permit_kidnapped ~= true then return false end
+    ctx.kidnapped = true
+    return true
 end
 
 -- The game gives a pooled head to another character (or to `ctx`): its updater is linked again.
@@ -2251,6 +2337,10 @@ function M.install_world(world, opts)
     -- A gimmick's context (GimmickManager._Context): its current save state, which
     -- loadSaveDataFromManager replaces (with a clone) as the game's load does.
     class("chainsaw.GimmickContext", "System.Object", {
+        getGmFlag = { 0, function(self)
+            local g = world.gimmick_table[self.key]
+            return g ~= nil and (g.attr[1] or 0) ~= 0
+        end, {}, { ret = "System.Boolean" } },
         loadSaveDataFromManager = { 1, function(self, src)
             local g = record_of(self.ctx, src)
             world.gimmick_table[self.key] = g
@@ -2271,10 +2361,20 @@ function M.install_world(world, opts)
                 Attr = typed_array("System.Byte", { 0, 0 }), TriggerSave = typed_array("chainsaw.GimmickContext.TriggerDone", {}),
                 IsDetected = false, AccDatas = typed_array("chainsaw.GimmickContext.AccessoryData", {}) } })
             cur.__ctx_key = key
+            local live = world.live_gimmicks and world.live_gimmicks[key]
+            if live ~= nil then
+                live.context.__fields._SaveCur = cur
+                return live.context
+            end
             local ctx = { category = id.__fields._Category, kind = id.__fields._Kind, group = id.__fields._Group,
                 index = id.__fields._Index }
             return new("chainsaw.GimmickContext", { key = key, ctx = ctx, __fields = { _SaveCur = cur } })
         end, { "chainsaw.ContextID" }, { ret = "chainsaw.GimmickContext" } },
+        -- The GimmickCore registered for that ID (a gimmick loaded and set up here).
+        findGimmick = { 1, function(_, id)
+            local live = world.live_gimmicks and world.live_gimmicks[key_of_ctx_object(id)]
+            return live and live.core or nil
+        end, { "chainsaw.ContextID" }, { ret = "chainsaw.GimmickCore" } },
         -- Declared with share.SaveDataBase, like the game's.
         saveGameSaveData = { 0, function()
             local keys = {}
@@ -2418,25 +2518,106 @@ function M.install_world(world, opts)
             return nil
         end, { "System.UInt32" } },
     })
-    class("chainsaw.PortrayalSettings.Param", "System.Object", {}, { _CalleePlay = "System.Object", _CalleeEnd = "System.Object" })
+    -- A sequence's parameter set: its effects (callees) run when it plays (triggerProcess), its end
+    -- effects when it finishes (onFinish, from PortrayalSettings.update: M.finish_portrayals).
+    local function items_of(arr)
+        if arr == nil then return {} end
+        return rawget(arr, "__items") or {}
+    end
+    class("chainsaw.PortrayalSettings.Param", "System.Object", {
+        onFinish = { 0, function(self)
+            for _, c in ipairs(items_of(self.__fields._CalleeEnd)) do
+                if classes[c.__type] and classes[c.__type]:get_method("triggerProcess") then c:call("triggerProcess", nil, nil) end
+            end
+        end },
+    }, { _CalleePlay = "System.Object", _CalleeEnd = "System.Object", _Settings = "chainsaw.PortrayalSettings" })
+    -- Effects a sequence can run (docs/RESEARCH.md 3.24): the game's shared empty method is
+    -- PortrayalParam.makeFinish; ReduceInventoryItemSettings' triggerProcess and makeFinish are one
+    -- function (apply).
+    class("chainsaw.PortrayalParam", "System.Object", {
+        makeFinish = { 0, function() end, {}, { code = "stub" } },
+    })
+    local TP = { "chainsaw.InteractTrigger", "chainsaw.InteractActionArgs" }
+    class("chainsaw.InventorySettings.Param", "chainsaw.PortrayalParam", {
+        triggerProcess = { 2, function() world.items_given = (world.items_given or 0) + 1 end, TP },
+    })
+    class("chainsaw.PlDieSettings.Param", "chainsaw.PortrayalParam", {
+        triggerProcess = { 2, function() world.player_killed = (world.player_killed or 0) + 1 end, TP },
+    })
+    class("chainsaw.ReduceInventoryItemSettings.Param", "chainsaw.PortrayalParam", {
+        triggerProcess = { 2, function() world.items_taken = (world.items_taken or 0) + 1 end, TP, { code = "reduce" } },
+        makeFinish = { 0, function() world.items_taken = (world.items_taken or 0) + 1 end, {}, { code = "reduce" } },
+    })
+    class("chainsaw.DevelopProcessSettings.Param", "chainsaw.PortrayalParam", {
+        triggerProcess = { 2, function() end, TP, { code = "stub" } },
+    })
+    -- An effect the mod cannot mute (no triggerProcess of its own here): never shared.
+    class("chainsaw.TestMovieSettings.Param", "chainsaw.PortrayalParam", {})
+    class("chainsaw.SetFlagSettings.Param", "chainsaw.PortrayalParam", {
+        triggerProcess = { 2, function() world.portrayal_flags = (world.portrayal_flags or 0) + 1 end, TP },
+    })
+    world.playing_params = {}
     class("chainsaw.OptionSettings`1<chainsaw.PortrayalSettings.Param>", "System.Object", {},
         { _Params = "chainsaw.PortrayalSettings.Param[]" })
     -- A gimmick's scripted sequence (docs/RESEARCH.md 3.19): call(key, trigger, args) plays it.
     world.portrayals = {}
     class("chainsaw.PortrayalSettings", "via.Component", {
-        ["call(System.UInt32, chainsaw.InteractTrigger, chainsaw.InteractActionArgs)"] = { 3, function(self, key)
+        ["call(System.UInt32, chainsaw.InteractTrigger, chainsaw.InteractActionArgs)"] = { 3, function(self, key, trig, args)
             world.portrayals[#world.portrayals + 1] = { guid = self.owner and self.owner.guid, key = key }
             if self.on_call then self.on_call(key) end
+            local params = self.__fields._Params and self.__fields._Params.__fields._Params
+            for _, param in ipairs(items_of(params)) do
+                if param.key == nil or param.key == key then
+                    param.__fields._Settings = self
+                    for _, c in ipairs(items_of(param.__fields._CalleePlay)) do
+                        if classes[c.__type] and classes[c.__type]:get_method("triggerProcess") then
+                            c:call("triggerProcess", trig, args)
+                        end
+                    end
+                    world.playing_params[#world.playing_params + 1] = param
+                end
+            end
         end, { "System.UInt32", "chainsaw.InteractTrigger", "chainsaw.InteractActionArgs" } },
     }, { _Params = "chainsaw.OptionSettings`1<chainsaw.PortrayalSettings.Param>" })
     for _, n in ipairs({ "GmPortrayalAreaHit", "SetFlagSettings", "ClapperboardSettings", "SoundCallSettings",
         "GmDoorBase", "GmPitfall", "PlDieSettings", "InventorySettings", "CustomLevel_DropAshleyItem" }) do
         class("chainsaw." .. n, "via.Component", {})
     end
-    for _, n in ipairs({ "PlDieSettings.Param", "InventorySettings.Param", "SetFlagSettings.Param", "SoundCallSettings.Param" }) do
-        class("chainsaw." .. n, "System.Object", {})
-    end
+    class("chainsaw.SoundCallSettings.Param", "chainsaw.PortrayalParam", {})
     world.trigger_runs = {}
+
+    -- Objectives (docs/RESEARCH.md 3.24): PurposeManager keeps the current PurposeGuiItem and
+    -- only takes one of higher priority (updateMainPurpose 0x1428e96f0: a copy, then the banner).
+    local PURPOSE_CTOR = ".ctor(chainsaw.gui.PurposeID, System.Guid, System.Int32, System.Single, System.Boolean, System.Single)"
+    class("chainsaw.gui.PurposeGuiItem", "System.Object", {
+        [PURPOSE_CTOR] = { 6, function(self, id, msg, prio, disp, mediate, delay)
+            self.id, self.msg, self.prio, self.disp, self.mediate, self.delay = id, msg, prio, disp, mediate, delay
+        end, { "chainsaw.gui.PurposeID", "System.Guid", "System.Int32", "System.Single", "System.Boolean", "System.Single" } },
+        get_MainPurposeID = { 0, function(self) return self.id end, {}, { ret = "chainsaw.gui.PurposeID" } },
+        get_Priority = { 0, function(self) return self.prio end, {}, { ret = "System.Int32" } },
+        get_Message = { 0, function(self) return self.msg end, {}, { ret = "System.Guid" } },
+        get_DisplayTime = { 0, function(self) return self.disp end, {}, { ret = "System.Single" } },
+        get_IsRequestMediate = { 0, function(self) return self.mediate end, {}, { ret = "System.Boolean" } },
+        get_DelayTime = { 0, function(self) return self.delay end, {}, { ret = "System.Single" } },
+        isValid = { 0, function(self) return self.id ~= nil and self.id > 0 end, {}, { ret = "System.Boolean" } },
+    })
+    class("chainsaw.PurposeManager", "System.Object", {
+        get_CurrPurposeItem = { 0, function(self) return self.cur end, {}, { ret = "chainsaw.gui.PurposeGuiItem" } },
+        ["updateMainPurpose(chainsaw.gui.PurposeGuiItem)"] = { 1, function(self, item)
+            if item == nil or item.id == nil then return end
+            if self.cur ~= nil and item.prio <= self.cur.prio then return end
+            self.cur = new("chainsaw.gui.PurposeGuiItem", { id = item.id, msg = item.msg, prio = item.prio,
+                disp = item.disp, mediate = item.mediate, delay = item.delay })
+            world.purpose_banners = (world.purpose_banners or 0) + 1
+        end, { "chainsaw.gui.PurposeGuiItem" } },
+    })
+    world.singletons["chainsaw.PurposeManager"] = new("chainsaw.PurposeManager")
+    -- Our game's own objective changes (its conditions now hold another purpose).
+    function M.set_purpose(id, prio, msg)
+        local pm = world.singletons["chainsaw.PurposeManager"]
+        pm.cur = new("chainsaw.gui.PurposeGuiItem", { id = id, prio = prio, msg = guid_value(msg or
+            ("%08x-0000-0000-0000-000000000000"):format(id)), disp = 3.0, mediate = false, delay = 0.0 })
+    end
 
     -- Chapter loads go through CampaignManager.loadGameSaveData(GameData).
     class("chainsaw.CampaignInitialSetting", "System.Object", {}, { _Chapter = "chainsaw.ChapterID",
@@ -2560,6 +2741,7 @@ function M.install_world(world, opts)
     class("chainsaw.CharacterManager", "System.Object", {
         getPlayerContextRef = { 0, function() return world.player end },
         getPartnerContextRef = { 0, function() return world.partner end },
+        get_PartnerContextList = { 0, function() return not world.no_partner_list and M.partner_list() or nil end },
         get_EnemyContextList = { 0, function() return world.enemy_list end },
         get_CharacterBackupDB = { 0, function() return backup_db end },
         getSpawnParamRef = M.character_manager_methods.getSpawnParamRef,
@@ -2593,17 +2775,45 @@ function M.install_world(world, opts)
     enum("chainsaw.GmCrow.RoutineType", { Idle = 0, Reaction = 1, Croak = 2, Peck = 3, Drink = 4, Run = 5,
         Landing = 6, Die = 7, Dead = 8, Sleep = 9, Loop = 10 })
     class("chainsaw.GimmickCore", "via.Component", {}, { _HasRegisteredMove = "System.Boolean" })
+    -- A live gimmick bound to a context (M.make_live_gimmick) keeps its flag in the gimmick
+    -- table: attribute 0 (GmBase.setGmFlag 0x141602d40: written, then onChangeGmFlag).
+    local function live_flag(self)
+        local g = self.ctx_key and world.gimmick_table[self.ctx_key]
+        if g ~= nil then return (g.attr[1] or 0) ~= 0 end
+        return self.flag == true
+    end
     class("chainsaw.GmBase", "via.Component", {
         get_Core = { 0, function(self) return self.core end },
+        get_Context = { 0, function(self) return self.context end },
+        get_HasInitialized = { 0, function(self) return self.initialized ~= false end },
         -- The gimmick flag (attribute 0 of its context); a change runs onChangeGmFlag.
-        setGmFlag = { 3, function(self, v)
-            if (self.flag == true) ~= (v == true) then
-                self.flag = v == true
-                if self.on_flag then self.on_flag(self.flag) end
+        setGmFlag = { 3, function(self, v, trig, args)
+            if live_flag(self) ~= (v == true) then
+                local g = self.ctx_key and world.gimmick_table[self.ctx_key]
+                if g ~= nil then g.attr[1] = v and 1 or 0 else self.flag = v == true end
+                if self.on_flag then self.on_flag(v == true) end
+                self:call("onChangeGmFlag", v == true, trig, args)
             end
         end, { "System.Boolean", "chainsaw.InteractTrigger", "chainsaw.InteractActionArgs" } },
-        getGmFlag = { 0, function(self) return self.flag == true end },
+        getGmFlag = { 0, function(self) return live_flag(self) end },
+        onChangeGmFlag = { 3, function() end, { "System.Boolean", "chainsaw.InteractTrigger", "chainsaw.InteractActionArgs" },
+            { code = "stub" } },
     })
+    -- GmUseItem (0x142fb7210): flag on -> its "use" sequence (the item set in the slot, the
+    -- lock opening) with the trigger of the player who used it, or none.
+    class("chainsaw.GmUseItem", "chainsaw.GmBase", {
+        onChangeGmFlag = { 3, function(self, v, trig, args)
+            if v and self.port ~= nil then
+                self.port:call("call(System.UInt32, chainsaw.InteractTrigger, chainsaw.InteractActionArgs)", self.use_key or 0x55E, trig, args)
+            end
+            -- A sequence of another object it sets off (a door the slot unlocks).
+            if v and self.linked ~= nil then
+                self.linked.port:call("call(System.UInt32, chainsaw.InteractTrigger, chainsaw.InteractActionArgs)", self.linked_key or 1, trig, args)
+            end
+        end, { "System.Boolean", "chainsaw.InteractTrigger", "chainsaw.InteractActionArgs" } },
+    })
+    -- A puzzle door that only reads its state when it is set up (no reaction of its own).
+    class("chainsaw.GmPutItemsPedestal", "chainsaw.GmBase", {})
     -- A pushed cart or shelf: its motion (MotWait / MotMove / MotMoved) and the AI map blocker.
     local push = class("chainsaw.GmPushMove", "chainsaw.GmBase", {
         setGmMotion = { 1, function(self, m) self.motion = m end, { "System.UInt32" } },
@@ -2714,6 +2924,35 @@ function M.set_gimmick(ctx, attr, triggers, announce)
             new("chainsaw.GmContextBox", { id = ctx_object(ctx) }))
     end
     return key
+end
+
+-- A gimmick loaded and set up in this game, bound to its context `ctx` in the gimmick table:
+-- its GameObject (GUID), GimmickCore, the gimmick component and its sequence (a PortrayalSettings
+-- with one parameter set per key: opts.keys = { [key] = { callees = {...}, end_callees = {...} } }).
+function M.make_live_gimmick(type_name, ctx, guid, opts)
+    opts = opts or {}
+    local key = M.set_gimmick(ctx, opts.attr or { 0, 0 })
+    local go = M.make_go(type_name:match("([^.]+)$"))
+    go.guid = guid
+    local core = M.add_component(go, "chainsaw.GimmickCore")
+    local params = {}
+    for k, spec in pairs(opts.keys or { [0x55E] = {} }) do
+        local plays, ends = {}, {}
+        for _, c in ipairs(spec.callees or {}) do plays[#plays + 1] = new(c) end
+        for _, c in ipairs(spec.end_callees or {}) do ends[#ends + 1] = new(c) end
+        local param = new("chainsaw.PortrayalSettings.Param", { key = k, __fields = {
+            _CalleePlay = typed_array("System.Object", plays), _CalleeEnd = typed_array("System.Object", ends) } })
+        params[#params + 1] = param
+    end
+    local settings = new("chainsaw.OptionSettings`1<chainsaw.PortrayalSettings.Param>", { __fields = {
+        _Params = typed_array("chainsaw.PortrayalSettings.Param", params) } })
+    local port = M.add_component(go, "chainsaw.PortrayalSettings", { __fields = { _Params = settings } })
+    local context = new("chainsaw.GimmickContext", { key = key, ctx = ctx, __fields = {} })
+    local comp = M.add_component(go, type_name, { ctx_key = key, context = context, core = core, port = port,
+        use_key = opts.use_key, linked = opts.linked, linked_key = opts.linked_key, initialized = opts.initialized })
+    M.world.live_gimmicks = M.world.live_gimmicks or {}
+    M.world.live_gimmicks[key] = { core = core, comp = comp, context = context, go = go }
+    return comp, key
 end
 
 -- FlagInfo[] as the game builds it (elements inline from 0x20, 8 bytes each).

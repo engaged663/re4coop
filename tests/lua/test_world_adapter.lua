@@ -492,14 +492,14 @@ T.run("event_triggers_are_reported_and_run_with_our_player", function()
         components = { "chainsaw.GmPortrayalAreaHit", "chainsaw.GmPitfall" } })
     mock.activate_trigger(pit, world.player.body)
     local death = mock.make_trigger("cccccccc-0000-0000-0000-000000000005", "Area_FallDeath", {
-        components = { "chainsaw.GmPortrayalAreaHit", "chainsaw.PortrayalSettings" }, callees = { "chainsaw.PlDieSettings.Param" } })
+        components = { "chainsaw.GmPortrayalAreaHit", "chainsaw.PortrayalSettings" }, callees = { "chainsaw.TestMovieSettings.Param" } })
     mock.activate_trigger(death, world.player.body)
     local item = mock.make_trigger("cccccccc-0000-0000-0000-000000000006", "Area_GiveKey", {
         components = { "chainsaw.GmPortrayalAreaHit", "chainsaw.InventorySettings" } })
     mock.activate_trigger(item, world.player.body)
     w:update()
     T.eq(#reported, 1, "only the pure event")
-    T.eq(w.counters.trigger_not_event, 3, "a trap, a deadly portrayal and an item hand-out ruled out")
+    T.eq(w.counters.trigger_not_event, 3, "a trap, a portrayal with an effect we cannot mute and an item hand-out ruled out")
 
     -- The partner's trigger here: found by GUID and name hash, marked done, run with our player.
     t.trigger.__fields["<Done>k__BackingField"] = 0

@@ -264,7 +264,8 @@ function M.install(Game, H)
         if info.layer_count == nil then
             local motion = self:enemy_motion(info)
             local n = motion and tonumber(self:call(motion, "getLayerCount")) or nil
-            local want = math.min(P.MAX_ENEMY_LAYERS, math.max(1, math.floor(tonumber(self.settings.enemy_anim_layers) or DEFAULT_LAYERS)))
+            local want = info.max_layers
+                or math.min(P.MAX_ENEMY_LAYERS, math.max(1, math.floor(tonumber(self.settings.enemy_anim_layers) or DEFAULT_LAYERS)))
             info.layer_count = math.min(want, n or 1)
         end
         return info.layer_count
@@ -437,7 +438,12 @@ function M.install(Game, H)
     -- puppet, so the body is checked right before each write.
     function Game:enemy_set_transform(id, pos, rot)
         local info = self:live_enemy(id)
-        local tf = info and info.transform
+        return info ~= nil and self:body_set_transform(info, pos, rot)
+    end
+
+    -- The same for any character whose cached data (transform, body) is `info` (Ashley too).
+    function Game:body_set_transform(info, pos, rot)
+        local tf = info.transform
         if not tf then return false end
         self.n_calls = self.n_calls + 2
         local ok = pcall(tf.call, tf, "set_Position", Vector3f.new(pos.x, pos.y, pos.z))
@@ -469,7 +475,11 @@ function M.install(Game, H)
     -- speed -> set_Speed. Between corrections the game plays the motion on by itself.
     function Game:enemy_set_anim(id, layers)
         local info = self:live_enemy(id)
-        if info == nil then return false end
+        return info ~= nil and self:body_set_anim(info, layers)
+    end
+
+    -- The same for any character whose cached data (body, motion layers) is `info`.
+    function Game:body_set_anim(info, layers)
         for i = 1, math.min(#layers, self:layer_count(info)) do
             local target = layers[i]
             local layer = self:enemy_layer(info, i - 1)
@@ -1382,6 +1392,24 @@ function M.install(Game, H)
         self.erased_spawns[uid] = nil
         self:cap("enemy_revive", true, "spawn param validated and permitted (save deaths forgotten)")
         return "spawning"
+    end
+
+    -- Whether level enemy `uid` is eliminated in our game: dead for good (its live context, or
+    -- the save backup the game keeps once its context is gone). A boss whose death is a cutscene
+    -- (El Gigante: Ch1f0z0HeadUpdater.onDead -> die demo) leaves the enemy list that way
+    -- without ever reporting HP 0 to us. nil when it cannot be told.
+    function Game:enemy_eliminated(uid)
+        local cm = singleton(CHARACTER_MANAGER)
+        local id = cm and uid and self:context_id_of(uid)
+        if id == nil then return nil end
+        local ctx = self:call(cm, "getContextRef", id)
+        if ctx ~= nil then return self:call(ctx, "get_IsEliminated") == true end
+        local db = self:call(cm, "get_CharacterBackupDB")
+        if db ~= nil and self:call(db, "ContainsKey", uid) == true then
+            local b = self:call(db, "get_Item", uid)
+            if b ~= nil then return self:call(b, "get_IsEliminated") == true end
+        end
+        return false
     end
 
     -- Host: the uids of every enemy our save has eliminated. The game keeps the state of every

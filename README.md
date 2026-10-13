@@ -37,6 +37,8 @@ through the campaign together on a LAN, or over the internet with a forwarded po
 | **Same deaths** | Only the game that runs an enemy decides its death, and sends it with the killing hit: in the other game the enemy dies where it died, from the same hit, with its own death animation and loot |
 | **Your own loot from every enemy** | Every enemy that dies gives each player their own loot roll, tailored to that player's inventory like in the normal game, also the enemies your partner killed. You see your loot, your partner sees theirs |
 | **Give items to your partner** | In the attache case, every item you can share (ammo, herbs and sprays, gunpowder and resources, grenades, weapon attachments, treasures) gets a last command, **Give to <partner>**: the item leaves your case and goes into your partner's, wherever they are. What does not fit in their case comes back to yours; nothing is ever lost. Key items, weapons and knives stay with you |
+| **One Ashley for both** | There is only one Ashley in the shared world. She starts with the host: she follows the host's player, and in the partner's game she is right there with the host too, walking, running and animating the same way. **Tap Alt** (or the panel's button) and she goes to the other player: from then on she follows them, in both games. Either player can tap it, with 5 s between two switches. She does not change hands while kidnapped, down or hiding, or while the other player is in a cutscene. Taken over far away, she is brought next to her new player |
+| **What one completes, both complete** | An item one player places in a slot appears there in the partner's game too and the lock opens for both; a puzzle one solves is solved for both (with its sequence on screen); levers, mechanisms and scripted events play for both. Those sequences run in the partner's game without handing out their items again or taking items from them. The objective on screen is the more advanced of the two. A boss killed in one game (El Gigante) dies in the other too |
 | **Key items exist once** | Whoever picks up a key item keeps it, and it disappears from the partner's world. Pickups are confirmed by the game's own "item obtained" flag |
 | **One shared world** | The story progress lives in the game's scenario flags (objectives, map reveals, doors unlocked, items taken, events seen) and its gimmick table (locks, keys used, levers, shutters, puzzles). Every flag the game turns on, whatever turned it on, is applied in the partner's game through the game's own setter within a fraction of a second, both ways. A flag going back off (a checkpoint reload) never undoes the partner's world |
 | **Cutscenes for both** | A cutscene or movie one player's game starts plays in the partner's game too: the game's own description of it (camera, flags it sets, the scripted sequence it continues, where it puts the players) is sent and played by the partner's game exactly as if their player had started it, **at once, wherever the partner is**: a partner who was far away watches it right away and is brought next to you when it ends. Never twice: a cutscene that save already played is skipped. **Skipping it skips it for both** (in the partner's game the same way its own skip button does) |
@@ -91,6 +93,14 @@ How it works and why: [docs/RESEARCH.md](docs/RESEARCH.md). Wire format: [docs/P
   for the host that the client's game never spawned - the client's save had it dead, or only the
   host triggered it - appears for the client too, where the host's is. Enemies the game creates
   on the fly (no level identity) still appear only where they spawned.
+* One Ashley for both (0.9.1, not run in the game yet): in the game that does not run her she
+  cannot be grabbed, attacked or hurt (that game's enemies leave her alone), and your shots
+  there do not hurt her. Doors and jumps that need her nearby only work for the player she
+  follows. Alt also zooms a scope: a tap while aiming does not switch her (*Options* can change
+  the key).
+* What one completes, both complete (0.9.1, not run in the game yet): a gimmick that only reads
+  its state when its area loads shows the partner's change after that area reloads, and a
+  puzzle the partner is still working on (pieces moved, not solved) is not shown live.
 * The partner's model is a visual copy: it does not collide and your bullets pass through it.
 * Thrown grenades, bullet impacts and blood on enemies happen only in the thrower's/shooter's
   game. Sounds the engine plays internally (outside the reflected `trigger` calls) may not be

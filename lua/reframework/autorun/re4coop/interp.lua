@@ -135,6 +135,25 @@ function Interp.blend(sa, sb, t)
     return out
 end
 
+-- States with animation layers ({bank, id, frame, speed} each): position and rotation blend;
+-- each layer blends its frame while both snapshots play the same motion, otherwise it takes
+-- the nearer snapshot's.
+function Interp.blend_layers(sa, sb, t)
+    local out = Interp.blend(sa, sb, t)
+    local la, lb = sa.layers or {}, sb.layers or {}
+    local layers = {}
+    for i = 1, math.max(#la, #lb) do
+        local a, b = la[i], lb[i]
+        if a ~= nil and b ~= nil and a.bank == b.bank and a.id == b.id and b.frame >= a.frame then
+            layers[i] = { bank = a.bank, id = a.id, frame = a.frame + (b.frame - a.frame) * t, speed = b.speed }
+        else
+            layers[i] = (t < 0.5 and a or b) or a or b
+        end
+    end
+    out.layers = layers
+    return out
+end
+
 -- The remote time that "now" shows (nil before the first snapshot).
 function Interp:target(local_now)
     if self.offset == nil then return nil end

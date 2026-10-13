@@ -43,6 +43,10 @@ local function make_world(id_base)
         end
     end
 
+    -- Level enemies our game has eliminated (dead for good: its context or its save backup).
+    w.eliminated = {}
+    function w:enemy_eliminated(uid) return self.eliminated[uid] == true end
+
     -- The enemy list the way game:list_enemies() returns it (fresh tables each call; layers
     -- and visibility only for the enemies the sync asks for).
     function w:list(want)
@@ -564,6 +568,84 @@ T.run("a_host_enemy_that_left_the_hosts_world_frees_the_clients_copy", function(
     T.eq(net_of(pair.client, c), nil, "no longer shared")
     T.eq(pair.client_world.puppet[c.id], nil, "the client's copy runs on its own")
     T.check(pair.client.counters.handed_over == 0 or true, "")
+end)
+
+-- El Gigante: its death is a cutscene (Ch1f0z0HeadUpdater.onDead -> die demo); the game then
+-- removes it eliminated, without the list ever showing it dead.
+local GIGANTE = "chainsaw.Ch1f0z0Context"
+
+T.run("a_boss_whose_death_removes_it_dies_in_the_partners_game_too", function()
+    local pair = make_pair()
+    pair.host_player = { x = 3, y = 0, z = 0 }
+    pair.client_player = { x = 30, y = 0, z = 0 }
+    local h = pair.host_world:spawn(GIGANTE, 0, 0, 0, 5000, 0x4601)
+    local c = pair.client_world:spawn(GIGANTE, 0, 0, 0, 5000, 0x4601)
+    pair:step(8)
+    T.eq(owner_of(pair, h), HOST, "the host's game runs it")
+    T.eq(pair.client_world.puppet[c.id], true, "the client's copy follows it")
+    -- The host's player kills it: its death cutscene plays and the game takes it away.
+    pair.host_world.eliminated[0x4601] = true
+    pair.host_world:remove(h)
+    pair:step(6)
+    T.check(not c.alive, "the client's Gigante dies too (it used to be let go, alive)")
+    T.eq(pair.client_world.calls.kill, 1, "killed once")
+    T.eq(pair.host.counters.vanished_deaths, 1, "the host announced it")
+    T.eq(pair.host.dead[0x4601] ~= nil, true, "in the host's graveyard")
+    pair:step(20)
+    T.eq(pair.client_world.calls.kill, 1, "only once")
+end)
+
+T.run("a_boss_the_client_runs_that_vanishes_dead_dies_for_the_host", function()
+    local pair = make_pair()
+    pair.host_player = { x = -30, y = 0, z = 0 }
+    pair.client_player = { x = 3, y = 0, z = 0 }
+    local h = pair.host_world:spawn(GIGANTE, 0, 0, 0, 5000, 0x4602)
+    local c = pair.client_world:spawn(GIGANTE, 0, 0, 0, 5000, 0x4602)
+    pair:step(8)
+    T.eq(owner_of(pair, h), CLIENT, "the client's game runs it")
+    pair.client_world.eliminated[0x4602] = true
+    pair.client_world:remove(c)
+    pair:step(6)
+    T.check(not h.alive, "the host's dies too (the host would have taken it over alive)")
+    T.eq(pair.client.counters.vanished_deaths, 1, "the client announced it")
+end)
+
+T.run("a_boss_that_unloaded_and_came_back_is_checked_again_when_it_dies", function()
+    local pair = make_pair()
+    pair.host_player = { x = 3, y = 0, z = 0 }
+    pair.client_player = { x = 30, y = 0, z = 0 }
+    local h = pair.host_world:spawn(GIGANTE, 0, 0, 0, 5000, 0x4604)
+    local c = pair.client_world:spawn(GIGANTE, 0, 0, 0, 5000, 0x4604)
+    pair:step(8)
+    pair.host_world:remove(h) -- its area unloads for a moment (not a death)
+    pair:step(2)
+    table.insert(pair.host_world.enemies, h) -- and loads again
+    pair:step(8)
+    T.check(c.alive, "still alive for the client")
+    pair.host_world.eliminated[0x4604] = true
+    pair.host_world:remove(h)
+    pair:step(6)
+    T.check(not c.alive, "its real death crosses")
+end)
+
+T.run("an_enemy_that_only_unloaded_or_is_the_partners_is_not_a_death", function()
+    local pair = make_pair()
+    pair.host_player = { x = 3, y = 0, z = 0 }
+    pair.client_player = { x = 30, y = 0, z = 0 }
+    local h = pair.host_world:spawn(GIGANTE, 0, 0, 0, 5000, 0x4603)
+    local c = pair.client_world:spawn(GIGANTE, 0, 0, 0, 5000, 0x4603)
+    pair:step(8)
+    -- The client's area unloads its puppet copy, which its save has dead (another session):
+    -- the host's game runs it, so the client does not decide.
+    pair.client_world.eliminated[0x4603] = true
+    pair.client_world:remove(c)
+    pair:step(6)
+    T.check(h.alive, "the host's lives on")
+    T.eq(pair.client.counters.vanished_deaths, nil, "the client announced nothing")
+    -- The host's area unloads it, not eliminated: not a death.
+    pair.host_world:remove(h)
+    pair:step(6)
+    T.eq(pair.host.counters.vanished_deaths, nil, "the host announced nothing")
 end)
 
 -------------------------------------------------------------------------------

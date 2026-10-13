@@ -3,13 +3,15 @@ local T = require("testlib")
 
 T.run("api_surface", function()
     for _, name in ipairs({ "host", "join", "stop", "send", "poll", "state", "role", "stats",
-        "local_addresses", "time", "max_payload", "version", "new_session", "set_simulated_loss" }) do
+        "local_addresses", "time", "max_payload", "version", "new_session", "set_simulated_loss",
+        "window_focused" }) do
         T.eq(type(re4coop_net[name]), "function", name)
     end
     local v, proto = re4coop_net.version()
     T.eq(v, require("re4coop.protocol").MOD_VERSION, "plugin and script versions match")
     T.eq(proto, 2, "net protocol")
     T.eq(re4coop_net.max_payload(), 1188, "max payload (1200 B datagrams)")
+    T.eq(type(re4coop_net.window_focused()), "boolean", "whether the game window has the focus")
     T.eq(re4coop_net.max_payload(), require("re4coop.protocol").MAX_PAYLOAD, "script knows the payload limit")
     T.eq(re4coop_net.state(), "idle", "idle at start")
     local t1 = re4coop_net.time()

@@ -139,23 +139,8 @@ local function rot_delta(a, b)
     return 1 - math.abs(d)
 end
 
--- Puppet states: position and rotation blend; each animation layer blends its frame while
--- both snapshots play the same motion, otherwise it takes the nearer snapshot's.
-local function blend_state(sa, sb, t)
-    local out = Interp.blend(sa, sb, t)
-    local la, lb = sa.layers or {}, sb.layers or {}
-    local layers = {}
-    for i = 1, math.max(#la, #lb) do
-        local a, b = la[i], lb[i]
-        if a ~= nil and b ~= nil and a.bank == b.bank and a.id == b.id and b.frame >= a.frame then
-            layers[i] = { bank = a.bank, id = a.id, frame = a.frame + (b.frame - a.frame) * t, speed = b.speed }
-        else
-            layers[i] = (t < 0.5 and a or b) or a or b
-        end
-    end
-    out.layers = layers
-    return out
-end
+-- Puppet states: position, rotation and animation layers (Interp.blend_layers).
+local blend_state = Interp.blend_layers
 
 -- opts: { role="host"|"client", protocol=<protocol module>, send=function(bytes, reliable),
 --         settings=<table read live>, log=function(fmt, ...),
@@ -265,6 +250,7 @@ function EnemyNet:observe(now, enemies)
         end
         l.prev_pos, l.prev_t = copy3(e.pos), now
         l.last_seen = now
+        l.vanish_checked = nil -- (in our list again: a later disappearance is checked again)
         l.e = e
         by_id[e.id] = e
         if e.uid ~= nil then
@@ -825,6 +811,28 @@ function EnemyNet:remove_dead(game, id, e, now, local_pos)
         return true
     end
     return false
+end
+
+-- Enemies we decide on that left our list this tick while alive: a boss whose death is a
+-- cutscene leaves it without ever reaching HP 0 here (El Gigante, docs/RESEARCH.md 3.24). If our
+-- game has it eliminated (dead for good), it died: the partner's copy dies too instead of being
+-- released to its own AI (which left the client fighting a Gigante the host had killed). An
+-- enemy that only unloaded with its area is not eliminated and is released as before. Checked
+-- once per disappearance, before the host retires its number.
+function EnemyNet:check_vanished_deaths(now, game)
+    if game == nil or game.enemy_eliminated == nil then return end
+    for id, l in pairs(self.locals) do
+        if l.last_seen ~= nil and l.last_seen < now and not l.vanish_checked and l.was_alive == true
+            and not l.death_sent and not l.self_killed and l.uid and l.e ~= nil then
+            l.vanish_checked = true
+            local net = l.net_id and self.nets[l.net_id]
+            if (net == nil or self:authority_here(net) or self:claimed(l)) and game:enemy_eliminated(l.uid) == true then
+                self:announce_death(game, id, l.e, net, now)
+                l.was_alive = false
+                self.counters.vanished_deaths = (self.counters.vanished_deaths or 0) + 1
+            end
+        end
+    end
 end
 
 -- An enemy whose death we decide died in our world: tell the partner (with where it died and
@@ -1484,6 +1492,7 @@ function EnemyNet:tick(now, enemies, game, players)
         if now - pr.time > 5.0 then self.predicted[seq] = nil end
     end
     self:observe(now, enemies)
+    self:check_vanished_deaths(now, game)
     self:check_puppet_damage(now)
 
     if self.role == "host" then

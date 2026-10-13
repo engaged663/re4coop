@@ -94,6 +94,21 @@ T.run("enemy_settings_of_0_8_are_reset_once_for_the_new_enemy_sync", function()
     T.eq(cfg.enemy_hit_predict, true, "hits take HP at once by default")
 end)
 
+T.run("ashley_settings", function()
+    local cfg = Config.load(nil)
+    T.eq(cfg.ashley_coop, true, "one Ashley for both by default")
+    T.eq(cfg.ashley_key, 0x12, "Alt")
+    T.eq(cfg.ashley_cooldown, 5.0, "5 s between switches")
+    local saved = Config.load(fake_json({ [Config.FILE] = { config_version = Config.VERSION, ashley_key = 999,
+        ashley_cooldown = 0.1 } }))
+    T.eq(saved.ashley_key, 0x12, "a bad key falls back to Alt")
+    T.eq(saved.ashley_cooldown, 1.0, "at least 1 s")
+    saved = Config.load(fake_json({ [Config.FILE] = { config_version = Config.VERSION, ashley_key = 0x47,
+        ashley_cooldown = 120 } }))
+    T.eq(saved.ashley_key, 0x47, "another key kept")
+    T.eq(saved.ashley_cooldown, 60.0, "at most 60 s")
+end)
+
 T.run("save_roundtrip", function()
     local files = {}
     local json = fake_json(files)

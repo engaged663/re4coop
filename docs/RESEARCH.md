@@ -1220,6 +1220,155 @@ through the whole weapon prefab (8 levels), plus the cameras a ScopeController r
 (`_WeaknessCameraGameObject`, and `_CameraRef`/`_WeaknessCameraRef` once set). The meshes - the
 rifle and its scope - stay drawn. *Diagnostics*: `puppet_cameras`. Not run in the game yet.
 
+### 3.23 One Ashley for both players (0.9.1)
+
+**Request.** Only one Ashley in the shared world, with the host at first; a tap of Alt sends
+her to the other player (she follows them from then on), at most once every 5 s.
+
+**How the game runs Ashley** (re4.exe, carved functions decompiled with REA):
+
+* She is `CharacterKindID.ch2_a1z0` = 200030 (the enum's literal values;
+  `PartnerBattleParamUserData.Ch2a3z0IAParam.GivingAmmoLimit` marks ch2_a3z0 as Luis).
+  `CharacterManager.getPartnerContextRef` (0x1434306b0) returns the first entry of
+  `PartnerContextList` (+0x98) - or, in one game mode with several partners, the one of kind
+  200032 - so the mod walks `PartnerContextList` and picks kind 200030.
+* Her context is a `PartnerBaseContext`: `IsKidnapped` +0x460, `IsPermitKidnapped` +0x470,
+  `IsPermitAttacked` +0x471, `_ThinkEnable` +0x430, `_PartnerState` +0x440 (`Npc.State` bits:
+  Down 1, Rescue 2^17, HidingLocker 2^54, UseGmHandle 2^57...).
+* Her AI is her head: `Ch2a1z0HeadUpdater` (a `PartnerHeadUpdater`).
+  `updateFollowTargetPosition` (0x1420642f0) takes the first context of CharacterManager's
+  player list (+0x90) and puts the follow target next to it. There is no general "far away"
+  warp: `IntelligentActionLeavePlayer` only steps away from a player who crowds her.
+* `PartnerNpcActionUpdaterUnit.updateKidnapped` (0x14108c470), part of her head, writes
+  `IsPermitKidnapped = _ThinkEnable` (or false during some states) **every frame**. A scan of
+  every byte write to +0x470 in `.text` found only it, `PartnerMoveTargetGimmick.onUpdate` and
+  `requestGimmick` among the partner's code. With her head off, nothing sets it again.
+* Enemies take her through `Ch1c0NPCTargetDriver_Ch2a1z0`: `startTarget` (0x14253f4d0)
+  gets the partner, checks kind 200030 and **only goes on while `IsPermitKidnapped` is set**;
+  `searchTargetContext` and `isExistPartnerNPC` use the same lookup.
+  `EnemyBehaviorTreeCondition_MFSM_CheckCautionAshleyKidnap` reads `IsCautionKidnap` (+0x479).
+* `CharacterContext.setTransform(vec3, Quaternion)` (0x1421f2ef0) stores the transform in the
+  context (+0x60/+0x70) and calls every listener of its change list (+0x230): the game's own
+  character teleport.
+* `HitPoint.NoDamage` (+0x19, `set_NoDamage`) makes `checkDead` false and the damage none.
+* Keyboard: Alt is RE4's default "zoom" key for scopes (Ctrl commands Ashley), per a controls
+  guide ([ProGameTalk](https://progametalk.com/resident-evil-4-remake/controls-key-bindings/)).
+
+**Design** (`ashley_sync.lua`, `game_ashley.lua`). Each game has its own Ashley; exactly one
+game runs her, the owner (the host's at first). The owner's Ashley is the game's own and
+follows the owner's player; it sends her state ~20 Hz (ASHLEY: position, rotation, HP, three
+animation layers). In the other game she is a **puppet** like an enemy the partner runs:
+head `set_UpdateSelf(false)`, `via.motion.MotionFsm2` off, `IsPermitKidnapped` and
+`IsPermitAttacked` cleared (re-asserted every tick), `NoDamage` on (its old value kept); her
+transform (+ `CharacterController.warp`) and motion layers follow the owner's, interpolated, and
+her HP too (never below 1: the owner decides whether she goes down). A tap of the key
+(press and release within 1 s, no Tab/Enter/F4/Esc meanwhile, not while aiming: Alt zooms;
+REFramework records Alt from `WM_SYSKEYDOWN` as `VK_MENU` but clears every key on
+`WM_KILLFOCUS`, so an Alt+Tab looks like a tap: the game window must still be the foreground
+window 0.25 s after the release - `re4coop_net.window_focused`, `GetForegroundWindow`)
+asks for a switch: the host switches (epoch + 1) or refuses - cooldown (5 s, the host's
+setting), she is busy (kidnapped, down, hiding, on a gimmick, grappled), the other game has no
+Ashley or its player is in a cutscene, down or loading; a client's request about an old epoch
+is answered with the current owner, so two presses at once switch once. Whoever stops running
+her puts her head and animation back (her permissions come back from her head's next update);
+whoever takes her over more than 20 m from its player brings her 1.5 m behind the player with
+`setTransform`. If the game running her has had no Ashley for 5 s while in game (a part of the
+story without her) and the other has one, she goes over by herself. *Diagnostics*: `ashley`,
+`ashley_puppet`, `ashley_warp`; counters `switches`, `refused`, `stale`, `warps`, `auto`.
+
+**Not covered.** In the game that does not run her she cannot be hurt by that game (not even by
+its player's stray shots), and doors or jumps that need her nearby only work for her player.
+Scripted moments that move her (cutscenes, `warpPartner`) happen in each game; the owner's
+state takes over again afterwards. Not run in the game yet.
+
+### 3.24 What one player completes, the other completes too (0.9.1)
+
+**Report.** Doors and the like crossed, but: a puzzle one player solved stayed unsolved for the
+other; objectives did not update; after El Gigante died the host's game moved on but the client's
+did not; an item placed in a slot to open a door opened it only for the player who placed it (the
+other could not pass).
+
+**What the game does** (re4.exe, carved and decompiled with REA):
+
+* **Gimmick state vs. the object on screen.** The gimmick sync wrote the partner's record into the
+  gimmick's context (`GimmickContext.loadSaveDataFromManager` 0x1411ecde0: `_SaveCur`, `_SaveBuff`,
+  `onLoadedGameSave` - data only). The object already on screen reacts only to the game's own
+  paths: `GmBase.setGmFlag(value, trigger, args)` (0x141602d40) writes attribute 0 and calls the
+  gimmick's `onChangeGmFlag` (vtable +0xd0) - 48 gimmick types react there: `GmUseItem`,
+  `GmUseItemGate`, `GmKeyHole`, `GmShutterItemInsertionPoint` (items set in slots), `GmLever`,
+  `GmShelves`, `GmPortrayal`, `GmUnlockPuzzle`, `GmStonePiecePuzzle`, `GmHoneyCombPuzzle`,
+  `GmClosingBoardLock`, `GmBigDoorPadlock`, `GmDoorCardKey`, `GmWindmill`... Some poll the flag
+  in their update (`GmCrestPuzzleDoor.updateGimmick` 0x142066b30 opens when it turns on); others
+  read it only in `initializeGimmick` (when their area loads).
+* **The write blocked the game's own reaction.** `GmUseItem.updateGimmick` (0x143011520) watches
+  a story flag (`_Flag`) and, when it is set, does `setGmFlag(true)` - its own reaction to the
+  flag the partner's game set. But it returns at once when its gimmick flag is already on, and
+  our record write had turned it on: the item never appeared and the door stayed locked.
+* **Sequences that move items were never shared.** Using an item runs the slot's sequence
+  (`PortrayalSettings.call`), whose parameter sets include `ReduceInventoryItemSettings` (the
+  item leaves the inventory), often `InventorySettings` (a reward), `ForceGetFileSettings`... The
+  mechanism sync (§3.19) refused any sequence with such an effect. Each effect runs through its
+  parameter's `triggerProcess` (`PortrayalSettings.Param.triggerProcess` 0x1437f7b10 runs
+  `_CalleePlay`); the end effects later, from `PortrayalSettings.update` (0x142222200) ->
+  `Param.onFinish` (0x14379c580: `_CalleeEnd` with no trigger). `ReduceInventoryItemSettings`'
+  `triggerProcess` and `makeFinish` are one function (0x140640ff0 -> `apply` 0x1438e64c0).
+  `InventorySettings.Param.triggerProcess` (0x1407631d0) adds the item (Process 0) or opens the
+  case (1); its `makeFinish` is the game's empty method (0x1400ae850) - so loading an area that
+  is already done never hands anything out.
+* **The game's latent network design.** `GimmickManager.PayloadGmFlag / PayloadAttr /
+  PayloadAttrAll / PayloadAccessory / PayloadGmParam / PayloadDetect`, `GimmickContext.recvAttr`
+  (0x1404694b0: `pushAttr`, data only), `GmBase.recvAccessory`, `recvGmParam`, and
+  `share.AppSendPacketInfo` (`via.network.protocol.SendOption`): a dormant way to replicate
+  gimmicks between players, in which a flag change is replayed as `setGmFlag` on the receiver.
+* **Objectives.** `PurposeManager.onUpdate` (0x1428830b0) asks `GameConditionCollector` for the
+  current purpose statement - conditions on story flags, **items held** (`ConditionItem.check`),
+  sub-progress, chapter, HP, UI - and takes it only if its `Priority` is higher than the current
+  one's (`updateMainPurpose` 0x1428e96f0: a copy of the `PurposeGuiItem`, then the objective
+  banner). A key item exists once in co-op, so the player without it kept the old objective.
+  `PurposeID` encodes the chapter: 2203 = ChapterID 22200's third objective.
+* **El Gigante** (`Ch1f0z0HeadUpdater`): `onDead` (0x142a15090) sets a story flag
+  (`requestSetFlag`), starts its death cutscene (`callTimelineEvent` -> `ClapperboardMediator
+  .requestPlayWithID` 0x1419baa60) or, when it cannot yet, `RequestDieDemo` (+0x473) for
+  `onLateUpdate`; the cutscene's end removes the character. In the game that runs it, it can
+  leave the enemy list that way without the list ever showing it dead (HP at 0). The partner's
+  copy was then *released* to its own AI - the client went on fighting a Gigante the host had
+  killed.
+
+**Design.**
+
+* **Muting the partner's player's effects** (`game_world.lua` `install_mute_hooks`): the
+  `triggerProcess` (and `makeFinish` where it does something) of every dangerous effect type -
+  items given or taken, deaths, chapter/campaign processes, game modes, tutorials, files, drops
+  (World.DENY_COMPONENTS) - is hooked and skipped while we replay the partner's action; a
+  sequence we replayed keeps its end effects muted until it finishes (`Param.onFinish` hooked).
+  The game's empty method is never hooked. An effect type that cannot be muted keeps its sequence
+  from being shared. *Diagnostics*: `mute_effects`.
+* **Sequences with such effects are shared now**: the item slot's sequence (the item appears,
+  the lock opens) and a puzzle's solution play in the partner's game; the item is not taken from
+  the partner, no reward is handed out twice. Level events too (§3.11): an event whose sequence
+  kills the player runs for the partner without the death.
+* **The gimmick reacts first** (`gimmick_react`): when the partner's record turns a gimmick's
+  flag on and the gimmick is on our screen and set up, `setGmFlag(true)` runs on it (muted) - the
+  same reaction it has in the partner's game - and then the record is written. Its sequence
+  counts as played, so the partner's MECHANISMS report of it does not play it twice. Not for doors
+  (door sync), traps, breakables, animals, pushed objects or the player's own actions
+  (World.MECH_DENY). A gimmick not on screen gets the record, and its area's load sets it up.
+  Setting `gimmick_reactions`; *Diagnostics*: "reacted live", "partner effects muted".
+* **Objectives** (`purpose_sync.lua`, PURPOSE): each game reports its objective when it changes
+  (and every 20 s); a game whose objective has a lower priority in the same chapter takes the
+  partner's through `updateMainPurpose` - the banner shows it as when its own conditions change.
+  Setting `sync_purposes`; *Diagnostics*: `purposes`, *objectives* counters.
+* **Bosses that vanish dead** (`enemy_net.lua` `check_vanished_deaths`): an enemy whose death
+  our game decides that leaves our list while alive is checked once: if our game has it
+  eliminated (`Game:enemy_eliminated`: its live context, else its save backup in
+  `CharacterBackupDB`), it died - announced like any death (before the host retires its number),
+  so the partner's copy dies instead of being released. An enemy that only unloaded with its
+  area is not eliminated and is released as before. *Diagnostics*: *enemies* `vanished_deaths`.
+
+**Not covered.** Gimmicks that read their state only when their area loads (no reaction, no
+polling) show the partner's change when that area loads again; the partner's progress *inside*
+an unsolved puzzle (pieces moved but not solved) is not shown live. Not run in the game yet.
+
 ## 4. Sync architecture
 
 ```

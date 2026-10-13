@@ -412,6 +412,13 @@ function R:guid_value(s)
     return v
 end
 
+-- The object's address (a stable key for a live object), or nil.
+function R.address(obj)
+    if obj == nil then return nil end
+    local ok, a = pcall(obj.get_address, obj)
+    return ok and a or nil
+end
+
 -- GUID of a GameObject: its ToString() is "Name@<guid>]"-like in RE Engine.
 function R.game_object_guid(go)
     if go == nil then return nil end

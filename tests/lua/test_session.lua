@@ -41,7 +41,9 @@ local function fake_game()
     function g:area_name() return tostring(self.chapter) end
     function g:teleport_player(pos) self.teleports[#self.teleports + 1] = pos self.pos = pos return true end
     function g:is_key_down(vk) return self.keys[vk] == true end
+    function g:window_focused() return self.focused ~= false end
     function g:restore_enemies() self.ai_restored = self.ai_restored + 1 end
+    function g:ashley_restore() self.ashley_restored = (self.ashley_restored or 0) + 1 end
     return g
 end
 
@@ -465,6 +467,7 @@ T.run("disconnect_restores_ai_on_the_game_thread", function()
     T.eq(game.ai_restored, 0, "not from the render thread")
     s:update()
     T.eq(game.ai_restored, 1, "on the next game frame")
+    T.eq(game.ashley_restored, 1, "Ashley too")
 end)
 
 -- The game's save system for the save tests: slots written; save_now reports through the
@@ -513,6 +516,94 @@ T.run("the_client_saves_with_the_host_once_it_holds_the_hosts_world", function()
     T.check(s:status().saves ~= nil, "in the status")
 end)
 
+-- Frames with keys held: keys = { [vk] = true } for `frames` frames of 0.05 s.
+local function hold(s, clock, game, keys, frames)
+    for _ = 1, frames do
+        for vk, v in pairs(keys) do game.keys[vk] = v end
+        clock.t = clock.t + 0.05
+        s:handle_hotkeys(clock.t)
+    end
+end
+
+T.run("a_tap_of_alt_switches_ashley", function()
+    for _, role in ipairs({ "host", "client" }) do
+        local s, _, clock, game = make(role)
+        local asked = 0
+        s.ashley_sync.request = function() asked = asked + 1 return true end
+        hold(s, clock, game, { [0x12] = true }, 3)
+        T.eq(asked, 0, role .. ": not while held")
+        hold(s, clock, game, { [0x12] = false }, 2)
+        T.eq(asked, 0, role .. ": once the game kept the focus a moment")
+        hold(s, clock, game, { [0x12] = false }, 5)
+        T.eq(asked, 1, role .. ": a tap switches")
+        hold(s, clock, game, { [0x12] = false }, 5)
+        T.eq(asked, 1, role .. ": once")
+        -- Alt+Tab (leaving the game), Alt+Enter, Alt+F4: shortcuts, not switches.
+        for _, k in ipairs({ 0x09, 0x0D, 0x73 }) do
+            hold(s, clock, game, { [0x12] = true }, 2)
+            hold(s, clock, game, { [k] = true }, 1)
+            hold(s, clock, game, { [k] = false, [0x12] = false }, 1)
+        end
+        T.eq(asked, 1, role .. ": shortcuts do not switch")
+        -- Alt+Tab as REFramework sees it: Alt released (its keys cleared), the game in the background.
+        hold(s, clock, game, { [0x12] = true }, 2)
+        game.focused = false
+        hold(s, clock, game, { [0x12] = false }, 8)
+        game.focused = true
+        hold(s, clock, game, { [0x12] = false }, 8)
+        T.eq(asked, 1, role .. ": leaving the game does not switch")
+        hold(s, clock, game, { [0x12] = true }, 2)
+        hold(s, clock, game, { [0x12] = false }, 2)
+        game.focused = false -- the focus goes right after the release
+        hold(s, clock, game, { [0x12] = false }, 8)
+        game.focused = true
+        T.eq(asked, 1, role .. ": nor right after it")
+        hold(s, clock, game, { [0x12] = true }, 30)
+        hold(s, clock, game, { [0x12] = false }, 8)
+        T.eq(asked, 1, role .. ": a long hold does not switch")
+        -- Alt zooms a scope: not while aiming.
+        s.local_aiming = true
+        hold(s, clock, game, { [0x12] = true }, 2)
+        s.local_aiming = false
+        hold(s, clock, game, { [0x12] = false }, 8)
+        T.eq(asked, 1, role .. ": not while aiming")
+        hold(s, clock, game, { [0x12] = true }, 1)
+        s.local_aiming = true -- aims while holding it (zooming)
+        hold(s, clock, game, { [0x12] = true }, 1)
+        s.local_aiming = false
+        hold(s, clock, game, { [0x12] = false }, 8)
+        T.eq(asked, 1, role .. ": nor when aiming meanwhile")
+        s.settings.ashley_key = 0x47 -- G
+        hold(s, clock, game, { [0x47] = true }, 1)
+        hold(s, clock, game, { [0x47] = false }, 8)
+        T.eq(asked, 2, role .. ": the key is a setting")
+        T.eq(Session.key_name(0x12), "Alt", "named")
+    end
+end)
+
+T.run("the_panel_button_switches_ashley_on_the_game_thread", function()
+    local s, _, clock = make("client")
+    local asked = 0
+    s.ashley_sync.request = function() asked = asked + 1 return true end
+    s:queue("ashley")
+    s:update_network_only()
+    T.eq(asked, 0, "not from the render thread")
+    clock.t = 0.1
+    s:update()
+    T.eq(asked, 1, "on the game thread")
+    T.check(s:status().ashley ~= nil, "in the status")
+end)
+
+T.run("ashley_messages_are_recorded_even_while_loading", function()
+    local s, net, clock, game = make("client")
+    game.loading = true
+    net.push(P.encode_ashley_owner({ owner = P.OWNER.CLIENT, epoch = 1, cooldown = 5,
+        reason = P.ASHLEY_REASON.CHANGED, by = P.OWNER.HOST }))
+    s:update_network_only()
+    T.check(s.ashley_sync:runs_here(), "the client's now")
+    T.check(told(s, "Ashley now follows you"), "told")
+end)
+
 T.run("shutdown_restores_everything", function()
     local pause = fake_pause()
     local s, net, _, game, world = make("client", { pause = pause })
@@ -522,6 +613,7 @@ T.run("shutdown_restores_everything", function()
     s:shutdown()
     T.eq(pause.active, false, "pauses back to normal")
     T.eq(game.ai_restored, 1, "enemy AI back on")
+    T.eq(game.ashley_restored, 1, "Ashley runs on her own again")
     T.eq(world.armed, nil, "no chapter switch left armed")
 end)
 

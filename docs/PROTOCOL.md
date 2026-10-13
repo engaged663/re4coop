@@ -58,9 +58,13 @@ Session rules:
 | `time()` | Monotonic seconds (`os.clock` is CPU time, so don't use it for networking) |
 | `max_payload()`, `version()` | `1188`; `"0.9.1", 2` |
 | `new_session()` | An independent session object with the same methods (tests/tools) |
+| `window_focused()` | Whether a window of this process is the foreground window (true off Windows): the Ashley key only counts while the game has the focus |
 
-## Game messages (game protocol version 10)
+## Game messages (game protocol version 11)
 
+Version 11 (mod 0.9.1) adds Ashley for both players (`ashley_sync.lua`): ASHLEY (41),
+ASHLEY_OWNER (42) and ASHLEY_SWITCH (43); and objectives for both (`purpose_sync.lua`): PURPOSE
+(44).
 Version 10 (mod 0.9.1) makes player events happen in both games: FLAGS only carries flags that
 turned on, plus trigger-kind flags that fired (PULSE); FLAG_WORDS changes only carry bits that
 turned on; CUTSCENE carries the game's own `ClapperboardMediator.PayloadPlay` (camera, flags,
@@ -123,6 +127,10 @@ The first byte is the message type. Formats use Lua `string.pack` notation.
 | 37 | ENEMY_CLAIM | reliable | client → host | `<B I2 B>`: net id, ownership epoch the client knew. The client's player started a finisher (stealth kill, grab, knife finish, stomp: `PlayerHeadUpdater.requestFatal` & co.) on that enemy; the client's game runs it from that moment. The host hands it over at once (ENEMY_OWNER) and keeps it with the client for 10 s, unless its own player is finishing it (then the claim runs out after 1.5 s and the client's copy is a puppet again) |
 | 39 | TRAPS | reliable | both | `<B B>` count (≤ 60) + n × (`guid` + `<B B>`): trap GameObject GUID, kind (1 bear trap `GmLegHoldTrap`, 2 sensor bomb `GmSensorBomb`), event (1 fired: it closed / went off - the receiver's plays it; 2 re-armed: a bear trap opened again; 3 spent: closed / gone before - set without playing it, for a joining partner or a report older than 20 s). Traps within 60 m of the sender's player whose state changed |
 | 40 | MECHANISMS | reliable | both | `<B B>` count (≤ 50) + n × (`guid` + `<B I4>`): gimmick GameObject GUID, kind (1 a scripted sequence: `PortrayalSettings.call(key)`; 2 a pushed cart or shelf: `GmPushMove`), key (the sequence's key hash; 0 for a push). A lever pulled, a big door, valve or shelf moved in the sender's game; the receiver plays the same sequence on the same object (`call(key, null, null)`), or moves the pushed object (`MotMove`, flag). Never sent back for what a MECHANISMS started |
+| 41 | ASHLEY | unreliable | both | `<B d B B fff I4 i4 i4 B>` time, ownership epoch, flags (1 present: the sender's game has an Ashley; 2 owner: the sender's game runs her; 4 alive; 8 kidnapped; 16 busy: she cannot change hands - kidnapped, down, hiding, on a gimmick - or the sender's player cannot take her: cutscene, down; 32 hidden), position, packed rotation, HP, max HP, layer count (≤ 3), then per layer `<I4 I4 f f>` motion bank, motion id, frame, speed. The owner sends her full state ~20 Hz; the other game only its presence (no layers) every 0.5 s. Nothing while the sender's game loads |
+| 42 | ASHLEY_OWNER | reliable | host → client | `<B B B f B B>` owner (0 host, 1 client), ownership epoch, seconds until she may switch again, reason (0 switched on a player's request, 1 switched because the game running her has had no Ashley for 5 s while the other has one, 2/3/4 refused: cooldown / she is busy / the other game has no Ashley or its player cannot take her, 5 the current owner repeated: to a client that just connected or asked about an old epoch), who asked (0 host, 1 client) |
+| 43 | ASHLEY_SWITCH | reliable | client → host | `<B B>` ownership epoch the client knew. The client's player tapped the switch key: Ashley should go to the other game than the one running her at that epoch. The host switches (or refuses) and answers with ASHLEY_OWNER; a request about an older epoch is answered with the current owner |
+| 44 | PURPOSE | reliable | both | `<B I4 i4 c16 f f B>` purpose ID (`chainsaw.gui.PurposeID`; the chapter is ID / 100, as in ChapterID's chapter part), priority, message GUID (16 raw bytes), display time, delay, flags (1 request mediate). The sender's current objective, when it changes and every 20 s. A receiver whose own objective has a lower priority, in the same chapter, takes it (`PurposeManager.updateMainPurpose`) |
 | 38 | SAVE | reliable | both | `<B B>`: kind (1 autosave, 2 the player's own save). The sender's game started a save (`SaveFlowController.start`); never sent for a save made because of a SAVE. The receiver's game saves too through its own save flow once it can (playing, no cutscene or loading screen, save system idle; a client also holds the host's world), unless it saved within the last 10 s: the host into its autosave (slot 0), the client into its co-op slot (default 20) |
 
 `guid` is 16 raw bytes: the 32 hex digits of the canonical GUID string, in order. Scenario
@@ -140,6 +148,11 @@ ENEMY_HIT / ENEMY_DEATH also carry the attack's AttackData values (hashed `Attac
 and the body part and side it hit (`DamageUserData.Parts`, `DamageUserData.PartsSide`); the
 owner decides whether the hit kills (`HitController.checkKill`). The old owner stops at once, the new one continues from the latest state it received
 (position extrapolated by the velocity, HP never raised).
+
+Ashley: one game runs her, the host's at first (epoch 0); each new owner bumps the epoch.
+Either player can ask for a switch; the host decides, so two requests at once switch once. A
+switch waits `ashley_cooldown` (5 s, the host's setting) after the last one. In the other game
+her AI head is off and she follows the owner's ASHLEY stream (interpolated like enemy puppets).
 
 Joining: once the client is in the host's chapter it sends WORLD_REQUEST; the host answers
 with full FLAG_WORDS and GIMMICKS, the OBJECTS destroyed so far and WORLD_DONE, and then

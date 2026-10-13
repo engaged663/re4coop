@@ -110,6 +110,19 @@ local function draw_status(session, status)
                     session:queue("travel")
                 end
             end
+            local ash = status.ashley
+            if ash ~= nil and ash.enabled and (ash.here or ash.partner_has) then
+                local who = ash.mine and "you" or (status.partner_name or "your partner")
+                local line = ("Ashley follows %s"):format(who)
+                if ash.cooldown > 0 then line = line .. (" (can switch in %d s)"):format(math.ceil(ash.cooldown)) end
+                imgui.text(line)
+                imgui.same_line()
+                if imgui.button(ash.mine and "Send Ashley to partner" or "Call Ashley to me") then
+                    session:queue("ashley")
+                end
+                imgui.same_line()
+                imgui.text_colored(("(or tap %s)"):format(status.ashley_key_name or "Alt"), COLOR_DIM)
+            end
             local tr = status.travel
             if tr ~= nil and tr.state ~= "idle" then
                 imgui.text_colored(("Travelling to partner (%s): %s"):format(tr.reason or "?", tr.state), COLOR_WARN)
@@ -222,6 +235,9 @@ local function draw_options(settings)
         checkbox(settings, "sync_doors", "Doors swing open and stay open in both games while either player is in them")
         checkbox(settings, "sync_traps", "Traps: a bear trap that snaps shut or a sensor bomb that goes off does so in both games")
         checkbox(settings, "sync_mechanisms", "Mechanisms: levers, big doors, valves, shelves, carts... move in both games, with their in-game camera")
+        checkbox(settings, "gimmick_reactions", "Puzzles, locks and item slots the partner completes react in your game too (unlock, open, solve)")
+        checkbox(settings, "sync_purposes", "Objectives: both players see the more advanced objective")
+        checkbox(settings, "ashley_coop", "Ashley: one Ashley for both players (starts with the host; tap Alt to send her to the other player)")
         checkbox(settings, "give_items", "'Give to partner' in the attache case's item commands")
         checkbox(settings, "sync_objects", "Breakables and animal deaths (crates, barrels, crows...)")
         checkbox(settings, "sync_object_states", "Experimental: other state changes of those objects")
@@ -393,13 +409,15 @@ local function draw_diagnostics(session, game, session_status, puppet, perf)
                     we.flag_events or 0, we.cutscene_events or 0, we.skip_events or 0, we.trigger_events or 0,
                     we.trigger_not_event or 0,
                     session_status.world_last_not_event and (", last: " .. session_status.world_last_not_event) or ""))
-                imgui.text(("partner gimmick states applied here: %d (%d wait for their area)"):format(
-                    we.gimmicks_applied or 0, we.gimmicks_waiting or 0))
+                imgui.text(("partner gimmick states applied here: %d (%d wait for their area), %d reacted live, %d partner effects muted"):format(
+                    we.gimmicks_applied or 0, we.gimmicks_waiting or 0, we.gimmick_reactions or 0, we.muted_effects or 0))
             end
             sync_line("gimmicks", session_status.gimmicks)
             sync_line("doors", session_status.doors)
             sync_line("traps", session_status.traps)
             sync_line("mechanisms", session_status.mechanisms)
+            sync_line("objectives", session_status.purposes)
+            sync_line("ashley", session_status.ashley)
             sync_line("items given", session_status.gives)
             if session_status.saves then
                 local sv = session_status.saves

@@ -221,10 +221,10 @@ end)
 
 T.run("adapter_keeps_other_syncs_and_player_actions_to_themselves", function()
     local w = fresh()
-    -- A door (door_sync), a lever whose sequence kills the player, a portrayal with no gimmick
-    -- (an event: trigger_sync).
+    -- A door (door_sync), a lever whose sequence runs an effect our game cannot mute, a
+    -- portrayal with no gimmick (an event: trigger_sync).
     local door = mock.make_mechanism(G_DOOR, "chainsaw.GmDoor")
-    local deadly = mock.make_mechanism(G_FAR, "chainsaw.GmLever", nil, { "chainsaw.PlDieSettings.Param" })
+    local deadly = mock.make_mechanism(G_FAR, "chainsaw.GmLever", nil, { "chainsaw.TestMovieSettings.Param" })
     local go = mock.make_go("Event")
     go.guid = "22222222-0000-0000-0000-000000000009"
     local event = { port = mock.add_component(go, "chainsaw.PortrayalSettings", { __fields = {} }) }

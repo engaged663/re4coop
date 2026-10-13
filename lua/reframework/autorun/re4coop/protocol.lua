@@ -3,7 +3,7 @@
 
 local P = {}
 
-P.VERSION = 10           -- bump on any incompatible change to the layouts below
+P.VERSION = 11           -- bump on any incompatible change to the layouts below
 P.MOD_VERSION = "0.9.1"
 P.MAX_PAYLOAD = 1188     -- re4coop_net.max_payload(): biggest message one datagram carries
 
@@ -47,6 +47,31 @@ P.T = {
     SAVE = 38,          -- reliable, both directions: the sender's game saved (the receiver's game saves too)
     TRAPS = 39,         -- reliable, both directions: traps that went off in the sender's game (bear traps, sensor bombs)
     MECHANISMS = 40,    -- reliable, both directions: a gimmick's scripted sequence / a pushed object moved in the sender's game
+    -- Ashley (protocol 11): one Ashley for both games, run by one of them (ashley_sync.lua).
+    ASHLEY = 41,        -- unreliable, both directions: the owner's Ashley (~20 Hz, full state) / the other's presence (~2 Hz)
+    ASHLEY_OWNER = 42,  -- reliable, host -> client: whose game runs Ashley (or why a switch was refused)
+    ASHLEY_SWITCH = 43, -- reliable, client -> host: the client's player asked to switch Ashley over
+    PURPOSE = 44,       -- reliable, both directions: the sender's current objective (purpose_sync.lua)
+}
+
+-- ASHLEY flags.
+P.ASHLEY_FLAGS = {
+    PRESENT = 1,   -- the sender's game has an Ashley right now
+    OWNER = 2,     -- the sender's game runs her: the message carries her full state
+    ALIVE = 4,
+    KIDNAPPED = 8, -- carried off by an enemy
+    BUSY = 16,     -- she cannot change hands now (kidnapped, down, hiding, on a gimmick)
+    HIDDEN = 32,   -- the owner's game does not draw her
+}
+
+-- ASHLEY_OWNER reasons: a change, or why the asked-for switch did not happen.
+P.ASHLEY_REASON = {
+    CHANGED = 0,   -- Ashley now follows `owner` (asked by a player)
+    AUTO = 1,      -- the game that ran her has no Ashley any more: she went to the other one
+    COOLDOWN = 2,  -- refused: switched less than the cooldown ago
+    BUSY = 3,      -- refused: she is kidnapped, down or busy
+    ABSENT = 4,    -- refused: the other game has no Ashley here / is not playing
+    ANNOUNCE = 5,  -- the current owner, repeated (a client that just connected)
 }
 
 -- MECHANISMS: what moved. PORTRAYAL: PortrayalSettings.call(key) on that GameObject; PUSH: a
@@ -943,6 +968,45 @@ function P.encode_mechanisms(mechs)
     return out
 end
 
+-- Ashley's state (ashley_sync.lua). m = { time, epoch, flags (P.ASHLEY_FLAGS; OWNER is set from
+-- m.owner), pos, rot, hp, max_hp, layers = { {bank, id, frame, speed}, ... } } (layers and the
+-- full state only from the owner).
+local ASHLEY_FORMAT = "<BdBBfffI4i4i4B"
+function P.encode_ashley(m)
+    local pos = m.pos or { x = 0, y = 0, z = 0 }
+    local layers = m.layers or {}
+    local nl = math.min(#layers, P.MAX_ENEMY_LAYERS)
+    local parts = { string.pack(ASHLEY_FORMAT, P.T.ASHLEY, m.time or 0, (m.epoch or 0) & 0xFF, (m.flags or 0) & 0xFF,
+        pos.x, pos.y, pos.z, pack_rot(m.rot), clamp_i32(m.hp), clamp_i32(m.max_hp), nl) }
+    for i = 1, nl do
+        local l = layers[i]
+        parts[#parts + 1] = string.pack(ENEMY_LAYER, clamp_u32(l.bank), clamp_u32(l.id), l.frame or 0, l.speed or 1)
+    end
+    return table.concat(parts)
+end
+
+-- Host -> client: Ashley is run by `owner` (P.OWNER.HOST/CLIENT) since ownership epoch `epoch`;
+-- `cooldown`: seconds until she may switch again; `reason`: P.ASHLEY_REASON; `by`: the player
+-- who asked (P.OWNER).
+function P.encode_ashley_owner(m)
+    return string.pack("<BBBfBB", P.T.ASHLEY_OWNER, (m.owner or P.OWNER.HOST) & 0xFF, (m.epoch or 0) & 0xFF,
+        m.cooldown or 0, (m.reason or 0) & 0xFF, (m.by or P.OWNER.HOST) & 0xFF)
+end
+
+-- Client -> host: switch Ashley over (to the other game than the one running her at `epoch`).
+function P.encode_ashley_switch(m)
+    return string.pack("<BB", P.T.ASHLEY_SWITCH, (m.epoch or 0) & 0xFF)
+end
+
+-- The sender's current objective (chainsaw.gui.PurposeGuiItem). m = { id (PurposeID), priority,
+-- message (GUID string), display, delay, mediate }
+local PURPOSE_FORMAT = "<BI4i4c16ffB"
+function P.encode_purpose(m)
+    local g = P.guid_to_bytes(m.message) or string.rep("\0", 16)
+    return string.pack(PURPOSE_FORMAT, P.T.PURPOSE, clamp_u32(m.id), clamp_i32(m.priority), g, m.display or 0,
+        m.delay or 0, m.mediate and 1 or 0)
+end
+
 -- traps = { {guid, kind, event}, ... } -> array of messages
 function P.encode_traps(traps)
     local out = {}
@@ -1516,6 +1580,39 @@ decoders[P.T.DOORS] = function(data)
         doors[i] = { guid = guid, open = (flags & 1) ~= 0, hold = (flags & 2) ~= 0, attr = attr }
     end
     return { doors = doors }
+end
+
+decoders[P.T.ASHLEY] = function(data)
+    local _, time, epoch, flags, x, y, z, rot, hp, max_hp, nl, off = string.unpack(ASHLEY_FORMAT, data)
+    if nl > P.MAX_ENEMY_LAYERS then error("too many layers") end
+    local F = P.ASHLEY_FLAGS
+    local m = { time = time, epoch = epoch, flags = flags, pos = { x = x, y = y, z = z }, rot = unpack_rot(rot),
+        hp = hp, max_hp = max_hp, layers = {},
+        present = (flags & F.PRESENT) ~= 0, owner = (flags & F.OWNER) ~= 0, alive = (flags & F.ALIVE) ~= 0,
+        kidnapped = (flags & F.KIDNAPPED) ~= 0, busy = (flags & F.BUSY) ~= 0, hidden = (flags & F.HIDDEN) ~= 0 }
+    for l = 1, nl do
+        local bank, id, frame, speed
+        bank, id, frame, speed, off = string.unpack(ENEMY_LAYER, data, off)
+        m.layers[l] = { bank = bank, id = id, frame = frame, speed = speed }
+    end
+    return m
+end
+
+decoders[P.T.ASHLEY_OWNER] = function(data)
+    local _, owner, epoch, cooldown, reason, by = string.unpack("<BBBfBB", data)
+    if owner ~= P.OWNER.HOST and owner ~= P.OWNER.CLIENT then error("bad owner") end
+    return { owner = owner, epoch = epoch, cooldown = cooldown, reason = reason, by = by }
+end
+
+decoders[P.T.PURPOSE] = function(data)
+    local _, id, priority, g, display, delay, flags = string.unpack(PURPOSE_FORMAT, data)
+    return { id = id, priority = priority, message = P.guid_from_bytes(g), display = display, delay = delay,
+        mediate = (flags & 1) ~= 0 }
+end
+
+decoders[P.T.ASHLEY_SWITCH] = function(data)
+    local _, epoch = string.unpack("<BB", data)
+    return { epoch = epoch }
 end
 
 decoders[P.T.MECHANISMS] = function(data)

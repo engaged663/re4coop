@@ -49,6 +49,8 @@ Config.DEFAULTS = {
     sync_doors = true,        -- a door is open in both games while either player keeps it open
     sync_traps = true,        -- bear traps that close and sensor bombs that go off do so in both games
     sync_mechanisms = true,   -- levers, big doors, valves, shelves, carts...: what one player moves moves in both games
+    gimmick_reactions = true, -- a gimmick the partner set (item placed, lock opened, puzzle solved) reacts here too, as in their game
+    sync_purposes = true,     -- the objective on screen is the more advanced of the two games' (same chapter)
     give_items = true,        -- "Give to <partner>" in the attache case's item commands
     give_label = "Give to %s", -- its text (%s = the partner's name)
     sync_object_states = false, -- experimental: also mirror other state changes of those objects
@@ -56,6 +58,12 @@ Config.DEFAULTS = {
     cutscene_travel = true,   -- a partner who watched your cutscene from far away joins you when it ends
     sync_skips = true,        -- skipping a cutscene skips it in the partner's game too
     sync_triggers = true,     -- a scripted event one player walks into also runs in the partner's game
+
+    -- Ashley (ashley_sync.lua): one Ashley for both games. She starts with the host; the switch
+    -- key sends her to the other player.
+    ashley_coop = true,
+    ashley_key = 0x12,            -- Alt (Windows virtual-key code); a tap, not while aiming (Alt zooms scopes)
+    ashley_cooldown = 5.0,        -- seconds between two switches (the host's setting decides)
 
     -- joining and travelling
     auto_travel = true,         -- client: on joining, load the host's chapter and appear next to them
@@ -184,6 +192,9 @@ function Config.sanitize(cfg)
     cfg.gate_grace = math.max(0.2, math.min(10.0, cfg.gate_grace))
     cfg.gate_radius = math.max(3.0, math.min(50.0, cfg.gate_radius))
     cfg.coop_save_slot = math.max(1, math.min(20, math.floor(cfg.coop_save_slot)))
+    cfg.ashley_key = math.floor(cfg.ashley_key)
+    if cfg.ashley_key < 1 or cfg.ashley_key > 254 then cfg.ashley_key = Config.DEFAULTS.ashley_key end
+    cfg.ashley_cooldown = math.max(1.0, math.min(60.0, cfg.ashley_cooldown))
     return cfg
 end
 

@@ -987,6 +987,24 @@ T.run("a_death_without_the_partners_values_plays_at_once", function()
     T.eq(world.native_crashes, 0, "no crash")
 end)
 
+T.run("whether_a_level_enemy_is_dead_for_good_here", function()
+    -- A boss whose death is a cutscene leaves the enemy list eliminated (docs/RESEARCH.md 3.24).
+    local game, world = fresh_game()
+    local id = { category = 0, kind = 0, group = 4100, index = 7 } -- the first enemy of fresh_game
+    local code = mock.context_code(id)
+    T.eq(game:enemy_eliminated(code), false, "alive")
+    world.enemies[1].eliminated = true
+    T.eq(game:enemy_eliminated(code), true, "its live context says so")
+    -- Gone from the scene: its save backup tells.
+    local gone = { category = 0, kind = 0, group = 4100, index = 9 }
+    mock.add_backup(gone, true)
+    T.eq(game:enemy_eliminated(mock.context_code(gone)), true, "its backup says so")
+    local unloaded = { category = 0, kind = 0, group = 4100, index = 10 }
+    mock.add_backup(unloaded, false)
+    T.eq(game:enemy_eliminated(mock.context_code(unloaded)), false, "unloaded alive")
+    T.eq(game:enemy_eliminated(mock.context_code({ category = 0, kind = 0, group = 4100, index = 11 })), false, "unknown")
+end)
+
 T.run("an_enemy_our_save_had_dead_is_spawned_again_for_the_hosts_world", function()
     -- isNextSpawn invalidates the spawn param of an enemy whose save backup says it died; one
     -- the level has not permitted yet never spawns either. enemy_revive undoes both and the
