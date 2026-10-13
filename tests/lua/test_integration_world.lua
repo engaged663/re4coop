@@ -391,9 +391,9 @@ T.run("an_item_the_client_places_unlocks_the_hosts_slot_and_its_objective_crosse
     local slot = mock.make_live_gimmick("chainsaw.GmUseItem", ctx, guid, { keys = { [0x55E] = {
         callees = { "chainsaw.ReduceInventoryItemSettings.Param" }, end_callees = { "chainsaw.InventorySettings.Param" } } } })
     client.settings.gimmick_interval = 0.5
-    client_world.gimmicks["1:0:40200:41"] = { ctx = ctx, attr = "  ", triggers = {}, detected = false, acc = {} }
+    client_world.gimmicks["1:0:40200:41"] = { ctx = ctx, attr = "\0\0", triggers = {}, detected = false, acc = {} }
     T.wait_until(function() return false end, step, 1.5) -- the client's game has compared its table
-    client_world.gimmicks["1:0:40200:41"] = { ctx = ctx, attr = " ", triggers = {}, detected = false, acc = {} }
+    client_world.gimmicks["1:0:40200:41"] = { ctx = ctx, attr = "\1\0", triggers = {}, detected = false, acc = {} }
     local ok = T.wait_until(function() return slot:call("getGmFlag") == true end, step, 5)
     T.check(ok, "the host's slot is set")
     local played = 0
@@ -532,7 +532,12 @@ T.run("the_host_gives_the_client_an_item_from_its_case", function()
 end)
 
 T.run("an_enemy_next_to_the_client_is_run_by_the_clients_game", function()
-    local ok = T.wait_until(function() return client_game.puppet[1] == true end, step, 3)
+    -- The client far from the Ganado (the tests before left it anywhere: the cutscene test had
+    -- it stand on the Ganado, which may have given the Ganado to the client's game, and then
+    -- next to the host, where neither player is clearly closer). Going back to the host takes a
+    -- lasting lead and its time with the owner (docs/PROTOCOL.md, enemy ownership).
+    client_game.player.pos = { x = 80, y = 0, z = 0 }
+    local ok = T.wait_until(function() return client_game.puppet[1] == true end, step, 8)
     T.check(ok, "far from the client, its copy of the Ganado follows the host's")
     client_game.player.pos = { x = 21, y = 0, z = 1 } -- the client walks up to the Ganado
     ok = T.wait_until(function() return client_game.puppet[1] == nil and ganado.head.update_self == false end, step, 5)
