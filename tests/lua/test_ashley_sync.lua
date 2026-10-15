@@ -20,29 +20,67 @@ end
 -- A game with a player and its Ashley. Her AI (when she is not a puppet) runs to the player at
 -- 4 m/s and stops 1.5 m from them, playing a walk whose frame advances.
 local function make_game(player, ashley)
-    local g = { player = copy3(player), present = true, puppet = false, moves = 0, anims = 0, hp_sets = {}, warps = {},
+    local g = { player = copy3(player), present = true, puppet = false, visible = true, extras = {}, removed = {},
+        moves = 0, anims = 0, hp_sets = {}, warps = {},
         ash = { pos = copy3(ashley), rot = { x = 0, y = 0, z = 0, w = 1 }, hp = 600, max_hp = 600, alive = true,
             kidnapped = false, busy = false, frame = 0 } }
     function g:ashley_read(full)
         if not self.present then return nil end
         local a = self.ash
         local st = { pos = copy3(a.pos), rot = a.rot, hp = a.hp, max_hp = a.max_hp, alive = a.alive,
-            kidnapped = a.kidnapped, busy = a.busy or a.kidnapped or not a.alive }
-        if full then st.layers = { { bank = 7, id = a.walking and 20 or 10, frame = a.frame, speed = 1 } } end
+            kidnapped = a.kidnapped, busy = a.busy or a.kidnapped or not a.alive, hidden = a.hidden }
+        if full then
+            st.layers = { { bank = 7, id = a.walking and 20 or 10, frame = a.frame, speed = 1, blend = 1, mask = 0, mode = 0 },
+                { bank = 9, id = 3, frame = 0, speed = 1, blend = a.arm_blend or 0, mask = 12, mode = 1 } }
+            st.bank_type = a.bank_type or 0
+        end
         return st
     end
     function g:ashley_set_puppet(on)
         self.puppet = on
+        if not on then self.visible = true end -- (the adapter draws her again when she is released)
         return true
+    end
+    function g:ashley_set_visible(on)
+        self.visible = on
+        return true
+    end
+    -- Other Ashleys of this game: { key, doll }; removing one fails while `refuse` is set.
+    function g:ashley_extras()
+        return self.extras
+    end
+    function g:ashley_remove_extra(key)
+        if self.refuse then return false end
+        for i, e in ipairs(self.extras) do
+            if e.key == key then
+                table.remove(self.extras, i)
+                self.removed[#self.removed + 1] = key
+                return "erased"
+            end
+        end
+        return false
     end
     function g:ashley_set_transform(pos, rot)
         self.ash.pos, self.ash.rot = copy3(pos), rot
         self.moves = self.moves + 1
         return true
     end
-    function g:ashley_set_anim(layers)
+    function g:ashley_set_anim(layers, bank_type)
         self.ash.layers = layers
+        self.ash.set_bank_type = bank_type
         self.anims = self.anims + 1
+        if self.banks_applied ~= nil then self.anim_after_banks = true end
+        return true
+    end
+    -- Her dynamic motion banks (`dyn`: a list), and the owner's put on the puppet.
+    function g:ashley_read_banks()
+        if self.dyn == nil then return nil end
+        return { banks = self.dyn }
+    end
+    function g:ashley_set_banks(banks, key)
+        self.banks_applied = banks
+        self.banks_applied_key = key
+        self.bank_sets = (self.bank_sets or 0) + 1
         return true
     end
     function g:ashley_set_hp(hp)
@@ -104,7 +142,7 @@ local function make_pair(opts)
                 local g = self[who .. "_game"]
                 g:ai(DT)
                 self[who]:tick(self.now, g, { in_game = not g.loading, local_pos = g.player,
-                    local_rot = { x = 0, y = 0, z = 0, w = 1 }, unable = g.cutscene })
+                    local_rot = { x = 0, y = 0, z = 0, w = 1 }, unable = g.cutscene, cutscene = g.cutscene })
                 self[who]:frame(self.now, g)
             end
         end
@@ -361,11 +399,223 @@ end)
 -- The real adapter (game_ashley.lua) against the mocked RE4.
 -------------------------------------------------------------------------------
 
+T.run("the_puppet_plays_every_layer_with_the_owners_banks", function()
+    local pair = make_pair()
+    local h, c = pair.host_game, pair.client_game
+    h.dyn = { { path = "_chainsaw/animation/ch2a1z0/gimmick_ladder.motlist", bank_id = 301, bank_type = 0,
+        mask_bit = 0, order = 5, flags = 1 } }
+    h.ash.bank_type = 1048576 -- Battle
+    h.ash.arm_blend = 0.75
+    pair:seconds(1)
+    T.eq(c.banks_applied and #c.banks_applied, 1, "the host's dynamic motion bank reached the client's puppet")
+    T.eq(c.banks_applied[1].path, "_chainsaw/animation/ch2a1z0/gimmick_ladder.motlist", "its motlist")
+    T.eq(c.banks_applied[1].bank_id, 301, "the bank it stands for")
+    T.eq(c.banks_applied[1].order, 5, "its order")
+    T.eq(c.banks_applied[1].flags, 1, "its overwrite flags")
+    T.eq(c.ash.set_bank_type, 1048576, "the host's bank variant")
+    local l = c.ash.layers
+    T.eq(#l, 2, "every layer")
+    T.eq(l[2].bank, 9, "the upper-body layer's motion")
+    T.near(l[2].blend, 0.75, 1e-4, "its blend rate")
+    T.eq(l[2].mask, 12, "its joint mask")
+    T.eq(l[2].mode, 1, "its blend mode")
+    T.eq(pair.host.counters.banks_sent, 1, "sent once")
+    -- Unchanged: not again until the resend; changed: at once.
+    pair:seconds(3)
+    T.eq(pair.host.counters.banks_sent, 1, "nothing new")
+    h.dyn[2] = { path = "_chainsaw/animation/ch2a1z0/hide.motlist", bank_id = 302, bank_type = 0, mask_bit = 0,
+        order = 0, flags = 0 }
+    pair:seconds(1)
+    T.eq(pair.host.counters.banks_sent, 2, "a new bank: sent")
+    T.eq(#c.banks_applied, 2, "and taken")
+    pair:seconds(10)
+    T.eq(pair.host.counters.banks_sent, 3, "again after a while (a partner that just joined)")
+    -- She goes over: the client's own banks are sent now, the host takes them.
+    c.dyn = { { path = "_chainsaw/animation/ch2a1z0/client.motlist", bank_id = 400, bank_type = 0, mask_bit = 0,
+        order = 0, flags = 0 } }
+    pair.host:request(pair.now)
+    pair:seconds(1.5)
+    T.check(pair.client:runs_here(), "the client's game runs her")
+    T.eq(h.banks_applied and h.banks_applied[1].bank_id, 400, "the host's puppet has the client's banks")
+    -- Back to the host (its banks unchanged): sent again at once for the new switch.
+    c.banks_applied = nil
+    pair:seconds(5)
+    pair.host:request(pair.now)
+    pair:seconds(1)
+    T.check(pair.host:runs_here(), "back with the host")
+    T.eq(c.banks_applied and #c.banks_applied, 2, "the client's puppet has the host's banks again at once")
+    -- Over to the client again, whose game shows no banks now: the host's puppet keeps none of
+    -- the client's old ones.
+    c.dyn = nil
+    pair:seconds(5)
+    pair.host:request(pair.now)
+    pair:seconds(0.5)
+    local sets = h.bank_sets
+    pair:seconds(1)
+    T.eq(h.bank_sets, sets, "no old banks are put on the host's puppet")
+    -- A banks message of an old switch is not taken.
+    pair.host:on_message({ type = P.T.ASHLEY_BANKS, epoch = (pair.host.epoch + 1) & 0xFF, banks = { { path = "x", bank_id = 1,
+        bank_type = 0, mask_bit = 0, order = 0, flags = 0 } } }, pair.now)
+    T.eq(pair.host.banks, nil, "another switch's banks: ignored")
+end)
+
+T.run("ashley_animation_messages_round_trip", function()
+    local m = assert(P.decode(P.encode_ashley({ time = 3.5, epoch = 2, flags = P.ASHLEY_FLAGS.PRESENT | P.ASHLEY_FLAGS.OWNER,
+        pos = { x = 1, y = 2, z = 3 }, rot = { x = 0, y = 0, z = 0, w = 1 }, hp = 500, max_hp = 600, bank_type = 1048577,
+        layers = { { bank = 7, id = 20, frame = 12.5, speed = 1, blend = 1, mask = 0, mode = 0 },
+            { bank = 9, id = 3, frame = 2, speed = 0.5, blend = 0.25, mask = 77, mode = 2 },
+            { bank = 11, id = 1, frame = 0, speed = 1 } } })))
+    T.eq(m.bank_type, 1048577, "her bank variant")
+    T.eq(#m.layers, 3, "three layers")
+    T.near(m.layers[2].blend, 0.25, 1e-6, "blend rate")
+    T.eq(m.layers[2].mask, 77, "joint mask")
+    T.eq(m.layers[2].mode, 2, "blend mode")
+    T.eq(m.layers[3].blend, nil, "a layer without them stays without them")
+    T.eq(m.layers[3].mask, nil, "no mask")
+    T.eq(m.layers[3].mode, nil, "no mode")
+    local many = {}
+    for i = 1, 12 do many[i] = { bank = i, id = i, frame = 0, speed = 1 } end
+    m = assert(P.decode(P.encode_ashley({ time = 0, epoch = 0, flags = 3, layers = many })))
+    T.eq(#m.layers, P.MAX_ASHLEY_LAYERS, "at most eight layers")
+    local banks = {}
+    for i = 1, 20 do
+        banks[i] = { path = ("_chainsaw/animation/ch2a1z0/bank_%02d_with_a_long_enough_name.motlist"):format(i),
+            bank_id = 300 + i, bank_type = i, mask_bit = 2 * i, order = -i, flags = i % 8 }
+    end
+    local bytes = P.encode_ashley_banks({ epoch = 7, banks = banks })
+    T.check(#bytes > P.MAX_PAYLOAD, "bigger than one datagram (sent in fragments)")
+    local b = assert(P.decode(bytes))
+    T.eq(b.type, P.T.ASHLEY_BANKS, "the banks message")
+    T.eq(b.epoch, 7, "its epoch")
+    T.eq(#b.banks, 20, "every bank")
+    T.eq(b.banks[20].path, banks[20].path, "the motlist")
+    T.eq(b.banks[20].bank_id, 320, "the bank")
+    T.eq(b.banks[20].bank_type, 20, "its type")
+    T.eq(b.banks[20].mask_bit, 40, "its mask bit")
+    T.eq(b.banks[20].order, -20, "its order")
+    T.eq(b.banks[20].flags, 4, "its flags")
+    T.eq(#assert(P.decode(P.encode_ashley_banks({ epoch = 1, banks = {} }))).banks, 0, "none")
+    -- An Ashley layer's blend rate, mask and mode travel through the interpolation.
+    local Interp = require("re4coop.interp")
+    local out = Interp.blend_layers({ pos = { x = 0, y = 0, z = 0 }, layers = { { bank = 1, id = 2, frame = 0, speed = 1, blend = 0, mask = 5, mode = 1 } } },
+        { pos = { x = 0, y = 0, z = 0 }, layers = { { bank = 1, id = 2, frame = 10, speed = 1, blend = 1, mask = 5, mode = 1 } } }, 0.5)
+    T.near(out.layers[1].blend, 0.5, 1e-6, "the blend rate blends")
+    T.eq(out.layers[1].mask, 5, "the mask")
+    T.eq(out.layers[1].mode, 1, "the mode")
+end)
+
+T.run("the_game_not_running_her_never_shows_an_ashley_of_its_own", function()
+    -- The host's game is still loading: it has not said where she is yet.
+    local pair = make_pair({ client_ashley = { x = 40, y = 0, z = 0 } })
+    local h, c = pair.host_game, pair.client_game
+    h.loading = true
+    pair:step(1)
+    T.eq(c.puppet, true, "a puppet at once, before the host's game has said where she is")
+    T.eq(c.visible, false, "and not drawn until it has")
+    local x = c.ash.pos.x -- (her AI had one frame before the sync saw her)
+    pair:seconds(1)
+    T.eq(c.ash.pos.x, x, "she does not walk to the client's player meanwhile")
+    h.loading = false
+    pair:seconds(0.5)
+    T.eq(c.visible, true, "drawn once the host's game said where she is")
+    T.near(dist(c.ash.pos, h.ash.pos), 0, 0.05, "there")
+    -- The host's game does not draw hers (a scripted moment): neither does the client's.
+    h.ash.hidden = true
+    pair:seconds(0.5)
+    T.eq(c.visible, false, "hidden like the host's")
+    h.ash.hidden = false
+    pair:seconds(0.5)
+    T.eq(c.visible, true, "drawn again")
+    -- The host's game pauses its reports (a menu, a load): she stays as she was.
+    h.loading = true
+    pair:seconds(3)
+    T.eq(c.visible, true, "still drawn where she was")
+    T.eq(c.puppet, true, "still a puppet")
+    h.loading = false
+    -- The host's game has no Ashley now: the client's is not drawn, until she goes over.
+    h.present = false
+    pair:seconds(1)
+    T.eq(c.visible, false, "the host's game has none: not drawn here either")
+    T.eq(c.puppet, true, "and still no Ashley of the client's own")
+    pair:seconds(5)
+    T.check(pair.client:runs_here(), "she went over to the client")
+    T.eq(c.puppet, false, "the client's game runs her")
+    T.eq(c.visible, true, "drawn")
+    T.check(pair.client.counters.hidden >= 2, "counted")
+end)
+
+T.run("another_ashley_is_removed_in_both_games", function()
+    local pair = make_pair()
+    local h, c = pair.host_game, pair.client_game
+    pair:seconds(1)
+    h.extras[1] = { key = "doll", doll = true }
+    c.extras[1] = { key = "second", doll = false }
+    pair:seconds(0.5)
+    T.eq(#h.removed + #c.removed, 0, "not at once (a reload may hold two a moment)")
+    pair:seconds(1)
+    T.eq(h.removed[1], "doll", "the host's game removed its other Ashley")
+    T.eq(c.removed[1], "second", "and the client's game its own")
+    T.eq(pair.host.counters.extras, 1, "counted")
+    T.eq(pair.client.counters.extras, 1, "counted")
+    -- One that comes and goes within the moment stays.
+    c.extras[1] = { key = "blink", doll = false }
+    pair:seconds(0.8)
+    c.extras = {}
+    pair:step(1)
+    c.extras[1] = { key = "blink", doll = false }
+    pair:seconds(0.8)
+    T.eq(#c.removed, 1, "a fresh appearance waits its moment again")
+    pair:seconds(0.5)
+    T.eq(c.removed[2], "blink", "then it is removed")
+    -- Not during a cutscene of ours (it may use one of its own).
+    h.cutscene = true
+    h.extras[1] = { key = "scene", doll = true }
+    pair:seconds(3)
+    T.eq(#h.removed, 1, "left alone during the cutscene")
+    h.cutscene = false
+    pair:seconds(0.5)
+    T.eq(h.removed[2], "scene", "removed after it")
+    -- A removal the game refused is tried again, not every tick.
+    c.refuse = true
+    c.extras[1] = { key = "stubborn", doll = true }
+    pair:seconds(1.5)
+    c.refuse = false
+    pair:seconds(1)
+    T.eq(c.removed[3], nil, "waits before trying again")
+    pair:seconds(1.5)
+    T.eq(c.removed[3], "stubborn", "tried again")
+end)
+
+T.run("an_ashley_alone_in_the_world_is_left_alone", function()
+    -- Neither game has her as a partner (a part of the story before she joins): a scripted
+    -- Ashley is the only one there is.
+    local pair = make_pair()
+    local h, c = pair.host_game, pair.client_game
+    h.present, c.present = false, false
+    h.extras[1] = { key = "waiting", doll = true }
+    c.extras[1] = { key = "waiting", doll = true }
+    pair:seconds(4)
+    T.eq(#h.removed + #c.removed, 0, "no shared Ashley: the scripted one stays in both")
+    -- Switched off: nothing is removed.
+    local off = make_pair({ settings = { ashley_single = false } })
+    off.host_game.extras[1] = { key = "doll", doll = true }
+    off:seconds(3)
+    T.eq(#off.host_game.removed, 0, "switched off")
+end)
+
+-- The key the adapter gives a character (its object address).
+local function R_addr(obj)
+    return require("re4coop.reflect").address(obj)
+end
+
+local test_clock = 0 -- the adapter's clock (seconds)
+
 local function fresh_game()
     package.loaded["re4coop.game"] = nil
     local world = mock.install()
     world.player = mock.make_player({ x = 0, y = 0, z = 0 })
-    return require("re4coop.game").new(function() end, function() return 0 end), world
+    test_clock = 0
+    return require("re4coop.game").new(function() end, function() return test_clock end), world
 end
 
 T.run("our_game_finds_ashley_among_the_partners", function()
@@ -459,6 +709,200 @@ T.run("a_puppet_keeps_her_own_no_damage_and_survives_a_reload", function()
     T.eq(again.head.update_self, false, "her head off")
     game:ashley_restore()
     T.eq(again.head.update_self, true, "the session ends: she runs again")
+end)
+
+T.run("our_game_removes_any_other_ashley_the_games_way", function()
+    local game, world = fresh_game()
+    local ashley = mock.make_ashley({ x = 2, y = 0, z = 0 }, 600)
+    local second = mock.make_ashley({ x = 8, y = 0, z = 0 }, 600)
+    second.spawn_param = mock.new("chainsaw.CharacterSpawnParam", { ctx = second, owner = mock.make_go("spawner") })
+    local doll = mock.make_doll_ashley({ x = 20, y = 0, z = 0 }, true)
+    local loose = mock.make_doll_ashley({ x = 30, y = 0, z = 0 }, false)
+    local child = mock.make_go("ch2a1z0_hair")
+    mock.set_parent(child.transform, loose.body.transform)
+    -- Only scripted ones: none of them is our Ashley.
+    world.partners, world.partner, world.dolls = {}, nil, { doll }
+    T.eq(game:ashley_read(false), nil, "a doll is never our Ashley")
+    T.eq(#game:ashley_extras(), 1, "but it is another one")
+    world.partners = { ashley, second }
+    world.partner = ashley
+    world.dolls = { doll, loose }
+    T.check(game:ashley_set_puppet(true), "ours is a puppet")
+    local extras = game:ashley_extras()
+    T.eq(#extras, 3, "the second partner and both dolls")
+    T.eq(extras[1].doll, false, "a partner")
+    T.eq(extras[2].doll, true, "a doll")
+    -- Ours stays ours even when the game lists another Ashley first.
+    world.partners = { second, ashley }
+    T.eq(game:ashley_context(), ashley, "the one we use")
+    T.eq(#game:ashley_extras(), 3, "the same three")
+    T.eq(game:ashley_remove_extra(R_addr(second)), "erased", "the second partner")
+    T.eq(second.spawn_param.invalid, true, "through its spawn param (CharacterSpawnParam.invalidateSpawn)")
+    T.eq(#world.partners, 1, "gone from the game")
+    T.eq(world.partners[1], ashley, "ours is still there")
+    T.eq(game:ashley_remove_extra(R_addr(doll)), "erased", "the doll with a spawn param")
+    T.eq(world.dolls[1], loose, "gone too")
+    -- Without a spawn param: it can no longer think, be grabbed, hurt or seen.
+    T.eq(game:ashley_remove_extra(R_addr(loose)), "hidden", "the doll without one")
+    T.eq(loose.head.update_self, false, "its head stops")
+    T.eq(loose.no_damage, true, "no damage")
+    T.eq(loose.body.draw_self, false, "not drawn")
+    T.eq(child.draw_self, false, "nor what hangs from it")
+    T.check(game:capabilities().ashley_extra.ok, "shown in Diagnostics")
+    T.eq(#game:ashley_extras(), 1, "only the hidden doll is left in the lists")
+    T.eq(game:ashley_context(), ashley, "ours untouched")
+    T.eq(ashley.head.update_self, false, "still our puppet")
+    -- Never our own Ashley's spawn param, even if another Ashley points at it.
+    local twin = mock.make_ashley({ x = 9, y = 0, z = 0 }, 600)
+    ashley.spawn_param = mock.new("chainsaw.CharacterSpawnParam", { ctx = ashley, owner = mock.make_go("spawner") })
+    twin.spawn_param = ashley.spawn_param
+    world.partners = { ashley, twin }
+    game:ashley_extras()
+    T.eq(game:ashley_remove_extra(R_addr(twin)), "hidden", "hidden instead")
+    T.check(ashley.spawn_param.invalid ~= true, "ours is never despawned")
+end)
+
+T.run("a_puppet_ashley_is_hidden_and_drawn_again", function()
+    local game, world = fresh_game()
+    local ashley = mock.make_ashley({ x = 2, y = 0, z = 0 }, 600)
+    local hair, off = mock.make_go("ch2a1z0_hair"), mock.make_go("ch2a1z0_bag")
+    mock.set_parent(hair.transform, ashley.body.transform)
+    mock.set_parent(off.transform, ashley.body.transform)
+    off.draw_self = false -- something the game does not draw
+    world.partner = ashley
+    game:ashley_set_puppet(true)
+    T.check(game:ashley_set_visible(false), "hidden")
+    T.check(game:ashley_set_visible(false), "asked again every tick")
+    T.eq(ashley.body.draw_self, false, "her body")
+    T.eq(hair.draw_self, false, "and what hangs from it")
+    T.check(game:capabilities().ashley_hide.ok, "shown in Diagnostics")
+    T.check(game:ashley_set_visible(true), "drawn")
+    T.check(ashley.body.draw_self ~= false and hair.draw_self ~= false, "again")
+    T.eq(off.draw_self, false, "what the game had hidden stays hidden")
+    game:ashley_set_visible(false)
+    game:ashley_set_puppet(false)
+    T.check(ashley.body.draw_self ~= false, "released: drawn again")
+    game:ashley_set_puppet(true)
+    game:ashley_set_visible(false)
+    game:ashley_restore()
+    T.check(ashley.body.draw_self ~= false, "the session ends: drawn again")
+end)
+
+-- Her motion as the game sets it up: two layers, a bank (100) every variant has, one (120) only
+-- the Battle variant has, and none of bank 301 (it comes in a dynamic bank).
+local function strict_ashley(world, with_controller)
+    local ashley = mock.make_ashley({ x = 2, y = 0, z = 0 }, 600)
+    local motion = mock.component(ashley.body, "via.motion.Motion")
+    motion.banks = { [100] = 0, [120] = 1048576 }
+    if with_controller then mock.add_component(ashley.body, "chainsaw.MotionController", { motion = motion }) end
+    world.partner = ashley
+    return ashley, motion
+end
+
+T.run("a_puppet_ashley_plays_every_motion_hers_can", function()
+    local game, world = fresh_game()
+    local ashley, motion = strict_ashley(world, true)
+    -- The owner's side: every layer in full, the bank variant, the dynamic banks.
+    motion.bank_type = 64
+    motion.layers[2].blend, motion.layers[2].mask, motion.layers[2].mode = 0.5, 33, 1
+    motion.dynamic = { mock.make_dynamic_bank("_chainsaw/animation/ch2a1z0/own.motlist", 250, { order = 3, ow_id = true }) }
+    local st = game:ashley_read(true)
+    T.eq(st.bank_type, 64, "her bank variant")
+    T.eq(#st.layers, 2, "both layers")
+    T.near(st.layers[2].blend, 0.5, 1e-6, "blend rate")
+    T.eq(st.layers[2].mask, 33, "joint mask")
+    T.eq(st.layers[2].mode, 1, "blend mode")
+    local r = game:ashley_read_banks()
+    T.eq(#r.banks, 1, "her dynamic bank")
+    T.eq(r.banks[1].path, "_chainsaw/animation/ch2a1z0/own.motlist", "its motlist")
+    T.eq(r.banks[1].bank_id, 250, "the bank it stands for")
+    T.eq(r.banks[1].order, 3, "its order")
+    T.eq(r.banks[1].flags, 1, "OverwriteBankID")
+    T.check(r.key ~= nil and r.key ~= "", "a key for the list")
+    motion.dynamic = {}
+    motion.bank_type = 0
+    -- The puppet's side.
+    game:ashley_set_puppet(true)
+    local layer = motion.layers[1]
+    T.check(game:ashley_set_anim({ { bank = 120, id = 5, frame = 3, speed = 1 } }, 1048576), "a Battle motion")
+    T.eq(motion.bank_type, 1048576, "her bank variant first")
+    T.eq(layer.bank, 120, "so the Battle motion is found")
+    T.eq(layer.motion, 5, "and played")
+    -- A motion of a bank only a dynamic bank brings: not found until the bank is here.
+    local wanted = { { bank = 301, id = 9, frame = 0, speed = 1 } }
+    game:ashley_set_anim(wanted, 1048576)
+    T.eq(layer.motion, 5, "not found here yet")
+    game:ashley_set_anim(wanted, 1048576)
+    T.eq(game.ashley_anim.missing, 1, "counted once")
+    T.check(game.ashley_anim.last_missing:find("bank 301 motion 9") ~= nil, "and named for Diagnostics")
+    local tries = layer.not_found
+    game:ashley_set_anim(wanted, 1048576)
+    T.eq(layer.not_found, tries, "not asked again every tick")
+    T.eq(game.ashley_anim.missing, 1, "still counted once")
+    local banks = { { path = "_chainsaw/animation/ch2a1z0/gimmick_ladder.motlist", bank_id = 301, bank_type = 0, mask_bit = 0,
+        order = 5, flags = 1 } }
+    T.check(game:ashley_set_banks(banks, "k1"), "the owner's banks")
+    T.eq(#motion.dynamic, 1, "added to her motion")
+    T.eq(mock.component(ashley.body, "chainsaw.MotionController").adds, 1, "through her MotionController")
+    local added = motion.dynamic[1]
+    T.eq(added.motlist:call("get_ResourcePath"), "_chainsaw/animation/ch2a1z0/gimmick_ladder.motlist", "its motlist loaded")
+    T.eq(added.bank_id, 301, "standing for bank 301")
+    T.eq(added.order, 5, "in its order")
+    T.eq(added.ow_id, true, "overwriting as the owner's")
+    T.check(game:capabilities().ashley_banks.ok, "shown in Diagnostics")
+    T.check(game:ashley_set_banks(banks, "k1"), "the same again")
+    T.eq(#motion.dynamic, 1, "nothing added twice")
+    test_clock = test_clock + 0.6
+    game:ashley_set_anim(wanted, 1048576)
+    T.eq(layer.motion, 9, "now it plays")
+    -- The upper-body layer's blend rate, joint mask and blend mode.
+    game:ashley_set_anim({ { bank = 301, id = 9, frame = 0, speed = 1 }, { bank = 100, id = 50, frame = 0, speed = 1, blend = 0.25,
+        mask = 7, mode = 2 } }, 1048576)
+    local arm = motion.layers[2]
+    T.near(arm.blend, 0.25, 1e-6, "blend rate")
+    T.eq(arm.mask, 7, "joint mask")
+    T.eq(arm.mode, 2, "blend mode")
+    T.check(game:capabilities().ashley_motion.ok, "shown in Diagnostics")
+    -- A bank the owner no longer has goes; one our own game gave her stays.
+    local own = mock.make_dynamic_bank("_chainsaw/animation/ch2a1z0/costume.motlist", 260)
+    motion.dynamic[#motion.dynamic + 1] = own
+    -- One her own game gave her too is not added twice.
+    T.check(game:ashley_set_banks({ banks[1], { path = "_chainsaw/animation/ch2a1z0/costume.motlist", bank_id = 260,
+        bank_type = 0, mask_bit = 0, order = 0, flags = 0 } }, "k1b"), "the owner has the costume bank too")
+    T.eq(#motion.dynamic, 2, "it is already here: not added again")
+    T.check(game:ashley_set_banks({}, "k2"), "the owner's banks changed")
+    T.eq(#motion.dynamic, 1, "ours went")
+    T.eq(motion.dynamic[1], own, "her own game's stayed")
+    game:ashley_set_banks(banks, "k3")
+    T.eq(#motion.dynamic, 2, "added again")
+    -- She stops being a puppet: what we added goes, her bank variant comes back.
+    game:ashley_set_puppet(false)
+    T.eq(#motion.dynamic, 1, "the banks we added are gone")
+    T.eq(motion.dynamic[1], own, "hers stay")
+    T.eq(motion.bank_type, 0, "her bank variant as her game had it")
+end)
+
+T.run("without_a_motion_controller_the_banks_go_straight_into_her_motion", function()
+    local game, world = fresh_game()
+    local ashley, motion = strict_ashley(world, false)
+    local own = mock.make_dynamic_bank("_chainsaw/animation/ch2a1z0/costume.motlist", 260)
+    motion.dynamic = { own }
+    game:ashley_set_puppet(true)
+    local banks = { { path = "a.motlist", bank_id = 301, bank_type = 0, mask_bit = 0, order = 0, flags = 0 },
+        { path = "b.motlist", bank_id = 302, bank_type = 0, mask_bit = 0, order = 0, flags = 0 } }
+    T.check(game:ashley_set_banks(banks, "k"), "added")
+    T.eq(#motion.dynamic, 3, "into her motion's own list")
+    T.eq(motion.dynamic[1], own, "after hers")
+    T.check((motion.dynamic_set or 0) >= 1, "through setDynamicMotionBankCount / setDynamicMotionBank")
+    -- The one in the middle of the list goes (the list closes up behind it).
+    local middle = motion.dynamic[2].bank_id
+    local keep = middle == 301 and banks[2] or banks[1]
+    T.check(game:ashley_set_banks({ keep }, "k2"), "one less")
+    T.eq(#motion.dynamic, 2, "taken out")
+    T.eq(motion.dynamic[1], own, "hers first")
+    T.eq(motion.dynamic[2].bank_id, keep.bank_id, "the other kept")
+    game:ashley_restore()
+    T.eq(#motion.dynamic, 1, "the session ends: only hers")
 end)
 
 T.run("taking_her_over_far_away_uses_the_games_own_teleport", function()

@@ -17,14 +17,32 @@
 -- If the game running her has no Ashley for a while (a part of the story without her there)
 -- while the other game has her, she goes over by herself.
 --
+-- Her animation in full: the owner sends every layer of her motion (motion, frame, speed, blend
+-- rate, joint mask, blend mode) and her motion's bank variant at ~20 Hz, and the extra motion
+-- banks her motion has loaded whenever they change (ASHLEY_BANKS, and every 10 s); the puppet
+-- loads the same banks and takes the same variant before it plays her motions, so every motion
+-- of hers can be found there, not only walking.
+--
+-- Never a second Ashley. The game that does not run her makes its own Ashley a puppet as soon
+-- as it has one (she never follows that game's player on her own), and draws her only where the
+-- owner's Ashley is: hidden until the owner's game has said where she is, and while the owner's
+-- game has none or does not draw her. And in both games any other character of her kind (a
+-- scripted "doll" Ashley, a second partner) is removed once it has stayed a moment, while the
+-- shared Ashley exists and our player is not in a cutscene (which may use one of its own).
+--
 -- Adapter contract (game):
---   game:ashley_read(full) -> { pos, rot, hp, max_hp, alive, kidnapped, busy, hidden, layers } | nil
---                             (nil: no Ashley in our game now; layers only when `full`)
+--   game:ashley_read(full) -> { pos, rot, hp, max_hp, alive, kidnapped, busy, hidden, layers, bank_type } | nil
+--                             (nil: no Ashley in our game now; layers and bank_type only when `full`)
 --   game:ashley_set_puppet(on) -> bool   (on: also asked again every tick; re-asserts the locks)
 --   game:ashley_set_transform(pos, rot) -> bool
---   game:ashley_set_anim(layers) -> bool
+--   game:ashley_set_anim(layers, bank_type) -> bool
+--   game:ashley_read_banks() -> { banks, key } | nil     (optional: her dynamic motion banks)
+--   game:ashley_set_banks(banks, key) -> bool           (optional: the puppet gets the owner's)
 --   game:ashley_set_hp(hp) -> bool        (never kills)
 --   game:ashley_warp(pos, rot) -> bool    (the game's own character teleport)
+--   game:ashley_set_visible(on) -> bool   (optional: our Ashley drawn or not)
+--   game:ashley_extras() -> { { key, doll }, ... }   (optional: the other Ashleys of our game)
+--   game:ashley_remove_extra(key) -> "erased"|"hidden"|false
 
 local Interp = require("re4coop.interp")
 
@@ -41,11 +59,25 @@ local WARP_BEHIND = 1.5       -- metres behind our player she lands
 local MIN_MOVE = 0.01
 local MIN_TURN = 1e-5
 local DEFAULT_COOLDOWN = 5.0
+local BANKS_READ = 0.5         -- seconds between two looks at the owner's dynamic motion banks
+local BANKS_RESEND = 10.0     -- the owner's banks again this often (a partner that just joined)
+local EXTRA_GRACE = 1.0       -- another Ashley stays this long before it is removed (a reload may hold two a moment)
+local EXTRA_RETRY = 2.0       -- seconds between attempts to remove the same one
 
 local function dist(a, b)
     local dx, dy, dz = a.x - b.x, a.y - b.y, a.z - b.z
     return math.sqrt(dx * dx + dy * dy + dz * dz)
 end
+
+-- A list of dynamic motion banks as one string (equal lists, equal keys).
+local function banks_key(banks)
+    local keys = {}
+    for i, b in ipairs(banks or {}) do
+        keys[i] = ("%s|%d|%d|%d"):format(b.path or "", b.bank_id or 0, b.bank_type or 0, b.mask_bit or 0)
+    end
+    return table.concat(keys, ";")
+end
+AshleySync.banks_key = banks_key
 
 local function rot_delta(a, b)
     if a == nil or b == nil then return 1 end
@@ -61,6 +93,7 @@ function AshleySync.new(opts)
     self.P = opts.protocol
     self.settings = opts.settings or {}
     self.send = opts.send
+    self.send_large = opts.send_large or function(bytes) return self.send(bytes, true) end
     self.log = opts.log or function() end
     self.notify = opts.notify or function() end
     self.partner_name = opts.partner_name or function() return "your partner" end
@@ -87,8 +120,14 @@ function AshleySync:reset()
     self.last_presence = -math.huge
     self.owner_absent_since = nil
     self.mirror_pos, self.mirror_rot = nil, nil
+    self.shown = nil         -- our puppet drawn (nil: not decided yet)
+    self.banks, self.banks_key = nil, nil -- the owner's dynamic motion banks (when the partner runs her)
+    self.sent_banks_key, self.sent_banks_epoch = nil, nil
+    self.last_banks_read, self.last_banks_sent = -math.huge, -math.huge
+    self.anim = nil          -- our game's animation stats for the puppet
+    self.extras_seen = {}    -- another Ashley of our game -> { since, tried, done }
     self.counters = { sent = 0, received = 0, switches = 0, refused = 0, requests = 0, stale = 0, puppets = 0,
-        warps = 0, moves = 0, anims = 0, auto = 0 }
+        warps = 0, moves = 0, anims = 0, auto = 0, hidden = 0, extras = 0, banks_sent = 0, banks_received = 0 }
 end
 
 function AshleySync:enabled()
@@ -143,6 +182,7 @@ function AshleySync:set_owner(owner, epoch, now)
         self.newest = nil
         self.mirror_pos, self.mirror_rot = nil, nil
     end
+    self.banks, self.banks_key = nil, nil -- (the previous owner's)
     return true
 end
 
@@ -244,11 +284,18 @@ function AshleySync:on_message(m, now)
         self.counters.received = self.counters.received + 1
         self.partner = { present = m.present, busy = m.busy, owner = m.owner, time = now }
         if m.owner and not self:runs_here() and m.epoch == self.epoch and m.present then
-            self.interp:push(m.time, now, { pos = m.pos, rot = m.rot, layers = m.layers, hp = m.hp, hidden = m.hidden })
+            self.interp:push(m.time, now, { pos = m.pos, rot = m.rot, layers = m.layers, hp = m.hp, hidden = m.hidden,
+                bank_type = m.bank_type })
             self.newest = m
             self.newest_at = now
         elseif m.owner and m.epoch ~= self.epoch then
             self.counters.stale = self.counters.stale + 1
+        end
+        return true
+    elseif m.type == T.ASHLEY_BANKS then
+        if not self:runs_here() and m.epoch == self.epoch then
+            self.counters.banks_received = self.counters.banks_received + 1
+            self.banks, self.banks_key = m.banks, banks_key(m.banks)
         end
         return true
     elseif m.type == T.ASHLEY_OWNER then
@@ -315,11 +362,13 @@ function AshleySync:tick(now, game, ctx)
     end
     -- Loading, a menu: we say nothing (a game that is only loading has not lost her).
     if not ctx.in_game then return end
+    self:guard_extras(now, game, ctx, st)
 
     if here then
         if self.puppet then
             game:ashley_set_puppet(false)
             self.puppet = false
+            self.shown = nil
         end
         if self.took_over and st ~= nil then
             self.took_over = false
@@ -328,6 +377,7 @@ function AshleySync:tick(now, game, ctx)
                 self.counters.warps = self.counters.warps + 1
             end
         end
+        self:share_banks(now, game, st)
         if st ~= nil and now - self.last_state >= 1.0 / STATE_HZ then
             self.last_state = now
             self:send_state(now, st, F.OWNER)
@@ -338,27 +388,97 @@ function AshleySync:tick(now, game, ctx)
         return
     end
 
-    -- The partner's game runs her: ours follows theirs.
+    -- The partner's game runs her: ours is a puppet from the moment it exists (never an Ashley
+    -- of our own following our player) and follows theirs.
     local fresh = self.newest_at ~= nil and now - self.newest_at < STALE
-    if st ~= nil and (self.puppet or fresh) then
-        if game:ashley_set_puppet(true) then
-            if not self.puppet then self.counters.puppets = self.counters.puppets + 1 end
-            self.puppet = true
+    if st ~= nil and game:ashley_set_puppet(true) then
+        if not self.puppet then self.counters.puppets = self.counters.puppets + 1 end
+        self.puppet = true
+    end
+    if self.puppet and st ~= nil and game.ashley_set_visible ~= nil then
+        local show = self:puppet_shown()
+        if game:ashley_set_visible(show) then
+            if not show and self.shown ~= false then self.counters.hidden = self.counters.hidden + 1 end
+            self.shown = show
         end
+    end
+    if self.puppet and st ~= nil and self.banks ~= nil and game.ashley_set_banks ~= nil then
+        game:ashley_set_banks(self.banks, self.banks_key) -- (before her motions: they may be in these banks)
     end
     if self.puppet and st ~= nil and fresh then
         local s = self.interp:sample(now)
         if s ~= nil then
             if s.layers ~= nil and #s.layers > 0 and self.settings.enemy_motion_sync ~= false
-                and game:ashley_set_anim(s.layers) then
+                and game:ashley_set_anim(s.layers, s.bank_type) then
                 self.counters.anims = self.counters.anims + 1
             end
             if s.hp ~= nil and s.hp > 0 and st.hp ~= s.hp then game:ashley_set_hp(s.hp) end
         end
     end
+    self.anim = game.ashley_anim
     if now - self.last_presence >= PRESENCE_INTERVAL then
         self.last_presence = now
         self:send_state(now, st, 0)
+    end
+end
+
+-- The owner: her dynamic motion banks to the other game when they change, after a switch and
+-- every BANKS_RESEND (a partner that just joined).
+function AshleySync:share_banks(now, game, st)
+    if st == nil or game.ashley_read_banks == nil or now - self.last_banks_read < BANKS_READ then return end
+    self.last_banks_read = now
+    local r = game:ashley_read_banks()
+    if r == nil then return end
+    local key = r.key or banks_key(r.banks)
+    if key ~= self.sent_banks_key or self.sent_banks_epoch ~= self.epoch or now - self.last_banks_sent >= BANKS_RESEND then
+        self.sent_banks_key, self.sent_banks_epoch, self.last_banks_sent = key, self.epoch, now
+        self.send_large(self.P.encode_ashley_banks({ epoch = self.epoch, banks = r.banks }))
+        self.counters.banks_sent = self.counters.banks_sent + 1
+    end
+end
+
+-- Whether our puppet is drawn: once the game running her has told us where she is (this
+-- owner, this epoch), and not while that game has no Ashley or does not draw her. A pause in its
+-- reports (a menu, a load) leaves her where she was, as she was.
+function AshleySync:puppet_shown()
+    local n = self.newest
+    if n == nil then return false end
+    local p = self.partner
+    if p ~= nil and p.owner and not p.present then return false end
+    return not n.hidden
+end
+
+-- Any other Ashley in our game (a doll NPC of her kind, a second partner) is removed once it
+-- has stayed EXTRA_GRACE seconds, while the shared Ashley exists (ours, or the partner's game
+-- has her) and not during our cutscene. Both games do this, so neither shows a second one.
+function AshleySync:guard_extras(now, game, ctx, st)
+    if game.ashley_extras == nil or game.ashley_remove_extra == nil or self.settings.ashley_single == false then
+        return
+    end
+    local seen, here = self.extras_seen, {}
+    local theirs = self:partner_report(now)
+    local shared = st ~= nil or (theirs ~= nil and theirs.present)
+    for _, e in ipairs(game:ashley_extras() or {}) do
+        here[e.key] = true
+        local x = seen[e.key]
+        if x == nil then
+            x = { since = now }
+            seen[e.key] = x
+        end
+        if shared and not ctx.cutscene and not x.done and now - x.since >= EXTRA_GRACE
+            and (x.tried == nil or now - x.tried >= EXTRA_RETRY) then
+            x.tried = now
+            local r = game:ashley_remove_extra(e.key)
+            if r then
+                x.done = true
+                self.counters.extras = self.counters.extras + 1
+                self.log("another Ashley (%s) appeared in our game - %s", e.doll and "a scripted one" or "a second partner",
+                    r == "erased" and "removed" or "hidden and stopped")
+            end
+        end
+    end
+    for key in pairs(seen) do
+        if not here[key] then seen[key] = nil end
     end
 end
 
@@ -397,7 +517,7 @@ function AshleySync:send_state(now, st, flags)
     local full = st ~= nil and (flags & F.OWNER) ~= 0
     self.send(self.P.encode_ashley({ time = now, epoch = self.epoch, flags = flags,
         pos = st and st.pos, rot = st and st.rot, hp = st and st.hp or 0, max_hp = st and st.max_hp or 0,
-        layers = full and st.layers or nil }), false)
+        layers = full and st.layers or nil, bank_type = full and st.bank_type or 0 }), false)
     self.counters.sent = self.counters.sent + 1
 end
 
@@ -420,10 +540,19 @@ end
 function AshleySync:release(game)
     if self.puppet and game ~= nil and game.ashley_set_puppet ~= nil then game:ashley_set_puppet(false) end
     self.puppet = false
+    self.shown = nil
 end
 
 function AshleySync:summary(now)
     local theirs = self:partner_report(now)
+    local counters = self.counters
+    if self.anim ~= nil then
+        counters = {}
+        for k, v in pairs(self.counters) do counters[k] = v end
+        for k, v in pairs(self.anim) do
+            if type(v) == "number" then counters["motion_" .. k] = v end
+        end
+    end
     return {
         enabled = self:enabled(),
         mine = self:runs_here(),
@@ -433,7 +562,8 @@ function AshleySync:summary(now)
         puppet = self.puppet,
         here = self.local_state ~= nil,
         partner_has = theirs ~= nil and theirs.present or false,
-        counters = self.counters,
+        counters = counters,
+        last_missing = self.anim and self.anim.last_missing or nil,
     }
 end
 

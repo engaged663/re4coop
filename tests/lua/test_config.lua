@@ -34,7 +34,7 @@ end)
 T.run("loads_and_sanitizes_saved_values", function()
     local files = { [Config.FILE] = { config_version = Config.VERSION, port = 99999, player_name = "", player_hz = 500,
         last_address = "10.0.0.5", enemy_erase = "yes", enemy_interp_delay = 5, enemy_authority = "everyone",
-        enemy_anim_layers = 9, roster_hz = 1000, unknown_key = 1 } }
+        enemy_partner_grabs = "sure", enemy_anim_layers = 9, roster_hz = 1000, unknown_key = 1 } }
     local cfg = Config.load(fake_json(files))
     T.eq(cfg.port, Config.DEFAULTS.port, "invalid port replaced")
     T.eq(cfg.player_name, "Player", "empty name replaced")
@@ -42,7 +42,8 @@ T.run("loads_and_sanitizes_saved_values", function()
     T.eq(cfg.last_address, "10.0.0.5", "address kept")
     T.eq(cfg.enemy_erase, true, "wrong type ignored")
     T.near(cfg.enemy_interp_delay, 0.4, 1e-9, "enemy smoothing clamped")
-    T.eq(cfg.enemy_authority, "shared", "unknown authority replaced")
+    T.eq(cfg.enemy_authority, nil, "the authority choice is gone: the host runs every enemy")
+    T.eq(cfg.enemy_partner_grabs, true, "wrong type ignored (grabs on by default)")
     T.eq(cfg.enemy_anim_layers, 3, "animation layers clamped")
     T.eq(cfg.roster_hz, 20, "roster rate clamped")
     T.eq(cfg.unknown_key, nil, "unknown keys dropped")
@@ -90,7 +91,7 @@ T.run("enemy_settings_of_0_8_are_reset_once_for_the_new_enemy_sync", function()
         T.eq(cfg[k], nil, k .. " removed")
     end
     T.eq(cfg.enemy_erase, false, "an unrelated choice is kept")
-    T.eq(cfg.enemy_authority, "shared", "enemies are shared between the players by default")
+    T.eq(cfg.enemy_partner_target, true, "the host's enemies fight the client by default")
     T.eq(cfg.enemy_hit_predict, true, "hits take HP at once by default")
 end)
 
@@ -150,7 +151,41 @@ T.run("a_0_9_0_config_gets_cutscenes_and_events_for_both_once", function()
     T.eq(cfg.sync_triggers, true, "events for both")
     T.eq(cfg.sync_flags, true, "story flags back on (they now work)")
     T.eq(cfg.exp_table_reload, nil, "the flag table reload is gone")
-    T.eq(cfg.enemy_authority, "host", "unrelated choices kept")
+    T.eq(cfg.enemy_authority, nil, "the authority choice is gone (0.10: always the host)")
+end)
+
+T.run("a_0_9_1_config_gets_host_enemies_that_fight_the_client_once", function()
+    -- 0.10 gave every enemy to the host and made the client a second player in the host's game:
+    -- the enemy switches start from their defaults once, the shared authority is gone.
+    local files = { [Config.FILE] = { config_version = 10, enemy_authority = "shared", sync_enemies = false,
+        enemy_mirror = false, enemy_anim_lock = false, enemy_hit_predict = false, sync_drops = false } }
+    local json = fake_json(files)
+    local cfg = Config.load(json)
+    for _, k in ipairs({ "sync_enemies", "enemy_mirror", "enemy_anim_lock", "enemy_hit_predict",
+        "enemy_partner_target", "enemy_partner_hits", "enemy_partner_noise" }) do
+        T.eq(cfg[k], true, k .. " on")
+    end
+    T.eq(cfg.enemy_partner_grabs, true, "grabs on the client: a real grab since config 12")
+    T.eq(cfg.enemy_authority, nil, "authority choice removed")
+    T.eq(cfg.sync_drops, false, "an unrelated choice is kept")
+    cfg.enemy_partner_target = false
+    Config.save(json, cfg)
+    T.eq(Config.load(json).enemy_partner_target, false, "switched off after the upgrade: kept")
+end)
+
+T.run("a_0_10_0_config_lets_enemies_grab_the_client_once", function()
+    -- 0.10.1 made a grab on the client a real grab the client breaks free of: the old
+    -- experimental "off" takes the new default once; parries and bosses start on.
+    local files = { [Config.FILE] = { config_version = 11, enemy_partner_grabs = false, sync_drops = false } }
+    local json = fake_json(files)
+    local cfg = Config.load(json)
+    T.eq(cfg.enemy_partner_grabs, true, "grabs on")
+    T.eq(cfg.enemy_partner_parry, true, "parries on")
+    T.eq(cfg.enemy_partner_bosses, true, "bosses on")
+    T.eq(cfg.sync_drops, false, "an unrelated choice is kept")
+    cfg.enemy_partner_grabs = false
+    Config.save(json, cfg)
+    T.eq(Config.load(json).enemy_partner_grabs, false, "switched off after the upgrade: kept")
 end)
 
 T.run("experimental_features_are_off_by_default", function()

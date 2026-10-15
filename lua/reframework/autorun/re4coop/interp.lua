@@ -135,9 +135,9 @@ function Interp.blend(sa, sb, t)
     return out
 end
 
--- States with animation layers ({bank, id, frame, speed} each): position and rotation blend;
--- each layer blends its frame while both snapshots play the same motion, otherwise it takes
--- the nearer snapshot's.
+-- States with animation layers ({bank, id, frame, speed[, blend, mask, mode]} each): position
+-- and rotation blend; each layer blends its frame (and blend rate) while both snapshots play the
+-- same motion, otherwise it takes the nearer snapshot's.
 function Interp.blend_layers(sa, sb, t)
     local out = Interp.blend(sa, sb, t)
     local la, lb = sa.layers or {}, sb.layers or {}
@@ -145,7 +145,9 @@ function Interp.blend_layers(sa, sb, t)
     for i = 1, math.max(#la, #lb) do
         local a, b = la[i], lb[i]
         if a ~= nil and b ~= nil and a.bank == b.bank and a.id == b.id and b.frame >= a.frame then
-            layers[i] = { bank = a.bank, id = a.id, frame = a.frame + (b.frame - a.frame) * t, speed = b.speed }
+            layers[i] = { bank = a.bank, id = a.id, frame = a.frame + (b.frame - a.frame) * t, speed = b.speed,
+                blend = (a.blend ~= nil and b.blend ~= nil) and (a.blend + (b.blend - a.blend) * t) or b.blend,
+                mask = b.mask, mode = b.mode }
         else
             layers[i] = (t < 0.5 and a or b) or a or b
         end

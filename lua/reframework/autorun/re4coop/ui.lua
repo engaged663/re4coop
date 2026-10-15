@@ -150,8 +150,19 @@ local function draw_status(session, status)
         end
         if status.enemies then
             local e = status.enemies
-            imgui.text(("Enemies: %d here, %d shared with your partner (your game runs %d, theirs %d), %d dead in the shared world"):format(
-                e.local_count, e.paired, e.run_here or 0, e.run_by_partner or 0, e.dead_known or 0))
+            local who = session.role == "host" and "your game runs them" or "the host's game runs them"
+            imgui.text(("Enemies: %d here, %d paired with the %s (%s), %d dead in the shared world"):format(
+                e.local_count, e.paired, session.role == "host" and "client's" or "host's", who, e.dead_known or 0))
+            if (e.targeting_partner or 0) > 0 then
+                local whom = session.role == "host" and "your partner" or "you"
+                imgui.text_colored(("%d enemies are after %s"):format(e.targeting_partner, whom), COLOR_WARN)
+            end
+        end
+        if status.partner_target and session.role == "host" then
+            local pt = status.partner_target
+            imgui.text_colored(pt.attached and "Your partner is a target of your enemies (they see, hear and attack them)"
+                or "Your partner is not a target of your enemies right now (not in your area, in a cutscene, or their model is not up)",
+                pt.attached and COLOR_OK or COLOR_DIM)
         end
         if status.animals and status.animals.role == "client" and status.animals.puppets > 0 then
             imgui.text_colored(("Animals: %d following the host's"):format(status.animals.puppets), COLOR_DIM)
@@ -205,19 +216,20 @@ local function draw_options(settings)
         checkbox(settings, "show_hud", "Show status HUD (top-left)")
 
         imgui.separator()
-        imgui.text_colored("Enemies and animals (each enemy is run by one game; the other shows it)", COLOR_DIM)
+        imgui.text_colored("Enemies and animals (the host's game runs every enemy; the client's shows them)", COLOR_DIM)
         checkbox(settings, "sync_enemies", "Sync enemies (every creature: villagers, dogs, bosses...)")
-        if imgui.button("Who runs enemies: " .. tostring(settings.enemy_authority)) then
-            settings.enemy_authority = settings.enemy_authority == "shared" and "host" or "shared"
-        end
-        imgui.same_line()
-        imgui.text_colored("shared = the closer player's game (enemies attack both), host = the host's game (host decides)", COLOR_DIM)
-        checkbox(settings, "enemy_mirror", "Enemies your partner's game runs stand and move where theirs are")
+        checkbox(settings, "enemy_partner_target", "Host: your enemies see, hear, chase and attack your partner too (they are a second player in your game)")
+        checkbox(settings, "enemy_partner_hits", "...and their attacks on your partner hurt them (client: you take the hits of the host's enemies)")
+        checkbox(settings, "enemy_partner_noise", "...and they hear your partner's shots, steps and reloads")
+        checkbox(settings, "enemy_partner_grabs", "...and may grab your partner (they break free in their own game)")
+        checkbox(settings, "enemy_partner_parry", "...and warn your partner of their attacks, so your partner can parry them")
+        checkbox(settings, "enemy_partner_bosses", "...and bosses go for your partner when your partner is the one they hate most")
+        checkbox(settings, "enemy_mirror", "Client: the host's enemies stand and move where they are in the host's game")
         checkbox(settings, "enemy_motion_sync", "...and play their animation (also animals)")
         checkbox(settings, "enemy_anim_lock", "...with their own animation state machine switched off")
         slider_int(settings, "enemy_anim_layers", "...animation layers sent per enemy", 1, 3)
-        checkbox(settings, "enemy_hit_predict", "Your hits on them take HP at once (the owner still decides deaths)")
-        checkbox(settings, "enemy_kill_with_hit", "Enemies your partner kills die here from the same killing hit")
+        checkbox(settings, "enemy_hit_predict", "Client: your hits on them take HP at once (the host still decides deaths)")
+        checkbox(settings, "enemy_kill_with_hit", "Client: enemies the host's game kills die here from the same killing hit")
         checkbox(settings, "enemy_erase", "Enemies your partner already killed never appear in your game (no corpse)")
         checkbox(settings, "enemy_spawn_missing", "Client: enemies alive in the host's game appear in yours too (even if your save had them dead)")
         slider_float(settings, "enemy_interp_delay", "Enemy smoothing (seconds behind; higher = smoother, later)", 0.03, 0.4)
@@ -238,6 +250,7 @@ local function draw_options(settings)
         checkbox(settings, "gimmick_reactions", "Puzzles, locks and item slots the partner completes react in your game too (unlock, open, solve)")
         checkbox(settings, "sync_purposes", "Objectives: both players see the more advanced objective")
         checkbox(settings, "ashley_coop", "Ashley: one Ashley for both players (starts with the host; tap Alt to send her to the other player)")
+        checkbox(settings, "ashley_single", "Ashley: remove any other Ashley that shows up (in both games)")
         checkbox(settings, "give_items", "'Give to partner' in the attache case's item commands")
         checkbox(settings, "sync_objects", "Breakables and animal deaths (crates, barrels, crows...)")
         checkbox(settings, "sync_object_states", "Experimental: other state changes of those objects")
@@ -366,20 +379,50 @@ local function draw_diagnostics(session, game, session_status, puppet, perf)
         if session_status and session_status.enemies then
             local en = session_status.enemies
             local c = en.counters
-            imgui.text(("enemy sync (%s authority): %d of %d enemies here have a level ID | pairs by ID %d, by position %d"):format(
-                en.authority or "?", en.with_uid or 0, en.local_count or 0, c.uid_pairs, c.spatial_pairs))
-            imgui.text(("enemy owners: %d run here, %d by the partner | changes %d, taken over %d, handed over %d, retired %d"):format(
-                en.run_here or 0, en.run_by_partner or 0, c.owner_changes, c.taken_over, c.handed_over, c.retired))
-            imgui.text(("enemy finishers: ours %d | claims sent %d, granted %d, refused %d"):format(
-                c.fatals or 0, c.claims_sent or 0, c.claims_granted or 0, c.claims_refused or 0))
-            imgui.text(("enemy states: sent %d, received %d | puppets %d, held %d | moves %d, animations %d, switches %d"):format(
-                c.states_sent, c.states_received, en.puppets or 0, en.held or 0, c.moves, c.anims, c.puppet_switches))
-            imgui.text(("enemy hits: forwarded %d, shown %d, received %d, run %d, as HP %d, bounced %d, unmatched %d, other damage %d | HP set %d, failed %d"):format(
-                c.hits_forwarded, c.hits_sent, c.hits_received, c.hits_applied, c.hits_fallback, c.hits_bounced,
+            imgui.text(("enemy sync (host authority): %d of %d enemies here have a level ID | pairs by ID %d, by position %d | numbered for the client %d, retired %d"):format(
+                en.with_uid or 0, en.local_count or 0, c.uid_pairs, c.spatial_pairs, c.assigned, c.retired))
+            imgui.text(("enemy finishers of the client: sent %d (unpaired %d), received %d, run %d, refused %d | enemies asked about the client %d, after the client now %d"):format(
+                c.fatals_sent, c.fatals_unpaired, c.fatals_received, c.fatals_applied, c.fatals_failed, c.partner_info,
+                en.targeting_partner or 0))
+            imgui.text(("enemy states: sent %d, received %d | puppets %d, held %d | moves %d, animations %d, switches %d, placed %d"):format(
+                c.states_sent, c.states_received, en.puppets or 0, en.held or 0, c.moves, c.anims, c.puppet_switches,
+                c.placed or 0))
+            imgui.text(("enemy hits: forwarded %d, shown %d, received %d, run %d, as HP %d, unmatched %d, other damage %d | HP set %d, failed %d"):format(
+                c.hits_forwarded, c.hits_sent, c.hits_received, c.hits_applied, c.hits_fallback,
                 c.hits_unmatched, c.damage_reported, c.hp_applied, c.hp_failed))
-            imgui.text(("enemy deaths: %d dead in the shared world%s | sent %d, received %d, killed here %d, erased %d, late %d | lists sent %d, received %d"):format(
-                en.dead_known or 0, en.listing_dead and " (reading the save...)" or "", c.deaths_sent, c.deaths_received,
-                c.kills_applied, c.erased, c.late_kills, c.graves_sent, c.graves_received))
+            imgui.text(("enemy deaths: %d dead in the shared world%s | sent %d (client's kills %d), received %d, killed here %d, erased %d, late %d | lists sent %d, received %d"):format(
+                en.dead_known or 0, en.listing_dead and " (reading the save...)" or "", c.deaths_sent, c.client_kills,
+                c.deaths_received, c.kills_applied, c.erased, c.late_kills, c.graves_sent, c.graves_received))
+        end
+        if session_status and session_status.partner_target then
+            local pt = session_status.partner_target
+            local c = pt.counters
+            local g = pt.game or {}
+            if pt.role == "host" then
+                imgui.text(("client as a target: %s | attached %d, failed %d, released %d, model lost %d | noises received %d, made %d (failed %d)"):format(
+                    pt.attached and "ON" or "off", c.attaches, c.attach_failed, c.detaches, g.lost or 0,
+                    c.noises_received, g.noises_applied or 0, g.noise_failed or 0))
+                imgui.text(("hits on the client's model: %d seen, %d sent to the client (not by an enemy %d, ours %d, grabs blocked %d) | finishers run %d, refused %d"):format(
+                    g.hits_seen or 0, c.hits_sent, g.not_enemy or 0, g.friendly or 0, g.grabs_blocked or 0,
+                    g.fatals_run or 0, g.fatals_refused or 0))
+                imgui.text(("our shots past the client %d | warnings for the client %d, sent %d | parries of the client: received %d, run %d, failed %d (presses %d)"):format(
+                    g.shots_passed or 0, g.signs or 0, c.signs_sent, c.parries_received, g.parries_run or 0,
+                    c.parries_failed, g.parry_inputs or 0))
+                imgui.text(("grabs on the client %d, holds sent %d, ended %d, timed out %d | escapes received %d, by the escape check %d, forced %d | boss targets turned to the client %d"):format(
+                    g.grabs or 0, c.grabs_sent, c.holds_ended, c.holds_timed_out, c.escapes_received,
+                    g.releases or 0, g.releases_forced or 0, g.boss_redirects or 0))
+            else
+                imgui.text(("our player for the host's enemies: noises heard %d, sent %d (merged %d) | finisher checks %d, requests %d"):format(
+                    g.noises_heard or 0, c.noises_sent, c.noises_merged, g.prompts or 0, g.requests or 0))
+                imgui.text(("hits from the host's enemies: received %d, taken %d, blocked (dodged) %d, failed %d, dropped %d | exact attack data %d"):format(
+                    c.hits_received, c.hits_applied, c.hits_blocked, c.hits_failed, c.hits_dropped, g.exact_attacks or 0))
+                imgui.text(("warnings from the host's enemies: received %d, shown %d | our parries %d (landed %d), sent %d | hits parried %d"):format(
+                    c.signs_received, c.signs_shown, g.player_parries or 0, g.player_parried or 0, c.parries_sent,
+                    c.hits_parried))
+                imgui.text(("held by the host's enemies: holds %d, grabs run %d (failed %d) | escapes %d, let go %d%s"):format(
+                    c.grabs_received, g.player_grabs or 0, g.player_grab_failed or 0, c.escapes_sent,
+                    g.player_released or 0, pt.grab and (" | HELD %d/%d"):format(pt.grab.presses, pt.grab.struggles) or ""))
+            end
         end
         if session_status and session_status.animals then
             local an = session_status.animals
@@ -396,6 +439,7 @@ local function draw_diagnostics(session, game, session_status, puppet, perf)
             if summary.pending then text = text .. (" | waiting for cutscene %s"):format(tostring(summary.pending)) end
             if summary.replaying then text = text .. (" | playing partner's cutscene %s"):format(tostring(summary.replaying)) end
             if summary.holding then text = text .. (" | %d partner flags wait for the cutscene"):format(summary.holding) end
+            if summary.last_missing then text = text .. (" | last motion not found here: %s"):format(summary.last_missing) end
             if summary.skips_waiting then text = text .. (" | %d partner skips wait for their cutscene"):format(summary.skips_waiting) end
             imgui.text(text)
         end

@@ -20,6 +20,7 @@
 local P = require("re4coop.protocol")
 local Interp = require("re4coop.interp")
 local EnemyNet = require("re4coop.enemy_net")
+local PartnerTarget = require("re4coop.partner_target")
 local ItemSync = require("re4coop.items_sync")
 local Avatar = require("re4coop.avatar")
 local DropSync = require("re4coop.drop_sync")
@@ -100,20 +101,20 @@ local OFFLINE_SAFE = {
     [P.T.FRAG] = true, [P.T.AVATAR] = true, [P.T.GEAR] = true, [P.T.POSE] = true, [P.T.ACTIONS] = true,
     -- Ashley: only her owner, epoch and the partner's latest state are recorded here; our
     -- game follows them on the next game tick.
-    [P.T.ASHLEY] = true, [P.T.ASHLEY_OWNER] = true, [P.T.ASHLEY_SWITCH] = true,
+    [P.T.ASHLEY] = true, [P.T.ASHLEY_OWNER] = true, [P.T.ASHLEY_SWITCH] = true, [P.T.ASHLEY_BANKS] = true,
 }
 
 -- Reliable messages that must not be lost but touch game objects: kept until the game loop
 -- runs again. Everything else arriving then (enemy snapshots, hits) is resent continuously.
 local DEFER = {
     [P.T.ENEMY_HIT] = true, [P.T.ENEMY_DEATH] = true, [P.T.ENEMY_OWNER] = true, [P.T.ENEMY_GRAVE] = true,
-    [P.T.ENEMY_CLAIM] = true,
+    [P.T.ENEMY_FATAL] = true,
     [P.T.FLAGS] = true, [P.T.FLAG_WORDS] = true, [P.T.GIMMICKS] = true, [P.T.OBJECTS] = true,
     [P.T.CUTSCENE] = true, [P.T.CUTSCENE_SKIP] = true, [P.T.TRIGGER] = true, [P.T.WORLD_REQUEST] = true, [P.T.WORLD_DONE] = true,
     [P.T.TRAPS] = true, [P.T.MECHANISMS] = true, [P.T.PURPOSE] = true,
 }
 
-local SYNC_NAMES = { "enemy_net", "drop_sync", "flag_sync", "gimmick_sync", "object_sync", "animal_sync",
+local SYNC_NAMES = { "enemy_net", "partner_target", "drop_sync", "flag_sync", "gimmick_sync", "object_sync", "animal_sync",
     "cutscene_sync", "trigger_sync", "door_sync", "trap_sync", "mechanism_sync", "ashley_sync", "purpose_sync" }
 
 function Session.new(opts)
@@ -306,11 +307,19 @@ function Session:make_syncs()
     for k, v in pairs(base) do enemy_opts[k] = v end
     enemy_opts.on_kill = function(id, now) self.drop_sync:on_remote_kill(id, now) end
     self.enemy_net = EnemyNet.new(enemy_opts)
-    -- A finisher our player starts on a puppet: may our game take that enemy over right away?
-    self.game.fatal_filter = function(id)
+    -- The client's player as a second player in the host's game (partner_target.lua).
+    local target_opts = {}
+    for k, v in pairs(base) do target_opts[k] = v end
+    target_opts.enemies = self.enemy_net
+    self.partner_target = PartnerTarget.new(target_opts)
+    -- Client: our copies of the host's enemies answer our player's finisher checks from what the
+    -- host's enemy says (enemy_net), and our player's noises are reported.
+    self.game.partner_fatal_query = function(id)
         local en = self.enemy_net
-        return en ~= nil and self.settings.sync_enemies ~= false and en:may_fatal(id)
+        if en == nil or self.settings.sync_enemies == false then return nil end
+        return en:partner_fatal(id)
     end
+    self.game.capture_noise = self.role == "client"
     self.flag_sync = FlagSync.new(base)
     self.gimmick_sync = GimmickSync.new(base)
     self.object_sync = ObjectSync.new(base)
@@ -321,6 +330,7 @@ function Session:make_syncs()
     local ashley_opts = {}
     for k, v in pairs(base) do ashley_opts[k] = v end
     ashley_opts.partner_name = function() return self.partner_name or "your partner" end
+    ashley_opts.send_large = function(bytes) return self:send_large(bytes) end
     self.ashley_sync = AshleySync.new(ashley_opts)
     local animal_opts = {}
     for k, v in pairs(base) do animal_opts[k] = v end
@@ -449,6 +459,7 @@ function Session:restore_game()
     if self.pause and self.pause.set_active then
         self.pause:set_active(false, self.settings.no_pause_mode, false, self.clock())
     end
+    if self.game.partner_target_detach then self.game:partner_target_detach() end
     if self.game.restore_enemies then self.game:restore_enemies() end
     if self.game.ashley_restore then self.game:ashley_restore() end
     if self.world and self.world.restore_animals then self.world:restore_animals() end
@@ -894,6 +905,15 @@ function Session:status()
         st.enemies = self.enemy_net:summary()
         st.partner_hits = self.enemy_net:recent_partner_hits(now, TRACER_SECONDS)
     end
+    if self.partner_target then
+        st.partner_target = self.partner_target:summary()
+        st.grab = st.partner_target.grab
+        if self.game.partner_stats then
+            local stats, attached = self.game:partner_stats()
+            st.partner_target.game = stats
+            st.partner_target.game_attached = attached
+        end
+    end
     if self.drop_sync then
         st.drops = self.drop_sync:summary()
     end
@@ -1144,10 +1164,13 @@ function Session:handle_message(data, now)
         if self.trigger_sync and self.world then self.trigger_sync:on_message(m, now) end
     elseif m.type == T.PURPOSE then
         if self.purpose_sync and self.world then self.purpose_sync:on_message(m, now) end
-    elseif m.type == T.ASHLEY or m.type == T.ASHLEY_OWNER or m.type == T.ASHLEY_SWITCH then
+    elseif m.type == T.ASHLEY or m.type == T.ASHLEY_OWNER or m.type == T.ASHLEY_SWITCH or m.type == T.ASHLEY_BANKS then
         if self.ashley_sync then self.ashley_sync:on_message(m, now) end
     elseif self.avatar_rx:on_message(m, now) then
         return
+    elseif m.type == T.PLAYER_NOISE or m.type == T.PLAYER_DAMAGE or m.type == T.ACTION_SIGN or m.type == T.ENEMY_PARRY
+        or m.type == T.PLAYER_GRAB or m.type == T.GRAB_ESCAPE then
+        if self.partner_target then self.partner_target:on_message(m, now, self.game) end
     elseif self.enemy_net and self.settings.sync_enemies then
         self.enemy_net:on_message(m, now, self.game)
     end
@@ -1256,10 +1279,26 @@ function Session:players_info(now)
         -- another region: the partner is not near our enemies
         return { local_pos = local_pos, loading = loading, other_region = true }
     end
-    -- A partner who is down or watching a cutscene cannot fight: enemies stay with us.
+    return { local_pos = local_pos, partner_pos = remote.pos, loading = loading }
+end
+
+-- Host: the client's character in our world, for partner_target.lua: its model (puppet.lua,
+-- built from the body prefab and shown), where the client is and their HP, and whether they can
+-- be fought (not in a cutscene or dead-and-gone, in our area). nil without a fresh partner state.
+function Session:partner_target_info(now)
+    local remote = self.interp:sample(now)
+    local age = self.interp:age(now)
+    if remote == nil or age == nil or age > 2.0 then return nil end
     local flags = remote.flags or 0
-    local busy = (flags & (P.PLAYER_FLAGS.DEAD | P.PLAYER_FLAGS.CUTSCENE)) ~= 0
-    return { local_pos = local_pos, partner_pos = remote.pos, partner_busy = busy, loading = loading }
+    local model = self.partner_model
+    local root = model ~= nil and model.target_root ~= nil and model:target_root() or nil
+    local loc = self.local_loc
+    return {
+        root = root, pos = remote.pos, rot = remote.rot, hp = remote.hp, max_hp = remote.max_hp,
+        busy = (flags & P.PLAYER_FLAGS.CUTSCENE) ~= 0,
+        elsewhere = self:partner_elsewhere(),
+        loading = loc ~= nil and (loc.loading == true or loc.playable == false),
+    }
 end
 
 -- No-pause: while hosting or connected, menus do not freeze the world (see game_pause.lua).
@@ -1426,7 +1465,8 @@ function Session:update()
     if self.game.set_capture then self.game:set_capture(active and s.share_character ~= false) end
     if self.game.set_active then
         self.game:set_active(active, { hits = s.sync_enemies ~= false,
-            drops = s.sync_enemies ~= false and s.sync_drops ~= false, gimmicks = s.sync_gimmicks ~= false })
+            drops = s.sync_enemies ~= false and s.sync_drops ~= false, gimmicks = s.sync_gimmicks ~= false,
+            partner = s.enemy_partner_target ~= false })
     end
     if self.world and self.world.set_active then self.world:set_active(active) end
     if self.give_sync then
@@ -1443,6 +1483,13 @@ function Session:update()
         if self.game.take_hit_events then self.game:take_hit_events() end
         if self.game.take_fatal_events then self.game:take_fatal_events() end
         if self.game.take_drop_events then self.game:take_drop_events() end
+        if self.game.take_noise_events then self.game:take_noise_events() end
+        if self.game.take_partner_damage_events then self.game:take_partner_damage_events() end
+        -- No partner: their model is no character of our game.
+        if self.game.partner_target_attached and self.game:partner_target_attached() then
+            self.game:partner_target_detach()
+        end
+        if self.partner_target then self.partner_target.attached = false end
         self:update_gate(now) -- releases a hold
         return
     end
@@ -1475,7 +1522,7 @@ function Session:update()
     end
     local fatals = self.game.take_fatal_events and self.game:take_fatal_events() or nil
     if self.enemy_net and s.sync_enemies and fatals ~= nil and #fatals > 0 then
-        self.enemy_net:on_local_fatal(fatals, now, self.game)
+        self.enemy_net:on_local_fatal(fatals, now)
     end
     local drops = self.game.take_drop_events and self.game:take_drop_events() or nil
 
@@ -1495,15 +1542,35 @@ function Session:update()
     elseif self.enemy_net and not s.sync_enemies then
         self.enemy_net:release_all(self.game) -- enemy sync switched off: our AI runs everything
     end
+    -- The client's player as a second player in the host's game.
+    if self.partner_target then
+        if self.role == "host" then
+            self.partner_target:host_tick(now, self.game, in_game and self:partner_target_info(now) or nil)
+        else
+            local loc = self.local_loc
+            local loading = loc ~= nil and (loc.loading == true or loc.playable == false)
+            self.partner_target:client_tick(now, self.game, { playable = in_game and not loading and not self.local_cutscene,
+                dead = self.local_dead })
+        end
+    end
     if self.drop_sync and s.sync_enemies then
         self.drop_sync:update(now, enemies, drops, self.game)
     end
     perf:stop("update.enemies", t0)
 
-    -- Every frame: the enemies the partner's game runs stand where the partner's are.
+    -- Every frame: the host's enemies stand where they are in the host's game (client), and
+    -- the client's character stands where the client is (host).
     if self.enemy_net and s.sync_enemies and in_game then
         t0 = perf:start()
         self.enemy_net:frame(now, self.game)
+        if self.partner_target and self.role == "host" then
+            self.partner_target:host_frame(self.game, self:partner_target_info(now))
+        elseif self.partner_target then
+            local loc = self.local_loc
+            local loading = loc ~= nil and (loc.loading == true or loc.playable == false)
+            self.partner_target:client_frame(now, self.game, { playable = not loading and not self.local_cutscene,
+                dead = self.local_dead })
+        end
         perf:stop("update.mirror", t0)
     end
 
@@ -1518,7 +1585,7 @@ function Session:update()
             local loading = loc ~= nil and (loc.loading == true or loc.playable == false)
             self.ashley_sync:tick(now, self.game, { in_game = in_game and not loading,
                 local_pos = self:fresh_local_pos(now), local_rot = self.last_local_rot,
-                unable = self.local_cutscene or self.local_dead or loading })
+                unable = self.local_cutscene or self.local_dead or loading, cutscene = self.local_cutscene })
         end
         if in_game then self.ashley_sync:frame(now, self.game) end
         perf:stop("update.ashley", t0)

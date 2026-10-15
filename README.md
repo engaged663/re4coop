@@ -4,17 +4,21 @@ An open-source [REFramework](https://github.com/praydog/REFramework) mod that co
 copies of **Resident Evil 4 (2023)** directly by IP address over UDP, so two players can go
 through the campaign together on a LAN, or over the internet with a forwarded port or a VPN.
 
-> **Status: v0.9.1, experimental.** v0.9.1 makes what one player sets off happen for both:
-> **cutscenes play in both games** and **scripted events** (an area you walk into that starts a
-> camera shot, a voice line, a scene) **run for the partner too**, and every story flag the
-> game changes now reaches the partner ([why and how](docs/RESEARCH.md#311-v091-player-events-for-both-players)).
-> v0.9 replaced the enemy sync with a new one built from
-> scratch ([why and how](docs/RESEARCH.md#310-v09-enemy-sync-rebuilt-from-scratch)): every
-> enemy is run by one game - by default the game of the player it is closer to, so **enemies
-> attack both players** - and the other game shows it moving, turning and animating exactly
-> like it; hits on it are run in its owner's game with every value of the original hit (same
-> damage, same reaction), and its death comes with the killing hit, in the same place, in both
-> games. The networking, sync logic and scripts are covered by automated tests, including
+> **Status: v0.10.1, experimental.** v0.10 gives **every enemy to the host**: nothing is shared
+> and nothing changes hands - the host's game runs every enemy's AI, and the client's game shows
+> it moving, turning and animating exactly like it. The client's player is **a second player in
+> the host's game** ([why and how](docs/RESEARCH.md#325-v010-the-client-as-a-second-player-in-the-hosts-game)):
+> the host's enemies see the client, hear the client's shots and steps, chase the client and
+> attack the client with their own AI, exactly as they do the host; their blows land on the
+> client's character, and the client takes them in its own game. The client's shots, kicks,
+> stealth kills and knife finishes run on the host's enemies as if the host's player had made
+> them. v0.10.1 adds the rest ([why and how](docs/RESEARCH.md#326-v0101-the-hosts-shots-parries-grabs-and-bosses-against-the-client)):
+> the host's enemies warn the client of their attacks and **the client's parries stagger them**,
+> they **grab the client**, who breaks free in their own game, **bosses go for the client** when
+> the client is the one they hate most, and **the host's bullets pass the client's character**. v0.9.1 made what one player sets off happen for both: **cutscenes play in both games**
+> and **scripted events run for the partner too**
+> ([why and how](docs/RESEARCH.md#311-v091-player-events-for-both-players)). The networking,
+> sync logic and scripts are covered by automated tests, including
 > end-to-end runs against a mock of REFramework, but most of it has **not yet been verified
 > inside the running game.** Some RE4 method names are probed at runtime (see
 > [docs/RESEARCH.md](docs/RESEARCH.md)). Please run the
@@ -31,13 +35,14 @@ through the campaign together on a LAN, or over the internet with a forwarded po
 | **Their weapons, shots and sounds** | Their weapon is spawned from its prefab (`wp4000.pfb`…) and held by the same hand joint, slide and all. Gunshots, reloads, footsteps and voice are replayed on the model's own sound containers, and shots get a muzzle flash |
 | **Shared enemies** | Every enemy, dogs and bosses included, is matched with its copy in the partner's game by the ID the level gives it (the same on both PCs), wherever each game placed it |
 | **Dead stays dead** | An enemy dead in the host's world never appears for the partner: killed in front of you it dies with its own death animation; one that only now spawns in your game, or is far away, is removed the way the game removes a finished enemy (no corpse, and it never comes back). That includes enemies the host killed before you joined (read from the host's save), and after your own game reloads a checkpoint. Enemies you killed where the host was not yet never appear for the host either |
-| **Enemies fight both players** | Each enemy is run by exactly one game, with that game's real AI: by default the game of the player it is closer to (it changes hands smoothly when the other player has been clearly closer for a moment, and the player who keeps shooting it draws it). So the enemies near you attack you, and the ones near your partner attack them. *Who runs enemies: host* gives every enemy to the host's game instead |
-| **Same position, rotation, animation and state** | The game that runs an enemy sends its full state 20 times a second: position, full rotation, velocity, HP, visibility and up to three animation layers (motion, frame, speed). In the other game the copy is a puppet: its AI and its own animation state machine are off, it stands, turns and animates exactly like the original, smoothly |
-| **Same hits, same damage, same reactions** | Your hit on an enemy your partner's game runs is sent with every value of the game's own hit and run through the enemy's hit code in their game: the same damage, flinch, stagger, knock-down or part break, which you then see on your copy. Your shot still shows blood and takes the HP at once on your screen, but never kills there: the enemy's game decides. A yellow tracer shows each shot your partner lands |
-| **Same deaths** | Only the game that runs an enemy decides its death, and sends it with the killing hit: in the other game the enemy dies where it died, from the same hit, with its own death animation and loot |
+| **The host runs every enemy** | Every enemy is run by the host's game, with its real AI, always: nothing changes hands, however close the client gets or however long it shoots. In the client's game every enemy is a puppet of the host's; one the host's world does not have (not spawned there yet, or its area unloaded) waits, still and unseen, until it does |
+| **Enemies fight both players** | In the host's game the client's character is a second player: the host's enemies **see** it (it carries the player's target marker), **hear** the client's shots, steps and reloads (they are made by its character in the host's world), turn on it when the client hits them, **chase and attack** it with their own AI. Their blows land on the client's character there and the client takes them in its own game - the same attack, damage and reaction, its own dodges and invincibility included - when its copy of the enemy shows the blow. The client sees which enemies are after it |
+| **Same position, rotation, animation and state** | The host sends the full state of its enemies 20 times a second: position, full rotation, velocity, HP, visibility and up to three animation layers (motion, frame, speed). In the client's game the copy is a puppet: its AI and its own animation state machine are off, it stands, turns and animates exactly like the original, smoothly |
+| **The client plays like the host** | The client's hit on an enemy is sent with every value of the game's own hit and run through the enemy's hit code in the host's game, with the client's character as the attacker: the same damage, flinch, stagger, knock-down or part break, and the enemy turns on the client. Its shot still shows blood and takes the HP at once on its screen, but never kills there: the host decides. Finishers too: the prompts the client gets come from what the host's enemy says (kick, stealth kill, knife finish), and acting on one makes the host's enemy play its side with the client as the attacker. A yellow tracer shows each shot your partner lands |
+| **Same deaths** | Only the host's game decides a death, and sends it with the killing hit: in the client's game the enemy dies where it died, from the same hit, with its own death animation and loot (and it counts as the client's kill when the client's hit or finisher killed it) |
 | **Your own loot from every enemy** | Every enemy that dies gives each player their own loot roll, tailored to that player's inventory like in the normal game, also the enemies your partner killed. You see your loot, your partner sees theirs |
 | **Give items to your partner** | In the attache case, every item you can share (ammo, herbs and sprays, gunpowder and resources, grenades, weapon attachments, treasures) gets a last command, **Give to <partner>**: the item leaves your case and goes into your partner's, wherever they are. What does not fit in their case comes back to yours; nothing is ever lost. Key items, weapons and knives stay with you |
-| **One Ashley for both** | There is only one Ashley in the shared world. She starts with the host: she follows the host's player, and in the partner's game she is right there with the host too, walking, running and animating the same way. **Tap Alt** (or the panel's button) and she goes to the other player: from then on she follows them, in both games. Either player can tap it, with 5 s between two switches. She does not change hands while kidnapped, down or hiding, or while the other player is in a cutscene. Taken over far away, she is brought next to her new player |
+| **One Ashley for both** | There is only one Ashley in the shared world. She starts with the host: she follows the host's player, and in the partner's game she is right there with the host too, walking, running and animating the same way (every animation of hers, not only walking). **Tap Alt** (or the panel's button) and she goes to the other player: from then on she follows them, in both games. Either player can tap it, with 5 s between two switches. She does not change hands while kidnapped, down or hiding, or while the other player is in a cutscene. Taken over far away, she is brought next to her new player. There is never a second Ashley: in the game that does not run her she only appears where the shared one is, and any other Ashley that shows up in either game is removed |
 | **What one completes, both complete** | An item one player places in a slot appears there in the partner's game too and the lock opens for both; a puzzle one solves is solved for both (with its sequence on screen); levers, mechanisms and scripted events play for both. Those sequences run in the partner's game without handing out their items again or taking items from them. The objective on screen is the more advanced of the two. A boss killed in one game (El Gigante) dies in the other too |
 | **Key items exist once** | Whoever picks up a key item keeps it, and it disappears from the partner's world. Pickups are confirmed by the game's own "item obtained" flag |
 | **One shared world** | The story progress lives in the game's scenario flags (objectives, map reveals, doors unlocked, items taken, events seen) and its gimmick table (locks, keys used, levers, shutters, puzzles). Every flag the game turns on, whatever turned it on, is applied in the partner's game through the game's own setter within a fraction of a second, both ways. A flag going back off (a checkpoint reload) never undoes the partner's world |
@@ -70,10 +75,22 @@ How it works and why: [docs/RESEARCH.md](docs/RESEARCH.md). Wire format: [docs/P
   [the crash analysis](docs/RESEARCH.md#37-v07-crashes-stutter-lag-and-loot)) and puts the riskiest
   features behind *Experimental* switches, but it is not proven crash-free yet: the breadcrumb
   file names the last thing the mod did before a crash.
-* **An enemy attacks the player of the game that runs it.** RE4's enemy AI only targets the
-  player of its own game, so v0.9 gives each enemy to the game of the player it is closer to. An
-  enemy standing between both players at the same distance attacks only one of them until it
-  changes hands. With *Who runs enemies: host* only the host is attacked.
+* **The client as a second player (0.10, not run in the game yet).** RE4's enemy AI only fights
+  characters of its own game; the host's enemies fight the client's character because the mod
+  gives it a player context of the host's game, a target marker, its damage colliders and a
+  place in the game's hit system (docs/RESEARCH.md 3.25). Whether every enemy kind behaves well
+  against it is unproven: *Diagnostics* shows each piece (`partner_context`, `partner_seen`,
+  `partner_hits`, `partner_heard`, `partner_damage`, `partner_fatal`) and the client's model can
+  be taken out of the fight with *Options → …see, hear, chase and attack your partner too*.
+  Bosses go for the client when their own hate puts the client first; attacks of theirs that
+  read "the player" directly still aim at the host.
+* Grabs on the client (0.10.1, not run in the game yet): the client's character is held by the
+  enemy's copy in the client's game; if it freezes in a pose, untick *...may grab your partner*
+  on the client (then only the grab's damage reaches it). A **parry** by the client lands in the
+  host's game one round trip after the client's screen shows it.
+* The host's shots and blows pass the client's character; your shots never hurt your partner.
+* Enemies near the client only exist where the host's game has loaded them: a client far ahead
+  of the host meets no enemies until the host's game spawns them.
 * Ragdolls, effects the enemies spawn themselves and grab reactions are simulated in each game
   on its own and can look different.
 * Traps (0.9.1, not run in the game yet): bear traps and sensor bombs are in sync. A bear trap
@@ -85,8 +102,7 @@ How it works and why: [docs/RESEARCH.md](docs/RESEARCH.md). Wire format: [docs/P
 * Your partner's hits and kills make the enemy react and die in your game, but never burst its
   head or break a limb there (the break effect of a replayed hit crashed the game); your own
   hits mutilate as always. The reaction is the one of your partner's weapon and of the body part
-  they hit (0.9.1, not run in the game yet). An enemy you both shoot stays with one game until
-  the fight pauses.
+  they hit (0.9.1, not run in the game yet).
 * Scoped weapons (0.9.1, not run in the game yet): your partner's rifle is only a model in your
   game - its scope never renders its view on your screen.
 * The host's world decides which enemies exist (0.9.1, not run in the game yet): an enemy alive
@@ -101,7 +117,8 @@ How it works and why: [docs/RESEARCH.md](docs/RESEARCH.md). Wire format: [docs/P
 * What one completes, both complete (0.9.1, not run in the game yet): a gimmick that only reads
   its state when its area loads shows the partner's change after that area reloads, and a
   puzzle the partner is still working on (pieces moved, not solved) is not shown live.
-* The partner's model is a visual copy: it does not collide and your bullets pass through it.
+* The partner's model does not collide with you. In the host's game it is a target of the
+  enemies (above); in the client's game it is only a visual copy (your bullets pass through it).
 * Thrown grenades, bullet impacts and blood on enemies happen only in the thrower's/shooter's
   game. Sounds the engine plays internally (outside the reflected `trigger` calls) may not be
   replayed; *Diagnostics* counts what gets through.
@@ -198,8 +215,8 @@ cmake -S . -B build-win -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-w64.cmake && cmake --
 
 **Releasing:** bump the version in `lua/reframework/autorun/re4coop/protocol.lua`
 (`MOD_VERSION`), `plugin/src/lua_api.hpp` (`kVersion`) and `CMakeLists.txt`, then push a
-matching tag (`git tag v0.9.1 && git push origin v0.9.1`). CI builds the MSVC zip, checks the
-versions and attaches `re4coop-v0.9.1.zip` + `.sha256` to a draft GitHub Release for you to
+matching tag (`git tag v0.10.0 && git push origin v0.10.0`). CI builds the MSVC zip, checks the
+versions and attaches `re4coop-v0.10.0.zip` + `.sha256` to a draft GitHub Release for you to
 publish.
 
 ## Repository layout
@@ -210,13 +227,14 @@ plugin/src/lua_api.*   `re4coop_net` Lua bindings (plain Lua C API)
 plugin/src/plugin_main.cpp  REFramework plugin entry points
 plugin/tests/          native transport tests + Lua test runner
 lua/reframework/autorun/re4coop.lua   entry script (REFramework autoloads it)
-lua/reframework/autorun/re4coop/      protocol, session, enemy_net, animal_sync, items_sync,
+lua/reframework/autorun/re4coop/      protocol, session, enemy_net, partner_target, animal_sync, items_sync,
                                       drop_sync, gate, flag_sync, gimmick_sync, object_sync,
                                       cutscene_sync, trigger_sync, door_sync, trap_sync, mechanism_sync, give_sync, save_sync, travel,
                                       pause_policy, interp, config, ui, overlay, perf (profiler,
                                       crash breadcrumbs),
                                       game (RE4 adapter: player, prefabs, sound mirror, HP,
-                                      pickups), game_enemies (enemies, puppets, hits), game_world (flags, gimmicks, breakables,
+                                      pickups), game_enemies (enemies, puppets, hits), game_partner (the
+                                      client as a second player in the host's game), game_world (flags, gimmicks, breakables,
                                       cutscenes, event triggers, warps, chapters), game_give (items to the
                                       partner), game_save (saves, loading on join), game_pause (menu pauses),
                                       reflect (shape-based lookups), avatar, puppet
@@ -230,20 +248,20 @@ docs/                  research, protocol, testing
 | Symptom | Fix |
 |---|---|
 | The game crashed | Send `reframework/data/re4coop_breadcrumb_host.json` / `_client.json` (in a session; `re4coop_breadcrumb.json` otherwise) (the last things the mod did, with the frame number), `re2_framework_log.txt` and the crash dump, and say what was happening. Then switch off the feature the breadcrumb names (every feature has a switch in *Options*) |
-| Stutter or low frame rate in co-op | *Diagnostics → Performance* shows the mod's cost per frame and its busiest part; send `reframework/data/re4coop_perf.json`. *Options*: lower *Character pose updates per second*, or untick *Enemies your partner's game runs stand and move where theirs are* or *Animals near the client…* |
+| Stutter or low frame rate in co-op | *Diagnostics → Performance* shows the mod's cost per frame and its busiest part; send `reframework/data/re4coop_perf.json`. *Options*: lower *Character pose updates per second*, or untick *Client: the host's enemies stand and move where they are in the host's game* or *Animals near the client…* |
 | Panel says `re4coop_net.dll is not loaded` | The DLL isn't in `reframework/plugins/`, or REFramework is too old. Check `re2_framework_log.txt` in the game folder |
 | "could not reach host" | Wrong IP or port, the host didn't click *Host game*, or a firewall is blocking it (see above). Both must be on the same network or VPN |
 | "Partner runs re4coop X…" | Install the same release on both PCs |
 | No partner model, but connected | The partner is on the title screen or loading, or in a different chapter (the HUD warns you). Check *Options*. *Diagnostics* → *Partner model* says what was built (`prefab` or `mirror`) or why it failed |
 | Partner model looks wrong or misbehaves | Tick *Build partner from meshes only* in *Options* (skips the body prefab). Then click *Write research dump* and open an issue with `reframework/data/re4coop_typedump.json` and `re4coop_research_log.json`: they list your character's objects, meshes and joints |
-| Enemies not syncing | Open *Diagnostics*. `enemy_uid` must read `[ok] N of N enemies have a level identity`, and *enemy sync* shows the pairs made by ID; *enemy owners* shows how many enemies each game runs. If `enemy_uid`, `enemy_set_hp`, `enemy_list`, `enemy_puppet`, `enemy_motion`, `hit_values`, `hit_apply` or (after a partner's kill) `enemy_erase` show `[--]`, click *Write research dump* and send `reframework/data/re4coop_typedump.json` and `re4coop_research_log.json` |
+| Enemies not syncing | Open *Diagnostics*. `enemy_uid` must read `[ok] N of N enemies have a level identity`, and *enemy sync* shows the pairs made by ID and how many the host numbered for the client. If `enemy_uid`, `enemy_set_hp`, `enemy_list`, `enemy_puppet`, `enemy_motion`, `hit_values`, `hit_apply` or (after a partner's kill) `enemy_erase` show `[--]`, click *Write research dump* and send `reframework/data/re4coop_typedump.json` and `re4coop_research_log.json` |
 | Enemies the partner killed still appear | *Diagnostics → enemy deaths* counts the dead in the shared world. On the host, `enemy_backups` must read `[ok]` after the partner joined. Untick *Enemies your partner already killed never appear in your game* to have them die visibly instead |
 | Teleport prompt shows too often or too late | *Options → Progression*: distance and seconds sliders, or switch it off |
 | A menu still pauses the game in co-op | *Options → Pauses*: tick *Also refuse pause requests*. *Diagnostics* lists which pause types were neutralised |
 | Something in the shared world misbehaves (a door, a flag that keeps flipping, a cutscene, an event) | Switch that part off in *Options → Shared world* and keep playing. *Diagnostics* shows the counters for flags, cutscenes, event triggers, gimmicks and objects; flags that flip back and forth are muted automatically |
 | A cutscene or an event shows for only one player | *Diagnostics*: `flag_hooks`, `cutscenes`, `cutscene_hooks`, `triggers` and `trigger_hooks` must be `[ok]`. The line *seen in our game* must count up when you set one off; *cutscenes* / *event triggers* say what was sent, played, refused or missed (a partner more than 40 m away runs an event when they walk in themselves) |
 | Enemies jitter, freeze in a pose or slide | *Options → Enemies and animals*: raise *Enemy smoothing* a little; untick *…with their own animation state machine switched off*; then *…and play their animation*; then *…stand and move where theirs are* (each game then moves its own copies; HP, hits and deaths still sync). Tell us which one fixed it |
-| Enemies change hands too often, or never attack you | *Who runs enemies* must read *shared* on the **host** (its setting decides). *enemy owners* in *Diagnostics* counts the hand-overs |
+| The host's enemies ignore the client, or never hurt it | On the **host**, *Diagnostics* must show `partner_context`, `partner_seen` and `partner_hits` `[ok]` and *client as a target: ON* while the client is in the host's area (its model built from the body prefab: not *Build partner from meshes only*). `partner_damage` counts the enemy hits sent; on the client, *hits from the host's enemies* counts what it took or dodged. *enemy finishers of the client* counts finishers run or refused |
 | Your shots do not make the partner's enemies react | *Diagnostics*: `hit_apply` on the partner's PC must be `[ok]` (without it their game only subtracts HP); `hit_values` lists how many hit values travel |
 | Animals freeze, slide or behave oddly on the client's screen | Untick *Animals near both players… move as in the host's game* (they run on their own again; deaths still sync). *Diagnostics*: `animal_puppets` must be `[ok]`, and the *animals* line counts the ones following |
 | Joining does not go to the host's chapter | *Diagnostics*: `chapter_switch` must be `[ok]`; then load any save while the HUD says it is joining. Without it, load the host's chapter yourself and use *Teleport to partner* |

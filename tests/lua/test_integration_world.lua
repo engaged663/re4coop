@@ -531,24 +531,26 @@ T.run("the_host_gives_the_client_an_item_from_its_case", function()
     T.check(ok, "the host was told")
 end)
 
-T.run("an_enemy_next_to_the_client_is_run_by_the_clients_game", function()
-    -- The client far from the Ganado (the tests before left it anywhere: the cutscene test had
-    -- it stand on the Ganado, which may have given the Ganado to the client's game, and then
-    -- next to the host, where neither player is clearly closer). Going back to the host takes a
-    -- lasting lead and its time with the owner (docs/PROTOCOL.md, enemy ownership).
+T.run("an_enemy_next_to_the_client_stays_the_hosts", function()
+    -- The host's game runs every enemy (protocol 13): the client walking right up to the Ganado,
+    -- or away from it, never moves it to the client's game.
     client_game.player.pos = { x = 80, y = 0, z = 0 }
     local ok = T.wait_until(function() return client_game.puppet[1] == true end, step, 8)
     T.check(ok, "far from the client, its copy of the Ganado follows the host's")
     client_game.player.pos = { x = 21, y = 0, z = 1 } -- the client walks up to the Ganado
-    ok = T.wait_until(function() return client_game.puppet[1] == nil and ganado.head.update_self == false end, step, 5)
-    T.check(ok, "the Ganado changed hands: the client's game runs it, the host's follows")
-    T.eq(mock.component(ganado.body, "via.motion.MotionFsm2").enabled, false, "the host's copy plays only the client's animation")
-    client_game.enemies[1].pos = { x = 24, y = 0, z = 3 } -- the client's AI moves it
-    ok = T.wait_until(function() return math.abs(ganado.pos.x - 24) < 0.05 and math.abs(ganado.pos.z - 3) < 0.05 end, step, 3)
-    T.check(ok, "the host's copy follows the client's (x=" .. ganado.pos.x .. ")")
+    for _ = 1, 60 do step() end
+    T.eq(client_game.puppet[1], true, "the client's copy is still a puppet")
+    T.check(ganado.head.update_self ~= false, "the host's game still runs it")
+    T.check(mock.component(ganado.body, "via.motion.MotionFsm2").enabled ~= false, "with its own animation")
+    ganado.pos.x, ganado.pos.z = 24, 3 -- the host's AI moves it
+    ok = T.wait_until(function()
+        local e = client_game.enemies[1]
+        return math.abs(e.pos.x - 24) < 0.05 and math.abs(e.pos.z - 3) < 0.05
+    end, step, 3)
+    T.check(ok, "the client's copy follows the host's (x=" .. client_game.enemies[1].pos.x .. ")")
     client_game.player.pos = { x = 80, y = 0, z = 0 } -- the client walks away again
-    ok = T.wait_until(function() return client_game.puppet[1] == true and ganado.head.update_self == true end, step, 6)
-    T.check(ok, "back to the host's game")
+    for _ = 1, 20 do step() end
+    T.eq(client_game.puppet[1], true, "and stays a puppet")
 end)
 
 local function gap(a, b)

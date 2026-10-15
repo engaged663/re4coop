@@ -818,32 +818,431 @@ T.run("objects_we_hand_to_the_game_hold_an_engine_reference_for_a_while", functi
     T.eq(#game.held_objects, 1, "the first one let go after its time (REFramework releases it with the wrapper)")
 end)
 
-T.run("a_finisher_on_a_puppet_switches_it_back_on_at_once", function()
-    -- A stealth kill / grab / knife finish goes to the enemy's AI head, which a puppet has
-    -- switched off: when the sync allows it, the head is back on before the request reaches it.
+T.run("a_puppets_finisher_checks_answer_from_the_host_and_its_requests_go_to_the_host", function()
+    -- Our player's target selector asks the enemy's AI head which finishers it allows; a
+    -- puppet's head does not think, so it answers from what the host's enemy says. Acting on the
+    -- prompt asks the head for the finisher: granted at once (our player's side plays), the
+    -- puppet does nothing, and the request goes to the host (docs/RESEARCH.md 3.25).
     local game, world = fresh_game()
     game:set_active(true)
     game:read_player_state()
     local list = game:list_enemies()
     local e2 = world.enemies[2]
     local id = list[2].id
+    local I = P.PARTNER_INFO
+    local answer = nil
+    game.partner_fatal_query = function(i)
+        if i == id and answer ~= nil then return answer[1], answer[2] end
+        return nil
+    end
+    e2.fatal_ok = true
+    T.eq(e2.head_updater:call("isEnableFatal", world.player), true, "its own answer while its own AI runs it")
     game:enemy_set_puppet(id, true)
-    T.eq(e2.head.update_self, false, "a puppet: AI off")
-    game.fatal_filter = function() return false end
-    mock.fatal(e2)
-    T.eq(e2.head.update_self, false, "not when the sync says no")
-    T.eq(#game:take_fatal_events(), 0, "nothing reported")
-    game.fatal_filter = function(i) return i == id end
-    mock.fatal(e2, "requestKnifeFatal")
-    T.eq(e2.head.update_self, true, "its AI head is back on before the request reaches it")
-    T.eq(mock.component(e2.body, "via.motion.MotionFsm2").enabled, true, "and its animation driver")
-    T.eq(world.fatal_requests[2].target, e2, "the game's request still goes through")
+    T.eq(e2.head_updater:call("isEnableFatal", world.player), 0, "a puppet without the host's word: no prompt")
+    answer = { I.KNOWN | I.FATAL | I.STEALTH, 4 }
+    T.eq(e2.head_updater:call("isEnableFatal", world.player), 1, "the host's enemy allows a finisher")
+    T.eq(e2.head_updater:call("isEnableKnifeFatal", world.player), 0, "not a knife finish")
+    T.eq(e2.head_updater:call("isEnableStealthKill", world.player, false), 1, "a stealth kill")
+    T.eq(e2.head_updater:call("getAvailableFatalType"), 4, "the finisher type it offers")
+    answer = { I.KNOWN | I.KNIFE, 4 }
+    world.player.head_updater.has_knife = false
+    T.eq(e2.head_updater:call("isEnableKnifeFatal", world.player), 0, "a knife finish needs our own knife")
+    world.player.head_updater.has_knife = true
+    T.eq(e2.head_updater:call("isEnableKnifeFatal", world.player), 1, "with it, offered")
+    answer = { I.KNOWN | I.FATAL | I.STEALTH, 4 }
+    local before = #world.head_fatals
+    T.eq(mock.fatal(e2, "requestKnifeFatal", { stealth = true }), 1, "granted: our player's side plays")
+    T.eq(#world.head_fatals, before, "the puppet's own head did nothing")
+    T.eq(e2.head.update_self, false, "still a puppet")
     local ev = game:take_fatal_events()
-    T.eq(ev[1], id, "reported")
-    T.eq(#ev, 1, "once")
+    T.eq(#ev, 1, "reported once")
+    T.eq(ev[1] and ev[1].id, id, "on that enemy")
+    T.eq(ev[1] and ev[1].kind, P.FATAL_KIND.STEALTH, "a stealth kill")
+    T.near(ev[1] and ev[1].pos.x or 0, 1, 1e-6, "where our player stands")
+    mock.fatal(e2, "requestFatal", { ftype = 2 })
+    ev = game:take_fatal_events()
+    T.eq(ev[1] and ev[1].kind, P.FATAL_KIND.NORMAL, "a kick")
+    T.eq(ev[1] and ev[1].ftype, 2, "with its type")
     mock.fatal(e2, "requestStompFatal")
-    T.eq(game:take_fatal_events()[1], id, "the stomp too")
-    T.check(game:capabilities().fatal_hook.ok, "shown in Diagnostics")
+    T.eq(game:take_fatal_events()[1].kind, P.FATAL_KIND.KILL, "a stomp")
+    -- Its own AI again: the hooks leave it alone.
+    game:enemy_set_puppet(id, false)
+    T.eq(mock.fatal(e2, "requestStompFatal"), true, "its own head runs the request")
+    T.eq(#world.head_fatals, before + 1, "itself")
+    T.eq(#game:take_fatal_events(), 0, "nothing for the host")
+end)
+
+T.run("the_partners_model_becomes_a_character_our_enemies_fight", function()
+    -- Host: the client's model (the body prefab, sanitized) gets a stand-in player context, a
+    -- TargetMarker under our player's tag, its damage colliders and HitManager registration.
+    local game, world = fresh_game()
+    clock_now = 0
+    game:set_active(true)
+    game:read_player_state()
+    local list = game:list_enemies()
+    local I = P.PARTNER_INFO
+    local model = mock.build_body_prefab({ x = 10, y = 0, z = 4 })
+    game:sanitize(game:collect_tree(model))
+    T.check(game:partner_target_attach(model, { hits = true }), "attached")
+    T.check(game:partner_target_attached(), "and says so")
+    local upd = mock.component(model, "chainsaw.PlayerBodyUpdater")
+    local ctx = upd.__fields["<Context>k__BackingField"]
+    T.eq(ctx and ctx.__type, "chainsaw.ChCommonPlContext", "the model is a player character of our game")
+    T.eq(ctx.kind_id, 100000, "Leon")
+    T.eq(ctx.__fields["<KindID>k__BackingField"], 100000, "(kind field)")
+    T.eq(ctx.__fields._BodyUpdater, upd, "its body is the model")
+    T.check(ctx.hitpoint ~= nil, "with a HitPoint (its constructor ran)")
+    T.eq(upd.enabled, false, "the body updater itself stays off")
+    local marker = mock.component(model, "chainsaw.TargetMarker")
+    T.check(marker ~= nil and marker.enabled ~= false, "a TargetMarker on")
+    T.eq(marker.__fields._UseTargetJoint, false, "aimed at the chest")
+    T.near(marker.__fields._TargetOffset.y, 1.3, 1e-6, "...1.3 m up")
+    T.eq(model.tag, "Player|Character", "tagged like our player")
+    local hc = mock.component(model, "chainsaw.HitController")
+    T.eq(world.hit_controllers[model], hc, "its HitController can be hit")
+    T.eq(hc.__fields["<ContextAccessor>k__BackingField"], upd, "and knows its body updater")
+    local damage_on, others_off = 0, 0
+    for _, c in ipairs(model.components) do
+        if c.__type == "via.physics.Colliders" then
+            if c.list and #c.list > 0 then
+                if c.enabled ~= false then damage_on = damage_on + 1 end
+            elseif c.enabled == false then
+                others_off = others_off + 1
+            end
+        end
+    end
+    T.eq(damage_on, 1, "its damage colliders on")
+    T.eq(others_off, 1, "its other colliders stay off")
+    -- It follows the partner; its marker registers once.
+    clock_now = 2
+    T.check(game:partner_target_update({ x = 11, y = 0, z = 5 }, { x = 0, y = 0, z = 0, w = 1 }, 700, 1000), "updated")
+    T.near(ctx.__fields["<Position>k__BackingField"].x, 11, 1e-6, "where the partner is")
+    T.eq(ctx.hp, 700, "with their HP")
+    T.eq(marker.registrations, 1, "registered once")
+    game:partner_target_update({ x = 11, y = 0, z = 5 }, nil, 700, 1000)
+    T.eq(marker.registrations, 1, "never twice")
+    -- What our enemies say about it, and its finishers.
+    local e1 = world.enemies[1]
+    e1.fatal_ok, e1.fatal_type = true, 1
+    mock.target(e1, model)
+    local pinfo, ftype = game:enemy_partner_info(list[1].id, true)
+    T.eq(pinfo, I.KNOWN | I.FATAL | I.TARGETS, "a near enemy after the partner, offering a finisher")
+    T.eq(ftype, 1, "a round kick")
+    T.eq(game:enemy_partner_info(list[2].id, false), I.KNOWN, "a far one: only whom it targets")
+    T.check(game:enemy_partner_fatal(list[1].id, P.FATAL_KIND.KILL, 0), "the partner's knife finish runs")
+    local f = world.head_fatals[#world.head_fatals]
+    T.eq(f.kind, "kill", "as requestFatalKill")
+    T.eq(f.attacker, ctx, "with the partner's character as the attacker")
+    T.eq(f.target, e1, "on our enemy")
+    -- A knife finish: the enemy asks the attacker's head for a knife. The stand-in borrows our
+    -- player's head for the question, whose knife counts as there (our own may be broken: the
+    -- partner's game adds its player's answer).
+    e1.knife_ok = true
+    world.player.head_updater.has_knife = false
+    pinfo = game:enemy_partner_info(list[1].id, true)
+    T.check((pinfo & I.KNIFE) ~= 0, "the enemy allows a knife finish")
+    T.eq(ctx.__fields._HeadUpdater, nil, "the stand-in gave the head back")
+    T.eq(world.player.head_updater:call("hasKnife"), false, "our own answer is ours again")
+    e1.refuse_fatal = true
+    T.check(not game:enemy_partner_fatal(list[1].id, P.FATAL_KIND.STEALTH, 0), "one the enemy refuses")
+    -- An enemy's attack lands on it: the partner's hit, taken off the model.
+    T.eq(mock.enemy_attack(e1, model, 80, { attack_id = 1100, key = 0x77 }), true, "landed")
+    local ev = game:take_partner_damage_events()
+    T.eq(#ev, 1, "one hit for the partner")
+    T.eq(ev[1].id, list[1].id, "by that enemy")
+    T.eq(ev[1].attack_id, 1100, "its attack")
+    T.eq(ev[1].key_hash, 0x77, "its key")
+    T.eq(#(hc.received or {}), 0, "the model took nothing")
+    -- A thrown weapon: its owner is the thrower.
+    mock.enemy_attack(e1, model, 20, { owner = e1.body })
+    T.eq(#game:take_partner_damage_events(), 1, "a thrower's hit too")
+    -- An explosion (no enemy behind it): it happens in the partner's game as well.
+    mock.enemy_attack(e1, model, 20, { owner = mock.make_go("barrel") })
+    T.eq(#game:take_partner_damage_events(), 0, "not sent")
+    -- Let go: enemies forget it, nothing lands on it any more.
+    game:partner_target_detach()
+    T.eq(e1.hate.lost and e1.hate.lost[1], model, "our enemies lose it")
+    T.eq(marker.enabled, false, "its marker off")
+    T.eq(world.hit_controllers[model], nil, "its HitController out of HitManager's list")
+    T.eq(upd.__fields["<Context>k__BackingField"], nil, "its body updater no character's")
+    T.eq(mock.enemy_attack(e1, model, 80), nil, "nothing lands on it")
+    -- A model the game unloads: let go of at once.
+    T.check(game:partner_target_attach(model, { hits = true }), "attached again")
+    mock.destroy(model)
+    T.eq(game:partner_target_update({ x = 11, y = 0, z = 5 }, nil, 700, 1000), false, "gone")
+    T.eq(game:partner_target_attached(), false, "detached")
+    T.eq(game:partner_stats().lost, 1, "counted")
+end)
+
+T.run("friendly_fire_and_grabs_never_reach_the_partner", function()
+    local game, world = fresh_game()
+    game:set_active(true)
+    game:read_player_state()
+    game:list_enemies()
+    local model = mock.build_body_prefab({ x = 10, y = 0, z = 4 })
+    game:sanitize(game:collect_tree(model))
+    game:partner_target_attach(model, { hits = true, grabs = false })
+    local hm = world.singletons["chainsaw.HitManager"]
+    local info = mock.new("chainsaw.HitController.DamageInfo", { data = { Damage = 30, AttackOwnerObject = world.player.body,
+        AttackGameObject = world.player.body, DamageGameObject = model,
+        AttackUserData = mock.new("chainsaw.collision.AttackUserData"),
+        AttackData = mock.new("chainsaw.collision.AttackHitUserData.AttackData") } })
+    T.eq(hm:call("hitSetting", info, world.player.hit_controller, world.hit_controllers[model]), 0, "our own shot: skipped")
+    T.eq(mock.enemy_attack(world.enemies[1], model, 50, { grapple = true }), 0, "a grab: skipped")
+    T.eq(#game:take_partner_damage_events(), 0, "nothing for the partner")
+    local stats = game:partner_stats()
+    T.eq(stats.friendly, 1, "counted as friendly fire")
+    T.eq(stats.grabs_blocked, 1, "and as a blocked grab")
+    -- Grabs allowed (the default since 0.10.1): the grab lands, and goes to the partner as a grab.
+    game:partner_target_detach()
+    game:partner_target_attach(model, { hits = true, grabs = true })
+    T.eq(mock.enemy_attack(world.enemies[1], model, 50, { grapple = true }), true, "a grab lands")
+    local ev = game:take_partner_damage_events()
+    T.eq(#ev, 1, "it is the partner's")
+    T.eq(ev[1] and ev[1].grab, true, "as a grab")
+end)
+
+-- 0.10.1 (docs/RESEARCH.md 3.26).
+
+-- Host: our model of the partner, attached, standing at `pos`, and the enemy near it.
+local function attached_model(game, world, pos)
+    game:set_active(true)
+    game:read_player_state()
+    local list = game:list_enemies()
+    local model = mock.build_body_prefab(pos)
+    game:sanitize(game:collect_tree(model))
+    T.check(game:partner_target_attach(model, { hits = true, grabs = true, parry = true, bosses = true }), "attached")
+    game:partner_target_update(pos, { x = 0, y = 0, z = 0, w = 1 }, 900, 1000)
+    return model, list
+end
+
+T.run("our_shots_pass_the_partners_model_and_enemy_blows_still_land", function()
+    -- HitController.poolDamage pools a contact's damage and asks whether the body shields the
+    -- attack: our own attacks' contacts with the model are dropped before it.
+    local game, world = fresh_game()
+    local model = attached_model(game, world, { x = 10, y = 0, z = 4 })
+    T.eq(mock.contact(world.player.hit_controller, model), false, "our blow passes")
+    local bullet = mock.make_go("bullet")
+    local shell = mock.add_component(bullet, "chainsaw.ShellBase")
+    shell.__fields["<AttackOwner>k__BackingField"] = world.player.body
+    T.eq(mock.contact(mock.add_component(bullet, "chainsaw.HitController"), model), false, "our bullet too")
+    T.eq(mock.contact(mock.component(world.enemies[1].body, "chainsaw.HitController"), model), true, "an enemy's lands")
+    T.eq(mock.contact(world.player.hit_controller, world.enemies[1].body), true, "and ours on an enemy")
+    T.eq(game:partner_stats().shots_passed, 2, "counted")
+    T.eq(game:capabilities().partner_shots.ok, true, "Diagnostics: partner_shots")
+    game:partner_target_detach()
+    T.eq(mock.contact(world.player.hit_controller, model), true, "detached: a body like any other")
+end)
+
+T.run("an_enemy_warning_the_partner_is_reported_and_the_partners_parry_staggers_it", function()
+    local game, world = fresh_game()
+    local e1 = world.enemies[1]
+    local model, list = attached_model(game, world, { x = 6, y = 0, z = 0 })
+    local id = list[1].id
+    mock.target(e1, model)
+    game:enemy_partner_info(id, false) -- the host learns it targets the model (a few times a second)
+    local upd = mock.enemy_body_updater(e1)
+    upd.sign, upd.just = mock.sign_info({ sign = 13, button = 1, distance = 3 }), true
+    game:partner_target_update({ x = 6, y = 0, z = 0 }, nil, nil, nil)
+    local ev = game:take_sign_events()
+    T.eq(#ev, 1, "its warning, polled")
+    T.eq(ev[1] and ev[1].id, id, "from that enemy")
+    T.eq(ev[1] and ev[1].sign_type, 13, "its sign type")
+    T.eq(ev[1] and ev[1].button, 1, "its button")
+    T.eq(ev[1] and ev[1].just, true, "its just timing")
+    game:partner_target_update({ x = 9.5, y = 0, z = 0 }, nil, nil, nil)
+    T.eq(#game:take_sign_events(), 0, "beyond the warning's reach: none")
+    upd.sign = nil
+    -- The game's own delivery to the model (its warning collider touched it): ours to report.
+    local util = mock.new("chainsaw.EnemyActionSignUtility")
+    util:call("sendActionSignInfo", e1.body, model, mock.sign_info({ sign = 2 }))
+    T.eq(#(world.signs_delivered or {}), 0, "the model has no head to show it")
+    ev = game:take_sign_events()
+    T.eq(ev[1] and ev[1].sign_type, 2, "reported")
+    util:call("sendActionSignInfo", e1.body, world.player.body, mock.sign_info({ sign = 2 }))
+    T.eq(#world.signs_delivered, 1, "our own player's warnings are the game's")
+    -- The partner's parry: our enemy's body is told, with the model as the parrying character.
+    T.eq(game:enemy_partner_parry(id, P.PARRY_KIND.PARRY, 13), true, "run")
+    T.eq(world.parries[1] and world.parries[1].body, upd, "on that enemy's body")
+    T.eq(world.parries[1] and world.parries[1].by, model, "by the model")
+    T.eq(world.parries[1] and world.parries[1].sign, 13, "for that attack")
+    T.eq(game:enemy_partner_parry(id, P.PARRY_KIND.INPUT, 0), true, "the press too")
+    T.eq(upd.parry_inputs, 1, "onParryInput")
+end)
+
+T.run("an_enemy_holds_the_partner_until_the_partner_breaks_free", function()
+    local game, world = fresh_game()
+    local e1 = world.enemies[1]
+    local model, list = attached_model(game, world, { x = 6, y = 0, z = 0 })
+    local id = list[1].id
+    mock.enemy_body_updater(e1)
+    e1.head_updater:call("requestGrapple", model, 0x77)
+    local held = game:partner_grabbers(clock())
+    T.eq(held[id] and held[id].action, 0x77, "held, with the grab's action")
+    local tree = mock.new("chainsaw.Ch1c0z0BehaviorTreeAction_CheckEscapeGrapple",
+        { __fields = { NumberOfStruggles = 6, isEnableKnifeEscape = true } })
+    local arg = mock.new("via.behaviortree.ActionArg", { owner = e1.body })
+    tree:call("update", arg)
+    T.eq(tree.updates, 1, "its escape check runs as usual")
+    held = game:partner_grabbers(clock())
+    T.eq(held[id].struggles, 6, "the presses it wants")
+    T.eq(held[id].knife, true, "and that a knife breaks free")
+    T.eq(game:enemy_partner_release(id, P.ESCAPE_KIND.MASH), true, "the partner broke free")
+    tree:call("update", arg)
+    T.eq(tree.escaped, true, "the escape check succeeded")
+    T.eq(arg.done, true, "and ended")
+    T.eq(tree.updates, 1, "instead of its own update")
+    T.eq(next(game:partner_grabbers(clock())), nil, "let go")
+    -- An enemy kind whose escape check does not run: the grab is undone as a rejected one.
+    e1.head_updater:call("requestGrapple", model, 0x78)
+    game:enemy_partner_release(id, P.ESCAPE_KIND.MASH)
+    T.check(game:partner_grabbers(clock())[id] ~= nil, "still held for a moment")
+    T.eq(next(game:partner_grabbers(clock() + 1)), nil, "then let go")
+    T.eq(e1.head_updater.rejected, 1, "as a rejected grab")
+    T.eq(e1.head_updater.rejected_action, 0x78, "of that grab")
+end)
+
+T.run("the_hosts_warning_reaches_our_head_and_our_parry_of_a_copy_is_reported", function()
+    -- Client: the warning goes to our player's head as from our own game's enemy; our player's
+    -- parry then asks our copy, whose answer stands and is reported for the host.
+    local game, world = fresh_game()
+    game:set_active(true)
+    game:read_player_state()
+    local list = game:list_enemies()
+    local e1 = world.enemies[1]
+    local id = list[1].id
+    T.eq(game:player_action_sign(id, { sign_type = 13, button = 1, just = true, act = true }), true, "shown")
+    local got = world.player.head_updater.signs and world.player.head_updater.signs[1]
+    T.eq(got and got.owner, e1.body, "from our copy of the enemy")
+    T.eq(got and got.sign, 13, "its sign type")
+    T.eq(got and got.just, true, "its just timing")
+    local upd = mock.enemy_body_updater(e1)
+    local r = upd:call("onParry", world.player.body, 13)
+    T.eq(r and r:call("get_Successful"), true, "its own answer")
+    T.eq(#game:take_parry_events(), 0, "not a copy of the host's: nothing to report")
+    game:enemy_set_puppet(id, true)
+    r = upd:call("onParry", world.player.body, 13)
+    T.eq(r and r:call("get_Successful"), true, "a copy answers as itself (our player's parry plays)")
+    upd:call("onParryInput")
+    local ev = game:take_parry_events()
+    T.eq(#ev, 2, "the parry and the press")
+    T.eq(ev[1] and ev[1].id, id, "of that copy")
+    T.eq(ev[1] and ev[1].kind, P.PARRY_KIND.PARRY, "a parry")
+    T.eq(ev[1] and ev[1].sign_type, 13, "of that attack")
+    T.eq(ev[1] and ev[1].ok, true, "that landed")
+    T.eq(ev[2] and ev[2].kind, P.PARRY_KIND.INPUT, "the press")
+end)
+
+T.run("a_grab_from_the_hosts_enemy_runs_through_the_games_hit_code_and_we_break_free", function()
+    local game, world = fresh_game()
+    game:set_active(true)
+    game:read_player_state()
+    local list = game:list_enemies()
+    local e1 = world.enemies[1]
+    local id = list[1].id
+    local ad = mock.new("chainsaw.collision.AttackHitUserData.AttackData", { __fields = { _AttackType = 4,
+        _AttackPower = 0, _Option = 0 } })
+    world.attack_catalog["1200:" .. tostring(0x78)] = ad
+    local landed = world.attacks_landed or 0
+    local r = game:player_take_hit({ attack_id = 1200, key_hash = 0x78, grab = true, grab_priority = 2, fields = {
+        { h = P.hash("Damage"), t = P.HIT_VALUE.I32, v = 100 },
+        { h = P.hash("DamageUserData.Parts"), t = P.HIT_VALUE.I32, v = 1 } } }, id)
+    T.eq(r, "applied", "applied")
+    T.eq(world.attacks_landed, landed + 1, "through HitManager.hitSetting")
+    local rec = world.player.hit_controller.received[#world.player.hit_controller.received]
+    T.eq(rec and rec.attacker, e1.body, "our copy of the enemy grabs")
+    T.eq(game:partner_stats().player_grabs, 1, "counted")
+    -- Breaking free: the presses the enemies' escape checks count.
+    local cmd = mock.new("share.hid.Command", { pressed = {} })
+    world.player.head_updater.__fields["<Command>k__BackingField"] = cmd
+    T.eq(game:player_grab_input(true), nil, "nothing pressed")
+    cmd.pressed[0x0ED27DB6] = true
+    T.eq(game:player_grab_input(true), "mash", "a press")
+    cmd.pressed[0x38324405] = true
+    T.eq(game:player_grab_input(true), "knife", "the knife")
+    T.eq(game:player_grab_input(false), "mash", "the knife not allowed")
+    world.player.head_updater.has_knife = false
+    T.eq(game:player_grab_input(true), "mash", "no knife to use")
+    -- Let go: our copy's grab undone, our character out of its grab.
+    world.player.body_updater = mock.add_component(world.player.body, "chainsaw.PlayerBodyUpdater", { ctx = world.player })
+    world.player.grabbed = true
+    T.eq(game:player_grab_release(id, 0x55), true, "released")
+    T.eq(e1.head_updater.rejected_action, 0x55, "our copy's grab undone")
+    T.eq(world.player.body_updater.cancel_grapple, true, "our character leaves its grab")
+    T.eq(world.player.grabbed, false, "free")
+end)
+
+T.run("the_partners_noise_is_made_by_the_model_and_ours_is_reported", function()
+    local game, world = fresh_game()
+    game:set_active(true)
+    game:read_player_state()
+    -- Client: our player's sounds are reported, no one else's.
+    game.capture_noise = true
+    mock.make_noise(world.player.body, { x = 1, y = 2, z = 3 }, 0.7)
+    mock.make_noise(world.enemies[1].body, { x = 5, y = 0, z = 0 }, 0.9)
+    local q = game:take_noise_events()
+    T.eq(#q, 1, "ours only")
+    T.near(q[1] and q[1].volume or 0, 0.7, 1e-6, "its volume")
+    T.near(q[1] and q[1].pos.x or 0, 1, 1e-6, "where it was made")
+    T.eq(q[1] and q[1].radius, 12, "its reach")
+    T.eq(#game:take_noise_events(), 0, "taken")
+    -- Host: the partner's noise, made by their model in our world (and not reported back).
+    game.capture_noise = false
+    local model = mock.build_body_prefab({ x = 10, y = 0, z = 4 })
+    game:sanitize(game:collect_tree(model))
+    T.eq(game:partner_noise({ pos = { x = 10, y = 0, z = 4 }, radius = 15, height = 3, volume = 0.5, sub = 1 }), false,
+        "not before the model is attached")
+    game:partner_target_attach(model, { hits = true })
+    local n0 = #world.noises
+    T.check(game:partner_noise({ pos = { x = 10, y = 0, z = 4 }, radius = 15, height = 3, volume = 0.5, sub = 1 }), "made")
+    local n = world.noises[n0 + 1]
+    T.eq(n and n.__fields["<OwnerGameObject>k__BackingField"], model, "by the model")
+    T.eq(n and n.__fields.Radius, 15, "with its reach")
+    T.eq(#game:take_noise_events(), 0, "the host does not report it")
+end)
+
+T.run("a_hit_from_the_hosts_enemy_runs_on_our_character_like_the_game_runs_one", function()
+    -- Client: HitManager.hitSetting's steps on our real character - kill by our HP, our own
+    -- check (a dodge), the non-lethal attacks' last HP, DamageCalcInfo.copy, callbackDamageHit.
+    local game, world = fresh_game()
+    game:set_active(true)
+    game:read_player_state()
+    local list = game:list_enemies()
+    local ad = mock.new("chainsaw.collision.AttackHitUserData.AttackData", { __fields = { _AttackType = 4,
+        _AttackPower = 0, _Option = 0 } })
+    world.attack_catalog["1100:" .. tostring(0x77)] = ad
+    local function hit(damage)
+        return { attack_id = 1100, key_hash = 0x77, fields = {
+            { h = P.hash("Damage"), t = P.HIT_VALUE.I32, v = damage },
+            { h = P.hash("Wince"), t = P.HIT_VALUE.F32, v = 25 },
+            { h = P.hash("DamageUserData.Parts"), t = P.HIT_VALUE.I32, v = 0 },
+            { h = P.hash("DamageUserData.PartsSide"), t = P.HIT_VALUE.I32, v = 0 } } }
+    end
+    T.eq(game:player_take_hit(hit(300), list[1].id), "applied", "applied")
+    local hc = world.player.hit_controller
+    local r = hc.received and hc.received[1]
+    T.eq(r and r.damage, 300, "its damage")
+    T.eq(r and r.wince, 25, "its values")
+    T.eq(r and r.attack_data, ad, "the attack's own data from HitManager's catalog")
+    T.eq(r and r.attacker, world.enemies[1].body, "our copy of the enemy attacks")
+    T.eq(r and r.part, 0, "on our head collider")
+    T.eq(r and r.kill, false, "not a kill")
+    T.eq(world.player.hp, 900, "our HP")
+    T.eq(hc.__fields["<DamageCalcInfo>k__BackingField"].data.Damage, 300, "DamageCalcInfo holds it, as the game's")
+    world.player.dodging = true
+    T.eq(game:player_take_hit(hit(300), list[1].id), "blocked", "dodged: our own check says no")
+    T.eq(world.player.hp, 900, "untouched")
+    world.player.dodging = false
+    ad.__fields._Option = 4
+    game:player_take_hit(hit(5000), list[1].id)
+    T.eq(world.player.hp, 1, "a non-lethal attack leaves 1 HP")
+    ad.__fields._Option = 0
+    game:player_take_hit(hit(5000), nil)
+    T.eq(world.player.hp, 0, "a lethal one kills")
+    T.eq(hc.received[#hc.received].kill, true, "as a kill")
+    T.eq(hc.received[#hc.received].attacker, world.player.body, "an unknown attacker: our own body stands in")
+    T.eq(game:player_take_hit({ attack_id = 9999, key_hash = 1, fields = hit(10).fields }, nil), "failed",
+        "an attack we have no data for (and no template) is not run")
 end)
 
 T.run("a_death_from_the_partners_game_comes_with_its_killing_hit", function()

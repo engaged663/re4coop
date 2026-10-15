@@ -184,6 +184,15 @@ function Puppet:is_visible()
     return self.state == "ready" and self.visible == true
 end
 
+-- The model's root GameObject while it can stand as the partner's character in our game
+-- (partner_target.lua): built from the real body prefab (its body updater, HitController and
+-- damage colliders come with it; a mesh-only mirror has none) and shown.
+function Puppet:target_root()
+    if self.state ~= "ready" or self.mode ~= "prefab" or not self.visible or self.root == nil then return nil end
+    if not self.game:alive(self.root_tf) then return nil end
+    return self.root
+end
+
 -------------------------------------------------------------------------------
 -- Building
 -------------------------------------------------------------------------------

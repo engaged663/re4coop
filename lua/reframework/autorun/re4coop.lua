@@ -69,6 +69,8 @@ local session = Session.new({
     perf = perf,
 })
 local puppet = Puppet.new(game, log_info)
+-- The host's enemies fight the partner's model as a second player (partner_target.lua).
+session.partner_model = puppet
 
 local last_game_tick = -math.huge
 local reported_error = {}
@@ -153,6 +155,14 @@ re.on_frame(function()
                 marker = not puppet:is_visible(),
             })
             if not ok then report_once("overlay", err) end
+        end
+    end
+
+    if session.role == "client" then
+        local grab = session:status_cached().grab
+        if grab ~= nil then
+            local okG, errG = pcall(Overlay.draw_grab, game, grab)
+            if not okG then report_once("grab prompt", errG) end
         end
     end
 

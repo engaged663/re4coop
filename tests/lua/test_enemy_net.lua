@@ -1,11 +1,12 @@
 -- Two simulated game worlds (host + client) running EnemyNet against each other, with every
--- message going through the real protocol encoder/decoder.
+-- message going through the real protocol encoder/decoder. The host's game runs every enemy;
+-- the client's shows them (protocol 13).
 local T = require("testlib")
 local P = require("re4coop.protocol")
 local EnemyNet = require("re4coop.enemy_net")
 
 local GANADO, DOG, CHIEF = "chainsaw.Ch1c0z0Context", "chainsaw.Ch1d1z1Context", "chainsaw.Ch1d0z0Context"
-local HOST, CLIENT = P.OWNER.HOST, P.OWNER.CLIENT
+local HOST = P.OWNER.HOST
 
 local function yaw_quat(yaw)
     return { x = 0, y = math.sin(yaw / 2), z = 0, w = math.cos(yaw / 2) }
@@ -83,12 +84,12 @@ local function make_world(id_base)
         local e = self:get(id)
         return e and e.hp or nil
     end
-    function w:enemy_kill(id, fields)
+    function w:enemy_kill(id, fields, by)
         local e = self:get(id)
         if not e or self.refuse_kill then return false end
         self.calls.kill = self.calls.kill + 1
         self.kills[#self.kills + 1] = { id = id, fields = fields, puppet = self.puppet[id] == true,
-            pos = { x = e.pos.x, y = e.pos.y, z = e.pos.z } }
+            pos = { x = e.pos.x, y = e.pos.y, z = e.pos.z }, by = by }
         e.hp, e.alive = 0, false
         return true
     end
@@ -163,6 +164,21 @@ local function make_world(id_base)
         self:spawn(sp.kind, sp.pos.x, sp.pos.y, sp.pos.z, 100, uid)
         return "spawning"
     end
+    -- Host: the client's finishers run on our enemies (refuse_fatal: the enemy's head says no),
+    -- and what our enemies say about the client's player (pinfo[id] = { bits, ftype }).
+    w.fatals, w.pinfo, w.info_asked = {}, {}, {}
+    function w:enemy_partner_fatal(id, kind, ftype)
+        if not self:get(id) or self.refuse_fatal then return false end
+        self.fatals[#self.fatals + 1] = { id = id, kind = kind, ftype = ftype }
+        return true
+    end
+    function w:enemy_partner_info(id, near)
+        self.info_asked[id] = near
+        local p = self.pinfo[id]
+        if p == nil then return P.PARTNER_INFO.KNOWN, 0 end
+        return p[1], p[2]
+    end
+
     -- The save's eliminated enemies, read over several calls like the real backup table.
     function w:scan_eliminated()
         if self.save_dead == nil then return true, {} end
@@ -220,8 +236,7 @@ local function make_pair(settings)
             for i = #events, 1, -1 do events[i] = nil end
         end
         sync:tick(self.now, world:list(function(id) return sync:wants_state(id) end), world,
-            { local_pos = me, partner_pos = partner, partner_busy = self.partner_busy,
-                loading = sync == self.client and self.client_loading or nil })
+            { local_pos = me, partner_pos = partner, loading = sync == self.client and self.client_loading or nil })
         sync:frame(self.now, world)
     end
 
@@ -249,13 +264,12 @@ local function make_pair(settings)
             fields = hit_fields(damage) }
     end
 
-    -- Our player starts a finisher (stealth kill, grab...) on `e`, the way game.lua's hook
-    -- reports it: the adapter switches a puppet back on at once when the sync allows it.
-    function pair:fatal(side, e)
+    -- The client's player starts a finisher on puppet `e`, the way game_partner.lua's hooks on
+    -- the puppet's AI head report it (the puppet itself does nothing).
+    function pair:fatal(side, e, kind, ftype)
         local sync = side == "host" and self.host or self.client
-        local world = side == "host" and self.host_world or self.client_world
-        if sync:may_fatal(e.id) then world.puppet[e.id] = nil end
-        sync:on_local_fatal({ e.id }, self.now, world)
+        sync:on_local_fatal({ { id = e.id, kind = kind or P.FATAL_KIND.KILL, ftype = ftype or 0,
+            pos = { x = 0, y = 0, z = 0 }, yaw = 0 } }, self.now)
     end
 
     return pair
@@ -338,34 +352,33 @@ T.run("a_context_reused_for_another_enemy_is_a_new_enemy", function()
 end)
 
 -------------------------------------------------------------------------------
--- Ownership
+-- Authority: the host's, always
 -------------------------------------------------------------------------------
 
-T.run("each_enemy_goes_to_the_game_of_the_player_it_is_closer_to", function()
+T.run("every_enemy_is_the_hosts_wherever_the_players_are", function()
     local pair = make_pair()
-    pair.host_player = { x = -20, y = 0, z = 0 }
-    pair.client_player = { x = 30, y = 0, z = 0 }
+    pair.host_player = { x = -60, y = 0, z = 0 }
+    pair.client_player = { x = 9, y = 0, z = 0 } -- right next to B, far from the host
     local h, c = standard_level(pair)
-    pair:step(6)
-    T.eq(owner_of(pair, h.a), HOST, "A (x=0) is the host's")
-    T.eq(owner_of(pair, h.b), CLIENT, "B (x=10) is the client's")
-    T.eq(pair.host_world.puppet[h.b.id], true, "the host's B follows the client's")
-    T.eq(pair.client_world.puppet[c.b.id], nil, "the client's B runs on its own AI")
-    T.eq(pair.client_world.puppet[c.a.id], true, "the client's A follows the host's")
-    T.eq(pair.host_world.puppet[h.a.id], nil, "the host's A runs")
+    pair:step(80)
+    for k in pairs(h) do
+        T.eq(owner_of(pair, h[k]), HOST, k .. " is the host's")
+        T.eq(pair.host_world.puppet[h[k].id], nil, k .. " runs on the host's AI")
+        T.eq(pair.client_world.puppet[c[k].id], true, k .. " is a puppet on the client")
+        T.eq(pair.client.nets[net_of(pair.client, c[k])].epoch, 1, k .. " numbered once")
+    end
+    T.eq(pair.host.counters.assigned, 3, "each numbered for the client once")
     local s = pair.client:summary()
-    T.eq(s.run_here, 1, "the client runs one")
-    T.eq(s.run_by_partner, 2, "and shows two")
+    T.eq(s.authority, "host", "host authority")
+    T.eq(s.puppets, 3, "the client shows three")
 end)
 
 T.run("a_puppet_switched_back_on_behind_the_syncs_back_is_switched_off_again", function()
     local pair = make_pair()
-    pair.host_player = { x = -20, y = 0, z = 0 }
-    pair.client_player = { x = 30, y = 0, z = 0 }
     local h, c = standard_level(pair)
     pair:step(6)
     T.eq(pair.client_world.puppet[c.a.id], true, "the client's A follows the host's")
-    -- The game adapter runs A's own AI again by itself (a refused finisher, a head linked again).
+    -- The game adapter runs A's own AI again by itself (a death it ran, a head linked again).
     pair.client_world.puppet[c.a.id] = nil
     pair:step(2)
     T.eq(pair.client_world.puppet[c.a.id], true, "A is a puppet again: its own AI does not run in both games")
@@ -373,115 +386,27 @@ T.run("a_puppet_switched_back_on_behind_the_syncs_back_is_switched_off_again", f
     T.eq(owner_of(pair, h.a), HOST, "still the host's")
 end)
 
-T.run("host_authority_keeps_every_enemy_with_the_host", function()
-    local pair = make_pair({ enemy_authority = "host" })
-    pair.host_player = { x = -50, y = 0, z = 0 }
-    pair.client_player = { x = 10, y = 0, z = 0 }
-    local h, c = standard_level(pair)
-    pair:step(40)
-    for k in pairs(h) do
-        T.eq(owner_of(pair, h[k]), HOST, k .. " stays with the host")
-        T.eq(pair.client_world.puppet[c[k].id], true, k .. " is a puppet on the client")
-    end
-end)
-
-T.run("an_enemy_changes_hands_only_after_a_clear_lasting_lead", function()
+T.run("the_client_shooting_an_enemy_never_takes_it_over", function()
+    -- 0.9 gave an enemy to the game of the player closest to it or shooting it. Now the client
+    -- shoots it from point blank for a long time: it stays the host's, every hit runs there.
     local pair = make_pair()
-    pair.host_player = { x = -5, y = 0, z = 0 }
-    pair.client_player = { x = 20, y = 0, z = 0 }
-    local h = pair.host_world:spawn(GANADO, 0, 0, 0, 100, 0x4001)
-    local c = pair.client_world:spawn(GANADO, 0, 0, 0, 100, 0x4001)
-    pair:step(5)
-    local owner, epoch = owner_of(pair, h)
-    T.eq(owner, HOST, "the host's first")
-    -- The client comes closer, but only 1 m closer than the host: no change.
-    pair.client_player = { x = 4, y = 0, z = 0 }
-    pair:step(40)
-    T.eq(owner_of(pair, h), HOST, "a small lead changes nothing")
-    -- Now clearly closer, but only for a moment.
-    pair.client_player = { x = 0.5, y = 0, z = 0 }
-    pair:step(5)
-    pair.client_player = { x = 4, y = 0, z = 0 }
-    pair:step(5)
-    T.eq(owner_of(pair, h), HOST, "a short lead changes nothing")
-    -- A lasting clear lead.
-    pair.client_player = { x = 0.5, y = 0, z = 0 }
-    pair:step(30)
-    local owner2, epoch2 = owner_of(pair, h)
-    T.eq(owner2, CLIENT, "the client's now")
-    T.check(epoch2 ~= epoch, "a new ownership epoch")
-    T.eq(pair.client.nets[net_of(pair.client, c)].epoch, epoch2, "the client knows the epoch")
-    T.eq(pair.client_world.puppet[c.id], nil, "the client's AI runs it")
-    T.eq(pair.host_world.puppet[h.id], true, "the host's copy follows")
-    -- And straight back is not possible before the minimum time.
-    pair.client_player = { x = 30, y = 0, z = 0 }
-    pair:step(20)
-    T.eq(owner_of(pair, h), CLIENT, "kept for the minimum time")
-    pair:step(60)
-    T.eq(owner_of(pair, h), HOST, "then back to the host")
-    T.eq(pair.client_world.puppet[c.id], true, "the client's copy follows again")
-end)
-
-T.run("the_player_who_hits_an_enemy_draws_it", function()
-    local pair = make_pair()
-    pair.host_player = { x = -4, y = 0, z = 0 }
-    pair.client_player = { x = 5, y = 0, z = 0 }
-    local h = pair.host_world:spawn(GANADO, 0, 0, 0, 1000, 0x4101)
-    local c = pair.client_world:spawn(GANADO, 0, 0, 0, 1000, 0x4101)
-    pair:step(5)
-    T.eq(owner_of(pair, h), HOST, "the host's (closer)")
-    -- Equal distances, but the client keeps shooting it: it goes to the client.
-    pair.host_player = { x = -5, y = 0, z = 0 }
-    for _ = 1, 60 do
-        pair:player_hit("client", c, 1)
-        pair:step(1)
-    end
-    T.eq(owner_of(pair, h), CLIENT, "the shooter's game runs it")
-end)
-
-T.run("an_enemy_both_players_shoot_stays_where_it_is", function()
-    -- Two players taking turns at one enemy: the last shooter's advantage (and players moving
-    -- around it) made it change hands again and again, and every change cut its reaction short.
-    local pair = make_pair()
-    pair.host_player = { x = -5, y = 0, z = 0 }
-    pair.client_player = { x = 5, y = 0, z = 0 }
+    pair.host_player = { x = -40, y = 0, z = 0 }
+    pair.client_player = { x = 1, y = 0, z = 0 }
     local h = pair.host_world:spawn(GANADO, 0, 0, 0, 100000, 0x4111)
     local c = pair.client_world:spawn(GANADO, 0, 0, 0, 100000, 0x4111)
     pair:step(5)
-    T.eq(owner_of(pair, h), HOST, "the host's")
-    local changes = pair.host.counters.owner_changes
-    local function fight(rounds)
-        for _ = 1, rounds do
-            for _ = 1, 25 do
-                pair:player_hit("client", c, 1)
-                pair:step(1)
-            end
-            for _ = 1, 25 do
-                pair:player_hit("host", h, 1)
-                pair:step(1)
-            end
-        end
-    end
-    fight(2)
-    pair.client_player = { x = 1, y = 0, z = 0 } -- the client steps right up to it
-    fight(4)
-    T.eq(owner_of(pair, h), HOST, "kept by the same game")
-    T.eq(pair.host.counters.owner_changes, changes, "never changed hands during the fight")
-    -- The fight is over: distance decides again.
-    pair:step(120)
-    T.eq(owner_of(pair, h), CLIENT, "the near player's game runs it once the fight is over")
-    -- A fight, and the client is suddenly far away (fell, travelled): the host takes it anyway.
-    fight(1)
-    pair.client_player = { x = 200, y = 0, z = 0 }
-    for _ = 1, 30 do -- still shooting at it from afar: the fight goes on
+    for _ = 1, 100 do
         pair:player_hit("client", c, 1)
         pair:step(1)
     end
-    T.eq(owner_of(pair, h), HOST, "a player out of range never keeps it")
+    T.eq(owner_of(pair, h), HOST, "the host's")
+    T.eq(pair.client_world.puppet[c.id], true, "the client's copy never ran")
+    T.eq(#pair.host_world.applied, 100, "every hit ran in the host's game")
+    T.eq(pair.host.counters.assigned, 1, "numbered once, never handed over")
 end)
 
 T.run("the_reaction_to_a_partners_hit_goes_out_at_once", function()
-    local pair = make_pair({ enemy_authority = "host", snapshot_hz = 2 })
+    local pair = make_pair({ snapshot_hz = 2 })
     local h, c = standard_level(pair)
     pair:step(10)
     -- Right after one of the host's regular states (the next is half a second away).
@@ -499,75 +424,21 @@ T.run("the_reaction_to_a_partners_hit_goes_out_at_once", function()
     T.check((pair.client.counters.fresh_anims or 0) > 0, "not one interpolation delay later")
 end)
 
-T.run("a_partner_who_is_down_or_in_a_cutscene_gets_no_enemies", function()
+T.run("a_host_enemy_that_left_the_hosts_world_leaves_the_clients_copy_waiting_unseen", function()
     local pair = make_pair()
-    pair.host_player = { x = -30, y = 0, z = 0 }
-    pair.client_player = { x = 2, y = 0, z = 0 }
-    pair.partner_busy = true
-    local h = pair.host_world:spawn(GANADO, 0, 0, 0, 100, 0x4201)
-    pair.client_world:spawn(GANADO, 0, 0, 0, 100, 0x4201)
-    pair:step(60)
-    T.eq(owner_of(pair, h), HOST, "stays with the host")
-    pair.partner_busy = false
-    pair:step(60)
-    T.eq(owner_of(pair, h), CLIENT, "the client's once it can fight")
-end)
-
-T.run("taking_over_continues_from_the_partners_latest_state", function()
-    local pair = make_pair()
-    pair.host_player = { x = 0, y = 0, z = -2 }
-    pair.client_player = { x = 0, y = 0, z = -40 }
-    local h = pair.host_world:spawn(GANADO, 0, 0, 0, 100, 0x4301)
-    local c = pair.client_world:spawn(GANADO, 30, 0, 30, 100, 0x4301)
-    pair:step(10)
-    -- The host's AI walked it and hurt it.
-    h.pos = { x = 3, y = 0, z = 1 }
-    h.hp = 40
-    pair:step(10)
-    T.near(c.pos.x, 3, 0.01, "the client's copy is where the host's is")
-    T.eq(c.hp, 40, "with the host's HP")
-    -- The players swap places: the client takes it over from there.
-    pair.host_player = { x = 0, y = 0, z = -60 }
-    pair.client_player = { x = 3, y = 0, z = -1 }
-    pair:step(80)
-    T.eq(owner_of(pair, h), CLIENT, "the client's")
-    T.near(c.pos.x, 3, 0.1, "continues where it was")
-    T.eq(c.hp, 40, "with the HP it had")
-    -- The client's AI moves it: the host's copy follows.
-    c.pos = { x = -6, y = 0, z = 2 }
-    c.rot = yaw_quat(1.2)
-    pair:step(10)
-    T.near(h.pos.x, -6, 0.01, "the host's copy follows the client's")
-    T.near(h.rot.y, math.sin(0.6), 0.01, "and its full rotation")
-end)
-
-T.run("an_owner_that_lost_its_copy_gives_it_back", function()
-    local pair = make_pair()
-    pair.host_player = { x = -30, y = 0, z = 0 }
-    pair.client_player = { x = 2, y = 0, z = 0 }
-    local h = pair.host_world:spawn(GANADO, 0, 0, 0, 100, 0x4401)
-    local c = pair.client_world:spawn(GANADO, 0, 0, 0, 100, 0x4401)
-    pair:step(8)
-    T.eq(owner_of(pair, h), CLIENT, "the client's")
-    pair.client_world:remove(c) -- the client's area unloaded
-    pair:step(40)
-    T.eq(owner_of(pair, h), HOST, "the host runs it again")
-    T.eq(pair.host_world.puppet[h.id], nil, "with its own AI")
-end)
-
-T.run("a_host_enemy_that_left_the_hosts_world_frees_the_clients_copy", function()
-    local pair = make_pair()
-    pair.host_player = { x = -30, y = 0, z = 0 }
-    pair.client_player = { x = 2, y = 0, z = 0 }
     local h = pair.host_world:spawn(GANADO, 0, 0, 0, 100, 0x4501)
     local c = pair.client_world:spawn(GANADO, 0, 0, 0, 100, 0x4501)
     pair:step(8)
-    T.eq(owner_of(pair, h), CLIENT, "the client's")
+    T.eq(pair.client_world.hidden[c.id], nil, "shown while the host has it")
     pair.host_world:remove(h) -- the host's area unloaded
     pair:step(140)
-    T.eq(net_of(pair.client, c), nil, "no longer shared")
-    T.eq(pair.client_world.puppet[c.id], nil, "the client's copy runs on its own")
-    T.check(pair.client.counters.handed_over == 0 or true, "")
+    T.eq(net_of(pair.client, c), nil, "no longer paired")
+    T.eq(pair.client_world.puppet[c.id], true, "the client's copy never runs on its own")
+    T.eq(pair.client_world.hidden[c.id], true, "and waits unseen")
+    table.insert(pair.host_world.enemies, h) -- the host's area loads it again
+    pair:step(10)
+    T.eq(net_of(pair.client, c), net_of(pair.host, h), "paired again")
+    T.eq(pair.client_world.hidden[c.id], nil, "shown again")
 end)
 
 -- El Gigante: its death is a cutscene (Ch1f0z0HeadUpdater.onDead -> die demo); the game then
@@ -595,25 +466,8 @@ T.run("a_boss_whose_death_removes_it_dies_in_the_partners_game_too", function()
     T.eq(pair.client_world.calls.kill, 1, "only once")
 end)
 
-T.run("a_boss_the_client_runs_that_vanishes_dead_dies_for_the_host", function()
-    local pair = make_pair()
-    pair.host_player = { x = -30, y = 0, z = 0 }
-    pair.client_player = { x = 3, y = 0, z = 0 }
-    local h = pair.host_world:spawn(GIGANTE, 0, 0, 0, 5000, 0x4602)
-    local c = pair.client_world:spawn(GIGANTE, 0, 0, 0, 5000, 0x4602)
-    pair:step(8)
-    T.eq(owner_of(pair, h), CLIENT, "the client's game runs it")
-    pair.client_world.eliminated[0x4602] = true
-    pair.client_world:remove(c)
-    pair:step(6)
-    T.check(not h.alive, "the host's dies too (the host would have taken it over alive)")
-    T.eq(pair.client.counters.vanished_deaths, 1, "the client announced it")
-end)
-
 T.run("a_boss_that_unloaded_and_came_back_is_checked_again_when_it_dies", function()
     local pair = make_pair()
-    pair.host_player = { x = 3, y = 0, z = 0 }
-    pair.client_player = { x = 30, y = 0, z = 0 }
     local h = pair.host_world:spawn(GIGANTE, 0, 0, 0, 5000, 0x4604)
     local c = pair.client_world:spawn(GIGANTE, 0, 0, 0, 5000, 0x4604)
     pair:step(8)
@@ -628,20 +482,18 @@ T.run("a_boss_that_unloaded_and_came_back_is_checked_again_when_it_dies", functi
     T.check(not c.alive, "its real death crosses")
 end)
 
-T.run("an_enemy_that_only_unloaded_or_is_the_partners_is_not_a_death", function()
+T.run("an_enemy_that_only_unloaded_is_not_a_death_and_the_client_never_decides_one", function()
     local pair = make_pair()
-    pair.host_player = { x = 3, y = 0, z = 0 }
-    pair.client_player = { x = 30, y = 0, z = 0 }
     local h = pair.host_world:spawn(GIGANTE, 0, 0, 0, 5000, 0x4603)
     local c = pair.client_world:spawn(GIGANTE, 0, 0, 0, 5000, 0x4603)
     pair:step(8)
-    -- The client's area unloads its puppet copy, which its save has dead (another session):
-    -- the host's game runs it, so the client does not decide.
+    -- The client's area unloads its copy, which its save has dead (another session).
     pair.client_world.eliminated[0x4603] = true
     pair.client_world:remove(c)
     pair:step(6)
     T.check(h.alive, "the host's lives on")
     T.eq(pair.client.counters.vanished_deaths, nil, "the client announced nothing")
+    T.eq(pair.client.counters.deaths_sent, 0, "the client never announces deaths")
     -- The host's area unloads it, not eliminated: not a death.
     pair.host_world:remove(h)
     pair:step(6)
@@ -653,7 +505,7 @@ end)
 -------------------------------------------------------------------------------
 
 T.run("puppets_follow_position_rotation_and_animation", function()
-    local pair = make_pair({ enemy_authority = "host" })
+    local pair = make_pair()
     local h, c = standard_level(pair)
     pair:step(5)
     for i = 1, 10 do
@@ -671,10 +523,12 @@ T.run("puppets_follow_position_rotation_and_animation", function()
     T.near(c.b.played[1].frame, 20, 0.5, "at its frame")
     T.eq(c.b.played[2].bank, 300, "second layer too")
     T.eq(pair.client_world.puppet[c.b.id], true, "its own AI and animation driver off")
+    T.eq(pair.host_world.calls.transform, 0, "the host's enemies are never moved by the sync")
+    T.eq(pair.host_world.calls.anim, 0, "nor animated by it")
 end)
 
-T.run("a_copy_spawned_elsewhere_jumps_to_the_owners_enemy", function()
-    local pair = make_pair({ enemy_authority = "host" })
+T.run("a_copy_spawned_elsewhere_jumps_to_the_hosts_enemy", function()
+    local pair = make_pair()
     local h = pair.host_world:spawn(GANADO, 0, 0, 0, 100, 0xD001)
     pair:step(5)
     local c = pair.client_world:spawn(GANADO, 35, 0, 12, 100, 0xD001)
@@ -684,8 +538,8 @@ T.run("a_copy_spawned_elsewhere_jumps_to_the_owners_enemy", function()
     T.check(h.alive, "untouched on the host")
 end)
 
-T.run("an_enemy_the_owner_does_not_draw_is_not_drawn", function()
-    local pair = make_pair({ enemy_authority = "host" })
+T.run("an_enemy_the_host_does_not_draw_is_not_drawn", function()
+    local pair = make_pair()
     local h, c = standard_level(pair)
     pair:step(5)
     h.a.drawn = false
@@ -696,8 +550,8 @@ T.run("an_enemy_the_owner_does_not_draw_is_not_drawn", function()
     T.eq(pair.client_world.hidden[c.a.id], nil, "shown again")
 end)
 
-T.run("damage_the_owner_takes_shows_up_on_the_puppet", function()
-    local pair = make_pair({ enemy_authority = "host" })
+T.run("damage_the_host_takes_shows_up_on_the_puppet", function()
+    local pair = make_pair()
     local h, c = standard_level(pair)
     pair:step(5)
     pair.host_world:damage(h.c, 120) -- the host's player shot the chief
@@ -709,8 +563,8 @@ end)
 -- Hits
 -------------------------------------------------------------------------------
 
-T.run("a_hit_on_an_enemy_the_partner_runs_is_run_by_the_partners_game", function()
-    local pair = make_pair({ enemy_authority = "host" })
+T.run("a_hit_of_the_clients_player_is_run_by_the_hosts_game", function()
+    local pair = make_pair()
     local h, c = standard_level(pair)
     pair:step(5)
     pair:player_hit("client", c.a, 30)
@@ -724,7 +578,7 @@ T.run("a_hit_on_an_enemy_the_partner_runs_is_run_by_the_partners_game", function
 end)
 
 T.run("the_hp_of_a_hit_in_flight_is_not_given_back", function()
-    local pair = make_pair({ enemy_authority = "host" })
+    local pair = make_pair()
     local h, c = standard_level(pair)
     pair:step(5)
     pair.drop_to_host = true -- the hit is still on its way
@@ -737,8 +591,8 @@ T.run("the_hp_of_a_hit_in_flight_is_not_given_back", function()
     T.eq(h.b.hp, 100, "(the host never got it)")
 end)
 
-T.run("a_puppet_never_dies_from_our_hit_the_owner_decides", function()
-    local pair = make_pair({ enemy_authority = "host" })
+T.run("a_puppet_never_dies_from_our_hit_the_host_decides", function()
+    local pair = make_pair()
     local h, c = standard_level(pair)
     pair:step(5)
     pair:player_hit("client", c.a, 500) -- far more than its HP
@@ -750,70 +604,28 @@ T.run("a_puppet_never_dies_from_our_hit_the_owner_decides", function()
     local k = pair.client_world.kills[1]
     T.check(k ~= nil and k.fields ~= nil and k.fields[1].v == 500, "killed with the same killing hit")
     T.eq(k.puppet, false, "with its own AI back on for its death")
+    T.eq(k.by, "self", "the client's own player's hit")
     T.eq(#pair.client_kills, 1, "the client rolls its loot for it")
     T.eq(pair.host.dead_count, 1, "buried on the host")
+    T.eq(pair.host.counters.client_kills, 1, "the host counts it as the client's kill")
 end)
 
-T.run("the_host_hitting_an_enemy_the_client_runs", function()
+T.run("the_hosts_kill_is_the_hosts_for_the_client", function()
     local pair = make_pair()
-    pair.host_player = { x = -30, y = 0, z = 0 }
-    pair.client_player = { x = 9, y = 0, z = 0 }
     local h, c = standard_level(pair)
-    pair:step(8)
-    T.eq(owner_of(pair, h.b), CLIENT, "B is the client's")
-    pair:player_hit("host", h.b, 40)
-    pair:step(2)
-    T.eq(c.b.hp, 60, "the client's game ran the host's hit")
-    T.eq(pair.client.counters.hits_applied, 1, "through its hit code")
-    pair:step(4)
-    T.eq(h.b.hp, 60, "and the host's copy agrees")
-end)
-
-T.run("a_hit_that_crossed_an_owner_change_is_sent_back", function()
-    local pair = make_pair()
-    pair.host_player = { x = 9, y = 0, z = 0 }
-    pair.client_player = { x = -30, y = 0, z = 0 }
-    local h, c = standard_level(pair)
-    pair:step(8)
-    T.eq(owner_of(pair, h.b), HOST, "B is the host's")
-    -- The host hands B to the client; the client hits its puppet before it hears of it.
-    pair.host_player = { x = -30, y = 0, z = 0 }
-    pair.client_player = { x = 9, y = 0, z = 0 }
-    pair.drop_types = { [P.T.ENEMY_OWNER] = true }
+    pair:step(5)
+    pair:player_hit("client", c.b, 10) -- the client hit it a while ago...
     pair:step(80)
-    T.eq(owner_of(pair, h.b), CLIENT, "the host gave B to the client")
-    pair.drop_types = nil
-    pair:player_hit("client", c.b, 15) -- still a puppet in the client's game: sent to the host
-    pair:step(6)
-    T.eq(pair.host.counters.hits_bounced, 1, "the host sent it back")
-    T.eq(pair.client.counters.hits_applied, 1, "the client's game ran it")
-    T.eq(c.b.hp, 85, "counted once")
-    pair:step(4)
-    T.eq(h.b.hp, 85, "both agree")
+    pair:player_hit("host", h.b, 200) -- ...the host's player kills it
+    pair.host_world:damage(h.b, 200)
+    pair:step(3)
+    T.check(not c.b.alive, "dead for the client")
+    T.eq(pair.client_world.kills[1].by, "partner", "killed by the host's hit (the partner's model attacks)")
+    T.eq(pair.host.counters.client_kills, 0, "not the client's kill")
 end)
 
-T.run("the_owners_last_hits_before_a_change_still_count", function()
+T.run("hits_of_the_hosts_player_are_only_shown_to_the_client", function()
     local pair = make_pair()
-    pair.host_player = { x = -30, y = 0, z = 0 }
-    pair.client_player = { x = 9, y = 0, z = 0 }
-    local h, c = standard_level(pair)
-    pair:step(60)
-    T.eq(owner_of(pair, h.b), CLIENT, "B is the client's")
-    pair.drop_to_client = true -- the host takes it back; the news is on its way
-    pair.host_player = { x = 9, y = 0, z = 0 }
-    pair.client_player = { x = -30, y = 0, z = 0 }
-    pair:step(30)
-    T.eq(owner_of(pair, h.b), HOST, "the host's again")
-    pair.drop_to_client = false
-    pair:player_hit("client", c.b, 20) -- the client's game still runs it: a normal hit
-    T.eq(c.b.hp, 80, "hurt in the client's game")
-    pair:step(6)
-    T.eq(h.b.hp, 80, "the damage reached the new owner")
-    T.eq(c.b.hp, 80, "and stays")
-end)
-
-T.run("hits_on_enemies_we_run_are_only_shown_to_the_partner", function()
-    local pair = make_pair({ enemy_authority = "host" })
     local h, c = standard_level(pair)
     pair:step(5)
     pair:player_hit("host", h.a, 10)
@@ -824,8 +636,8 @@ T.run("hits_on_enemies_we_run_are_only_shown_to_the_partner", function()
     T.eq(c.a.hp, 90, "the HP arrives with the host's state")
 end)
 
-T.run("other_damage_to_a_puppet_goes_to_the_owner", function()
-    local pair = make_pair({ enemy_authority = "host" })
+T.run("other_damage_to_a_puppet_goes_to_the_host", function()
+    local pair = make_pair()
     local h, c = standard_level(pair)
     pair:step(5)
     pair.client_world:damage(c.c, 50) -- a barrel exploded next to it in the client's game
@@ -835,8 +647,8 @@ T.run("other_damage_to_a_puppet_goes_to_the_owner", function()
     T.eq(c.c.hp, 250, "and both agree")
 end)
 
-T.run("without_hit_code_the_owner_applies_the_damage_as_hp", function()
-    local pair = make_pair({ enemy_authority = "host" })
+T.run("without_hit_code_the_host_applies_the_damage_as_hp", function()
+    local pair = make_pair()
     pair.host_world.no_hit_code = true
     local h, c = standard_level(pair)
     pair:step(5)
@@ -847,123 +659,81 @@ T.run("without_hit_code_the_owner_applies_the_damage_as_hp", function()
     pair:player_hit("client", c.a, 70)
     pair:step(3)
     T.check(not h.a.alive, "a lethal amount kills")
+    T.eq(pair.host_world.kills[1].by, "partner", "the client's player killed it")
 end)
 
 -------------------------------------------------------------------------------
--- Deaths
+-- Finishers (stealth kill, knife finish, stomp, kicks)
 -------------------------------------------------------------------------------
 
-T.run("an_enemy_the_client_runs_dies_in_both_games", function()
+T.run("the_host_says_which_finishers_each_enemy_offers_the_client", function()
     local pair = make_pair()
-    pair.host_player = { x = -30, y = 0, z = 0 }
-    pair.client_player = { x = 9, y = 0, z = 0 }
+    pair.client_player = { x = 0, y = 0, z = -2 }
     local h, c = standard_level(pair)
-    pair:step(8)
-    T.eq(owner_of(pair, h.b), CLIENT, "B is the client's")
-    c.b.pos = { x = 12, y = 0, z = 1 }
-    pair:player_hit("client", c.b, 100)
-    T.check(not c.b.alive, "died in the client's game (it runs it)")
-    pair:step(3)
-    T.check(not h.b.alive, "and in the host's")
-    local k = pair.host_world.kills[1]
-    T.eq(k.fields[1].v, 100, "from the same killing hit")
-    T.near(k.pos.x, 12, 0.01, "where it died")
-    T.eq(#pair.host_kills, 1, "the host rolls its loot")
-    T.eq(pair.host.dead_count, 1, "in the host's graveyard")
-    T.eq(pair.client.counters.deaths_sent, 1, "announced once")
+    local I = P.PARTNER_INFO
+    pair.host_world.pinfo[h.a.id] = { I.KNOWN | I.FATAL | I.TARGETS, 1 }
+    pair:step(6)
+    local pinfo, ftype = pair.client:partner_fatal(c.a.id)
+    T.eq(pinfo, I.KNOWN | I.FATAL | I.TARGETS, "the client knows what the host's enemy says")
+    T.eq(ftype, 1, "and the finisher it offers (a round kick)")
+    T.eq(pair.client:summary().targeting_partner, 1, "one enemy is after the client")
+    T.eq(pair.host:summary().targeting_partner, 1, "the host counts it too")
+    local near = pair.host_world.info_asked[h.a.id]
+    T.eq(near, true, "the close enemy was asked about finishers")
+    T.eq(pair.host_world.info_asked[h.b.id], false, "a farther one only whether it targets the client")
+    -- The host's enemy goes quiet (its area unloads): no stale answer.
+    pair.drop_to_client = true
+    pair:step(50)
+    T.eq(pair.client:partner_fatal(c.a.id), nil, "no answer without fresh news")
 end)
 
--------------------------------------------------------------------------------
--- Finishers (stealth kill, grab, knife finish, stomp)
--------------------------------------------------------------------------------
-
--- The bug: the host's player grabbed and killed an enemy the client's game ran. The request
--- went to the host's puppet (AI off), the client's enemy went on chasing the client and only
--- died when it changed hands seconds later.
-T.run("the_host_finishing_an_enemy_the_client_runs_takes_it_at_once", function()
-    local pair = make_pair()
-    pair.host_player = { x = -30, y = 0, z = 0 }
-    pair.client_player = { x = 9, y = 0, z = 0 }
-    local h, c = standard_level(pair)
-    pair:step(8)
-    T.eq(owner_of(pair, h.b), CLIENT, "B is the client's (it chases the client)")
-    pair.host_player = { x = 9.5, y = 0, z = 0 } -- the host's player walks up behind it
-    pair:fatal("host", h.b)
-    T.eq(owner_of(pair, h.b), HOST, "the host's game runs it at once")
-    T.eq(pair.host_world.puppet[h.b.id], nil, "its AI is on here for the finisher")
-    pair:step(2)
-    T.eq(pair.client_world.puppet[c.b.id], true, "the client's copy follows the host's")
-    pair:step(60) -- 3 s, the client still a little closer
-    T.eq(owner_of(pair, h.b), HOST, "it stays with the host while the finisher plays out")
-    pair.host_world:damage(h.b, 100) -- the finisher kills it
-    pair:step(3)
-    T.check(not c.b.alive, "dead in the client's game too, right away")
-    T.eq(pair.host.counters.fatals, 1, "counted")
-end)
-
-T.run("the_clients_finisher_on_a_host_enemy_runs_in_the_clients_game", function()
+T.run("the_clients_finisher_on_a_host_enemy_runs_in_the_hosts_game", function()
     local pair = make_pair()
     local h, c = standard_level(pair)
     pair:step(6)
-    T.eq(owner_of(pair, h.a), HOST, "A is the host's")
     T.eq(pair.client_world.puppet[c.a.id], true, "the client shows a puppet")
-    pair:fatal("client", c.a)
-    T.eq(pair.client_world.puppet[c.a.id], nil, "the client's game runs it from this moment")
-    c.a.pos = { x = 1.5, y = 0, z = 0.5 } -- the finisher moves it
-    pair:player_hit("client", c.a, 30) -- the knife
-    T.eq(c.a.hp, 70, "the finisher's hits count here")
+    pair:fatal("client", c.a, P.FATAL_KIND.STEALTH, 0)
+    T.eq(pair.client_world.puppet[c.a.id], true, "still a puppet: the client's game does not run it")
     pair:step(1)
-    T.eq(pair.client_world.puppet[c.a.id], nil, "not a puppet again while the host answers")
-    T.eq(h.a.hp, 100, "those hits are not run in the host's game as well")
-    pair:step(3)
-    T.eq(owner_of(pair, h.a), CLIENT, "the host handed it over")
-    T.eq(pair.host_world.puppet[h.a.id], true, "the host's copy follows the client's")
-    T.near(c.a.pos.x, 1.5, 1e-6, "the client's enemy stayed where the finisher put it")
-    T.eq(c.a.hp, 70, "and kept its damage")
-    T.eq(pair.host.counters.claims_granted, 1, "granted")
-    pair:step(60)
-    T.eq(owner_of(pair, h.a), CLIENT, "it stays with the client while the finisher plays out")
-    pair.client_world:damage(c.a, 70)
-    pair:step(3)
-    T.check(not h.a.alive, "dead in the host's game too")
-end)
-
-T.run("a_finisher_that_kills_before_the_host_answers_still_kills_in_both_games", function()
-    local pair = make_pair()
-    local h, c = standard_level(pair)
-    pair:step(6)
-    pair:fatal("client", c.a)
-    pair.client_world:damage(c.a, 100) -- a quick finisher: dead before the host's answer
-    pair:step(1)
-    T.eq(pair.client.counters.deaths_sent, 1, "the client announces the death (its game ran it)")
-    pair:step(3)
-    T.check(not h.a.alive, "dead in the host's game too")
-    pair:step(60)
-    T.check(not h.a.alive, "and it stays dead")
-end)
-
-T.run("two_finishers_on_one_enemy_the_hosts_wins", function()
-    local pair = make_pair()
-    local h, c = standard_level(pair)
-    pair:step(6)
-    pair:fatal("host", h.a)
-    pair:fatal("client", c.a)
-    pair:step(3)
-    T.eq(owner_of(pair, h.a), HOST, "the host keeps it")
-    T.eq(pair.host.counters.claims_refused, 1, "the client's claim refused")
-    pair:step(40) -- the claim runs out
-    T.eq(pair.client_world.puppet[c.a.id], true, "the client's copy follows the host's again")
-end)
-
-T.run("host_authority_never_runs_a_finisher_in_the_clients_game", function()
-    local pair = make_pair({ enemy_authority = "host" })
-    local h, c = standard_level(pair)
-    pair:step(6)
-    pair:fatal("client", c.a)
-    T.eq(pair.client_world.puppet[c.a.id], true, "still a puppet")
-    pair:step(3)
+    local f = pair.host_world.fatals[1]
+    T.check(f ~= nil, "the host's game was asked")
+    T.eq(f and f.id, h.a.id, "on its own copy of the enemy")
+    T.eq(f and f.kind, P.FATAL_KIND.STEALTH, "the same finisher")
+    T.eq(pair.host.counters.fatals_applied, 1, "run")
     T.eq(owner_of(pair, h.a), HOST, "still the host's")
-    T.eq(pair.client.counters.claims_sent, 0, "nothing claimed")
+    -- The finisher kills it in the host's game: the client's copy dies, the kill is the client's.
+    pair.host_world:damage(h.a, 100)
+    pair:step(3)
+    T.check(not c.a.alive, "dead in the client's game too")
+    T.eq(pair.client_world.kills[1].by, "self", "by the client's player")
+    T.eq(pair.host.counters.client_kills, 1, "the host counts the client's kill")
+end)
+
+T.run("a_kick_carries_its_finisher_type", function()
+    local pair = make_pair()
+    local h, c = standard_level(pair)
+    pair:step(6)
+    pair:fatal("client", c.b, P.FATAL_KIND.NORMAL, 2)
+    pair:step(1)
+    local f = pair.host_world.fatals[1]
+    T.eq(f and f.kind, P.FATAL_KIND.NORMAL, "a normal finisher")
+    T.eq(f and f.ftype, 2, "a straight kick")
+end)
+
+T.run("a_finisher_the_host_cannot_run_is_counted", function()
+    local pair = make_pair()
+    local h, c = standard_level(pair)
+    pair:step(6)
+    pair.host_world.refuse_fatal = true
+    pair:fatal("client", c.a, P.FATAL_KIND.KILL, 0)
+    pair:step(1)
+    T.eq(pair.host.counters.fatals_failed, 1, "refused by the host's enemy")
+    -- An enemy the client's game has but the host's does not (held, unpaired): nothing is sent.
+    local lone = pair.client_world:spawn(GANADO, 70, 0, 70, 100, 0x4999)
+    pair:step(2)
+    pair:fatal("client", lone, P.FATAL_KIND.KILL, 0)
+    T.eq(pair.client.counters.fatals_unpaired, 1, "unpaired: dropped")
+    T.check(h.a.alive, "nothing died")
 end)
 
 T.run("a_host_enemy_the_clients_save_had_dead_appears_for_the_client", function()
@@ -982,7 +752,7 @@ T.run("a_host_enemy_the_clients_save_had_dead_appears_for_the_client", function(
     T.eq(c and c.uid, 0x5101, "it spawned")
     pair:step(20)
     T.eq(net_of(pair.client, c), net_of(pair.host, h), "paired with the host's")
-    T.eq(owner_of(pair, h), HOST, "the host's player is closer: the host runs it")
+    T.eq(owner_of(pair, h), HOST, "the host runs it")
     T.eq(pair.client_world.puppet[c.id], true, "the client's copy follows it")
     T.near(c.pos.x, 4, 0.05, "where the host's is")
     T.eq(pair.client.counters.spawn_spawning, 1, "spawned once")
@@ -991,8 +761,6 @@ T.run("a_host_enemy_the_clients_save_had_dead_appears_for_the_client", function(
 end)
 
 T.run("an_enemy_spawned_for_the_hosts_world_starts_where_the_hosts_is", function()
-    -- The client is the closer player: its game runs the enemy it just spawned - from where the
-    -- host's enemy is and with its HP, not from its own spawn point.
     local pair = make_pair()
     pair.host_player = { x = 0, y = 0, z = -20 }
     pair.client_player = { x = 3, y = 0, z = 2 }
@@ -1002,7 +770,7 @@ T.run("an_enemy_spawned_for_the_hosts_world_starts_where_the_hosts_is", function
     pair:step(60)
     local c = pair.client_world.enemies[1]
     T.eq(c and c.uid, 0x5151, "spawned")
-    T.eq(owner_of(pair, h), CLIENT, "the client's game runs it")
+    T.eq(owner_of(pair, h), HOST, "the host's game runs it")
     T.near(c.pos.x, 5, 0.5, "from where the host's was")
     T.near(c.pos.z, 5, 0.5, "in every axis")
     T.eq(c.hp, 65, "with the HP it had there")
@@ -1055,7 +823,7 @@ T.run("the_client_spawns_nothing_far_away_while_loading_or_when_switched_off", f
 end)
 
 T.run("dead_stays_dead_for_enemies_that_spawn_later", function()
-    local pair = make_pair({ enemy_authority = "host" })
+    local pair = make_pair()
     pair.client_player = { x = 0, y = 0, z = -5 }
     local h = pair.host_world:spawn(GANADO, 0, 0, 0, 100, 0x5001)
     pair:step(5)
@@ -1078,12 +846,14 @@ T.run("the_clients_kill_of_an_enemy_the_host_has_not_loaded", function()
     local pair = make_pair()
     pair.host_player = { x = -200, y = 0, z = 0 }
     pair.client_player = { x = 100, y = 0, z = 0 }
-    -- The client ran ahead: its level spawned a villager the host's has not.
+    -- The client ran ahead: its level spawned a villager the host's has not. It waits, unseen;
+    -- a stray bullet still finds it.
     local c = pair.client_world:spawn(GANADO, 101, 0, 1, 100, 0x5101)
     pair:step(5)
-    T.eq(pair.client_world.puppet[c.id], nil, "shared authority: the client's game runs it meanwhile")
+    T.eq(pair.client_world.puppet[c.id], true, "held: the client's game does not run it")
     pair:player_hit("client", c, 100)
     pair:step(3)
+    T.check(c.alive, "it never dies in the client's game")
     T.eq(pair.host.dead_count, 1, "the kill is in the host's graveyard")
     pair.host_player = { x = 95, y = 0, z = 0 }
     local h = pair.host_world:spawn(GANADO, 101, 0, 1, 100, 0x5101)
@@ -1103,7 +873,7 @@ T.run("a_joining_client_learns_the_dead_of_the_hosts_save", function()
 end)
 
 T.run("a_host_reload_brings_its_dead_back_for_the_client_too", function()
-    local pair = make_pair({ enemy_authority = "host" })
+    local pair = make_pair()
     local h, c = standard_level(pair)
     pair:step(5)
     pair.host_world:damage(h.a, 100)
@@ -1123,7 +893,7 @@ T.run("an_enemy_erased_here_can_spawn_again_after_the_hosts_reload", function()
     -- The host kills an enemy the client has not loaded; when the client's level spawns it,
     -- it is erased (its spawn param invalidated). The host then reloads a checkpoint: that
     -- enemy is alive in its world again, so the client's spawn param must be able to spawn it.
-    local pair = make_pair({ enemy_authority = "host" })
+    local pair = make_pair()
     local h = pair.host_world:spawn(GANADO, 0, 0, 0, 100, 0x2001)
     pair:step(5)
     pair.host_world:damage(h, 100)
@@ -1138,8 +908,8 @@ T.run("an_enemy_erased_here_can_spawn_again_after_the_hosts_reload", function()
     T.eq(pair.client_world.restored, 1, "valid again after the host's reload")
 end)
 
-T.run("host_authority_holds_client_only_enemies_until_the_host_has_them", function()
-    local pair = make_pair({ enemy_authority = "host" })
+T.run("client_only_enemies_wait_until_the_host_has_them", function()
+    local pair = make_pair()
     pair.host_player = { x = 0, y = 0, z = 0 }
     pair.client_player = { x = 100, y = 0, z = 0 }
     local c = pair.client_world:spawn(GANADO, 101, 0, 1, 100, 0x7101)
@@ -1154,16 +924,16 @@ T.run("host_authority_holds_client_only_enemies_until_the_host_has_them", functi
     T.near(c.pos.x, 40, 0.01, "where the host's is")
 end)
 
-T.run("a_copy_fought_before_the_host_loaded_it_keeps_its_damage", function()
+T.run("a_copy_hit_before_the_host_loaded_it_keeps_its_damage", function()
     local pair = make_pair()
     pair.host_player = { x = 0, y = 0, z = 0 }
     pair.client_player = { x = 100, y = 0, z = 0 }
     local c = pair.client_world:spawn(GANADO, 99, 0, 0, 100, 0x7201)
     pair:step(5)
-    pair:player_hit("client", c, 60) -- the client's game runs it: a normal hit
+    -- Held in the client's game: a stray hit takes HP there (never the last), the host has none yet.
+    pair:player_hit("client", c, 60)
     pair:step(2)
     T.eq(c.hp, 40, "hurt in the client's game")
-    -- The host arrives first, its level spawns it fresh: the host is closer, so it runs it.
     pair.host_player = { x = 98, y = 0, z = 0 }
     local h = pair.host_world:spawn(GANADO, 99, 0, 0, 100, 0x7201)
     pair:step(10)
@@ -1173,7 +943,7 @@ T.run("a_copy_fought_before_the_host_loaded_it_keeps_its_damage", function()
 end)
 
 T.run("traffic_stays_small", function()
-    local pair = make_pair({ enemy_authority = "host" })
+    local pair = make_pair()
     for i = 1, 30 do
         pair.host_world:spawn(GANADO, i, 0, 0, 100, 0x8000 + i)
         pair.client_world:spawn(GANADO, i, 0, 0, 100, 0x8000 + i)
@@ -1185,14 +955,15 @@ T.run("traffic_stays_small", function()
     for _, net in pairs(probe.nets) do
         local e = probe.by_id[net.local_id]
         entries[#entries + 1] = { net_id = net.net_id, epoch = net.epoch, uid = e.uid, kind_hash = e.kind_hash, pos = e.pos,
-            rot = e.rot, hp = e.hp, max_hp = e.max_hp, layers = { { bank = 1, id = 2, frame = 3, speed = 1 },
-                { bank = 1, id = 2, frame = 3, speed = 1 } } }
+            rot = e.rot, hp = e.hp, max_hp = e.max_hp, pinfo = P.PARTNER_INFO.KNOWN, ftype = 1,
+            layers = { { bank = 1, id = 2, frame = 3, speed = 1 }, { bank = 1, id = 2, frame = 3, speed = 1 } } }
     end
     for _, m in ipairs(P.encode_enemy_states(1, entries)) do
         T.check(#m <= P.MAX_PAYLOAD, "every message fits a datagram")
         bytes = bytes + #m
     end
-    T.check(bytes < 2600, ("30 enemies with two layers in %d bytes per state"):format(bytes))
+    T.check(bytes < 2700, ("30 enemies with two layers in %d bytes per state"):format(bytes))
+    T.eq(pair.sent.client[P.T.ENEMY_STATE] or 0, 0, "the client never sends enemy states")
 end)
 
 T.finish()

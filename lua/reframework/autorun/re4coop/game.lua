@@ -225,12 +225,13 @@ end
 
 -- A partner is connected (or not). Installs the hooks the session needs the first time it
 -- becomes active; REFramework cannot remove hooks, so while inactive every hook body returns
--- right away. opts: { hits = bool, drops = bool, gimmicks = bool }
+-- right away. opts: { hits = bool, drops = bool, gimmicks = bool, partner = bool }
 function Game:set_active(active, opts)
     self.active = active and true or false
     if not self.active then return end
     opts = opts or {}
     if opts.hits ~= false and not self.hit_hook_installed then self:install_hit_hook() end
+    if opts.partner ~= false and opts.hits ~= false and not self.partner_hooks_installed then self:install_partner_hooks() end
     if opts.drops ~= false and not self.drop_hook_installed then self:install_drop_hook() end
     if opts.gimmicks ~= false and not self.gimmick_hook_installed then self:install_gimmick_hook() end
 end
@@ -240,6 +241,8 @@ end
 function Game:on_reload()
     self.counters.reloads = self.counters.reloads + 1
     self.perf:crumb("game.reload", nil, true)
+    -- The partner's model is no character of the new scene's enemies.
+    if self.partner_target_detach ~= nil then pcall(self.partner_target_detach, self) end
     -- Pooled heads and bodies can outlive a checkpoint reload: never leave one switched off.
     self:reload_enemies()
     self:reload_ashley()
@@ -1105,6 +1108,7 @@ function Game:read_player_state()
     if transform ~= nil then
         st.rot = q4(self:call(transform, "get_Rotation"))
     end
+    self.last_player_pose = { pos = pos, yaw = st.rot and yaw_of(st.rot) or 0 }
 
     local hp = self:call(ctx, "get_HitPoint")
     if hp ~= nil then
@@ -2441,6 +2445,13 @@ function Game:draw_circle(x, y, r, color)
     draw.outline_circle(x, y, r, color, 16)
 end
 
+-- The game window's size in pixels (nil when unknown).
+function Game:screen_size()
+    local ok, size = pcall(function() return imgui.get_display_size() end)
+    if ok and size ~= nil and size.x ~= nil and size.x > 0 then return size.x, size.y end
+    return nil
+end
+
 -------------------------------------------------------------------------------
 -- Diagnostics
 -------------------------------------------------------------------------------
@@ -2944,6 +2955,10 @@ require("re4coop.game_enemies").install(Game, {
 require("re4coop.game_ashley").install(Game, {
     singleton = singleton, address_of = address_of, type_name_of = type_name_of, v3 = v3, q4 = q4,
     CHARACTER_MANAGER = CHARACTER_MANAGER,
+})
+
+require("re4coop.game_partner").install(Game, {
+    singleton = singleton, find_type = find_type, address_of = address_of, type_name_of = type_name_of, v3 = v3,
 })
 
 require("re4coop.game_give").install(Game, { singleton = singleton, find_type = find_type })

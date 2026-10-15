@@ -43,7 +43,12 @@ local function invoke(m, obj, ...)
         end
         if skip then
             M.skipped = (M.skipped or 0) + 1
-            return nil
+            -- REFramework still runs the post-hooks: what they return is what the caller gets.
+            local r = nil
+            for _, h in ipairs(m.hooks) do
+                if h.post then r = h.post(r) end
+            end
+            return r
         end
         -- A pre-hook that wrote a parameter (args[i] = sdk.to_ptr(v)) changes what the method gets.
         for i = 1, params.n do
@@ -246,6 +251,7 @@ local function new(type_name, data)
     return o
 end
 M.new = new
+M.make_method = make_method
 
 local function vec(x, y, z) return { x = x, y = y, z = z } end
 local function quat(x, y, z, w) return { x = x, y = y, z = z, w = w } end
@@ -406,6 +412,21 @@ M.PREFAB = {
     muzzle = "_chainsaw/vfx/provider/epv_system/epv_muzzleflash/epve_0015_muzzleflash_0000.pfb",
 }
 
+-- The player's grab state (PlayerBaseContext.get_IsInGrappleDamage) and the way out of a grab
+-- (PlayerBodyUpdater.set_RequestCancelGrappleAction): their classes exist once install ends.
+local function install_player_grab()
+    local pbc = classes["chainsaw.PlayerBaseContext"]
+    pbc.methods.get_IsInGrappleDamage = make_method("get_IsInGrappleDamage", 0, function(self) return self.grabbed == true end,
+        {}, { ret = "System.Boolean" })
+    pbc.method_order[#pbc.method_order + 1] = "get_IsInGrappleDamage"
+    local pbu = classes["chainsaw.PlayerBodyUpdater"]
+    pbu.methods.set_RequestCancelGrappleAction = make_method("set_RequestCancelGrappleAction", 1, function(self, v)
+        self.cancel_grapple = v
+        if v and self.ctx then self.ctx.grabbed = false end
+    end, { "System.Boolean" })
+    pbu.method_order[#pbu.method_order + 1] = "set_RequestCancelGrappleAction"
+end
+
 function M.install(opts)
     opts = opts or {}
     classes = {}
@@ -485,15 +506,74 @@ function M.install(opts)
         set_Frame = { 1, function(self, f) self.frame = f self.seeks = (self.seeks or 0) + 1 end },
         get_Speed = { 0, function(self) return self.speed or 1.0 end },
         set_Speed = { 1, function(self, v) self.speed = v end },
+        -- A motion its Motion cannot find (M.motion_playable) is not played: nothing changes.
         ["changeMotion(System.UInt32, System.UInt32, System.Single, System.Single, via.motion.InterpolationMode, via.motion.InterpolationCurve)"] = {
-            6, function(self, bank, id, frame) self.bank, self.motion, self.frame = bank, id, frame
+            6, function(self, bank, id, frame)
+                if self.motion_comp ~= nil and not M.motion_playable(self.motion_comp, bank) then
+                    self.not_found = (self.not_found or 0) + 1
+                    return
+                end
+                self.bank, self.motion, self.frame = bank, id, frame
                 self.changes = (self.changes or 0) + 1 end,
             { "System.UInt32", "System.UInt32", "System.Single", "System.Single", "via.motion.InterpolationMode",
                 "via.motion.InterpolationCurve" } },
+        get_BlendRate = { 0, function(self) return self.blend or 1.0 end },
+        set_BlendRate = { 1, function(self, v) self.blend = v end },
+        get_JointMaskID = { 0, function(self) return self.mask or 0 end },
+        set_JointMaskID = { 1, function(self, v) self.mask = v end },
+        get_BlendMode = { 0, function(self) return self.mode or 0 end },
+        set_BlendMode = { 1, function(self, v) self.mode = v end },
     })
+    -- Motion: its layers, its bank variant (TargetBankType) and its dynamic motion banks.
     class("via.motion.Motion", "via.Component", {
-        getLayer = { 1, function(self, i) return (self.layers or {})[i + 1] end, { "System.UInt32" } },
+        getLayer = { 1, function(self, i)
+            local l = (self.layers or {})[i + 1]
+            if l ~= nil then l.motion_comp = self end
+            return l
+        end, { "System.UInt32" } },
         getLayerCount = { 0, function(self) return #(self.layers or {}) end },
+        get_TargetBankType = { 0, function(self) return self.bank_type or 0 end },
+        set_TargetBankType = { 1, function(self, v) self.bank_type = v end },
+        getDynamicMotionBankCount = { 0, function(self) return #(self.dynamic or {}) end },
+        getDynamicMotionBank = { 1, function(self, i) return (self.dynamic or {})[i + 1] end },
+        setDynamicMotionBankCount = { 1, function(self, n)
+            self.dynamic = self.dynamic or {}
+            for i = #self.dynamic, n + 1, -1 do self.dynamic[i] = nil end
+            self.dynamic_set = (self.dynamic_set or 0) + 1
+        end },
+        setDynamicMotionBank = { 2, function(self, i, b)
+            self.dynamic = self.dynamic or {}
+            self.dynamic[i + 1] = b
+        end },
+    })
+    class("via.motion.MotionListResourceHolder", "System.Object", {
+        get_ResourcePath = { 0, function(self) return self.path end },
+    })
+    local function prop(name, field)
+        return { ["get_" .. name] = { 0, function(self) return self[field] end },
+            ["set_" .. name] = { 1, function(self, v) self[field] = v end } }
+    end
+    local bank_methods = {}
+    for _, pr in ipairs({ { "MotionList", "motlist" }, { "BankID", "bank_id" }, { "BankType", "bank_type" },
+        { "BankTypeMaskBit", "mask_bit" }, { "Order", "order" }, { "OverwriteBankID", "ow_id" },
+        { "OverwriteBankType", "ow_type" }, { "OverwriteBankTypeMaskBit", "ow_mask" } }) do
+        for k, v in pairs(prop(pr[1], pr[2])) do bank_methods[k] = v end
+    end
+    class("via.motion.DynamicMotionBank", "System.Object", bank_methods)
+    -- The game's way to add a dynamic bank to a character's motion (on its body).
+    class("chainsaw.MotionController", "via.Component", {
+        addDynamicMotionBank = { 1, function(self, b)
+            local m = self.motion
+            m.dynamic = m.dynamic or {}
+            m.dynamic[#m.dynamic + 1] = b
+            self.adds = (self.adds or 0) + 1
+        end },
+        removeDynamicMotionBank = { 1, function(self, b)
+            local m = self.motion
+            for i = #(m.dynamic or {}), 1, -1 do
+                if m.dynamic[i] == b then table.remove(m.dynamic, i) end
+            end
+        end },
     })
     class("via.motion.MotionFsm2", "via.Component", {})
     class("via.motion.Chain", "via.Component", {})
@@ -586,6 +666,9 @@ function M.install(opts)
         set_DrawSelf = { 1, function(self, v) self.draw_self = v end },
         get_UpdateSelf = { 0, function(self) return self.update_self ~= false end },
         set_UpdateSelf = { 1, function(self, v) self.update_self = v end },
+        -- The GameObject's tag string ("A|B"): TargetMarker.register files a marker under it.
+        get_Tag = { 0, function(self) return self.tag or "" end },
+        set_Tag = { 1, function(self, v) self.tag = v end },
         -- RE Engine prints a GameObject as "name@<guid>" (the GUID from the scene file).
         ["ToString()"] = { 0, function(self) return ("%s@%s]"):format(self.name or "", self.guid or "") end },
         destroy = { 1, function(self, go) M.destroy(go or self) end },
@@ -714,21 +797,63 @@ function M.install(opts)
     class("chainsaw.PlayerTargetSelector", "System.Object", {
         get_LockonTarget = { 0, function(self) return self.target end },
     })
+    -- PlayerHeadUpdater.requestFatal (0x141d65b70) asks the target's AI head
+    -- convertNormalFatalAction(our context, FatalType); requestKnifeFatal (0x141d66c00)
+    -- requestFatalKill or, from behind, requestStealthKill; requestStompFatal requestFatalKill.
     local function fatal_request(name)
         return { 0, function(self)
             world.fatal_requests = world.fatal_requests or {}
-            world.fatal_requests[#world.fatal_requests + 1] = { kind = name, target = self.selector.target }
-            return true
+            local target = self.selector.target
+            world.fatal_requests[#world.fatal_requests + 1] = { kind = name, target = target }
+            local head = target and target.head_updater
+            if head == nil then return false end
+            local me = world.player
+            if name == "requestFatal" then
+                return head:call("convertNormalFatalAction", me, self.ftype or 1)
+            elseif name == "requestKnifeFatal" and self.stealth then
+                return head:call("requestStealthKill", me)
+            end
+            return head:call("requestFatalKill", me)
         end, {}, { ret = "System.Boolean" } }
     end
     class("chainsaw.PlayerHeadUpdater", "System.Object", {
+        -- PlayerHeadUpdater.hasKnife (virtual +0x318): whether the player has a knife to use.
+        hasKnife = { 0, function(self) return self.has_knife ~= false end, {}, { ret = "System.Boolean" } },
         get_TargetSelectorDriver = { 0, function(self) return self.selector end },
         requestFatal = fatal_request("requestFatal"),
         requestKnifeFatal = fatal_request("requestKnifeFatal"),
         requestStompFatal = fatal_request("requestStompFatal"),
     })
     -- A head's updater: linked to its character (Context) while in use, unlinked in the pool.
+    world.head_fatals = {}
+    local function head_request(kind)
+        return { kind == "normal" and 2 or 1, function(self, ctx, ftype)
+            world.head_fatals[#world.head_fatals + 1] = { head = self, kind = kind, attacker = ctx, ftype = ftype,
+                target = self.context }
+            return self.context ~= nil and self.context.refuse_fatal ~= true
+        end, kind == "normal" and { "chainsaw.CharacterContext", "chainsaw.PlayerDefine.FatalType" }
+            or { "chainsaw.CharacterContext" }, { ret = "System.Boolean" } }
+    end
     class("chainsaw.HeadUpdater", "via.Component", {
+        -- The finisher checks PlayerTargetSelector.checkTargetType asks (context: the player's).
+        isEnableFatal = { 1, function(self) return self.context ~= nil and self.context.fatal_ok == true end,
+            { "chainsaw.CharacterContext" }, { ret = "System.Boolean" } },
+        -- EnemyHeadUpdater.isEnableKnifeFatal (0x1413d6800) also asks the attacker's head
+        -- (CharacterContext._HeadUpdater) hasKnife(): no head, no knife finish.
+        isEnableKnifeFatal = { 1, function(self, ctx)
+            if self.context == nil or self.context.knife_ok ~= true or ctx == nil then return false end
+            local head = ctx.__fields._HeadUpdater or ctx.head_updater
+            if head == nil then return false end
+            local k = head:call("hasKnife")
+            return k == true or k == 1
+        end, { "chainsaw.CharacterContext" }, { ret = "System.Boolean" } },
+        isEnableStealthKill = { 2, function(self) return self.context ~= nil and self.context.stealth_ok == true end,
+            { "chainsaw.CharacterContext", "System.Boolean" }, { ret = "System.Boolean" } },
+        getAvailableFatalType = { 0, function(self) return self.context and self.context.fatal_type or 0 end, {},
+            { ret = "chainsaw.PlayerDefine.FatalType" } },
+        requestFatalKill = head_request("kill"),
+        requestStealthKill = head_request("stealth"),
+        convertNormalFatalAction = head_request("normal"),
         get_Context = { 0, function(self) return self.context end },
         -- CharacterHeadUpdater.entryDeadAction (0x1411a5f60): requests the death action.
         entryDeadAction = { 0, function(self)
@@ -752,6 +877,12 @@ function M.install(opts)
         checkKill = { 1, function(self, d)
             return self.ctx ~= nil and self.ctx.hitpoint:call("checkDead", d) or false
         end, { "System.Int32" }, { ret = "System.Boolean" } },
+        -- HitController.callbackCheckDamageHit (Delegates.OnCheckDamageHit): the character's own
+        -- check (a dodge, invincibility frames).
+        callbackCheckDamageHit = { 1, function(self)
+            return not (self.ctx ~= nil and self.ctx.dodging == true)
+        end, { "chainsaw.HitController.DamageInfo" }, { ret = "System.Boolean" } },
+        get_CurrentHitPoint = { 0, function(self) return self.ctx and self.ctx.hp or 0 end, {}, { ret = "System.Int32" } },
         callbackDamageHit = { 1, function(self, info)
             self:call("playDamageSe", info)
             local ctx = self.ctx
@@ -801,6 +932,12 @@ function M.install(opts)
             end
         end, { "chainsaw.HitController.DamageInfo" } },
     })
+    local hc_fields = classes["chainsaw.HitController"].fields
+    hc_fields["<ContextAccessor>k__BackingField"] = "chainsaw.IContextAccessor"
+    hc_fields["<Delegate>k__BackingField"] = "chainsaw.HitController.Delegates"
+    hc_fields["<DamageCalcInfo>k__BackingField"] = "chainsaw.HitController.DamageInfo"
+    class("chainsaw.HitController.Delegates", "System.Object", {})
+    M.install_partner(world)
     -- Parts breaks (heads bursting, limbs): the break effect of a hit the mod ran crashed the
     -- game in WindManager.attachWindSettingEffect (re4.exe+0x326e37f, 2026-10-12).
     world.head_burst = false -- what the death lottery draws
@@ -894,6 +1031,7 @@ function M.install(opts)
         get_BodyGameObject = { 0, function(self) return self.body end },
         get_HeadGameObject = { 0, function(self) return self.head end },
         get_HeadUpdater = { 0, function(self) return self.head_updater end },
+        get_BodyUpdater = { 0, function(self) return self.body_updater end },
         -- The spawn param that created the character: its ContextID, which is also the
         -- character's own _ID (nil for characters without one).
         get_SpawnerID = { 0, function(self) return self.spawner end },
@@ -996,6 +1134,8 @@ function M.install(opts)
         end, { "via.vec3", "via.Quaternion" } },
     })
     class("chainsaw.Ch3a8z0Context", "chainsaw.PartnerBaseContext", {}) -- an NPC partner
+    -- A scripted NPC without AI of its own (CharacterManager.DollNpcContextList).
+    class("chainsaw.DollNpcBaseContext", "chainsaw.CharacterContext", {})
 
     class("System.Collections.Generic.List`1<chainsaw.EnemyBaseContext>", "System.Object", {
         get_Count = { 0, function(self) return #world.enemies end },
@@ -1022,10 +1162,17 @@ function M.install(opts)
         end })
     end
     M.partner_list = partner_list
+    -- CharacterManager.DollNpcContextList: world.dolls.
+    function M.doll_list()
+        return new("System.Collections.Generic.List`1<chainsaw.CharacterContext>", { items = function()
+            return world.dolls or {}
+        end })
+    end
     local character_manager_methods = {
         getPlayerContextRef = { 0, function() return world.player end },
         getPartnerContextRef = { 0, function() return world.partner end },
         get_PartnerContextList = { 0, function() return not world.no_partner_list and partner_list() or nil end },
+        get_DollNpcContextList = { 0, function() return M.doll_list() end },
         get_EnemyContextList = { 0, function() return enemy_list end },
         get_CharacterBackupDB = { 0, function() return backup_db end },
         getSpawnParamRef = { 1, function(_, id) return world.spawn_params[id:call("get_Code")] end,
@@ -1213,8 +1360,18 @@ function M.install(opts)
             { static = true } },
         getStage = { 0, function(self) return self.stage or 40210 end },
     }, { _ID = "chainsaw.ContextID", _ItemData = "chainsaw.DropItemContext.SaveData", _IsLostItem = "System.Boolean" })
-    class("chainsaw.HateTargetInfo", "System.Object", {}, { _Target = "via.GameObject", _Hate = "System.Single" })
+    class("chainsaw.HateTargetInfo", "System.Object", {}, { _Target = "via.GameObject", _Hate = "System.Single",
+        ["<TargetGameObject>k__BackingField"] = "via.GameObject" })
     class("chainsaw.HateController", "via.Component", {
+        -- HateController.lose(GameObject): the target is forgotten.
+        lose = { 1, function(self, go)
+            self.lost = self.lost or {}
+            self.lost[#self.lost + 1] = go
+            local cur = self.__fields["<CurrentTarget>k__BackingField"]
+            if cur ~= nil and cur.__fields["<TargetGameObject>k__BackingField"] == go then
+                self.__fields["<CurrentTarget>k__BackingField"] = nil
+            end
+        end, { "via.GameObject" } },
         get_CurrentTarget = { 0, function(self) return self.target end },
         get_FindState = { 0, function() return 2 end },
         get_TotalAttention = { 0, function() return 0.5 end },
@@ -1428,7 +1585,268 @@ function M.install(opts)
         drag_int = function(_, v) return false, v end,
         color_edit = function(_, v) return false, v end,
     }
+    install_player_grab()
     return world
+end
+
+-------------------------------------------------------------------------------
+-- The partner as a second player (game_partner.lua, docs/RESEARCH.md 3.25)
+-------------------------------------------------------------------------------
+
+function M.install_partner(world)
+    world.noises, world.hit_controllers, world.attack_catalog = {}, {}, {}
+    world.marker_registrations = 0
+    -- BodyUpdater: answers which character its GameObject is (IContextAccessor.<Context>).
+    class("chainsaw.BodyUpdater", "via.Component", {}, { ["<Context>k__BackingField"] = "chainsaw.Context" })
+    class("chainsaw.PlayerBodyUpdater", "chainsaw.BodyUpdater", {})
+    -- The player context class (CharacterContext's constructor makes its HitPoint).
+    class("chainsaw.ChCommonPlContext", "chainsaw.PlayerBaseContext", {
+        [".ctor"] = { 0, function(self)
+            self.pos, self.hp, self.max_hp = M.vec(0, 0, 0), 2520, 2520
+            M.add_hitpoint(self)
+        end },
+        initialize = { 6, function(self, id, kind)
+            self.__fields._ID = id
+            self.kind_id = kind
+            self.initialized = (self.initialized or 0) + 1
+        end },
+        get_BodyGameObject = { 0, function(self)
+            local u = self.__fields._BodyUpdater
+            return u and u.owner or nil
+        end },
+    }, { ["<KindID>k__BackingField"] = "chainsaw.CharacterKindID", ["<Setupped>k__BackingField"] = "System.Boolean",
+        _BodyUpdater = "chainsaw.CharacterBodyUpdater", _HeadUpdater = "chainsaw.CharacterHeadUpdater",
+        ["<Position>k__BackingField"] = "via.vec3",
+        ["<Rotation>k__BackingField"] = "via.Quaternion", ["<LastValidPosition>k__BackingField"] = "via.vec3",
+        ["<LastValidRotation>k__BackingField"] = "via.Quaternion" })
+    -- TargetMarker: what enemies' sight sensors look for, filed under its GameObject's tag.
+    class("chainsaw.TargetMarker", "via.Component", {
+        register = { 0, function(self)
+            self.registrations = (self.registrations or 0) + 1
+            world.marker_registrations = world.marker_registrations + 1
+            self.registered_tag = self.owner and self.owner.tag
+        end },
+        unregister = { 0, function(self) self.registrations = math.max(0, (self.registrations or 0) - 1) end },
+        get_IsRegistered = { 0, function(self) return (self.registrations or 0) > 0 end, {}, { ret = "System.Boolean" } },
+    }, { _UseTargetJoint = "System.Boolean", _TargetOffset = "via.vec3" })
+    -- AttackUserData: the attack's identity in HitManager's catalog; get_IsGrapple.
+    local au = classes["chainsaw.collision.AttackUserData"]
+    au.fields._AttackHitDataID, au.fields._KeyNameHash = "chainsaw.collision.AttackDataID", "System.UInt32"
+    au.methods.get_IsGrapple = M.make_method("get_IsGrapple", 0, function(self) return self.grapple == true end, {},
+        { ret = "System.Boolean" })
+    au.method_order[#au.method_order + 1] = "get_IsGrapple"
+    -- HitManager: the HitControllers that can be hit (by GameObject), the attack catalog, and
+    -- hitSetting (0x142357370): IsKill, the damaged character's check, the non-lethal attacks'
+    -- last HP, DamageCalcInfo.copy, callbackDamageHit.
+    class("chainsaw.HitManager", "System.Object", {
+        registerHitController = { 1, function(_, hc) world.hit_controllers[hc.owner] = hc end, { "chainsaw.HitController" } },
+        unregisterHitController = { 1, function(_, hc)
+            if world.hit_controllers[hc.owner] == hc then world.hit_controllers[hc.owner] = nil end
+        end, { "chainsaw.HitController" } },
+        getHitController = { 1, function(_, go) return world.hit_controllers[go] end, { "via.GameObject" } },
+        getAttackData = { 2, function(_, id, hash) return world.attack_catalog[tostring(id) .. ":" .. tostring(hash)] end,
+            { "chainsaw.collision.AttackDataID", "System.UInt32" } },
+        hitSetting = { 3, function(_, info, attacker, damaged)
+            local d = info.data
+            d.IsKill = damaged:call("checkKill", d.Damage or 0)
+            if damaged:call("callbackCheckDamageHit", info) == false then return false end
+            local ad = d.AttackData
+            if ad ~= nil and ((ad.__fields._Option or 0) & 4) ~= 0 and damaged:call("checkKill", d.Damage or 0) then
+                d.Damage = math.max(0, (damaged:call("get_CurrentHitPoint") or 1) - 1)
+            end
+            d.IsKill = damaged:call("checkKill", d.Damage or 0)
+            local calc = damaged.__fields["<DamageCalcInfo>k__BackingField"]
+            if calc ~= nil then calc:call("copy", info) end
+            damaged:call("callbackDamageHit", info)
+            world.attacks_landed = (world.attacks_landed or 0) + 1
+            return true
+        end, { "chainsaw.HitController.DamageInfo", "chainsaw.HitController", "chainsaw.HitController" },
+            { ret = "System.Boolean" } },
+    })
+    world.singletons["chainsaw.HitManager"] = M.new("chainsaw.HitManager")
+    -- SoundDetectionManager: the sounds enemies hear (registerSound).
+    class("chainsaw.SoundDetectionInfo", "System.Object", {}, { Position = "via.vec3", Radius = "System.Single",
+        Height = "System.Single", Volume = "System.Single", SubVolumePerSec = "System.Single",
+        ["<OwnerGameObject>k__BackingField"] = "via.GameObject", ["<RequestGameObject>k__BackingField"] = "via.GameObject" })
+    class("chainsaw.SoundDetectionManager", "System.Object", {
+        registerSound = { 1, function(_, info) world.noises[#world.noises + 1] = info end, { "chainsaw.SoundDetectionInfo" } },
+    })
+    world.singletons["chainsaw.SoundDetectionManager"] = M.new("chainsaw.SoundDetectionManager")
+
+    -- 0.10.1 (docs/RESEARCH.md 3.26). HitController.poolDamage (0x142009ef0): the attacker's
+    -- controller pools a contact's damage and decides whether the body shields the attack.
+    local hc_cls = classes["chainsaw.HitController"]
+    hc_cls.methods.poolDamage = make_method("poolDamage", 4, function(self, _, au, du)
+        world.pooled = world.pooled or {}
+        world.pooled[#world.pooled + 1] = { attacker = self, attack = au, damage = du }
+    end, { "via.physics.CollisionInfo", "chainsaw.collision.AttackUserData", "chainsaw.collision.DamageUserData",
+        "System.Boolean" })
+    hc_cls.methods.get_AttackOwner = make_method("get_AttackOwner", 0, function(self) return self.attack_owner end)
+    hc_cls.method_order[#hc_cls.method_order + 1] = "poolDamage"
+    hc_cls.method_order[#hc_cls.method_order + 1] = "get_AttackOwner"
+    class("chainsaw.ShellBase", "via.Component", {}, { ["<AttackOwner>k__BackingField"] = "via.GameObject" })
+    -- An enemy's body updater: its attack's warning (action sign) and its parry answer.
+    class("chainsaw.EnemyActionSignTrack.EnemyActionSignInfo", "System.Object", {}, { _SignType = "chainsaw.ActionSignType",
+        _ButtonSetting = "chainsaw.ActionSignButton", _JustTiming = "System.Boolean", _ActTiming = "System.Boolean",
+        _TargetAngleCheck = "System.Boolean", _Distance = "System.Single" })
+    class("chainsaw.ParryResult", "System.Object", {
+        get_Successful = { 0, function(self) return self.ok == true end, {}, { ret = "System.Boolean" } },
+    })
+    class("chainsaw.EnemyBodyUpdater", "via.Component", {
+        checkEnableActionSign = { 0, function(self) return self.sign ~= nil end, {}, { ret = "System.Boolean" } },
+        getActionSignInfo = { 0, function(self) return self.sign end },
+        checkJustTimingActionSign = { 0, function(self) return self.just == true end, {}, { ret = "System.Boolean" } },
+        onParry = { 2, function(self, go, sign)
+            world.parries = world.parries or {}
+            world.parries[#world.parries + 1] = { body = self, by = go, sign = sign }
+            return new("chainsaw.ParryResult", { ok = self.parry_ok ~= false })
+        end, { "via.GameObject", "chainsaw.ActionSignType" } },
+        onParryInput = { 0, function(self) self.parry_inputs = (self.parry_inputs or 0) + 1 end },
+    })
+    -- EnemyActionSignUtility.sendActionSignInfo(owner, target, info): to the target's player head.
+    class("chainsaw.EnemyActionSignUtility", "System.Object", {
+        sendActionSignInfo = { 3, function(_, owner, target, info)
+            world.signs_delivered = world.signs_delivered or {}
+            world.signs_delivered[#world.signs_delivered + 1] = { owner = owner, target = target, info = info }
+        end, { "via.GameObject", "via.GameObject", "chainsaw.EnemyActionSignTrack.EnemyActionSignInfo" } },
+    })
+    -- Grabs on the enemy's AI head (EnemyHeadUpdater): requestGrapple, the rejected grab.
+    local head_cls = classes["chainsaw.HeadUpdater"]
+    for name, spec in pairs({
+        requestGrapple = { 2, function(self, target, action)
+            if self.context then self.context.__fields["<GrappleTarget>k__BackingField"] = target end
+            self.grab_action = action
+        end, { "via.GameObject", "System.UInt32" } },
+        onRejectGrapple = { 1, function(self, action)
+            self.rejected = (self.rejected or 0) + 1
+            self.rejected_action = action
+        end, { "System.UInt32" } },
+        clearGrappleTarget = { 0, function(self)
+            if self.context then self.context.__fields["<GrappleTarget>k__BackingField"] = nil end
+        end },
+    }) do
+        head_cls.methods[name] = make_method(name, spec[1], spec[2], spec[3])
+        head_cls.method_order[#head_cls.method_order + 1] = name
+    end
+    classes["chainsaw.EnemyHeadUpdater"] = head_cls
+    -- A grabbing Ganado's escape check (a behavior tree action) and its argument.
+    class("via.behaviortree.ActionArg", "System.Object", {
+        ["getComponent(System.Type)"] = { 1, function(self, t) return M.component(self.owner, t.name) end, { "System.Type" } },
+        notifyActionEnd = { 0, function(self) self.done = true end },
+    })
+    class("chainsaw.Ch1c0z0BehaviorTreeAction_CheckEscapeGrapple", "System.Object", {
+        update = { 1, function(self, arg) self.updates = (self.updates or 0) + 1 end, { "via.behaviortree.ActionArg" } },
+        onSuccessfulEscape = { 1, function(self, arg)
+            self.escaped = true
+            local body = M.component(arg.owner, "chainsaw.EnemyBodyUpdater")
+            local ctx = body and body.ctx
+            if ctx then ctx.__fields["<GrappleTarget>k__BackingField"] = nil end
+        end, { "via.behaviortree.ActionArg" } },
+    }, { NumberOfStruggles = "System.Int32", isEnableKnifeEscape = "System.Boolean" })
+    -- ActionTargetController.setTypeTarget(type, target): what the enemy aims at.
+    class("chainsaw.ActionTargetController", "via.Component", {
+        ["setTypeTarget(chainsaw.TargetType, via.GameObject)"] = { 2, function(self, t, go)
+            self.target_type, self.target = t, go
+        end, { "chainsaw.TargetType", "via.GameObject" } },
+        get_HateController = { 0, function(self) return self.hate end },
+    })
+    -- The player's side: the warning on its head, its input, its grab state.
+    local ph = classes["chainsaw.PlayerHeadUpdater"]
+    ph.methods.onHitActionSign = make_method("onHitActionSign", 1, function(self, info)
+        self.signs = self.signs or {}
+        self.signs[#self.signs + 1] = { owner = info.__fields.OwnerGameObject, sign = info.__fields.SignType,
+            just = info.__fields.JustTiming }
+    end, { "chainsaw.ActionSignHitInfo" })
+    ph.method_order[#ph.method_order + 1] = "onHitActionSign"
+    class("chainsaw.ActionSignHitInfo", "System.Object", {}, { OwnerGameObject = "via.GameObject",
+        SignType = "chainsaw.ActionSignType", ButtonType = "chainsaw.ActionSignButton", JustTiming = "System.Boolean",
+        ActTiming = "System.Boolean", TargetAngleCheck = "System.Boolean" })
+    class("share.hid.Command", "System.Object", {
+        ["isTrigger(System.UInt32)"] = { 1, function(self, h) return (self.pressed or {})[h] == true end,
+            { "System.UInt32" }, { ret = "System.Boolean" } },
+    })
+    class("chainsaw.collision.GrappleUserData", "chainsaw.collision.AttackUserData", {},
+        { _GrapplePriority = "chainsaw.collision.AttackPriority" })
+end
+
+-- Enemy `ctx`'s body updater (chainsaw.EnemyBodyUpdater, CharacterContext.get_BodyUpdater).
+function M.enemy_body_updater(ctx)
+    if ctx.body_updater == nil then ctx.body_updater = M.add_component(ctx.body, "chainsaw.EnemyBodyUpdater", { ctx = ctx }) end
+    return ctx.body_updater
+end
+
+-- An attack's warning (EnemyActionSignInfo). opts: { sign, button, just, act, distance }
+function M.sign_info(opts)
+    opts = opts or {}
+    return M.new("chainsaw.EnemyActionSignTrack.EnemyActionSignInfo", { __fields = { _SignType = opts.sign or 0,
+        _ButtonSetting = opts.button or 0, _JustTiming = opts.just == true, _ActTiming = opts.act ~= false,
+        _TargetAngleCheck = false, _Distance = opts.distance or 3 } })
+end
+
+-- A contact of `attacker_hc`'s attack on `go`'s first damage collider, the way the engine
+-- reports it (HitController.poolDamage, hooks around it). Returns whether it was pooled.
+function M.contact(attacker_hc, go)
+    local hc = M.world.hit_controllers[go] or M.component(go, "chainsaw.HitController")
+    local du = hc and hc.colliders and hc.colliders.list[1] and hc.colliders.list[1].user_data
+    local before = #(M.world.pooled or {})
+    attacker_hc:call("poolDamage", nil, M.new("chainsaw.collision.AttackUserData"), du, false)
+    return #(M.world.pooled or {}) > before
+end
+
+-- A character's damage colliders: chest and head (chainsaw.collision.DamageUserData).
+function M.damage_colliders(type_name)
+    local list = {}
+    for _, part in ipairs({ { 1, 0 }, { 0, 0 } }) do
+        list[#list + 1] = M.new("via.physics.Collider", { user_data = M.new(type_name or "chainsaw.collision.DamageUserData",
+            { __fields = { Parts = part[1], PartsSide = part[2] } }) })
+    end
+    return M.new("via.physics.Colliders", { list = list })
+end
+
+-- A HitController as the game constructs it (its Delegates and DamageCalcInfo exist).
+function M.add_hit_controller(go, ctx, cols)
+    return M.add_component(go, "chainsaw.HitController", { ctx = ctx, colliders = cols, __fields = {
+        ["<Delegate>k__BackingField"] = M.new("chainsaw.HitController.Delegates"),
+        ["<DamageCalcInfo>k__BackingField"] = M.new("chainsaw.HitController.DamageInfo") } })
+end
+
+-- Enemy `enemy` targets `go` (its HateController's current target).
+function M.target(enemy, go)
+    local hate = enemy.hate
+    local info = M.new("chainsaw.HateTargetInfo")
+    info.__fields["<TargetGameObject>k__BackingField"] = go
+    hate.__fields["<CurrentTarget>k__BackingField"] = info
+end
+
+-- Enemy `enemy`'s attack lands on `go`, the way the engine resolves it: HitManager finds the
+-- damaged HitController by GameObject and runs hitSetting (hooks around it). opts: { attack_id,
+-- key, grapple, option, owner (the attack's owner GameObject, default the enemy's body) }.
+-- Returns hitSetting's result, or nil when `go` has no registered HitController.
+function M.enemy_attack(enemy, go, damage, opts)
+    opts = opts or {}
+    local hm = M.world.singletons["chainsaw.HitManager"]
+    local damaged = hm:call("getHitController", go)
+    if damaged == nil then return nil end
+    local attacker = M.component(enemy.body, "chainsaw.HitController")
+    local au = M.new("chainsaw.collision.AttackUserData", { grapple = opts.grapple, __fields = {
+        _AttackHitDataID = opts.attack_id or 1100, _KeyNameHash = opts.key or 0xABC } })
+    local ad = M.new("chainsaw.collision.AttackHitUserData.AttackData", { __fields = { _AttackType = 4, _AttackPower = 1,
+        _Option = opts.option or 0 } })
+    local du = damaged.colliders and damaged.colliders.list[1] and damaged.colliders.list[1].user_data or nil
+    local owner = opts.owner or enemy.body
+    local info = M.new("chainsaw.HitController.DamageInfo", { data = { Damage = damage, Wince = 20, Break = 0,
+        Stopping = 0, DamageDir = M.vec(1, 0, 0), Position = M.vec(0, 1, 0), WeaponID = 0, IsCritical = false,
+        IsKill = false, AttackOwnerObject = owner, AttackGameObject = owner, DamageGameObject = go, AttackUserData = au,
+        AttackData = ad, DamageUserData = du } })
+    return hm:call("hitSetting", info, attacker, damaged)
+end
+
+-- A sound the game registers (SoundDetectionManager.registerSound) with `owner` as its owner.
+function M.make_noise(owner, pos, volume)
+    local info = M.new("chainsaw.SoundDetectionInfo", { __fields = { Position = M.vec(pos.x, pos.y, pos.z), Radius = 12,
+        Height = 3, Volume = volume or 0.6, SubVolumePerSec = 0.5, ["<OwnerGameObject>k__BackingField"] = owner,
+        ["<RequestGameObject>k__BackingField"] = owner } })
+    return M.world.singletons["chainsaw.SoundDetectionManager"]:call("registerSound", info)
 end
 
 -------------------------------------------------------------------------------
@@ -1721,6 +2139,8 @@ local function add_hitpoint(ctx)
     end
 end
 
+M.add_hitpoint = add_hitpoint
+
 -- A character created by a level spawn param carries that spawn param's ContextID as its
 -- own `_ID` (level data: category 0 = Character, e.g. group 12); one created at runtime gets
 -- CharacterManager.generateDynamicContextID's ContextID(Character, 0, group 1, counter).
@@ -1769,6 +2189,9 @@ function M.make_character(type_name, pos, hp, spawner)
     ctx.body = body
     ctx.head = M.make_go(type_name:match("(Ch%w+)Context") and (type_name:match("(Ch%w+)Context") .. "_head") or "head")
     ctx.head_updater = M.add_component(ctx.head, "chainsaw.HeadUpdater", { context = ctx })
+    -- Its HateController (EnemyHeadUpdater.<HateController>): whom it is after.
+    ctx.hate = M.new("chainsaw.HateController", { owner = ctx.head })
+    ctx.head_updater.__fields["<HateController>k__BackingField"] = ctx.hate
     return ctx
 end
 
@@ -1780,6 +2203,37 @@ function M.make_ashley(pos, hp)
     ctx.body.name, ctx.head.name = "ch2a1z0_body", "ch2a1z0_head"
     ctx.think_enable, ctx.permit_kidnapped, ctx.permit_attacked = true, true, true
     return ctx
+end
+
+-- A scripted Ashley (a doll NPC of her kind) at `pos`; with `spawn_param`, the level spawn
+-- param that made her (invalidateSpawn(true) despawns her).
+function M.make_doll_ashley(pos, spawn_param)
+    local ctx = M.make_character("chainsaw.DollNpcBaseContext", pos, 600)
+    ctx.kind_id = M.ASHLEY_KIND
+    ctx.body.name, ctx.head.name = "ch2a1z0_body", "ch2a1z0_head"
+    if spawn_param then ctx.spawn_param = new("chainsaw.CharacterSpawnParam", { ctx = ctx, owner = M.make_go("spawner") }) end
+    return ctx
+end
+
+-- Whether `motion` can play a motion of `bank` (only for a Motion with `banks` set: bank ->
+-- the TargetBankType bits its variant needs, 0 = any): one of its own banks in the selected
+-- variant, or a dynamic bank standing for it.
+function M.motion_playable(motion, bank)
+    if motion.banks == nil then return true end
+    local need = motion.banks[bank]
+    if need ~= nil and (need == 0 or ((motion.bank_type or 0) & need) ~= 0) then return true end
+    for _, b in ipairs(motion.dynamic or {}) do
+        if b.bank_id == bank then return true end
+    end
+    return false
+end
+
+-- A dynamic motion bank for `path` standing for bank `bank_id`.
+function M.make_dynamic_bank(path, bank_id, opts)
+    opts = opts or {}
+    return new("via.motion.DynamicMotionBank", { motlist = new("via.motion.MotionListResourceHolder", { path = path }),
+        bank_id = bank_id, bank_type = opts.bank_type or 0, mask_bit = opts.mask_bit or 0, order = opts.order or 0,
+        ow_id = opts.ow_id or false, ow_type = false, ow_mask = false })
 end
 
 -- Every partner whose head runs: she follows the player (up to 0.3 m a frame, stopping 1.5 m
@@ -1816,13 +2270,17 @@ function M.relink_head(head_updater, ctx)
     head_updater.context = ctx
 end
 
--- The game despawns a character: its context leaves the enemy list and its body is destroyed.
--- Its head GameObject survives: the game pools heads and gives them to the next characters.
+-- The game despawns a character: its context leaves the character lists and its body is
+-- destroyed. Its head GameObject survives: the game pools heads and gives them to the next
+-- characters.
 function M.despawn(ctx)
-    local list = M.world.enemies
-    for i = #list, 1, -1 do
-        if list[i] == ctx then table.remove(list, i) end
+    local w = M.world
+    for _, list in ipairs({ w.enemies or {}, w.partners or {}, w.dolls or {} }) do
+        for i = #list, 1, -1 do
+            if list[i] == ctx then table.remove(list, i) end
+        end
     end
+    if w.partner == ctx then w.partner = nil end
     ctx.despawned = true
     if ctx.body ~= nil then M.destroy(ctx.body) end
     -- Its head goes back to the pool unlinked: HeadUpdater.Context is null there.
@@ -1895,8 +2353,13 @@ function M.make_player(pos, opts)
     ctx.weapon = wp
     local head = M.make_go(opts.head_name or "ch0a0z0_head")
     M.add_component(head, "chainsaw.PlayerEquipment")
+    ctx.head_updater = M.add_component(head, "chainsaw.PlayerHeadUpdater")
     ctx.voice = M.add_component(head, "via.wwise.WwiseContainer")
     ctx.body, ctx.head = body, head
+    -- What enemies see (a TargetMarker filed under the body's tag) and hit (its damage colliders).
+    body.tag = "Player|Character"
+    ctx.marker = M.add_component(body, "chainsaw.TargetMarker", { registrations = 1 })
+    ctx.hit_controller = M.add_hit_controller(body, ctx, M.damage_colliders())
     -- A recognisable animated pose: every joint turned a little around a different axis.
     for i, j in ipairs(body.transform.joints) do
         local a = 0.05 * i
@@ -1919,6 +2382,14 @@ function M.build_body_prefab(pos, name)
     M.add_component(body, "chainsaw.CharacterBodyLogic")
     M.add_component(body, "chainsaw.WwiseContainerApp")
     M.add_component(body, "via.motion.Chain")
+    -- What makes it a character once the mod gives it a context (game_partner.lua): its body
+    -- updater, its HitController (constructed: Delegates and DamageCalcInfo) and its damage
+    -- colliders (a component of their own, next to the other colliders).
+    M.add_component(body, "chainsaw.PlayerBodyUpdater")
+    local cols = M.damage_colliders()
+    cols.owner = body
+    body.components[#body.components + 1] = cols
+    M.add_hit_controller(body, nil, cols)
     M.child(body, "cha000_00", { mesh = M.MESH.body, mdf = M.MDF.body, same_joints = true })
     M.child(body, "cha002_00", { mesh = M.MESH.jacket, mdf = M.MDF.jacket, same_joints = true })
     return body
@@ -2018,9 +2489,11 @@ end
 
 -- The player starts a finisher (`request`: "requestFatal", "requestKnifeFatal" or
 -- "requestStompFatal") on `enemy`: the game's PlayerHeadUpdater call, hooks around it.
-function M.fatal(enemy, request)
+function M.fatal(enemy, request, opts)
     request = request or "requestFatal"
-    local head = new("chainsaw.PlayerHeadUpdater", { selector = new("chainsaw.PlayerTargetSelector", { target = enemy }) })
+    opts = opts or {}
+    local head = new("chainsaw.PlayerHeadUpdater", { selector = new("chainsaw.PlayerTargetSelector", { target = enemy }),
+        stealth = opts.stealth, ftype = opts.ftype })
     M.fire_hooks(request, head)
     return head:call(request)
 end
@@ -2742,6 +3215,7 @@ function M.install_world(world, opts)
         getPlayerContextRef = { 0, function() return world.player end },
         getPartnerContextRef = { 0, function() return world.partner end },
         get_PartnerContextList = { 0, function() return not world.no_partner_list and M.partner_list() or nil end },
+        get_DollNpcContextList = { 0, function() return M.doll_list() end },
         get_EnemyContextList = { 0, function() return world.enemy_list end },
         get_CharacterBackupDB = { 0, function() return backup_db end },
         getSpawnParamRef = M.character_manager_methods.getSpawnParamRef,

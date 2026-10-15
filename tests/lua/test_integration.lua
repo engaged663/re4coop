@@ -109,10 +109,11 @@ function client_game:list_enemies()
     return out
 end
 function client_game:enemy_set_hp(id, hp) self.enemies[id].hp = math.max(1, hp) return true end
-function client_game:enemy_kill(id, fields)
+function client_game:enemy_kill(id, fields, by)
     self.enemies[id].hp = 0
     self.enemies[id].alive = false
     self.enemies[id].killing_hit = fields
+    self.enemies[id].killed_by = by
     self.kills = self.kills + 1
     return true
 end
@@ -149,12 +150,50 @@ function client_game:take_hit_events()
     self.hit_queue = {}
     return q
 end
--- Finishers our player started (game.lua's requestFatal hook).
+-- Finishers our player started on puppets (game_partner.lua's hooks on their AI heads):
+-- { {id, kind, ftype, pos, yaw}, ... }.
 client_game.fatal_queue = {}
 function client_game:take_fatal_events()
     local q = self.fatal_queue
     self.fatal_queue = {}
     return q
+end
+-- Noises our player made (game_partner.lua's SoundDetectionManager.registerSound hook).
+client_game.noise_queue = {}
+function client_game:take_noise_events()
+    local q = self.noise_queue
+    self.noise_queue = {}
+    return q
+end
+-- Hits the host's enemies landed on our character there (game_partner.lua's player_take_hit).
+client_game.host_hits = {}
+function client_game:player_take_hit(hit, attacker)
+    self.host_hits[#self.host_hits + 1] = { hit = hit, attacker = attacker }
+    return "applied"
+end
+-- The host's enemies' warnings our player's head got (player_action_sign), our player's
+-- parries of our copies (take_parry_events), the escape presses while held (player_grab_input:
+-- grab_presses presses, one a frame) and who let our character go (player_grab_release).
+client_game.signs, client_game.parry_queue, client_game.released, client_game.grab_presses = {}, {}, {}, 0
+function client_game:player_action_sign(id, m)
+    self.signs[#self.signs + 1] = { id = id, m = m }
+    return true
+end
+function client_game:take_parry_events()
+    local q = self.parry_queue
+    self.parry_queue = {}
+    return q
+end
+function client_game:player_grab_input()
+    if self.grab_presses > 0 then
+        self.grab_presses = self.grab_presses - 1
+        return "mash"
+    end
+    return nil
+end
+function client_game:player_grab_release(id, action)
+    self.released[#self.released + 1] = { id = id, action = action }
+    return true
 end
 function client_game:take_drop_events()
     local q = self.drop_queue
@@ -337,7 +376,7 @@ T.run("enemy_sync_end_to_end", function()
     T.check(ok, "the host's enemy took the client's hit (hp=" .. host_e1.hp .. ")")
     local r = mock.component(host_e1.body, "chainsaw.HitController").received
     T.eq(r[#r].wince, 7, "and reacted with the client's wince")
-    T.eq(r[#r].attacker, world.player.body, "a live attacker in the host's game")
+    T.eq(r[#r].attacker, partner_model(), "the client's character attacks in the host's game (the enemy turns on it)")
 
     -- The host's AI walks enemy 1: the client's copy follows.
     host_e1.pos.x, host_e1.pos.z = 7, 1.5
@@ -380,26 +419,170 @@ T.run("hits_and_drops_end_to_end", function()
     T.eq(#client_game.spawned, 1, "exactly once")
 end)
 
-T.run("a_finisher_by_the_client_end_to_end", function()
-    -- A new enemy near the host: the host's game runs it, the client shows a puppet.
-    local host_e3 = mock.make_character("chainsaw.Ch1c0z0Context", { x = 2, y = 0, z = -2 }, 100)
-    world.enemies[#world.enemies + 1] = host_e3
-    client_game.enemies[3] = { id = 3, kind = "chainsaw.Ch1c0z0Context", pos = { x = 2.2, y = 0, z = -2.1 }, yaw = 0,
+-- The host's enemies fight the client's character as a second player of the host's game.
+T.run("the_hosts_enemies_see_and_attack_the_client_end_to_end", function()
+    local model = partner_model()
+    local ok = T.wait_until(function()
+        return world.hit_controllers[model] ~= nil and mock.component(model, "chainsaw.TargetMarker") ~= nil
+    end, step, 5)
+    T.check(ok, "the client's model is a character of the host's game")
+    -- What the enemies see: its body updater says which character it is - our stand-in.
+    local upd = mock.component(model, "chainsaw.PlayerBodyUpdater")
+    local ctx = upd.__fields["<Context>k__BackingField"]
+    T.eq(ctx and ctx.__type, "chainsaw.ChCommonPlContext", "a player context of the host's game")
+    T.eq(ctx and ctx.kind_id, 100000, "Leon (ch0_a0z0)")
+    T.eq(ctx.__fields._BodyUpdater, upd, "whose body is the model")
+    T.eq(model.tag, "Player|Character", "tagged like the host's player")
+    local marker = mock.component(model, "chainsaw.TargetMarker")
+    T.check(marker.enabled ~= false, "with a TargetMarker on")
+    ok = T.wait_until(function() return (marker.registrations or 0) == 1 end, step, 3)
+    T.check(ok, "registered once")
+    ok = T.wait_until(function() return math.abs((ctx.__fields["<Position>k__BackingField"] or {}).x or 0) > 1 end, step, 3)
+    T.near(ctx.__fields["<Position>k__BackingField"].x, client_game.player.pos.x, 0.5, "standing where the client is")
+
+    -- A villager near the client, run by the host.
+    local host_e4 = mock.make_character("chainsaw.Ch1c0z0Context", { x = 9, y = 0, z = 3 }, 100)
+    world.enemies[#world.enemies + 1] = host_e4
+    client_game.enemies[3] = { id = 3, kind = "chainsaw.Ch1c0z0Context", pos = { x = 9.1, y = 0, z = 3.1 }, yaw = 0,
         hp = 100, max_hp = 100, alive = true }
-    local ok = T.wait_until(function() return client_game.puppet[3] == true end, step, 5)
+    ok = T.wait_until(function() return client_game.puppet[3] == true end, step, 5)
     T.check(ok, "the client's copy is a puppet of the host's")
-    -- The client's player grabs it for a stealth kill: game.lua's hook asks the session first,
-    -- switches the puppet back on, and reports it.
-    T.check(client_game.fatal_filter ~= nil and client_game.fatal_filter(3), "the session lets the client take it")
-    client_game.puppet[3] = nil
-    client_game.fatal_queue = { 3 }
-    ok = T.wait_until(function() return host_e3.head.update_self == false end, step, 5)
-    T.check(ok, "the host's copy became the puppet (its AI off)")
-    T.eq(client_game.puppet[3], nil, "the client's game runs it")
-    -- The finisher kills it in the client's game: dead in the host's too.
-    client_game.enemies[3].hp, client_game.enemies[3].alive = 0, false
-    ok = T.wait_until(function() return host_e3.hp == 0 end, step, 5)
-    T.check(ok, "the host's copy died (hp=" .. host_e3.hp .. ")")
+
+    -- It goes after the client: the client knows.
+    mock.target(host_e4, model)
+    ok = T.wait_until(function() return client.enemy_net:summary().targeting_partner == 1 end, step, 5)
+    T.check(ok, "the client is told an enemy is after it")
+
+    -- Its attack lands on the model: the client takes the hit.
+    T.eq(mock.enemy_attack(host_e4, model, 150, { attack_id = 1100, key = 0x77 }), true, "the hit landed in the host's game")
+    ok = T.wait_until(function() return #client_game.host_hits == 1 end, step, 5)
+    T.check(ok, "the client got the hit")
+    local got = client_game.host_hits[1]
+    T.eq(got and got.attacker, 3, "from its copy of that villager")
+    T.eq(got and got.hit.attack_id, 1100, "with the attack's identity")
+    T.eq(got and got.hit.key_hash, 0x77, "(its key)")
+    local dmg
+    for _, f in ipairs(got and got.hit.fields or {}) do
+        if f.h == P.hash("Damage") then dmg = f.v end
+    end
+    T.eq(dmg, 150, "and its damage")
+    T.eq(#(mock.component(model, "chainsaw.HitController").received or {}), 0, "the model itself took nothing")
+
+    -- The host's own shots never reach the client, and pass its character: their contact is
+    -- dropped before the game pools it (and decides the body stops the shot).
+    local hm = world.singletons["chainsaw.HitManager"]
+    local info = mock.new("chainsaw.HitController.DamageInfo", { data = { Damage = 30, AttackOwnerObject = world.player.body,
+        AttackGameObject = world.player.body, DamageGameObject = model,
+        AttackUserData = mock.new("chainsaw.collision.AttackUserData"),
+        AttackData = mock.new("chainsaw.collision.AttackHitUserData.AttackData") } })
+    hm:call("hitSetting", info, world.player.hit_controller, world.hit_controllers[model])
+    T.eq(mock.contact(world.player.hit_controller, model), false, "the host's blow passes the client's character")
+    local bullet = mock.make_go("bullet")
+    local shell = mock.add_component(bullet, "chainsaw.ShellBase")
+    shell.__fields["<AttackOwner>k__BackingField"] = world.player.body
+    T.eq(mock.contact(mock.add_component(bullet, "chainsaw.HitController"), model), false, "and so does the host's bullet")
+    T.eq(mock.contact(mock.component(host_e4.body, "chainsaw.HitController"), model), true, "an enemy's blow still lands")
+    T.eq(mock.contact(world.player.hit_controller, host_e4.body), true, "and the host's on enemies")
+    run_for(0.5)
+    T.eq(#client_game.host_hits, 1, "no friendly fire")
+
+    -- Its attack warns the client's character: the client's player gets the prompt.
+    local body_upd = mock.enemy_body_updater(host_e4)
+    body_upd.sign, body_upd.just = mock.sign_info({ sign = 0, distance = 3 }), true
+    ok = T.wait_until(function() return #client_game.signs > 0 end, step, 5)
+    T.check(ok, "the client got the warning")
+    T.eq(client_game.signs[1] and client_game.signs[1].id, 3, "from its copy of that villager")
+    T.eq(client_game.signs[1] and client_game.signs[1].m.just, true, "with its just-timing")
+    body_upd.sign = nil
+    -- The client parries its copy: the host's villager staggers, from the client's character.
+    client_game.parry_queue = { { id = 3, kind = P.PARRY_KIND.PARRY, sign_type = 0, ok = true } }
+    ok = T.wait_until(function() return #(world.parries or {}) > 0 end, step, 5)
+    T.check(ok, "the host's villager was parried")
+    T.eq(world.parries[1] and world.parries[1].body, body_upd, "that villager")
+    T.eq(world.parries[1] and world.parries[1].by, model, "by the client's character")
+    -- Its blow still on its way when the client parried is not taken.
+    T.eq(mock.enemy_attack(host_e4, model, 80), true, "the blow landed in the host's game")
+    run_for(0.5)
+    T.eq(#client_game.host_hits, 1, "the parried blow is not taken")
+
+    -- A boss aiming at "the player" itself goes for the client when its hate puts the client first.
+    local atc = mock.add_component(host_e4.body, "chainsaw.ActionTargetController", { hate = host_e4.hate })
+    atc:call("setTypeTarget(chainsaw.TargetType, via.GameObject)", 4, world.player.body)
+    T.eq(atc.target, model, "the client's character")
+    mock.target(host_e4, world.player.body)
+    atc:call("setTypeTarget(chainsaw.TargetType, via.GameObject)", 4, world.player.body)
+    T.eq(atc.target, world.player.body, "the host's player when the host is first")
+    mock.target(host_e4, model)
+
+    -- A grab: the villager holds the client's character until the client breaks free.
+    run_for(1.2) -- past the parry's shield
+    host_e4.head_updater:call("requestGrapple", model, 0x1234)
+    T.eq(mock.enemy_attack(host_e4, model, 60, { grapple = true }), true, "a grab lands on the client")
+    ok = T.wait_until(function() return #client_game.host_hits == 2 end, step, 5)
+    T.check(ok, "the client got the grab")
+    T.eq(client_game.host_hits[2] and client_game.host_hits[2].hit.grab, true, "as a grab")
+    ok = T.wait_until(function() return client.partner_target.grab ~= nil end, step, 5)
+    T.check(ok, "the client knows it is held")
+    T.eq(client.partner_target.grab and client.partner_target.grab.id, 3, "by its copy of the villager")
+    T.eq(client.partner_target.grab and client.partner_target.grab.action, 0x1234, "with the grab's action")
+    local tree = mock.new("chainsaw.Ch1c0z0BehaviorTreeAction_CheckEscapeGrapple",
+        { __fields = { NumberOfStruggles = 3, isEnableKnifeEscape = false } })
+    local arg = mock.new("via.behaviortree.ActionArg", { owner = host_e4.body })
+    tree:call("update", arg)
+    ok = T.wait_until(function() return client.partner_target.grab and client.partner_target.grab.struggles == 3 end,
+        step, 5)
+    T.check(ok, "the presses the villager's escape check wants")
+    client_game.grab_presses = 3
+    ok = T.wait_until(function() return client.partner_target.grab == nil end, step, 5)
+    T.check(ok, "the client broke free")
+    T.eq(client_game.released[1] and client_game.released[1].id, 3, "let go by its copy")
+    ok = T.wait_until(function()
+        tree:call("update", arg)
+        return tree.escaped == true
+    end, step, 5)
+    T.check(ok, "the host's villager's escape check succeeded")
+    T.eq(arg.done, true, "and ended")
+    T.eq(host_e4.__fields["<GrappleTarget>k__BackingField"], nil, "the villager let go")
+    run_for(0.5)
+    T.eq(#client_game.released, 1, "let go once")
+
+    -- The client's noise: the host's enemies hear the model make it.
+    local before = #world.noises
+    client_game.noise_queue = { { pos = { x = 10, y = 0, z = 4 }, radius = 15, height = 3, volume = 0.9, sub = 0.4 } }
+    ok = T.wait_until(function() return #world.noises > before end, step, 5)
+    T.check(ok, "a sound registered in the host's game")
+    local n = world.noises[#world.noises]
+    T.eq(n and n.__fields["<OwnerGameObject>k__BackingField"], model, "made by the client's model")
+    T.near(n and n.__fields.Volume or 0, 0.9, 1e-6, "as loud as in the client's game")
+
+    -- Finishers: the host's villager says which it offers the client; the client's request runs
+    -- on the host's villager with the client's character as the attacker.
+    host_e4.fatal_ok, host_e4.fatal_type = true, 2
+    ok = T.wait_until(function()
+        local pinfo = client.enemy_net:partner_fatal(3)
+        return pinfo ~= nil and (pinfo & P.PARTNER_INFO.FATAL) ~= 0
+    end, step, 5)
+    T.check(ok, "a kick is offered to the client")
+    local _, ftype = client.enemy_net:partner_fatal(3)
+    T.eq(ftype, 2, "a straight kick")
+    local n0 = #world.head_fatals
+    client_game.fatal_queue = { { id = 3, kind = P.FATAL_KIND.NORMAL, ftype = 2, pos = client_game.player.pos, yaw = 0 } }
+    ok = T.wait_until(function() return #world.head_fatals > n0 end, step, 5)
+    T.check(ok, "the host's villager got the request")
+    local f = world.head_fatals[#world.head_fatals]
+    T.eq(f and f.kind, "normal", "the kick")
+    T.eq(f and f.ftype, 2, "its type")
+    T.eq(f and f.target, host_e4, "on the host's villager")
+    T.eq(f and f.attacker, ctx, "with the client's character as the attacker")
+    T.eq(host_e4.head.update_self ~= false, true, "the host's game still runs it")
+    client_game.fatal_queue = { { id = 3, kind = P.FATAL_KIND.STEALTH, ftype = 0, pos = client_game.player.pos, yaw = 0 } }
+    ok = T.wait_until(function() return world.head_fatals[#world.head_fatals].kind == "stealth" end, step, 5)
+    T.check(ok, "a stealth kill too")
+    -- It kills the villager in the host's game: the client's copy dies, as the client's kill.
+    host_e4.hp = 0
+    ok = T.wait_until(function() return client_game.enemies[3].alive == false end, step, 5)
+    T.check(ok, "dead for the client too")
+    T.eq(client_game.enemies[3].killed_by, "self", "the client's own kill")
 end)
 
 T.run("key_items_exist_once", function()

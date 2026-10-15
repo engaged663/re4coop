@@ -66,6 +66,20 @@ end
 
 -- Compact status text in the top-left corner, plus the newest chat/notice lines.
 -- model: puppet status (puppet.lua) or nil.
+-- Client: our character is held by one of the host's enemies: how to break free.
+-- grab = { presses, struggles, knife }
+function Overlay.draw_grab(game, grab)
+    if grab == nil then return end
+    local text = ("HELD! Mash the action button to break free (%d/%d)"):format(grab.presses or 0, grab.struggles or 0)
+    if grab.knife then text = text .. " - or use your knife" end
+    local w, h = 1920, 1080
+    if game.screen_size then
+        local sw, sh = game:screen_size()
+        if sw then w, h = sw, sh end
+    end
+    game:draw_text(text, w / 2 - #text * 3.5, h * 0.7, COLOR_DOWN)
+end
+
 function Overlay.draw_hud(game, status, messages, now, model)
     local x, y = 12, 12
     local line = "RE4 Co-op: "

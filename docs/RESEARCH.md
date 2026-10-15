@@ -26,7 +26,7 @@ framework for RE Engine games. It loads as `dinput8.dll` next to `re4.exe` and p
 | **Lua scripting** (`reframework/autorun/*.lua`), Lua 5.4.3 via sol2 | All game logic, UI and rendering of the partner |
 | **Type database (TDB) reflection**: `sdk.find_type_definition`, `get_method`, `:call()`, `get_field`/`set_field` | Reading the player, enemies and HP without hard-coded offsets |
 | **Managed singletons**: `sdk.get_managed_singleton("chainsaw.CharacterManager")` | Entry points into game state |
-| **Method hooks**: `sdk.hook(method, pre, post)` | Capturing the local player's sounds, effects and shots so the partner's copy can replay them (§4.1), and every hit on an enemy (`HitController.callbackDamageHit`) with all its values, so the enemy's owner can run it (§3.10) |
+| **Method hooks**: `sdk.hook(method, pre, post)` | Capturing the local player's sounds, effects and shots so the partner's copy can replay them (§4.1), and every hit on an enemy (`HitController.callbackDamageHit`) with all its values, so the host can run it (§3.10, §3.25) |
 | **Application-entry callbacks**: `re.on_application_entry("LateUpdateBehavior", fn)`, `"PrepareRendering"` | Game-thread tick for networking and sync; end-of-frame pose capture and pose check (§4.1) |
 | **Drawing**: `re.on_frame` + `draw.world_to_screen/line/text/...` | Partner name tag, HP bar, HUD |
 | **ImGui**: `re.on_draw_ui` + `imgui.*` | Host/Join panel inside the REFramework menu |
@@ -583,7 +583,7 @@ runs every enemy and every animal; the client's game shows them.**
 Consequence: RE4's enemy AI picks its targets among the characters of its own game. The host's
 enemies only know the host's Leon (the partner's model is visual only, §4.1), so enemies chase
 and attack the host's character, and the client's character is not attacked by enemies the
-host's game has loaded. Making the partner a target in the host's game is on the roadmap (§5).
+host's game has loaded. v0.10 makes the client's character a target in the host's game (§3.25).
 
 **Animals.** Established like §3.8 (functions cut out of `re4.exe`, decompiled with Ghidra
 through REA; addresses for the October 2026 build):
@@ -632,6 +632,10 @@ the same pointer to Lua again in the meantime. The mod now only calls `add_ref()
 creates and lets the collector release them.
 
 ### 3.10 v0.9: enemy sync rebuilt from scratch
+
+*(Superseded by v0.10, §3.25: the host's game runs every enemy again, and the client's character
+is a second player there instead of enemies changing hands. The hit, death and puppet machinery
+below is kept.)*
 
 v0.8 made the host's game run every enemy and turned the client's copies into followers. That
 left gaps players see at once: the host's enemies only ever attack the host (RE4's AI targets
@@ -1276,6 +1280,68 @@ whoever takes her over more than 20 m from its player brings her 1.5 m behind th
 story without her) and the other has one, she goes over by herself. *Diagnostics*: `ashley`,
 `ashley_puppet`, `ashley_warp`; counters `switches`, `refused`, `stale`, `warps`, `auto`.
 
+**Ashley's animation** (report after the first game: "she only has her walking animation, the
+rest of her animations do not work"). The puppet copied three layers (motion bank, motion id,
+frame, speed) like an enemy puppet, but her motion depends on more, all of it set by her animation
+state machine, which is off on a puppet:
+
+* **Bank variants.** `via.motion.Motion.TargetBankType` (+0x300) selects which variant of a motion
+  bank is used. `PartnerBehaviorTreeAction_MFSM_OverwriteBankType.onUpdate` (0x142388310)
+  writes it on every update of the state it belongs to: `(weapon category + 1) | _BankTypeBit`
+  (`PlayerDefine.MotionBankTypeBit`: Variation1-3, Light, CloseMotion, Battle, Water, Situation,
+  Vital_Caution, Vital_Danger...), keeping the low bits when `_IsMaskOtherBit`. On a puppet it
+  stayed what it was, so a motion only in another variant (her battle, caution, situation
+  motions) was not found: `changeMotion` played nothing new and she kept walking.
+* **Dynamic motion banks.** Actions and gimmicks bring their own motlists:
+  `CharacterDynamicMotionBankAttacher.Data.attach` (0x140f8a470) ->
+  `MotionController.addDynamicMotionBank` (0x140f81bd0; `removeDynamicMotionBank` 0x141023ed0)
+  adds a `via.motion.DynamicMotionBank` (motlist, `BankID`, `BankType`, `BankTypeMaskBit`,
+  `Order`, overwrite flags) to her motion. The owner's game added them to hers only.
+* **Layers.** Her body (`PartnerBodyUpdater`, a `PlayerBodyUpdater`) mixes upper-body and action
+  layers in with `TreeLayer.BlendRate`, `JointMaskID` and `BlendMode`
+  (`PartnerUpperArmBlendMaskDriver`); three layers without those showed only the base layer.
+
+The owner now sends her bank variant and up to 8 layers with blend rate, joint mask and blend
+mode (ASHLEY, ~20 Hz), and her dynamic motion banks whenever they change (ASHLEY_BANKS, after a
+switch and every 10 s). The puppet takes the variant before it changes motion, loads the same
+motlists (`sdk.create_resource` + a new `DynamicMotionBank`, added through her
+`MotionController`, else straight into `Motion`'s dynamic bank list), sets each layer's blend
+rate, mask and mode, and takes its banks away (and its variant back) when it stops being a
+puppet. A motion it still cannot find is counted and named in *Diagnostics* ("last motion not
+found here") and asked for again every 0.5 s. *Diagnostics*: `ashley_motion`, `ashley_banks`;
+counters `banks_sent`, `banks_received`, `motion_changes`, `motion_missing`, `motion_banks`,
+`motion_bank_types`, `motion_blends`, `motion_masks`.
+
+**Never a second Ashley** (report after the first game: "sometimes a player's game shows its
+normal Ashley"). Two ways it happened:
+
+* The game that does not run her made her a puppet only once the owner's state had arrived, so
+  for that while - right after a switch, while the owner's game loaded, or for good while the
+  owner's game had no Ashley - she was that game's normal Ashley, following its player. Now she
+  is a puppet as soon as that game has her, and drawn only where the owner's Ashley is: hidden
+  (her body and everything attached, only what was drawn) until the owner's game has said where
+  she is for this switch, while it reports no Ashley and while it does not draw hers. A pause in
+  its reports (menu, load) leaves her where she was.
+* Other characters of her kind. `CharacterManager` keeps, next to `PartnerContextList`, a
+  `DollNpcContextList` (+0xb0): scripted NPCs without AI of their own (`DollNpcBaseContext`,
+  spawned by `DollNpcSpawnParam`, whose `isNextSpawn` 0x1411e4dd0 spawns while its character
+  exists or the base rules allow). Each character comes from a level spawn param that owns its
+  `ContextID` (`updateSpawn` 0x142559670 creates and destroys it); `PartnerNpcSpawnParam.
+  isNextSpawn` (0x1424f0580) spawns a partner when there is a player and its backup is not
+  eliminated - nothing in it checks for another Ashley, so co-op state (partner flags, a
+  replayed event) can leave a doll Ashley or a second partner next to the shared one. Both
+  games now remove any character of kind 200030 other than theirs once it has stayed 1 s
+  (a reload can hold the old and new one for a moment), while the shared Ashley exists (in
+  either game) and not during their player's cutscene (which may use one): its spawn param's
+  `invalidateSpawn(true)` (0x1424edb70: status bit Invalidated; `updateSpawn` then destroys it,
+  and it does not spawn again while that spawn param lives - an area reload spawns it again, and
+  it is removed again). Never our own Ashley's spawn param; one without a spawn param of its
+  own is stopped instead (head off, no grabs, no damage, not drawn). The partner we use stays
+  ours while she exists, whatever order the game lists them in; a doll is never ours. When no
+  game has a partner Ashley (before she joins), a scripted Ashley is the only one and is left
+  alone. Setting `ashley_single`; *Diagnostics*: `ashley_extra`, `ashley_hide`; counters
+  `extras`, `hidden`.
+
 **Not covered.** In the game that does not run her she cannot be hurt by that game (not even by
 its player's stray shots), and doors or jumps that need her nearby only work for her player.
 Scripted moments that move her (cutscenes, `warpPartner`) happen in each game; the owner's
@@ -1369,6 +1435,248 @@ other could not pass).
 polling) show the partner's change when that area loads again; the partner's progress *inside*
 an unsolved puzzle (pieces moved but not solved) is not shown live. Not run in the game yet.
 
+### 3.25 v0.10: the client as a second player in the host's game
+
+**Request.** Enemies entirely the host's: nothing shared and nothing changing hands, but the
+client's player must be able to do to them everything the host's player does, and they must
+detect, chase and attack the client the same way - without the authority ever leaving the host.
+
+**Why v0.9 handed enemies over.** RE4's enemy AI only fights characters of its own game, and the
+partner's model was only a picture there (§4.1): the host's enemies could not see it, hear it,
+hit it or be finished by it. v0.9 worked around that by letting the closer player's game run each
+enemy (§3.10). To keep every enemy in the host's game, the host's enemies have to perceive,
+target, hit and be finished by the client's character in the host's game itself.
+
+**What the game does** (re4.exe, functions carved out by their `.pdata` and decompiled with
+Ghidra through REA; names from `il2cpp_dump.json`; addresses for the October 2026 build):
+
+* **Sight, hearing and touch go by tag.** `TargetSensor.setupTargetTagHash` (0x14317cb90) splits
+  the sensor's `_TargetTags` string at `|` and hashes each tag. `TargetMarker.register`
+  (0x1426bec30) splits the tag of the marker's own GameObject the same way and files the marker
+  in a static dictionary (tag hash → `List<TargetMarker>`). `TargetSensor.checkSightSensor`
+  (0x1430e65b0), `checkHearingSensor` (0x1430e33d0) and `checkTouchSensor` (0x1430e8880) only
+  look at markers filed under their tags (`isInsideScan` 0x1431251a0, then a ray). A marker aims
+  at its target joints (`initTargetJoints` 0x142683780) or, with `_UseTargetJoint` off, at its
+  transform plus `_TargetOffset`. So any GameObject with an enabled, registered `TargetMarker`
+  under the player's tag is something the enemies' sensors find.
+* **A sighting becomes a target through the character, not "the player".**
+  `CharacterBodySensorDriver.onSighting` (0x141b75400) → `EnemyHeadUpdater.onSensorSighting`
+  (0x1413fd810; Ganados: `Ch1c0HeadUpdaterCommon.onSensorSighting` 0x1419a1840) → `find`
+  (0x1413aa420) and `addAttention` (0x14136bda0). Both look up the GameObject's character (a
+  helper at 0x1411b9f80 asks the GameObject's `IContextAccessor` component: `BodyUpdater`'s
+  `<Context>k__BackingField`, the field `BodyUpdater.setContextRef` 0x143622750 writes) and pass
+  it to `checkFindToCharacter` (0x1409c46b0) / `checkAddAttentionToCharacter` (0x141381b90),
+  which reject only Ashley (kind 200030). Hearing (`onSensorHearSound` 0x1413fd1c0) and touch
+  (`onSensorTouch` 0x1413fdcb0) take the same path.
+* **Hate and the action target.** `HateController.find` (0x1413aa1b0), `attention`
+  (0x141373330), `addHate` (0x14136cd10) and `lose` (0x1403f9780) keep a `HateTargetInfo` per
+  GameObject; `ActionTargetController.updateHateTargetArray` (0x141a15270) makes the most hated
+  one the action target (`setTypeTarget` 0x1419cc680; Ganados `setFindActionTarget`
+  0x1419c6a40), and `ActionTarget.setTargetObject` (0x1407789d0 / 0x1426ddb30) stores its
+  GameObject with its `CharacterContext` (looked up as above). Chasing, turning and attacking
+  use that target. Nothing on this path is tied to the game's own player.
+* **A hit turns the enemy on its attacker.** `EnemyHeadUpdater.onHitDamage` (0x1413f1a70) calls
+  `addAttention`/`addHate` with the hit's `AttackOwnerObject`.
+* **Noises.** The player's shots, steps and reloads become `SoundDetectionManager.registerSound`
+  (0x1421dc350) with a `SoundDetectionInfo` (built by `makeSoundDetectionInfo` 0x1421b24f0 /
+  0x1421b2660): position, radius, height, volume, the volume it loses per second, and the owner
+  and requesting GameObjects - the ones the enemies that hear it turn to.
+* **How an enemy's blow reaches its victim.** `HitController.checkAttackDamage` (0x141f34b30)
+  reports the attack collider's contact; `HitManager.onUpdate` (0x142387070) → `checkHitDamage`
+  (0x142323840) finds the damaged side with `getHitController(GameObject)` (0x142343c00), a
+  dictionary filled by `registerHitController` (0x14238fc00) - which `HitController.setup`
+  (0x14202fb50) calls for its own GameObject - and emptied by `unregisterHitController`
+  (0x1423c6e10, from `onDestroy` 0x141fac500). Then `hitSetting(info, attacker, damaged)`
+  (0x142357370): `checkKill` (0x141f3ab30), the damaged side's `callbackCheckDamageHit` (its
+  dodges and invincibility), a non-lethal clamp when `AttackData._Option & 4`, `DamageInfo.copy`
+  (0x14232b360) into the damaged side's `DamageCalcInfo`, `callbackDamageHit` (0x141f31970), and
+  for a grab (`AttackUserData.get_IsGrapple`) `HitManager.requestGrapple` (0x1406c8be0) →
+  `HitController.callbackGrappleHit` (0x14060a630) → `EnemyHeadUpdater.requestGrapple`
+  (0x141417250), which plays the grab on the victim's body directly. The partner's model comes
+  from the body prefab, whose `HitController` and colliders the mod switched off with the rest
+  of its logic (§4.1), so it never registered.
+* **Registering a HitController that never ran is safe.** Its constructor (0x141edd450) always
+  creates its `Delegates` (0x142d7af00) with a `DamageInfo`, and `callbackEvent` (0x141f31b20)
+  calls only the delegates that are set.
+* **An attack has an identity.** `AttackUserData._AttackHitDataID` and `_KeyNameHash` name it;
+  `HitManager.getAttackData(id, hash)` returns the same `AttackData` from the game's catalog in
+  any game, so the client can rebuild the attack that hit its character.
+* **Finishers ask the enemy's head, with the attacker's context.**
+  `PlayerHeadUpdater.requestFatal` (0x141d65b70) calls the target's AI head
+  `convertNormalFatalAction(context, FatalType)` (virtual +0x5c8); `requestKnifeFatal`
+  (0x141d66c00) `requestStealthKill(context)` from behind (+0x5a8), else `requestFatalKill`
+  (+0x5a0); `requestStompFatal` (0x141d68730) `requestFatalKill` (+0x5a0). The context is the
+  attacker's: the enemy plays its side against that character. The prompts come from
+  `PlayerTargetSelector.checkTargetType` (0x1437416d0), which asks the enemy's head
+  `isEnableFatal` (0x1413d6770; Ganados 0x14196f010), `isEnableKnifeFatal` (0x1413d6800 /
+  0x14196f240), `isEnableStealthKill` (Ganados 0x1402f9f50) and `getAvailableFatalType`
+  (Ganados 0x141945880) - queries without side effects. `isEnableKnifeFatal` also asks the
+  attacker's own head (`CharacterContext._HeadUpdater`) its virtual +0x318,
+  `PlayerHeadUpdater.hasKnife` (0x141d1d3a0; only two Mercenaries characters override it).
+* **A player context without a character.** `ChCommonPlContext`'s constructor (0x140b2b5b0 →
+  `PlayerBaseContext` 0x143260cc0 → `CharacterContext` 0x142133810: HitPoint, timers, lists) and
+  `CharacterContext.initialize(id, kind, spawn id, position, rotation, AccessoryID[])`
+  (0x1421a6780) make a usable context outside the character spawner. The body updater's
+  `IValidatable.get_Valid` (0x1400aef60, shared by many types) only checks that the component
+  exists, so the context can be written into the field directly.
+
+**Design.**
+
+* **The host runs every enemy, always** (`enemy_net.lua`, protocol 13). The host numbers its
+  enemies (epoch 0, then 1 once the client reports a copy, with the host's HP - lowered to the
+  copy's if the client hurt it before the host's level spawned it). No hand-overs, no claims, no
+  bounced hits: ENEMY_STATE flows host → client only, the client's copies are puppets, a copy
+  the host has not loaded waits still and unseen. The `enemy_authority` setting is gone.
+* **The client's model becomes a character of the host's game** (`game_partner.lua`,
+  `partner_target.lua`) while the client is in the host's area, neither game is in a cutscene
+  or loading, and the model was built from the body prefab:
+  1. a stand-in `ChCommonPlContext` (Leon's kind 100000, a ContextID of the mod's own: group 14,
+     index 4094) whose position, rotation and HP follow the client's PLAYER stream, set as the
+     `<Context>` of the model's body updaters, with the model's body updater as its
+     `_BodyUpdater`;
+  2. the host player's tag on the model's root, and a `TargetMarker` (added when the prefab has
+     none) aimed at the chest (`_UseTargetJoint` off, `_TargetOffset` 1.3 m), registered;
+  3. the model's damage colliders on (only those: no pushing or attack colliders) and its
+     `HitController` registered with `HitManager`.
+  Taken down otherwise: every enemy's `HateController.lose(model)`, the marker off, the
+  colliders off, the controller unregistered, the contexts cleared. Every object the game can
+  reach through the stand-in is kept referenced (§3.17).
+* **Their blows land on the client** (`HitManager.hitSetting` hooked on the host): the host's own
+  hits on the model are refused (no friendly fire); grabs are refused unless *...may grab your
+  partner* is on (experimental: only the grab's damage reaches the client); an enemy's hit is
+  taken off in `callbackDamageHit` (the model takes nothing) and sent as PLAYER_DAMAGE with the
+  attack's id, key and every hit value. The client rebuilds the `AttackData` (the catalog, else
+  a deep copy of a template) and `AttackUserData`, and runs what `hitSetting` runs on its own
+  player's `HitController` (`checkKill`, `callbackCheckDamageHit`, the non-lethal clamp,
+  `DamageCalcInfo`, `callbackDamageHit`) with its copy of the enemy as the attacker, one enemy
+  interpolation delay later, when its copy shows the blow.
+* **They hear the client**: the client hooks `registerSound` and sends its player's noises
+  (PLAYER_NOISE, repeated footsteps merged); the host registers each with the model as owner and
+  requester.
+* **The client's hits are the client's**: run in the host's game with the model as attacker
+  (`Game:attacker_body`), so the enemy turns on the client. A death within 3 s of the client's hit
+  and after the host's own last hit is announced as the client's kill (ENEMY_DEATH flag 16).
+* **Finishers**: the host asks its enemies within 8 m of the model the four queries with the
+  stand-in as the attacker - for the knife question the stand-in borrows the host player's head,
+  whose `hasKnife` answers yes meanwhile - and sends the answers with the enemy's state (partner
+  info, finisher type; whether it targets the client too, up to 60 m). On the client the
+  puppets' AI heads are hooked: the queries answer from the host's bits (the knife ANDed with the
+  client player's own `hasKnife`), and a request answers "done" and goes to the host as
+  ENEMY_FATAL, where the same request runs on the host's enemy with the stand-in context. The
+  enemy's side then plays in the host's game and its state stream shows it on the client.
+
+**Not covered, and risks** (none of this has run in the game yet). Enemy actions that read the
+target's head or input (the stand-in's `_HeadUpdater` is null outside the knife question); a tag
+on the model that something else reads; enemies the host has not loaded (the client meets none
+there). The host's shots, parries, grabs and bosses: §3.26. *Diagnostics* shows each piece:
+`partner_context`, `partner_seen`, `partner_hits`, `partner_heard`, `partner_damage`,
+`partner_fatal`, `noise_hook`.
+
+### 3.26 v0.10.1: the host's shots, parries, grabs and bosses against the client
+
+**Request.** Fix what v0.10 left out (§3.25): the client's character stopped the host's bullets,
+a knife parry by the client did not stagger the host's enemy, enemies never grabbed the client,
+and bosses that look for "the player" themselves ignored the client.
+
+**Shots** (re4.exe, as in §3.25). A contact of an attack collider is
+`HitController.checkAttackDamage` (0x141f34b30) → `poolDamage(collisionInfo, attackUserData,
+damageUserData, childToParent)` (0x142009ef0) on the *attacker's* controller. It finds the
+struck controller (`HitManager.getHitController` 0x142343c00) and the attack's owner
+(`getAttackOwner` 0x141f6f900), and asks `shieldingDecision(damageGameObject,
+attackHitController, collisionInfo, attackData)` (0x142038810; the delegate
+`OnShieldingDecision` through `Delegates.callbackShieldingDecision` 0x140675ff0, for a bullet
+`BulletShell.shieldingDecisionEvent` 0x141619830) whether the body stops the attack - before
+`hitSetting`, which is where v0.10 skipped the host's own hits. So the model's damage colliders
+stopped the bullet although it did no damage. Fix: `poolDamage` is hooked; a contact whose
+`DamageUserData` is one of the model's and whose owner is not an enemy (the controller's
+`<AttackOwner>`, its GameObject, or a `ShellBase`'s `<AttackOwner>`: our player's bullets,
+knife, kicks) is dropped there - no damage pooled, nothing shielded, the shot flies on. Enemy
+contacts pool as before.
+
+**Parry.** An enemy attack warns its target with an *action sign*: the attack motion's
+`EnemyActionSignTrack` arms the body's `EnemyActionSignUtility` (`EnemyBodyUpdater` +0x2b0,
+`onUpdateTrack` 0x141b7b9e0); the sign collider's contact runs
+`EnemyBodyUpdater.updateActionSign(CollisionInfo)` (0x1439b38a0) → `checkActionSign` →
+`EnemyActionSignUtility.sendActionSignInfo(owner, target, info)` (0x141b8f930). That looks up
+the target's player head through its context (helper 0x143107510; none → nothing happens) and
+calls `PlayerHeadUpdater.onHitActionSign(ActionSignHitInfo)` (virtual +0x350; 0x140a6d7e0 →
+`PlayerHeadActionSign.onHitActionSign` 0x141b65210) with `OwnerGameObject`, `SignType`,
+`ButtonType`, `JustTiming`, `ActTiming`, `TargetAngleCheck`: the prompt. The press:
+`PlayerHeadActionSign.updateParry` (0x141bd5ca0) → `onHitParry(owner)` (0x141b687d0) → the
+owner's `IActionSignNotifier.onParry(player body, signType)`: `EnemyBodyUpdater.onParry`
+(0x143961a40, needs the context's head) → `EnemyHeadUpdater.notifyParry` (0x1413dfe30): the
+parrying knife's wear (through the parrier's context head, 0x143107350 - skipped without one),
+a notice with the parrier's context (0x1423942e0), the enemy's own reaction (`onParry`
+0x1413f9020: the wince action from `getParryActionHash`, `ParryExecutionState`; 22 kinds
+override it) and a `ParryResult` (`Successful`, `IsForceParryMot`, `EffectType`,
+`PlayerMotType`) the player's parry plays from. The stand-in has no head, so the host's enemies'
+warnings to the model went nowhere, and the client's copies (AI off) warn no one.
+Design: the host reports every warning meant for the model - `sendActionSignInfo` with the
+model as target is hooked (and skipped: no head there), and every frame the enemies whose hate
+target is the model are asked `checkEnableActionSign` / `getActionSignInfo` /
+`checkJustTimingActionSign`, within the sign's `_Distance` (the warning collider may never touch
+the model) - as ACTION_SIGN, every frame it lasts. The client hands it to its own player's head
+one enemy interpolation delay later (with its copy of the enemy as `OwnerGameObject`), every
+frame while the host repeats it: the prompt shows with the blow the client sees. The client's
+parry asks its copy as usual (the copy's head computes a real `ParryResult`, so the client's
+parry plays and its knife wears; the copy's own wince never plays, its head is off) and is
+reported (ENEMY_PARRY, also the press: `onParryInput`). The host runs
+`EnemyBodyUpdater.onParry(model, signType)` on its enemy: it staggers in the host's game and
+the client sees it through ENEMY_STATE. A hit of that enemy reaching the client within 1 s after
+a landed parry (struck in the host's game before the parry arrived) is not taken.
+
+**Grabs.** A grab is a hit whose `AttackUserData` is a `chainsaw.collision.GrappleUserData`
+(`get_IsGrapple`, `_GrapplePriority`). `HitManager.hitSetting` → `requestGrapple` (0x1406c8be0)
+→ the grabber's `onHitGrapple` (Ganados: `Ch1c0HeadUpdaterCommon.onHitGrapple` 0x1419981d0 - the
+victim must be a `PlayerBaseContext` without blocking state flags, then height, ground and wall
+checks) → `EnemyHeadUpdater.requestGrapple(target, action)` (0x141417250:
+`CharacterContext.<GrappleTarget>` +0x130 = target, `CharacterHeadActionDriver.entryAdditional
+(action)`); `CharacterHeadUpdater.onHitGrapple` (0x1412046c0) jacks the victim's motion
+(`PlayerBodyUpdater.setDynamicMotionJackFsm`: the grabber drives the victim's animation). The
+hold ends in a behavior tree action of the grabber's kind (`Ch1c0z0BehaviorTreeAction_
+CheckEscapeGrapple`: `start` 0x141052a40, `update` 0x141066440, `getHeadUpdater` 0x140fcfee0,
+`updateTargetPL` 0x141099700, `onSuccessfulEscape` 0x141014e30; thirteen other kinds have
+their own). It finds the victim's `PlayerHeadUpdater` through the victim's context and counts
+that head's `share.hid.Command` triggers: 0x0ED27DB6 (mashing, `NumberOfStruggles` presses) or
+0x38324405 (the knife, with `isEnableKnifeEscape` and `hasKnife`); then `onSuccessfulEscape` and
+the action ends (`ActionArg.notifyActionEnd`). With the stand-in (no head) it never ends.
+`EnemyHeadUpdater.onRejectGrapple(action)` (0x1413f9b50; most kinds override it) undoes a grab:
+the grabber's jack reset, the occupied action unlocked, the victim's jacked motion bank cleared.
+Design: grabs on the model are no longer refused. The host follows its enemies whose
+`<GrappleTarget>` is the model (PLAYER_GRAB, with the grab's action from a hook on
+`requestGrapple`, and the presses and knife from the escape check once it runs). The grab's hit
+travels as PLAYER_DAMAGE with the grab flag; the client runs it through its own
+`HitManager.hitSetting` with its copy's `HitController` as the attacker and a rebuilt
+`GrappleUserData`, so its copy grabs its own player there (the client's dodge checks first).
+While held, the client counts its own player's `Command` triggers with the same hashes and
+shows how many are left; when free (or the host's enemy lets go), its copy's grab is undone
+(`onRejectGrapple`, `clearGrappleTarget`) and its player leaves the grab
+(`PlayerBodyUpdater.set_RequestCancelGrappleAction`), and GRAB_ESCAPE makes the host enemy's
+escape check succeed on its next update; an enemy kind whose check does not run is released with
+`onRejectGrapple` + `clearGrappleTarget` after 0.5 s. A hold on the model never lasts over 15 s.
+*...may grab your partner* (host) switches grabs off (refused, as in v0.10); off on the client,
+a grab is only its damage.
+
+**Bosses.** Most enemies turn hate into the target in `setActionTargetHate` (EnemyHeadUpdater
+0x141422a70; 16 kinds override it). Bosses aim at "the player" themselves:
+`ActionTargetController.setTypeTarget(TargetType, GameObject)` (0x1419cc680; with an offset
+0x1419cc970) with `TargetType.ManualPlayer` (4); `Ch1f0z0` and `Ch4f9z0` choose with
+`setTargetMainPlayer / NearPlayer / AnotherPlayer / NpcPlayer` from the game's players
+(`CharacterManager.PlayerContextList` +0x90, which 600-odd functions read inline). Fix:
+`setTypeTarget` is hooked: a ManualPlayer target that is the host's player becomes the model
+when the controller's own `HateController` puts the model first (the client hurt it most, or is
+what it saw and heard), and inside those two kinds' `setTargetNearPlayer` also when the model is
+nearer.
+
+**Not covered, and risks** (none of this has run in the game yet). The client's grab runs the
+game's `hitSetting` on a `DamageInfo` the mod built (no attack collider); the copy that jacks
+the client's player has its animation driver off, so the client's grabbed animation may hold
+still - *Options → ...may grab your partner* on the client falls back to the grab's damage
+alone. A parry lands one round trip later in the host's game than on the client's screen.
+Boss attacks that read `PlayerContextList` directly (not their action target) still aim those
+parts at the host. *Diagnostics*: `partner_shots`, `partner_parry`, `partner_grab`,
+`partner_bosses`.
+
 ## 4. Sync architecture
 
 ```
@@ -1379,13 +1687,13 @@ an unsolved puzzle (pieces moved but not solved) is not shown live. Not run in t
  │  session ─ enemy_net   │   PLAYER (20 Hz, unrel.)  │  session ─ enemy_net   │
  │   items, drops, gate   │   POSE / AVATAR / ACTIONS │   items, drops, gate   │
  │   flag/gimmick/object/ │   ENEMY_STATE (20 Hz)     │   flag/gimmick/object/ │
- │   animal/cutscene/     │   ENEMY_ROSTER, ANIMALS   │   animal/cutscene/     │
- │   trigger sync, travel │   ENEMY_HIT/DEATH/OWNER   │   trigger sync, travel │
+ │   animal/cutscene/     │   ROSTER/OWNER, ANIMALS   │   animal/cutscene/     │
+ │   trigger sync, travel │   ENEMY_HIT/DEATH/FATAL   │   trigger sync, travel │
  │  game / game_world /   │   FLAGS, FLAG_WORDS,      │  game / game_world /   │
  │  game_pause (sdk)      │   GIMMICKS, OBJECTS,      │  game_pause (sdk)      │
  │  puppet (partner model)│   CUTSCENE,TRIGGER,WORLD_*│  puppet (partner model)│
- │ re4coop_net.dll        │   CHAT/NOTIFY/HELLO       │ re4coop_net.dll        │
- └────────────────────────┘                           └────────────────────────┘
+ │ re4coop_net.dll        │   PLAYER_NOISE/DAMAGE,    │ re4coop_net.dll        │
+ └────────────────────────┘   CHAT/NOTIFY/HELLO       └────────────────────────┘
 ```
 
 * **Two full game instances, one world.** Each player runs their own RE4 with their own Leon,
@@ -1398,21 +1706,28 @@ an unsolved puzzle (pieces moved but not solved) is not shown live. Not run in t
   second (POSE). The receiver spawns the partner's body prefab, dresses it and poses it, 100 ms in
   the past for smooth interpolation. Details in §4.1. Name tag, distance and HP bar are drawn on
   top.
-* **Enemies: one shared set, one owner each** (§3.10).
+* **Enemies: the host's, all of them** (§3.25).
   * Identity: every level enemy's own ContextID (its spawn param's, level data) is its **uid**
     on both machines; the host numbers its enemies for the wire and the client pairs by uid.
     Runtime enemies are paired by kind + spawn point (§3.8).
-  * Authority: each enemy is run by one game, its owner - by default the game of the player it
-    is closer to, so enemies attack both players; the host decides and every change bumps the
-    enemy's ownership epoch. The other game's copy is a puppet (AI head and animation state
-    machine off) that follows the owner's stream: position, full rotation, up to three
-    animation layers, visibility, HP.
-  * Hits: a hit on an enemy the partner runs is sent with every DamageInfo value and run through
-    the owner's own hit code (same damage, same reaction); our game never kills a puppet.
-  * Deaths: the owner announces each death with the killing hit; the other game kills its copy
-    with that hit where it died. The host's **graveyard** keeps every enemy dead in its world
-    (also from its save), and an enemy dead in the partner's world is killed or erased wherever
-    it appears (§3.8).
+  * Authority: the host's game runs every enemy, always. The client's copy is a puppet (AI head
+    and animation state machine off) that follows the host's stream: position, full rotation,
+    up to three animation layers, visibility, HP.
+  * The client is a second player in the host's game: its model there carries a stand-in player
+    context, the player's target marker and tag, its damage colliders and a place in the game's
+    hit system, so the host's enemies see it, hear the client's noises, chase and attack it; their
+    blows on it land on the client's own character, in the client's game. Their warnings give the
+    client the parry prompt, the client's parries stagger them, they grab the client (who breaks
+    free in its own game), bosses go for the client when their hate says so, and the host's shots
+    pass the client's character (§3.26).
+  * Hits: the client's hit is sent with every DamageInfo value and run through the host's own hit
+    code with the client's character as the attacker (same damage, same reaction, and the enemy
+    turns on the client); the client's game never kills a puppet. Finishers the client starts
+    run on the host's enemy the same way; their prompts come from the host's enemy.
+  * Deaths: the host announces each death with the killing hit (and whether it was the
+    client's); the client kills its copy with that hit where it died. The host's **graveyard**
+    keeps every enemy dead in its world (also from its save), and an enemy dead in the host's
+    world is killed or erased wherever it appears in the client's (§3.8).
   * Each player rolls their own loot from every enemy that dies in their game (§3.7).
 * **Animals: the host's** (§3.9). The client's copies of the host's animals near both players
   follow them, AI off the game's update; deaths cross both ways.
@@ -1498,18 +1813,18 @@ joint.
 different chapters, and when no pose arrived for 3 s. If the game unloads the copy with an area,
 it is rebuilt.
 
-### 4.2 Known limitations (v0.9.1)
+### 4.2 Known limitations (v0.10)
 
 * v0.6 crashed in game; v0.7 removes the causes we found (§3.7), but has not been run in game
   yet. After a crash, `re4coop_breadcrumb.json` names the last thing the mod did.
 * Most of this has not been verified in the running game yet. The riskiest assumptions are that the
   body prefab can be spawned outside the game's character spawner once its logic is disabled
   (*Build partner from meshes only* is the escape hatch), that switching an enemy's AI head off
-  leaves its body and HitController working (*Enemies your partner's game runs stand and move
-  where theirs are* switches puppets off), that disabling `via.motion.MotionFsm2` lets the
+  leaves its body and HitController working (*Client: the host's enemies stand and move where
+  they are in the host's game* switches puppets off), that disabling `via.motion.MotionFsm2` lets the
   written animation play (*…with their own animation state machine switched off*), that a
   DamageInfo built from the partner's values runs like a real hit (`hit_apply` in
-  *Diagnostics*; without it the owner applies HP), and that the probed flag/gimmick/cutscene
+  *Diagnostics*; without it the host applies HP), and that the probed flag/gimmick/cutscene
   methods are the ones named in §3.6. The enemy identity, kill and erase calls of §3.8 come from
   the game's code, but have not run in the game yet either.
 * Enemies the client's *own* save has eliminated but the host's world has alive cannot be
@@ -1517,10 +1832,12 @@ it is rebuilt.
   there). Joining with an older save than the host avoids it.
 * After a host checkpoint reload the host's enemies come back; enemies the client already
   removed stay gone in the client's game.
-* The partner's character is visual only: no collision, enemies of your game don't see it,
-  bullets pass through it. Enemies attack the partner because the partner's game runs the
-  enemies near them (§3.10); an enemy fighting both players at the same distance belongs to one
-  game and attacks that game's player. With *Who runs enemies: host* only the host is attacked.
+* The client as a second player in the host's game (§3.25, §3.26) is built from the game's code
+  but unproven in the running game: enemy actions that read the target's head, the client's
+  grabbed animation (run by a copy whose animation driver is off), parries landing one round trip
+  later on the host, and boss attacks that read the game's player directly are the known risks.
+  In the client's game the host's character is still a picture (no collision, bullets pass
+  through it): it needs nothing more, since the client's game runs no enemy.
 * Ragdolls, AI-spawned effects and grab reactions are each game's own (§3.10).
 * Animal puppets rely on `GimmickManager.unregisterMove`/`registerMove` (§3.9), not yet run in
   the game; *Options → Animals near both players…* switches them off. Animals placed at runtime
@@ -1552,9 +1869,11 @@ it is rebuilt.
 
 ## 5. Roadmap
 
-1. **In-game validation of v0.9.1** with the checklist in [TESTING.md](TESTING.md), enemies
+1. **In-game validation of v0.10** with the checklist in [TESTING.md](TESTING.md), enemies
    first (steps 12-14: `enemy_uid`, `enemy_puppet`, `hit_values`, `hit_apply`, `enemy_motion`,
-   `enemy_erase`, `enemy_backups`), the shared world's events (flags, cutscenes, event
+   `enemy_erase`, `enemy_backups`; then the client as a second player: `partner_context`,
+   `partner_seen`, `partner_hits`, `partner_heard`, `partner_damage`, `partner_fatal`), the
+   shared world's events (flags, cutscenes, event
    triggers: `flag_hooks`, `cutscene_hooks`, `trigger_hooks`), then the profiler's
    numbers, the breadcrumb file after any crash, `drop_calls` in the research log, and the
    experimental features one at a time.
@@ -1564,9 +1883,8 @@ it is rebuilt.
 3. Shared checkpoints: when one player dies, both reload (RE5/RE6 style), or the other revives
    them.
 4. Replicate thrown objects (grenades, eggs, bolts) and hit effects on enemies.
-5. Enemies that can target both players in one game: the partner's model as a target
-   (`HateController.find/addHate` on a stand-in character), so an enemy between the players can
-   switch targets without changing hands.
+5. ~~Enemies that can target both players in one game~~: done in v0.10 (§3.25); grabs on the
+   client, the client's parries, bosses and the host's shots in v0.10.1 (§3.26).
 6. Optional Steam networking transport for NAT traversal.
 
 ## Sources

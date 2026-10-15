@@ -6,7 +6,7 @@
 --   * Reading: CharacterManager.get_EnemyContextList(); per context its HitPoint, its body
 --     GameObject (Transform: position and full rotation; via.motion.Motion: the animation
 --     layers - motion bank, motion id, frame, speed) and its level identity (ContextID code).
---   * Puppets: an enemy the partner's game runs has its AI head switched off
+--   * Puppets (client): an enemy of the host's has its AI head switched off
 --     (HeadGameObject.set_UpdateSelf(false), pool-safe: see wake_head) and its body's
 --     animation state machine (via.motion.MotionFsm2) disabled, so nothing but the partner's
 --     stream moves it: transform writes (+ CharacterController.warp) and motion layer writes
@@ -14,7 +14,8 @@
 --   * Hits: HitController.callbackDamageHit(DamageInfo) runs for every hit on a character. A
 --     pre-hook reads every primitive value of the DamageInfo (found by reflection, so nothing
 --     about its layout is hard-coded), and for a puppet makes sure our game cannot kill it (the
---     owner decides). A partner's hit is run through the same callback with those values.
+--     host decides). The client's hit is run through the same callback with those values in the
+--     host's game, with the client's character (game_partner.lua) as the attacker.
 --   * Reactions and deaths are the AI's (docs/RESEARCH.md 3.20): CharacterHeadUpdater.onHitDamage
 --     takes the HP, chooses the reaction from the hit's AttackData (_AttackType, _AttackPower,
 --     _Option) and the body part of its DamageUserData, and starts the death only for a hit
@@ -44,7 +45,8 @@ local MOTION_BLEND_FRAMES = 6.0 -- interpolation frames when a puppet's layer ch
 local MAX_HIT_EVENTS = 64
 local DAMAGE_INFO = "chainsaw.HitController.DamageInfo"
 -- Object fields of a DamageInfo (and its HitInfo/ContactInfo parents) and what a replayed hit
--- carries in them: "attacker" = our live body, "target" = the enemy's body, "go" = kept if the
+-- carries in them: "attacker" = the attacker's live body (the partner's model in our world for
+-- the partner's hits, else our own), "target" = the enemy's body, "go" = kept if the
 -- GameObject is alive, "comp" = kept if the component is alive, "clear" = null. AttackGameObject
 -- is never null: RagdollUnit.onDamageHit (a killing hit that throws the body) reads its position
 -- without a check - a null one crashed the game (docs/RESEARCH.md 3.13). DamageCollidable and
@@ -108,7 +110,7 @@ function M.install(Game, H)
         self.hit_templates = { by_weapon = {}, any = nil, refs = {} }
         self.erased_spawns = {} -- uid (or "id:<id>") -> spawn param we invalidated (enemy_erase)
         self.hit_events = {}
-        self.fatal_events = {} -- enemies our player started a finisher on (see on_local_fatal)
+        self.fatal_events = {} -- finishers our player started on puppets (game_partner.lua)
         self.hit_stats = { seen = 0, by_player = 0, other_owner = 0, not_enemy = 0, clamped = 0, applied = 0,
             apply_failed = 0, kills_with_hit = 0, fields = 0, attack_clones = 0, parts_matched = 0,
             kill_decided = 0, deaths_forced = 0 }
@@ -348,6 +350,8 @@ function M.install(Game, H)
             end
         end
         self.puppets[id] = { go = head, upd = upd, drivers = drivers }
+        -- Its finisher checks answer from the host's information (game_partner.lua).
+        if upd ~= nil and self.watch_puppet_head ~= nil then self:watch_puppet_head(id, upd) end
         self:cap("enemy_puppet", true, ("head off, %d animation driver(s) off"):format(#drivers))
         return true
     end
@@ -363,6 +367,7 @@ function M.install(Game, H)
         local p = self.puppets[id]
         if p == nil then return end
         self.puppets[id] = nil
+        if p.upd ~= nil and self.forget_puppet_head ~= nil then self:forget_puppet_head(p.upd) end
         for _, comp in ipairs(p.drivers or {}) do
             if self:alive(comp) then pcall(comp.call, comp, "set_Enabled", true) end
         end
@@ -801,12 +806,20 @@ function M.install(Game, H)
         end
         local game = self
         local ok = pcall(sdk.hook, m, function(args)
-            if game.active and not game.replaying then
+            if game.active and not game.replaying and not game.replaying_player then
+                local skip = false
                 pcall(function()
                     local hc = sdk.to_managed_object(args[2])
                     local info = sdk.to_managed_object(args[3])
-                    if hc ~= nil and info ~= nil then game:on_enemy_hit(hc, info) end
+                    if hc == nil or info == nil then return end
+                    -- A hit on the partner's model is the partner's to take (game_partner.lua).
+                    if game.partner_damage_hit ~= nil and game:partner_damage_hit(hc, info) then
+                        skip = true
+                        return
+                    end
+                    game:on_enemy_hit(hc, info)
                 end)
+                if skip then return sdk.PreHookResult.SKIP_ORIGINAL end
             end
         end, function(retval) return retval end)
         self:cap("hit_hook", ok, ok and "HitController.callbackDamageHit" or "sdk.hook failed")
@@ -827,27 +840,8 @@ function M.install(Game, H)
                 end
             end, function(retval) return retval end)
         end
-        -- Finishers (stealth kill, grab, knife finish, stomp): PlayerHeadUpdater.requestFatal /
-        -- requestKnifeFatal / requestStompFatal hand the request to the target's AI head
-        -- (CharacterContext._HeadUpdater) - which a puppet has switched off. See on_local_fatal.
-        local ptd = find_type("chainsaw.PlayerHeadUpdater")
-        local fatal_hooked = 0
-        for _, name in ipairs({ "requestFatal", "requestKnifeFatal", "requestStompFatal" }) do
-            local okF, fm = pcall(function() return ptd and ptd:get_method(name) end)
-            if okF and fm ~= nil and pcall(sdk.hook, fm, function(args)
-                if not game.active then return end
-                pcall(function()
-                    local head = sdk.to_managed_object(args[2])
-                    local sel = head and head:call("get_TargetSelectorDriver")
-                    local target = sel and sel:call("get_LockonTarget")
-                    local id = target and address_of(target)
-                    if id ~= nil then game:on_local_fatal(id) end
-                end)
-            end, function(retval) return retval end) then
-                fatal_hooked = fatal_hooked + 1
-            end
-        end
-        self:cap("fatal_hook", fatal_hooked > 0, ("%d finisher request(s) watched"):format(fatal_hooked))
+        -- Finishers our player starts on a puppet are answered by the puppet's own AI head
+        -- methods, hooked per enemy kind when it becomes a puppet (game_partner.lua).
         -- Guard: the body thrown by a killing hit (RagdollUnit.onDamageHit, maybe a frame later)
         -- never gets a hit without the attacker's GameObject or the damage data - the original
         -- dereferences both without a check (the crash at re4.exe+0x37959f8). Only adds force.
@@ -939,24 +933,8 @@ function M.install(Game, H)
         return out
     end
 
-    -- Our player starts a finisher on enemy `id` (inside the game's request, before the enemy's
-    -- AI head receives it). A puppet's head is off: it would keep the request and do nothing
-    -- while the partner's game ran the enemy on - the enemy chased the partner and only died
-    -- when it changed hands seconds later. If `fatal_filter(id)` allows it (enemy sync: our game
-    -- may take the enemy over), its head and animation driver go back on right here, so the
-    -- finisher plays out in our game; enemy_net takes the enemy over (take_fatal_events).
-    function Game:on_local_fatal(id)
-        if self.enemy_ctx[id] == nil then return end
-        if self.fatal_filter ~= nil and not self.fatal_filter(id) then return end
-        self.perf:crumb("enemy.fatal", self.enemy_info[id] and self.enemy_info[id].kind, true)
-        if self.puppets[id] ~= nil then self:restore_puppet(id) end
-        for _, v in ipairs(self.fatal_events) do
-            if v == id then return end
-        end
-        if #self.fatal_events < MAX_HIT_EVENTS then self.fatal_events[#self.fatal_events + 1] = id end
-    end
-
-    -- Enemies our player started a finisher on since the last call: { id, ... }.
+    -- Finishers our player started on puppets since the last call (game_partner.lua):
+    -- { {id, kind, ftype, pos, yaw}, ... }.
     function Game:take_fatal_events()
         local out = self.fatal_events or {}
         if #out > 0 then self.fatal_events = {} end
@@ -967,11 +945,22 @@ function M.install(Game, H)
         return self.last_hits[id]
     end
 
-    -- Makes every object field of a hit we run safe: our live body as the attacker, the enemy
-    -- as the damaged object, other objects only while they still exist. False if no live
+    -- The body that attacks in a hit we run: the partner's model in our world for the partner's
+    -- hits ("partner", while it stands as a character of ours: game_partner.lua), else our own.
+    function Game:attacker_body(by)
+        if by == "partner" and self.partner_target_attached ~= nil and self:partner_target_attached() then
+            local root = self.ptarget.root
+            if root ~= nil and self:go_alive(root) then return root end
+        end
+        return self.player_body
+    end
+
+    -- Makes every object field of a hit we run safe: a live attacker body (attacker_body), the
+    -- enemy as the damaged object, other objects only while they still exist. False if no live
     -- attacker exists.
-    function Game:sanitize_damage_info(info, target_body)
-        local body = self.player_body
+    function Game:sanitize_damage_info(info, target_body, by)
+        local body = self:attacker_body(by)
+        if body == nil or not self:go_alive(body) then body = self.player_body end
         if body == nil or not self:go_alive(body) then return false end
         for _, f in ipairs(HIT_OBJECT_FIELDS) do
             local name, rule = f[1], f[2]
@@ -1142,17 +1131,18 @@ function M.install(Game, H)
         return best[1], best[2], best_score >= 3
     end
 
-    -- A fresh DamageInfo carrying a hit's values (nil if one cannot be built: no live attacker,
+    -- A fresh DamageInfo carrying a hit's values (by: whose player's hit, see attacker_body; nil
+    -- if one cannot be built: no live attacker,
     -- no attack data yet, or no damage data for the enemy). The game reads these without a
     -- check: AttackUserData/AttackData in the damage sound (HitController.playDamageSe),
     -- AttackGameObject and DamageUserData when a killing hit throws the body
     -- (RagdollUnit.onDamageHit -> addForceFromPointForce). Each null one crashed the game.
-    function Game:build_hit(info, fields)
+    function Game:build_hit(info, fields, by)
         local okC, d = pcall(sdk.create_instance, DAMAGE_INFO)
         if not okC or d == nil then return nil end
         d = self:hold(d, HIT_HOLD) -- the game frees an unreferenced DamageInfo mid-hit (see Game:hold)
         self:write_damage_fields(d, fields)
-        if not self:sanitize_damage_info(d, info.body) then return nil end
+        if not self:sanitize_damage_info(d, info.body, by) then return nil end
         local weapon = tonumber(self:call(d, "get_WeaponID"))
         local tpl = self:hit_template(weapon)
         if tpl == nil then
@@ -1205,8 +1195,10 @@ function M.install(Game, H)
         return nil
     end
 
-    -- Runs the partner's hit on our enemy (we own it): the same values its game computed, so
-    -- the same damage and the same reaction. hit = { damage, fields, critical }. Whether it
+    -- Host: runs the client's hit on our enemy: the same values its game computed, so the same
+    -- damage and the same reaction, with the client's character as the attacker (the enemy
+    -- turns on it: EnemyHeadUpdater.onHitDamage gives attention and hate to the hit's
+    -- AttackOwnerObject). hit = { damage, fields, critical }. Whether it
     -- kills is ours to say: the AI starts a death only for a hit marked IsKill, and the
     -- shooter's game marked it against its own copy's HP. A kill it had marked that does not
     -- kill here would make the enemy die with HP left; one it did not mark that takes our last
@@ -1214,7 +1206,7 @@ function M.install(Game, H)
     function Game:enemy_apply_hit(id, hit)
         local info = self:live_enemy(id)
         if info == nil or hit.fields == nil or #hit.fields == 0 then return false end
-        local d = self:build_hit(info, hit.fields)
+        local d = self:build_hit(info, hit.fields, "partner")
         if d == nil then
             self.hit_stats.apply_failed = self.hit_stats.apply_failed + 1
             self:cap("hit_apply", false, "cannot build a DamageInfo")
@@ -1241,10 +1233,10 @@ function M.install(Game, H)
     -- Deaths
     ---------------------------------------------------------------------------
 
-    -- Our copy dies because the partner's game decided it: with its own logic (death
-    -- animation, ragdoll, loot), from the killing hit when we have it (same direction, same
-    -- kind of death), else HitPoint.dead() / HP 0.
-    function Game:enemy_kill(id, fields)
+    -- Our copy dies because the other game decided it: with its own logic (death animation,
+    -- ragdoll, loot), from the killing hit when we have it (same direction, same kind of
+    -- death), else HitPoint.dead() / HP 0. by: whose player's hit it was ("self" | "partner").
+    function Game:enemy_kill(id, fields, by)
         local info = self:live_enemy(id)
         local ctx = info and self.enemy_ctx[id]
         local hp = ctx and self:call(ctx, "get_HitPoint")
@@ -1254,7 +1246,7 @@ function M.install(Game, H)
         if self.settings.enemy_kill_with_hit ~= false then
             -- Without the partner's values: a plain killing hit, from in front of it.
             local plain = fields == nil or #fields == 0
-            local d = self:build_hit(info, plain and {} or fields)
+            local d = self:build_hit(info, plain and {} or fields, by or "partner")
             if d ~= nil then
                 if plain then self:aim_plain_hit(d, info) end
                 local cur = tonumber(self:call(hp, "get_CurrentHitPoint")) or 0

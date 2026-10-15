@@ -6,7 +6,7 @@ Config.FILE = "re4coop.json"
 
 -- Bumped when defaults change for safety: settings saved by an older version take the new
 -- default for the keys listed in Config.RESET_ON_UPGRADE.
-Config.VERSION = 10
+Config.VERSION = 12
 
 Config.DEFAULTS = {
     config_version = Config.VERSION,
@@ -19,25 +19,30 @@ Config.DEFAULTS = {
     player_hz = 20,
     pose_hz = 30,         -- partner model pose updates per second
     enemy_tick_hz = 20,
-    snapshot_hz = 20,     -- states per second of the enemies your game runs
+    snapshot_hz = 20,     -- host: states per second of its enemies
     roster_hz = 5,        -- client: reports of the host's enemies it has a copy of, per second
     interp_delay = 0.066, -- seconds the partner is shown in the past (smooths network jitter)
 
-    -- enemy sync (enemy_net.lua): every enemy is run by one game, its owner; the other shows it.
+    -- enemy sync (enemy_net.lua): the host's game runs every enemy; the client's game shows them.
     -- Pairing is by the level's own enemy IDs.
     sync_enemies = true,
-    enemy_authority = "shared", -- "shared": each enemy is run by the game of the player it is closer to
-                                -- (enemies fight both players); "host": the host's game runs every enemy.
-                                -- The host's setting decides.
-    enemy_mirror = true,        -- enemies the partner's game runs stand and move where the partner's are
-    enemy_motion_sync = true,   -- those enemies (and animals) also play the partner's animation
-    enemy_anim_lock = true,     -- their own animation state machine is switched off (only the partner's animation plays)
+    enemy_mirror = true,        -- client: the host's enemies stand and move where they are in the host's game
+    enemy_motion_sync = true,   -- client: they (and animals) also play the host's animation
+    enemy_anim_lock = true,     -- client: their own animation state machine is switched off (only the host's animation plays)
     enemy_anim_layers = 2,      -- animation layers sent per enemy (1-3)
-    enemy_hit_predict = true,   -- your hits on them take HP at once (never the last HP: the owner decides deaths)
-    enemy_kill_with_hit = true, -- an enemy the partner's game killed dies here from the same killing hit
+    enemy_hit_predict = true,   -- client: your hits on them take HP at once (never the last HP: the host decides deaths)
+    enemy_kill_with_hit = true, -- client: an enemy the host's game killed dies here from the same killing hit
     enemy_erase = true,         -- enemies dead in the partner's world that only now spawn here never appear (no corpse)
     enemy_spawn_missing = true, -- client: enemies alive in the host's world that our game never spawned are spawned
-    enemy_interp_delay = 0.1,   -- seconds the partner's enemies are shown in the past (smoothness vs. delay)
+    enemy_interp_delay = 0.1,   -- client: seconds the host's enemies are shown in the past (smoothness vs. delay)
+    -- The client's player as a second player in the host's game (partner_target.lua). The host's
+    -- settings decide what its enemies do; the client's whether it takes their hits.
+    enemy_partner_target = true, -- the host's enemies see, hear, chase and attack the client's character
+    enemy_partner_hits = true,   -- their attacks on it hurt the client
+    enemy_partner_noise = true,  -- they hear the client's shots, steps and reloads
+    enemy_partner_grabs = true,  -- they may grab the client's character (the client breaks free in their own game)
+    enemy_partner_parry = true,  -- their attacks warn the client too (parry/dodge prompts), and the client's parries stagger them
+    enemy_partner_bosses = true, -- bosses that aim at "the player" themselves go for the client when their hate says so
     sync_drops = true,        -- every enemy that dies gives each player their own loot roll, also the partner's kills
     sync_animals = true,      -- crows, chickens, fish, bats and rats near the client move as in the host's game
     animal_host_only = true,  -- client: animals the host's game does not report stay where they are
@@ -62,6 +67,7 @@ Config.DEFAULTS = {
     -- Ashley (ashley_sync.lua): one Ashley for both games. She starts with the host; the switch
     -- key sends her to the other player.
     ashley_coop = true,
+    ashley_single = true,         -- any other Ashley in either game (a scripted one, a second partner) is removed
     ashley_key = 0x12,            -- Alt (Windows virtual-key code); a tap, not while aiming (Alt zooms scopes)
     ashley_cooldown = 5.0,        -- seconds between two switches (the host's setting decides)
 
@@ -121,12 +127,17 @@ Config.DEFAULTS = {
 -- replay_partner_hits - partner hits now run for real in the enemy owner's game.) Version 10
 -- (0.9.1) rebuilt cutscene sync on the game's own PayloadPlay and made it a default, next to
 -- the new event trigger sync. (Gone: exp_table_reload - partner flags no longer reload the
--- flag table.)
+-- flag table.) Version 11 (0.10) gave every enemy to the host and made the client a second
+-- player in the host's game. (Gone: enemy_authority - the host's game always runs the enemies.)
+-- Version 12 (0.10.1) made grabs on the client a real grab (the client breaks free), no longer
+-- an experiment.
 Config.RESET_ON_UPGRADE = {
     [7] = { "interp_delay", "snapshot_hz", "replay_partner_hits", "sync_cutscenes", "travel_reload", "stage_travel" },
     [8] = { "sync_enemies", "enemy_mirror", "enemy_motion_sync" },
     [9] = { "sync_enemies", "enemy_mirror", "enemy_motion_sync", "snapshot_hz", "enemy_interp_delay" },
     [10] = { "sync_cutscenes", "sync_flags", "sync_triggers" },
+    [11] = { "sync_enemies", "enemy_mirror", "enemy_motion_sync", "enemy_anim_lock", "enemy_hit_predict" },
+    [12] = { "enemy_partner_grabs" },
 }
 
 local function copy(t)
@@ -170,9 +181,6 @@ function Config.sanitize(cfg)
     cfg.pose_hz = math.max(10, math.min(60, cfg.pose_hz))
     cfg.enemy_tick_hz = math.max(5, math.min(60, cfg.enemy_tick_hz))
     cfg.roster_hz = math.max(2, math.min(20, cfg.roster_hz))
-    if cfg.enemy_authority ~= "shared" and cfg.enemy_authority ~= "host" then
-        cfg.enemy_authority = Config.DEFAULTS.enemy_authority
-    end
     cfg.enemy_anim_layers = math.max(1, math.min(3, math.floor(cfg.enemy_anim_layers)))
     if cfg.no_pause_mode ~= "menus" and cfg.no_pause_mode ~= "all" and cfg.no_pause_mode ~= "off" then
         cfg.no_pause_mode = Config.DEFAULTS.no_pause_mode
