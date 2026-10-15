@@ -19,6 +19,7 @@
 --     -> phase CheckGameClearData) without waiting for its windows to close; Decided resets
 --     the request (resetRequestGameIntent).
 
+local Guard = require("re4coop.hookguard")
 local M = {}
 
 local SAVE_MANAGER = "share.SaveDataManager"
@@ -66,7 +67,7 @@ function M.install(Game, H)
         -- 1. Every save: report it, and send the client's autosaves to its co-op slot.
         local flow = find_type("chainsaw.SaveFlowController")
         local start_m = flow and flow:get_method("start")
-        local saves_ok = start_m ~= nil and pcall(sdk.hook, start_m, function(args)
+        local saves_ok = start_m ~= nil and pcall(Guard.hook, start_m, function(args)
             local slot = int_arg(args[3])
             if slot == nil then return end
             local mirrored = self.save_mirroring == true
@@ -88,7 +89,7 @@ function M.install(Game, H)
         local done = {}
         local menu_mgr = find_type("chainsaw.SaveLoadMenuGuiManager")
         local cont_m = menu_mgr and menu_mgr:get_method("findContinueSave")
-        if cont_m ~= nil and pcall(sdk.hook, cont_m, function(args)
+        if cont_m ~= nil and pcall(Guard.hook, cont_m, function(args)
             self.continue_mgr = managed(args[2])
         end, function(retval)
             local ok, swapped = pcall(self.swap_continue_save, self)
@@ -99,7 +100,7 @@ function M.install(Game, H)
             local td = find_type(s[1])
             local upd = td and td:get_method("update")
             local where = s[2]
-            if upd ~= nil and pcall(sdk.hook, upd, function()
+            if upd ~= nil and pcall(Guard.hook, upd, function()
                 self.save_counters.menu_frames = self.save_counters.menu_frames + 1
                 self.menu_seen = where
                 local ok, want = pcall(h.on_menu, where)

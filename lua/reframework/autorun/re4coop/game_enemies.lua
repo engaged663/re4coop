@@ -28,6 +28,7 @@
 --     up in the save).
 
 local P = require("re4coop.protocol")
+local Guard = require("re4coop.hookguard")
 
 local M = {}
 
@@ -805,7 +806,7 @@ function M.install(Game, H)
             return
         end
         local game = self
-        local ok = pcall(sdk.hook, m, function(args)
+        local ok = pcall(Guard.hook, m, function(args)
             if game.active and not game.replaying and not game.replaying_player then
                 local skip = false
                 pcall(function()
@@ -827,7 +828,7 @@ function M.install(Game, H)
         -- dereference in playDamageSe that crashed the partner's game).
         local okS, se = pcall(function() return td:get_method("playDamageSe") end)
         if okS and se ~= nil then
-            pcall(sdk.hook, se, function(args)
+            pcall(Guard.hook, se, function(args)
                 if not game.replaying then return end
                 local skip = false
                 pcall(function()
@@ -848,7 +849,7 @@ function M.install(Game, H)
         local rtd = find_type("chainsaw.RagdollUnit")
         local okR, rm = pcall(function() return rtd and rtd:get_method("onDamageHit") end)
         if okR and rm ~= nil then
-            pcall(sdk.hook, rm, function(args)
+            pcall(Guard.hook, rm, function(args)
                 if not game.active then return end
                 local skip = false
                 pcall(function()
@@ -905,7 +906,7 @@ function M.install(Game, H)
             if okM and m ~= nil and (fn == nil or (fn ~= stub and not seen[fn])) then
                 if fn ~= nil then seen[fn] = true end
                 local returns_bool, skipped = spec[3], false
-                if pcall(sdk.hook, m, function()
+                if pcall(Guard.hook, m, function()
                     skipped = false
                     if game.replaying and game.settings.enemy_replay_mutilation ~= true then
                         skipped = true

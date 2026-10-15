@@ -4,7 +4,7 @@ An open-source [REFramework](https://github.com/praydog/REFramework) mod that co
 copies of **Resident Evil 4 (2023)** directly by IP address over UDP, so two players can go
 through the campaign together on a LAN, or over the internet with a forwarded port or a VPN.
 
-> **Status: v0.10.1, experimental.** v0.10 gives **every enemy to the host**: nothing is shared
+> **Status: v0.10.2, experimental.** (0.10.2 fixes the client running at 2 fps in 0.10.1.) v0.10 gives **every enemy to the host**: nothing is shared
 > and nothing changes hands - the host's game runs every enemy's AI, and the client's game shows
 > it moving, turning and animating exactly like it. The client's player is **a second player in
 > the host's game** ([why and how](docs/RESEARCH.md#325-v010-the-client-as-a-second-player-in-the-hosts-game)):
@@ -231,7 +231,7 @@ lua/reframework/autorun/re4coop/      protocol, session, enemy_net, partner_targ
                                       drop_sync, gate, flag_sync, gimmick_sync, object_sync,
                                       cutscene_sync, trigger_sync, door_sync, trap_sync, mechanism_sync, give_sync, save_sync, travel,
                                       pause_policy, interp, config, ui, overlay, perf (profiler,
-                                      crash breadcrumbs),
+                                      crash breadcrumbs), hookguard (no hook on a shared stub body),
                                       game (RE4 adapter: player, prefabs, sound mirror, HP,
                                       pickups), game_enemies (enemies, puppets, hits), game_partner (the
                                       client as a second player in the host's game), game_world (flags, gimmicks, breakables,

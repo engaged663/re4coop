@@ -6,6 +6,7 @@
 -- on PauseManager whose type is a Dictionary of PauseParameter". Everything here is
 -- defensive: lookups are cached, every engine call is pcall'ed, and failures return nil.
 
+local Guard = require("re4coop.hookguard")
 local R = {}
 R.__index = R
 
@@ -470,7 +471,7 @@ function R:hook(info, pre, post)
     if info == nil or info.method == nil then return false end
     local key = (info.owner or "?") .. "::" .. info.name .. "(" .. table.concat(info.params or {}, ",") .. ")"
     if self.hooked[key] then return true end
-    local ok, err = pcall(sdk.hook, info.method, pre, post or function(retval) return retval end)
+    local ok, err = pcall(Guard.hook, info.method, pre, post or function(retval) return retval end)
     if ok then
         self.hooked[key] = true
         return true

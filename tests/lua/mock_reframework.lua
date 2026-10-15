@@ -429,6 +429,8 @@ end
 
 function M.install(opts)
     opts = opts or {}
+    -- A fresh world has other method bodies: the hook guard forgets the old ones.
+    if package.loaded["re4coop.hookguard"] then package.loaded["re4coop.hookguard"].reset() end
     classes = {}
     M.classes = classes
     objects = {}

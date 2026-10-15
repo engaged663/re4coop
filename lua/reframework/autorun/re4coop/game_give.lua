@@ -17,6 +17,7 @@
 --     that hand out items use) and puts it in the case with CsInventoryController.add(Item,
 --     Default): AddItemResult.AddCount says how many fitted.
 
+local Guard = require("re4coop.hookguard")
 local M = {}
 
 local GIVE_COMMAND = 13 -- chainsaw.ItemCommandType.Store: never offered by the attache case
@@ -70,7 +71,7 @@ function M.install(Game, H)
         -- 1. The give entry, last in the command list of a givable item.
         local inv = find_type("chainsaw.InventoryManager")
         local menu_m = inv and inv:get_method("getItemCommandMenu")
-        if menu_m ~= nil and pcall(sdk.hook, menu_m, function(args)
+        if menu_m ~= nil and pcall(Guard.hook, menu_m, function(args)
             self.give_menu_item = nil
             local a = managed(args[3])
             if a ~= nil then self.give_menu_item = self:call(a, "get_Item") or (a.get_field and a:get_field("Item")) end
@@ -81,7 +82,7 @@ function M.install(Game, H)
         -- 2. Its label.
         local cmd_gui = find_type("chainsaw.gui.commandmenu.ItemCommandGui")
         local draw_m = cmd_gui and cmd_gui:get_method("drawCommand")
-        if draw_m ~= nil and pcall(sdk.hook, draw_m, function(args)
+        if draw_m ~= nil and pcall(Guard.hook, draw_m, function(args)
             self.give_draw = nil
             if tonumber(sdk.to_int64(args[3])) == GIVE_COMMAND and self.give_offered then
                 self.give_draw = managed(args[2])
@@ -95,7 +96,7 @@ function M.install(Game, H)
         -- 3. Choosing it.
         local state = find_type("chainsaw.ItemWindowGuiState_AttacheCaseSelectCommand")
         local decide_m = state and state:get_method("decide")
-        if decide_m ~= nil and pcall(sdk.hook, decide_m, function(args)
+        if decide_m ~= nil and pcall(Guard.hook, decide_m, function(args)
             pcall(self.on_give_decided, self, managed(args[2]))
         end, function(retval) return retval end) then done[#done + 1] = "decide" end
         local ok = #done == 3

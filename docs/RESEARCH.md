@@ -1677,6 +1677,38 @@ Boss attacks that read `PlayerContextList` directly (not their action target) st
 parts at the host. *Diagnostics*: `partner_shots`, `partner_parry`, `partner_grab`,
 `partner_bosses`.
 
+### 3.27 v0.10.2: the client at 2 fps (hooks on shared stub bodies)
+
+**Report.** With 0.10.1 the client's game ran at 2-3 fps. Its profile
+(`re4coop_perf_client.json`): the mod's own work took 35-175 ms a frame, most of it receiving
+messages (`update.net`), and another ~260 ms of every frame went outside the mod's spans.
+
+**Cause.** The client hooks the finisher queries and requests of each of its puppet heads'
+types (§3.25: `isEnableFatal`, `isEnableKnifeFatal`, `isEnableStealthKill`,
+`getAvailableFatalType`, `requestFatalKill`, `requestStealthKill`,
+`convertNormalFatalAction`). For an enemy kind that does not override one of them -
+`Ch8g3z0` here, of kind 81105 - REFramework resolves the method to `EnemyHeadUpdater`'s, and
+its native body is a trivial stub that the compiler folded with every identical body: the
+"return false" body at re4.exe 0x1400aea70 (`isEnableStealthKill`, `requestFatalKill`,
+`requestStealthKill`, `convertNormalFatalAction`) is also the body of 17,388 other methods
+(`System.Array.get_IsReadOnly`, `get_IsSynchronized`...), and `getAvailableFatalType`'s
+(0x1400bdec0) of 122. REFramework hooks the native body, so every call of every one of those
+methods, on every thread, went through the mod's Lua hook under REFramework's script lock -
+including the game calls the mod itself makes, which is why `update.net` grew too. Only the
+client has puppets, so only the client crawled. The most shared bodies of re4.exe (from the
+dump's method addresses): 0x1400ae850 (empty, 59,967 methods), 0x1400af550 (44,640),
+0x1400ae950 (23,930), 0x1400ae940 (22,383), 0x1400aea70 (return false, 17,388), 0x1400aff00
+(return true, 8,023), field getters like 0x1400b0f40 and 0x1400aed30 (2,500 each). Most have
+no `.pdata` entry (leaf functions); every method the mod means to hook has one.
+
+**Fix.** Every hook of the mod now goes through `hookguard.lua`, which refuses a method whose
+body is the body of one of fifteen well-known trivial framework methods (`System.Action.
+EndInvoke`, `System.Array.get_IsReadOnly`, `get_IsFixedSize`, `get_SyncRoot`, `Insert`,
+`CopyTo`, `Add`, `System.Collections.ArrayList.get_Count`...; resolved by name at run time, so
+the addresses of a game update do not matter). A refused method has nothing to hook anyway: an
+enemy kind without its own finisher query offers no finisher in the host's game either.
+*Diagnostics* lists the refusals (`hook_guard`).
+
 ## 4. Sync architecture
 
 ```

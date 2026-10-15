@@ -1569,6 +1569,34 @@ T.run("give_an_item_from_the_attache_case", function()
     T.eq(#refused, 0, "nothing refused")
 end)
 
+T.run("a_method_whose_body_is_a_shared_stub_is_never_hooked", function()
+    -- 0.10.1 in the game: enemy kinds that do not override EnemyHeadUpdater.isEnableStealthKill
+    -- (a dog, Ch8g3z0) inherit a "return false" body the compiler shares with 17,388 methods
+    -- (System.Array.get_IsReadOnly...). Hooking it for a puppet head sent every call of all of
+    -- them through Lua: the client's game ran at 2 fps. Such a body is refused.
+    local game, world = fresh_game()
+    mock.class("System.Array", "System.Object", {
+        get_IsReadOnly = { 0, function() return false end, {}, { ret = "System.Boolean" } },
+    })
+    mock.classes["System.Array"].methods.get_IsReadOnly.code = "body:return_false"
+    mock.classes["chainsaw.HeadUpdater"].methods.isEnableStealthKill.code = "body:return_false"
+    game:set_active(true)
+    game:read_player_state()
+    local list = game:list_enemies()
+    game:enemy_set_puppet(list[2].id, true)
+    T.eq(#(mock.hooks["isEnableStealthKill"] or {}), 0, "the shared stub is not hooked")
+    T.eq(#(mock.hooks["isEnableFatal"] or {}), 1, "the kind's own query is")
+    local Guard = require("re4coop.hookguard")
+    T.eq(Guard.summary().refused, 1, "one refusal")
+    local cap = game:capabilities().hook_guard
+    T.check(cap ~= nil and cap.detail:find("isEnableStealthKill", 1, true) ~= nil, "named in Diagnostics")
+    T.check(cap ~= nil and cap.detail:find("System.Array.get_IsReadOnly", 1, true) ~= nil, "with the body it shares")
+    -- The puppet still answers the queries it has from the host.
+    world.enemies[2].fatal_ok = true
+    game.partner_fatal_query = function() return P.PARTNER_INFO.KNOWN | P.PARTNER_INFO.FATAL, 0 end
+    T.eq(world.enemies[2].head_updater:call("isEnableFatal", world.player), 1, "the hooked query answers from the host")
+end)
+
 T.run("hooks_absent_without_sdk_hook", function()
     local game = fresh_game({ no_hook = true })
     game:set_active(true)

@@ -17,6 +17,7 @@
 -- so a crash can be traced to the last thing the mod did.
 
 local P = require("re4coop.protocol")
+local Guard = require("re4coop.hookguard")
 local Perf = require("re4coop.perf")
 
 local Game = {}
@@ -477,6 +478,12 @@ function Game:report_hp_writer()
 end
 
 function Game:capabilities()
+    -- Hooks refused because their body is a shared trivial one (hookguard.lua).
+    local g = Guard.summary()
+    if g.refused > 0 then
+        self.caps.hook_guard = { ok = true, detail = ("%d hooks, %d refused (shared bodies): %s"):format(g.hooked,
+            g.refused, table.concat(g.names, ", ")) }
+    end
     return self.caps
 end
 
@@ -1792,7 +1799,7 @@ function Game:install_hooks()
     local reg = self:mirror_registry()
     local hooked = { sound = 0, effect = 0 }
     for _, entry in ipairs(reg.list) do
-        local ok = pcall(sdk.hook, entry.method, function(args)
+        local ok = pcall(Guard.hook, entry.method, function(args)
             if self.capture_enabled then
                 pcall(self.capture_call, self, entry, args)
             end
@@ -1808,7 +1815,7 @@ function Game:install_hooks()
     if gun_td ~= nil then
         for _, name in ipairs(SHOOT_METHODS) do
             local m = gun_td:get_method(name)
-            if m ~= nil and pcall(sdk.hook, m, function(args)
+            if m ~= nil and pcall(Guard.hook, m, function(args)
                 pcall(self.on_shot, self, args)
             end, function(retval) return retval end) then
                 names[#names + 1] = name
@@ -2064,7 +2071,7 @@ function Game:install_pickup_hooks()
     for _, name in ipairs(PICKUP_CALLBACKS) do
         local okM, m = pcall(function() return td and td:get_method(name) end)
         if okM and m ~= nil then
-            local ok = pcall(sdk.hook, m, function(args) pcall(record, args, name) end,
+            local ok = pcall(Guard.hook, m, function(args) pcall(record, args, name) end,
                 function(retval) return retval end)
             if ok then hooked[#hooked + 1] = name end
         end
@@ -2159,7 +2166,7 @@ function Game:install_drop_hook()
         local m = find_overload(td, spec.method, spec.nparams)
         if spec.name == "generate" then self.drop_generate_m = m end
         if m ~= nil then
-            local ok = pcall(sdk.hook, m, function(args)
+            local ok = pcall(Guard.hook, m, function(args)
                 if game.active then pcall(game.on_drop_call, game, spec, args) end
             end, function(retval) return retval end)
             if ok then hooked[#hooked + 1] = spec.name end
@@ -2341,7 +2348,7 @@ function Game:install_gimmick_hook()
             if #log > MAX_GIMMICK_LOG then table.remove(log, 1) end
         end
     end
-    local ok = pcall(sdk.hook, m, function(args)
+    local ok = pcall(Guard.hook, m, function(args)
         if game.active then pcall(on_dirty, args) end
     end, function(retval) return retval end)
     self:cap("gimmick_hook", ok, ok and "GimmickManager.pushDirtyList" or "sdk.hook failed")

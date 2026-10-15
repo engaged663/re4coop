@@ -44,6 +44,7 @@
 -- parries of our copies go to the host.
 
 local P = require("re4coop.protocol")
+local Guard = require("re4coop.hookguard")
 
 local M = {}
 
@@ -567,7 +568,7 @@ function M.install(Game, H)
         local okM, hs = pcall(function() return hm_td and hm_td:get_method("hitSetting") end)
         if okM and hs ~= nil then
             local skipped = false
-            pcall(sdk.hook, hs, function(args)
+            pcall(Guard.hook, hs, function(args)
                 skipped = false
                 if not game.active or game.ptarget == nil or game.ptarget.hc_addr == nil then return end
                 local skip = false
@@ -594,7 +595,7 @@ function M.install(Game, H)
         local okK, hk = pcall(function() return ph_td and ph_td:get_method("hasKnife") end)
         if okK and hk ~= nil then
             local probed = false
-            pcall(sdk.hook, hk, function()
+            pcall(Guard.hook, hk, function()
                 probed = false
                 if game.knife_probe then
                     probed = true
@@ -613,7 +614,7 @@ function M.install(Game, H)
         local sm_td = find_type(SOUND_MANAGER)
         local okR, rs = pcall(function() return sm_td and sm_td:get_method("registerSound") end)
         if okR and rs ~= nil then
-            local ok = pcall(sdk.hook, rs, function(args)
+            local ok = pcall(Guard.hook, rs, function(args)
                 if not game.active or not game.capture_noise then return end
                 pcall(function() game:on_sound(sdk.to_managed_object(args[3])) end)
             end, function(retval) return retval end)
@@ -636,7 +637,7 @@ function M.install(Game, H)
         local hc_td = find_type(HIT_CONTROLLER)
         local okP, pd = pcall(function() return hc_td and hc_td:get_method("poolDamage") end)
         if okP and pd ~= nil then
-            local ok = pcall(sdk.hook, pd, function(args)
+            local ok = pcall(Guard.hook, pd, function(args)
                 local st = game.ptarget
                 if not game.active or st == nil or not st.attached then return end
                 local skip = false
@@ -655,7 +656,7 @@ function M.install(Game, H)
         -- target, info): the model has no player head to show it, so the partner's game does).
         local su_td = find_type(SIGN_UTILITY)
         for _, m in ipairs(su_td and methods_named(su_td, "sendActionSignInfo", 3) or {}) do
-            pcall(sdk.hook, m, function(args)
+            pcall(Guard.hook, m, function(args)
                 local st = game.ptarget
                 if not game.active or st == nil or not st.attached or not st.parry then return end
                 local skip = false
@@ -672,7 +673,7 @@ function M.install(Game, H)
         local eh_td = find_type("chainsaw.EnemyHeadUpdater")
         local okG, rg = pcall(function() return eh_td and eh_td:get_method("requestGrapple") end)
         if okG and rg ~= nil then
-            pcall(sdk.hook, rg, function(args)
+            pcall(Guard.hook, rg, function(args)
                 local st = game.ptarget
                 if not game.active or st == nil or not st.attached then return end
                 pcall(function()
@@ -692,7 +693,7 @@ function M.install(Game, H)
             local fn = okU and upd and method_function(upd) or nil
             if upd ~= nil and (fn == nil or not seen[fn]) then
                 if fn ~= nil then seen[fn] = true end
-                if pcall(sdk.hook, upd, function(args)
+                if pcall(Guard.hook, upd, function(args)
                     local st = game.ptarget
                     if not game.active or st == nil or not st.attached then return end
                     local skip = false
@@ -714,7 +715,7 @@ function M.install(Game, H)
                 local okT, types = pcall(m.get_param_types, m)
                 local okN, tn = pcall(function() return types[2]:get_full_name() end)
                 if okT and okN and tn == "via.GameObject" then
-                    if pcall(sdk.hook, m, function(args)
+                    if pcall(Guard.hook, m, function(args)
                         local st = game.ptarget
                         if not game.active or st == nil or not st.attached or not st.bosses then return end
                         pcall(function()
@@ -736,7 +737,7 @@ function M.install(Game, H)
             local td = find_type(tname)
             local okN, m = pcall(function() return td and td:get_method("setTargetNearPlayer") end)
             if okN and m ~= nil then
-                pcall(sdk.hook, m, function() game.near_intent = true end, function(retval)
+                pcall(Guard.hook, m, function() game.near_intent = true end, function(retval)
                     game.near_intent = false
                     return retval
                 end)
@@ -750,7 +751,7 @@ function M.install(Game, H)
             local okO, op = pcall(function() return td and td:get_method("onParry") end)
             if okO and op ~= nil then
                 local cur = nil
-                pcall(sdk.hook, op, function(args)
+                pcall(Guard.hook, op, function(args)
                     cur = nil
                     if not game.active or next(game.puppets or {}) == nil then return end
                     pcall(function()
@@ -773,7 +774,7 @@ function M.install(Game, H)
             end
             local okI, oi = pcall(function() return td and td:get_method("onParryInput") end)
             if okI and oi ~= nil then
-                pcall(sdk.hook, oi, function(args)
+                pcall(Guard.hook, oi, function(args)
                     if not game.active or next(game.puppets or {}) == nil then return end
                     pcall(function()
                         local id = game:puppet_of_body(sdk.to_managed_object(args[2]))
@@ -1287,7 +1288,7 @@ function M.install(Game, H)
             if fn ~= nil and hh.fns[fn] then return end
             if fn ~= nil then hh.fns[fn] = true end
             local answer = nil
-            pcall(sdk.hook, m, function(args)
+            pcall(Guard.hook, m, function(args)
                 answer = nil
                 if not game.active then return end
                 local pid

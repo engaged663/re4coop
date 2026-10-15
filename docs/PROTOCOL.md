@@ -56,7 +56,7 @@ Session rules:
 | `stats()` | Table: `rtt_ms, peer, peer_name, bytes_sent, bytes_recv, resends, reliable_in_flight, out_of_order, unordered_duplicates, …` |
 | `local_addresses()` | Array of this PC's LAN IPv4 addresses |
 | `time()` | Monotonic seconds (`os.clock` is CPU time, so don't use it for networking) |
-| `max_payload()`, `version()` | `1188`; `"0.10.1", 2` |
+| `max_payload()`, `version()` | `1188`; `"0.10.2", 2` |
 | `new_session()` | An independent session object with the same methods (tests/tools) |
 | `window_focused()` | Whether a window of this process is the foreground window (true off Windows): the Ashley key only counts while the game has the focus |
 
