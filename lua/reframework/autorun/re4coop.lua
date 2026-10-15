@@ -1,7 +1,8 @@
 -- RE4 (2023) LAN co-op - entry point loaded by REFramework from reframework/autorun.
 --
 -- Requires reframework/plugins/re4coop_net.dll (provides the `re4coop_net` UDP API).
--- Open the REFramework menu (Insert) -> "RE4 Co-op (LAN)" to host or join.
+-- Host or join from the game's own main menu ("Multijugador", above "Opciones"), or from the
+-- REFramework menu (Insert) -> "RE4 Co-op (LAN)".
 
 local function log_info(msg)
     if log and log.info then log.info("[re4coop] " .. msg) end
@@ -33,6 +34,7 @@ local Session = require("re4coop.session")
 local Puppet = require("re4coop.puppet")
 local Overlay = require("re4coop.overlay")
 local UI = require("re4coop.ui")
+local LobbyUI = require("re4coop.lobby_ui")
 local P = require("re4coop.protocol")
 local Perf = require("re4coop.perf")
 
@@ -131,6 +133,17 @@ re.on_application_entry("PrepareRendering", function()
     if not ok2 then report_once("partner pose", err2) end
 end)
 
+-- The host's LAN addresses for the lobby (asked for again every few seconds).
+local addresses, addresses_at = {}, -math.huge
+local function local_addresses(now)
+    if now - addresses_at > 5.0 then
+        addresses_at = now
+        local ok, list = pcall(re4coop_net.local_addresses)
+        addresses = ok and type(list) == "table" and list or {}
+    end
+    return addresses
+end
+
 -- Render thread: only drawing, plus network service while the game loop is not ticking.
 re.on_frame(function()
     local now = re4coop_net.time()
@@ -139,6 +152,12 @@ re.on_frame(function()
         local ok, err = pcall(session.update_network_only, session)
         if not ok then report_once("network", err) end
     end
+
+    -- The lobby's screens over the game's main menu, and the loaders of a game it started.
+    local okL, errL = pcall(LobbyUI.draw, { session = session, lobby = session.lobby, settings = settings, json = json,
+        now = now, addresses = session.role == "host" and local_addresses(now) or nil })
+    if not okL then report_once("lobby", errL) end
+    local covering = LobbyUI.covering(session.lobby, now)
 
     local state = session:partner_render_state()
     if state ~= nil then
@@ -166,7 +185,7 @@ re.on_frame(function()
         end
     end
 
-    if settings.show_hud and session.role ~= "none" then
+    if settings.show_hud and session.role ~= "none" and not covering then
         local ok, err = pcall(Overlay.draw_hud, game, session:status_cached(), session.messages, now,
             settings.show_partner and puppet:status() or nil)
         if not ok then report_once("hud", err) end

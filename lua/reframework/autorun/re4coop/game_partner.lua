@@ -19,8 +19,8 @@
 --     is the model's; the model's body updater (BodyUpdater.<Context>, a plain field write -
 --     setContextRef would run entryContext) points back at it;
 --   * a TargetMarker on the model with the tag of our own player's marker, so enemies see it;
---   * its damage colliders on and its HitController in HitManager's list, so enemy attacks
---     land on it; such a hit is taken off the model (callbackDamageHit skipped) and sent to the
+--   * its damage colliders on (its RequestSetCollider with the body's damage request set alone)
+--     and its HitController in HitManager's list, so enemy attacks land on it; such a hit is taken off the model (callbackDamageHit skipped) and sent to the
 --     partner, whose game runs it on their real character;
 --   * the partner's noises registered as sounds the model makes, so enemies hear them;
 --   * finishers the partner's player starts are asked of our enemy's AI head with the stand-in
@@ -63,6 +63,7 @@ local DAMAGE_INFO = "chainsaw.HitController.DamageInfo"
 local ATTACK_DATA = "chainsaw.collision.AttackHitUserData.AttackData"
 local ATTACK_USER_DATA = "chainsaw.collision.AttackUserData"
 local COLLIDERS = "via.physics.Colliders"
+local REQUEST_SET_COLLIDER = "via.physics.RequestSetCollider"
 local NON_LETHAL_OPTION = 4                -- AttackData._Option bit: the hit leaves 1 HP (hitSetting)
 local MAX_EVENTS = 32
 local HIT_HOLD = 5.0
@@ -305,17 +306,31 @@ function M.install(Game, H)
             self:cap("partner_hits", false, "the model's HitController was never constructed")
             return
         end
-        local n = 0
+        local n, sets_off = 0, 0
         for _, node in ipairs(self:collect_tree(root, 4)) do
             local ga = address_of(node.go)
             if ga ~= nil then st.gos[ga] = true end
             for _, comp in ipairs(self:components(node.go)) do
-                if type_name_of(comp) == COLLIDERS and self:damage_only(comp) then
+                local tname = type_name_of(comp)
+                if tname == COLLIDERS and self:damage_only(comp) then
                     -- Their DamageUserData: what our own attacks' contacts are recognised by.
                     self:damage_user_datas(comp, st.damage_uds)
                     if self:call(comp, "get_Enabled") == false and pcall(comp.call, comp, "set_Enabled", true) then
                         st.colliders[#st.colliders + 1] = comp
                         n = n + 1
+                    end
+                elseif tname == REQUEST_SET_COLLIDER then
+                    -- Where Leon keeps his body's damage shapes (ch0a0z0.rcol, docs/RESEARCH.md
+                    -- 3.29): on with its body's damage set alone.
+                    local kept, off = self:damage_request_sets_only(comp, st.damage_uds)
+                    sets_off = sets_off + off
+                    if kept then
+                        local on = self:call(comp, "get_Enabled") ~= false
+                        if not on and pcall(comp.call, comp, "set_Enabled", true) then
+                            st.colliders[#st.colliders + 1] = comp
+                            on = true
+                        end
+                        if on then n = n + 1 end
                     end
                 end
             end
@@ -325,8 +340,56 @@ function M.install(Game, H)
         if ok then
             st.hc, st.hc_addr = self:keep(hc) or hc, address_of(hc)
         end
-        self:cap("partner_hits", ok and n > 0, ("%s, %d damage collider set(s) on"):format(
-            ok and "HitController registered" or "HitManager.registerHitController failed", n))
+        self:cap("partner_hits", ok and n > 0, ("%s, %d damage collider set(s) on, %d other request set(s) off"):format(
+            ok and "HitController registered" or "HitManager.registerHitController failed", n, sets_off))
+    end
+
+    -- A RequestSetCollider of the partner's model keeps only its body's damage shapes in our
+    -- game: of its request sets whose collidables all carry DamageUserData (Leon: Damage,
+    -- ArmorDamage, KidnappedDamage, NearmissDamage), the first of the most collidables (Damage)
+    -- is registered and every other set unregistered - press, target, touch and avoid sensors,
+    -- kicks, and the other damage sets, so an enemy blow meets one body (not also a near-miss
+    -- shape). The DamageUserData of every damage set go into `uds` (our own attacks pass them).
+    -- Returns whether a damage set is kept, and how many other sets were unregistered.
+    function Game:damage_request_sets_only(rsc, uds)
+        local n = tonumber(self:call(rsc, "get_NumRequestSets")) or 0
+        local group = self:call(rsc, "getRequestSetGroups(System.UInt32)", 0)
+        local sets, main = {}, nil
+        for i = 0, math.min(n, 64) - 1 do
+            local m = tonumber(self:call(rsc, "getNumCollidablesFromIndex(System.UInt32)", i)) or 0
+            local set_ud = self:call(rsc, "getRequestSetUserDataFromIndex(System.UInt32)", i)
+            local found, damage = {}, m > 0
+            for j = 0, math.min(m, 64) - 1 do
+                local col = self:call(rsc, "getCollidableFromIndex(System.UInt32, System.UInt32)", i, j)
+                local ud = col and self:call(col, "get_UserData") or set_ud
+                local tname = ud and type_name_of(ud) or nil
+                if tname == nil or not tname:find("DamageUserData", 1, true) then
+                    damage = false
+                    break
+                end
+                found[#found + 1] = ud
+            end
+            local id = group and tonumber(self:call(group, "getRequestSetIdFromIndex(System.UInt32)", i)) or i
+            sets[#sets + 1] = { id = id, index = i, damage = damage, count = m }
+            if damage then
+                for _, ud in ipairs(found) do
+                    local a = address_of(ud)
+                    if a ~= nil then uds[a] = true end
+                end
+                if main == nil or m > main.count then main = sets[#sets] end
+            end
+        end
+        local off = 0
+        for _, s in ipairs(sets) do
+            local registered = self:call(rsc, "isRegisteredRequestSetFromIndex(System.UInt32)", s.index)
+            if s == main then
+                if registered ~= true then self:call(rsc, "registerRequestSet(System.UInt32)", s.id) end
+            elseif registered ~= false then
+                self:call(rsc, "unregisterRequestSet(System.UInt32)", s.id)
+                off = off + 1
+            end
+        end
+        return main ~= nil, off
     end
 
     -- Whether every collider of a via.physics.Colliders is a damage collider (DamageUserData):
@@ -1359,27 +1422,25 @@ function M.install(Game, H)
     ---------------------------------------------------------------------------
 
     -- One of our player's damage colliders (body part `part`, side `side`; else the chest; else
-    -- any): collider, DamageUserData | nil.
+    -- any), from a request set registered now when there is one: collider, DamageUserData | nil.
+    -- Leon keeps them in his RequestSetCollider (ch0a0z0.rcol: Damage, ArmorDamage,
+    -- KidnappedDamage...), not in his Colliders (one sphere without damage data): see
+    -- Game:damage_collidables and docs/RESEARCH.md 3.29.
     function Game:player_damage_collider(hc, part, side)
-        local cols = hc and self:call(hc, "get_Colliders")
-        local n = cols and tonumber(self:call(cols, "getCollidersCount")) or 0
         local best, best_score = nil, -1
-        for i = 0, math.min(n, 128) - 1 do
-            local col = self:call(cols, "getColliders", i)
-            local ud = col and self:call(col, "get_UserData")
-            local tname = ud and type_name_of(ud) or nil
-            if tname ~= nil and tname:find("DamageUserData", 1, true) then
-                local parts = tonumber(get_field(ud, "Parts"))
-                local s = tonumber(get_field(ud, "PartsSide"))
-                local score = 0
-                if part ~= nil and parts == part then
-                    score = (side == nil or s == side) and 4 or 3
-                elseif parts == CHEST then
-                    score = 2
-                end
-                if score > best_score then best, best_score = { col, ud }, score end
-                if score == 4 then break end
+        for _, c in ipairs(self:damage_collidables(hc)) do
+            local ud = c[2]
+            local parts = tonumber(get_field(ud, "Parts"))
+            local s = tonumber(get_field(ud, "PartsSide"))
+            local score = 0
+            if part ~= nil and parts == part then
+                score = (side == nil or s == side) and 4 or 3
+            elseif parts == CHEST then
+                score = 2
             end
+            score = score * 2 + (c[3] ~= false and 1 or 0)
+            if score > best_score then best, best_score = c, score end
+            if score == 9 then break end
         end
         if best == nil then return nil, nil end
         return best[1], best[2]
@@ -1471,7 +1532,8 @@ function M.install(Game, H)
         local damage = tonumber(self:call(d, "get_Damage")) or 0
         pcall(d.call, d, "set_IsKill", self:call(hc, "checkKill", damage) == true)
         self.perf:crumb("player.hit_from_host", nil, "now")
-        if self:call(hc, "callbackCheckDamageHit", d) == false then
+        local lands = self:call(hc, "callbackCheckDamageHit", d)
+        if lands == false or lands == 0 then -- (0: a hook's "false", invincibility)
             st.stats.player_blocked = st.stats.player_blocked + 1
             return "blocked"
         end

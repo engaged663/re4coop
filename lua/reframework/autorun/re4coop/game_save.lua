@@ -100,9 +100,15 @@ function M.install(Game, H)
             local td = find_type(s[1])
             local upd = td and td:get_method("update")
             local where = s[2]
-            if upd ~= nil and pcall(Guard.hook, upd, function()
+            if upd ~= nil and pcall(Guard.hook, upd, function(args)
                 self.save_counters.menu_frames = self.save_counters.menu_frames + 1
                 self.menu_seen = where
+                self.menu_seen_time = self.clock()
+                if where == "menu" then
+                    -- The main menu's state object: the lobby starts games through it (game_menu.lua).
+                    self.main_menu_state = managed(args[2]) or self.main_menu_state
+                    self.menu_state_seen = self.menu_seen_time
+                end
                 local ok, want = pcall(h.on_menu, where)
                 if ok and want then self:request_continue() end
             end, function(retval) return retval end) then done[#done + 1] = where end

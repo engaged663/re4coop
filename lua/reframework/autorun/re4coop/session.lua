@@ -39,6 +39,8 @@ local AshleySync = require("re4coop.ashley_sync")
 local PurposeSync = require("re4coop.purpose_sync")
 local TriggerSync = require("re4coop.trigger_sync")
 local Travel = require("re4coop.travel")
+local Lobby = require("re4coop.lobby")
+local Config = require("re4coop.config")
 local Perf = require("re4coop.perf")
 
 local Session = {}
@@ -102,7 +104,16 @@ local OFFLINE_SAFE = {
     -- Ashley: only her owner, epoch and the partner's latest state are recorded here; our
     -- game follows them on the next game tick.
     [P.T.ASHLEY] = true, [P.T.ASHLEY_OWNER] = true, [P.T.ASHLEY_SWITCH] = true, [P.T.ASHLEY_BANKS] = true,
+    -- The lobby and the synchronized start: state only (lobby.lua); the game acts on the next tick.
+    [P.T.LOBBY_SETTINGS] = true, [P.T.LOBBY_PLAYER] = true, [P.T.LOBBY_START] = true, [P.T.LOAD_STATE] = true,
+    [P.T.LOAD_GO] = true,
 }
+
+local LOBBY_TYPES = {
+    [P.T.LOBBY_SETTINGS] = true, [P.T.LOBBY_PLAYER] = true, [P.T.LOBBY_START] = true, [P.T.LOAD_STATE] = true,
+    [P.T.LOAD_GO] = true,
+}
+local LOBBY_SAVES_EVERY = 2.0 -- seconds between reads of the host's co-op files while the lobby is open
 
 -- Reliable messages that must not be lost but touch game objects: kept until the game loop
 -- runs again. Everything else arriving then (enemy snapshots, hits) is resent continuously.
@@ -196,6 +207,26 @@ function Session.new(opts)
             end,
             continue_slot = function() return self.save_sync:continue_slot(self.clock()) end,
             on_menu = function(where) return self:on_menu(where) end,
+        })
+    end
+
+    -- The lobby in the game's own main menu (lobby.lua, game_menu.lua): one per session object
+    -- too (the menu hooks are installed once).
+    self.lobby = Lobby.new({ protocol = P, settings = self.settings,
+        send = function(bytes, reliable) return self:send(bytes, reliable) end,
+        notify = function(text, kind) self:add_message(text, kind) end,
+        role = function() return self.role end,
+        active = function() return self.partner_connected and self.compatible end,
+        my_name = function() return self.settings.player_name end,
+        partner_name = function() return self.partner_name or "Compañero" end })
+    self.lobby_hold = false
+    if self.game ~= nil and self.game.install_menu_hooks ~= nil and self.settings.lobby_menu ~= false then
+        self.game:install_menu_hooks({
+            entry = Lobby.ACTION.MULTIPLAYER, section = Lobby.SECTION, labels = Lobby.LABELS,
+            mode = function() return self.lobby.menu_mode end,
+            covered = function() return self.lobby:covers_menu() end,
+            on_decide = function(action) self:on_menu_decide(action) end,
+            on_cancel = function() self.lobby:set_menu_mode("main") end,
         })
     end
 
@@ -396,6 +427,9 @@ function Session:run_actions(in_game)
             self:join(a.arg)
         elseif a.name == "leave" then
             self:leave()
+        elseif a.name == "lobby_leave" then
+            -- Leaving the lobby screen ends the session it was made for.
+            if self.lobby:close() == "leave" and self.role ~= "none" then self:leave() end
         elseif not in_game then
             keep[#keep + 1] = a
         elseif a.name == "teleport" then
@@ -468,6 +502,8 @@ end
 
 function Session:leave()
     self.net.stop()
+    if self.lobby then self.lobby:on_disconnected(self.clock()) end
+    if self.save_sync then self.save_sync:set_host_slot(nil) end
     if self.role ~= "none" then
         self:add_message("Left the co-op session", "info")
     end
@@ -728,6 +764,11 @@ end
 
 -- Transition gate: hold (freeze) the local game until the partner reaches the transition.
 function Session:update_gate(now)
+    if self.lobby_hold then
+        -- The synchronized start holds our loaded map until the partner's has loaded too.
+        self:apply_hold(true)
+        return
+    end
     local partner = self.interp:sample(now)
     local age = self.interp:age(now)
     local fresh = partner ~= nil and age ~= nil and age <= 1.5
@@ -943,6 +984,7 @@ function Session:status()
         st.saves.game = self.game.save_counters
     end
     st.items = self.item_sync:summary()
+    if self.lobby then st.lobby = self.lobby:summary() end
     st.left_behind = self.left_behind
     st.teleport_key_name = Session.key_name(self.settings.teleport_key)
     st.snooze_key_name = Session.key_name(self.settings.snooze_key)
@@ -1014,6 +1056,7 @@ function Session:handle_event(ev, now)
         if self.save_sync then self.save_sync:reset() end
         self:add_message(("%s connected (%s)"):format(ev.name or "Partner", ev.peer or "?"), "good")
         self:send_hello()
+        if self.lobby then self.lobby:on_connected() end
         -- The client joins the host's game: go where the host is, with the host's world.
         if self.role == "client" and self.world ~= nil then
             if self.settings.auto_travel ~= false and self.travel ~= nil then
@@ -1029,6 +1072,7 @@ function Session:handle_event(ev, now)
         local who = self.partner_name or "Partner"
         local was_connected = self.partner_connected
         if self.give_sync then self.give_sync:partner_left(now) end
+        if self.lobby then self.lobby:on_disconnected(now) end
         self:reset_peer()
         if ev.type == "rejected" then
             self.last_error = ev.data
@@ -1130,6 +1174,8 @@ function Session:handle_message(data, now)
         if self.give_sync then self.give_sync:on_message(m, now) end
     elseif m.type == T.SAVE then
         if self.save_sync then self.save_sync:on_message(m, now) end
+    elseif LOBBY_TYPES[m.type] then
+        if self.lobby then self.lobby:on_message(m, now, self:menu_open()) end
     elseif m.type == T.ITEM_TAKEN then
         self.item_sync:on_message(m, now)
     elseif m.type == T.ITEM_DROPPED then
@@ -1204,6 +1250,7 @@ function Session:send_player_state(now)
     if st.cutscene then flags = flags | P.PLAYER_FLAGS.CUTSCENE end
     if st.aiming then flags = flags | P.PLAYER_FLAGS.AIMING end
     if self.gate.holding ~= nil then flags = flags | P.PLAYER_FLAGS.GATE_WAITING end
+    if self.settings.invincible == true then flags = flags | P.PLAYER_FLAGS.INVINCIBLE end
 
     self:send(P.encode_player({
         time = now,
@@ -1299,6 +1346,29 @@ function Session:partner_target_info(now)
         elsewhere = self:partner_elsewhere(),
         loading = loc ~= nil and (loc.loading == true or loc.playable == false),
     }
+end
+
+-- Invincibility (a testing option): our player is invincible while our Options or the
+-- connected partner's ask for it (game_invincible.lua), also playing alone.
+function Session:update_invincible()
+    local game = self.game
+    if game.set_invincible == nil then return end
+    local mine = self.settings.invincible == true
+    local theirs = self.partner_connected == true and self.partner_state ~= nil
+        and ((self.partner_state.flags or 0) & P.PLAYER_FLAGS.INVINCIBLE) ~= 0
+    local want = mine or theirs
+    if not want and not self.invincible_wanted then return end
+    if want ~= self.invincible_wanted then
+        self.invincible_wanted = want
+        if want then
+            self:add_message(theirs and not mine and "Invincibility on (your partner turned it on)"
+                or "Invincibility on (both players)", "info")
+        else
+            self:add_message("Invincibility off", "info")
+        end
+    end
+    local ok, on = pcall(game.set_invincible, game, want)
+    self.invincible_on = ok and on == true
 end
 
 -- No-pause: while hosting or connected, menus do not freeze the world (see game_pause.lua).
@@ -1419,6 +1489,10 @@ function Session:on_menu(where)
     local now = self.clock()
     self.menu_where, self.menu_time = where, now
     if self.save_sync == nil then return false end
+    -- A game the lobby starts loads the way the lobby says; in the lobby, nothing loads on its
+    -- own (unless the client chose to join the host's game in progress).
+    local lobby = self.lobby
+    if lobby ~= nil and (lobby.start ~= nil or (lobby:is_open() and not lobby.join_running)) then return false end
     local age = self.interp:age(now)
     local partner_in_game = self.partner_state ~= nil and age ~= nil and age < 3.0
     local joining = self.role == "client" and self.partner_connected and self.compatible
@@ -1445,6 +1519,164 @@ function Session:apply_deferred(now)
     end
 end
 
+-------------------------------------------------------------------------------
+-- The lobby (lobby.lua): the "Multijugador" section of the game's main menu, the lobby
+-- screen and the synchronized start
+-------------------------------------------------------------------------------
+
+-- The game's main menu list is up (the lobby can show over it).
+function Session:menu_open()
+    local g = self.game
+    if g == nil or g.menu_status == nil then return false end
+    local ok, st = pcall(g.menu_status, g)
+    return ok and st ~= nil and st.open == true
+end
+
+-- One of our entries was chosen in the game's menu (from the game's own decision call).
+function Session:on_menu_decide(action)
+    local effect = self.lobby:on_menu_decide(action)
+    if effect == "host" then
+        if self.role == "none" then
+            Config.sanitize(self.settings)
+            if not self:host() then
+                self.lobby:close() -- the error is in the messages; back to the section
+            end
+        elseif self.role == "client" then
+            self:add_message("Ya estás unido a una partida: sal de ella antes de crear una sala", "warn")
+            self.lobby:close()
+        else
+            self.lobby:on_connected() -- already hosting: the lobby greets the partner we have
+        end
+    end
+end
+
+-- Client: our game holds the host's world and stands next to the host (or has nothing to take over).
+function Session:lobby_synced()
+    if self.role ~= "client" then return true end
+    if self.join_travel_pending or self.sync_on_join then return false end
+    if self.travel ~= nil and self.travel:busy() then return false end
+    return self.world == nil or self.world_synced or self.world_sync_pending == nil
+end
+
+-- A start the lobby agreed on: start the game here. a = { role, params, slot }
+function Session:run_lobby_action(a, now)
+    if a.kind ~= "start" then return end
+    local g, p, lobby = self.game, a.params, self.lobby
+    local NEW = P.LOBBY_MODE.NEW
+    local ok, why
+    if g.menu_start_new == nil then
+        lobby:start_failed("este juego no tiene menú principal (adaptador)", now)
+        return
+    end
+    self.lobby_chapter_armed = false
+    if a.role == "host" then
+        self.save_sync:set_host_slot(a.slot) -- the co-op file takes this game's saves
+        if p.mode == NEW then
+            ok, why = g:menu_start_new(p.key, p.difficulty)
+        else
+            if p.chapter ~= nil and p.chapter > 0 and self.world ~= nil then
+                self.world:arm_chapter_switch(p.chapter_id) -- the save, in the chapter chosen
+                self.lobby_chapter_armed = true
+            end
+            self.save_sync:request_load(a.slot, now)
+            ok, why = g:menu_continue(a.slot)
+        end
+    else
+        if p.mode == NEW then
+            -- Both games start the same fresh game: there is nothing of the host's to take over.
+            self.join_travel_pending, self.sync_on_join = false, false
+            self.world_synced = true
+            ok, why = g:menu_start_new(p.key, p.difficulty)
+        else
+            -- Our own progress with the host (its co-op slot) in the host's chapter, then the
+            -- usual join: the host's world, next to the host.
+            local slot = self.save_sync:coop_slot()
+            if self.world ~= nil and p.chapter_id ~= nil and p.chapter_id ~= 0 then
+                self.world:arm_chapter_switch(p.chapter_id)
+                self.lobby_chapter_armed = true
+            end
+            if self.world ~= nil then
+                if self.settings.auto_travel ~= false and self.travel ~= nil then
+                    self.join_travel_pending = true
+                else
+                    self.sync_on_join = true
+                end
+            end
+            if g:save_exists(slot) then
+                self.save_sync:request_load(slot, now)
+                ok, why = g:menu_continue(slot)
+            else
+                -- No co-op save yet: a new game in the host's chapter.
+                ok, why = g:menu_start_new(p.key or 1, p.difficulty)
+            end
+        end
+    end
+    if not ok then lobby:start_failed(why or "?", now) end
+end
+
+-- Every game frame: the game's menu entries, our screens' input, the host's co-op files, the
+-- synchronized start and the loadout.
+function Session:update_lobby(now)
+    local lobby, g = self.lobby, self.game
+    if lobby == nil then return end
+    if g.menu_tick then g:menu_tick({ mode = lobby.menu_mode, covered = lobby:covers_menu() }) end
+    if lobby:is_open() then
+        if g.gui_commands and not self.ui_text_active then lobby:push_nav(g:gui_commands()) end
+        if self.role == "host" and lobby:in_lobby() and g.save_slot_info
+            and now - (self.lobby_saves_at or -math.huge) >= LOBBY_SAVES_EVERY then
+            self.lobby_saves_at = now
+            local infos = {}
+            for f = 1, Lobby.FILES do infos[f] = g:save_slot_info(lobby:file_slot(f)) end
+            lobby:set_saves(infos)
+        end
+        if self.weapon_names == nil and g.weapon_name then
+            local names = {}
+            for _, l in ipairs(Lobby.LOADOUTS) do
+                for _, wp in ipairs(l.weapons) do names[wp] = g:weapon_name(wp) end
+            end
+            self.weapon_names = names
+        end
+    end
+    local a = lobby:take_action()
+    while a ~= nil do
+        self:run_lobby_action(a, now)
+        a = lobby:take_action()
+    end
+    if lobby.start == nil then
+        self.lobby_hold = false
+        return
+    end
+    local in_game = self:fresh_local_pos(now) ~= nil
+    local held = self.lobby_hold
+    self.lobby_hold = lobby:tick(now, {
+        connected = self.partner_connected and self.compatible,
+        in_menu = self:menu_open() or (self.menu_time ~= nil and now - self.menu_time < 1.0),
+        in_game = in_game,
+        loading_screen = g.loading_screen ~= nil and g:loading_screen() or false,
+        synced = self:lobby_synced(),
+        continue_pressed = held and self:key_pressed(self.settings.continue_key) or false,
+    })
+    local s = lobby.start
+    if s ~= nil and s.released and self.lobby_chapter_armed and self.world ~= nil then
+        self.lobby_chapter_armed = false
+        self.world:disarm_chapter_switch() -- the load it was for is done
+    end
+    local loc = self.local_loc
+    local playable = in_game and not self.local_cutscene and not self.local_dead
+        and (loc == nil or (not loc.loading and loc.playable ~= false))
+    local loadout = lobby:take_loadout(now, playable)
+    if loadout ~= nil and g.give_loadout then
+        local r, why = g:give_loadout(loadout.weapons, Lobby.AMMO_STACKS)
+        if r == nil then
+            self:add_message("No se pudo dar el equipo inicial: " .. tostring(why), "warn")
+        else
+            local text = ("Equipo %s: %s"):format(loadout.name, #r.given > 0 and table.concat(r.given, ", ") or "nada")
+            if r.full > 0 then text = text .. " (no cupo todo en el maletín)" end
+            self:add_message(text, #r.given > 0 and "good" or "warn")
+        end
+    end
+end
+
 -- Network + game sync. Call once per game frame from a game-thread callback.
 function Session:update()
     local now = self.clock()
@@ -1459,6 +1691,7 @@ function Session:update()
     end
     self:apply_pending_restores()
     self:update_pause()
+    self:update_invincible()
     if self.pause and self.pause.update then self.pause:update(now) end
     local active = self.partner_connected and self.compatible
     local s = self.settings
@@ -1477,6 +1710,9 @@ function Session:update()
     end
     if self.save_sync then self.save_sync:tick(now, self.game, self:can_save_now(now)) end
     perf:stop("update.net", t0)
+    t0 = perf:start()
+    self:update_lobby(now)
+    perf:stop("update.lobby", t0)
     if not active then
         -- Game events from before the partner joined are stale by the time we sync.
         if self.game.take_pickup_events then self.game:take_pickup_events() end

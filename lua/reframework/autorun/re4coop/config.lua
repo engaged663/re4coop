@@ -6,7 +6,7 @@ Config.FILE = "re4coop.json"
 
 -- Bumped when defaults change for safety: settings saved by an older version take the new
 -- default for the keys listed in Config.RESET_ON_UPGRADE.
-Config.VERSION = 12
+Config.VERSION = 14
 
 Config.DEFAULTS = {
     config_version = Config.VERSION,
@@ -31,7 +31,7 @@ Config.DEFAULTS = {
     enemy_anim_lock = true,     -- client: their own animation state machine is switched off (only the host's animation plays)
     enemy_anim_layers = 2,      -- animation layers sent per enemy (1-3)
     enemy_hit_predict = true,   -- client: your hits on them take HP at once (never the last HP: the host decides deaths)
-    enemy_kill_with_hit = true, -- client: an enemy the host's game killed dies here from the same killing hit
+    enemy_kill_with_hit = false, -- client: an enemy the host's game killed dies here from the same killing hit (crashed the client's game)
     enemy_erase = true,         -- enemies dead in the partner's world that only now spawn here never appear (no corpse)
     enemy_spawn_missing = true, -- client: enemies alive in the host's world that our game never spawned are spawned
     enemy_interp_delay = 0.1,   -- client: seconds the host's enemies are shown in the past (smoothness vs. delay)
@@ -43,6 +43,7 @@ Config.DEFAULTS = {
     enemy_partner_grabs = true,  -- they may grab the client's character (the client breaks free in their own game)
     enemy_partner_parry = true,  -- their attacks warn the client too (parry/dodge prompts), and the client's parries stagger them
     enemy_partner_bosses = true, -- bosses that aim at "the player" themselves go for the client when their hate says so
+    invincible = false,          -- testing: no player takes damage or dies (either player turning it on covers both)
     sync_drops = true,        -- every enemy that dies gives each player their own loot roll, also the partner's kills
     sync_animals = true,      -- crows, chickens, fish, bats and rats near the client move as in the host's game
     animal_host_only = true,  -- client: animals the host's game does not report stay where they are
@@ -79,6 +80,16 @@ Config.DEFAULTS = {
     -- saving
     sync_saves = true,          -- a save either game makes (autosave or typewriter) makes the partner's game save too
     coop_save_slot = 20,        -- client: the slot (1-20) its saves with the host go to, its autosaves included
+    coop_host_first_slot = 17,  -- host: its lobby's co-op save files 1-3 are this slot and the next two (17-19)
+
+    -- the lobby in the game's main menu (lobby.lua): "Multijugador" above "Opciones"
+    lobby_menu = true,          -- our entry and section in the game's own main menu (restart the game to change)
+    lobby_file = 1,             -- host: the co-op save file last chosen (1-3)
+    lobby_chapter = 1,          -- host: the chapter a new co-op game last started in (1-16)
+    lobby_difficulty = 20,      -- host: the difficulty last chosen (chainsaw.CampaignManager.Difficulty)
+    lobby_loadout = 1,          -- the loadout last chosen (lobby.lua LOADOUTS)
+    start_sync = true,          -- a lobby game holds each map once loaded until both have loaded
+    start_timeout = 120,        -- seconds a loaded map waits for the partner's at most
 
     -- pauses
     no_pause = true,             -- while hosting or connected, menus and the inventory do not pause the game
@@ -130,7 +141,8 @@ Config.DEFAULTS = {
 -- flag table.) Version 11 (0.10) gave every enemy to the host and made the client a second
 -- player in the host's game. (Gone: enemy_authority - the host's game always runs the enemies.)
 -- Version 12 (0.10.1) made grabs on the client a real grab (the client breaks free), no longer
--- an experiment.
+-- an experiment. Version 13 (0.11) added the lobby (nothing to reset). Version 14 (0.11) turned
+-- enemy_kill_with_hit off: the host's killing hit run on the client's copy crashed its game.
 Config.RESET_ON_UPGRADE = {
     [7] = { "interp_delay", "snapshot_hz", "replay_partner_hits", "sync_cutscenes", "travel_reload", "stage_travel" },
     [8] = { "sync_enemies", "enemy_mirror", "enemy_motion_sync" },
@@ -138,6 +150,7 @@ Config.RESET_ON_UPGRADE = {
     [10] = { "sync_cutscenes", "sync_flags", "sync_triggers" },
     [11] = { "sync_enemies", "enemy_mirror", "enemy_motion_sync", "enemy_anim_lock", "enemy_hit_predict" },
     [12] = { "enemy_partner_grabs" },
+    [14] = { "enemy_kill_with_hit" },
 }
 
 local function copy(t)
@@ -203,6 +216,14 @@ function Config.sanitize(cfg)
     cfg.ashley_key = math.floor(cfg.ashley_key)
     if cfg.ashley_key < 1 or cfg.ashley_key > 254 then cfg.ashley_key = Config.DEFAULTS.ashley_key end
     cfg.ashley_cooldown = math.max(1.0, math.min(60.0, cfg.ashley_cooldown))
+    cfg.coop_host_first_slot = math.max(1, math.min(18, math.floor(cfg.coop_host_first_slot)))
+    cfg.lobby_file = math.max(1, math.min(3, math.floor(cfg.lobby_file)))
+    cfg.lobby_chapter = math.max(1, math.min(16, math.floor(cfg.lobby_chapter)))
+    if cfg.lobby_difficulty ~= 10 and cfg.lobby_difficulty ~= 20 and cfg.lobby_difficulty ~= 30 and cfg.lobby_difficulty ~= 40 then
+        cfg.lobby_difficulty = Config.DEFAULTS.lobby_difficulty
+    end
+    cfg.lobby_loadout = math.max(1, math.min(6, math.floor(cfg.lobby_loadout)))
+    cfg.start_timeout = math.max(30, math.min(600, math.floor(cfg.start_timeout)))
     return cfg
 end
 

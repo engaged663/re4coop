@@ -64,6 +64,10 @@ local ATTACK_DATA = "chainsaw.collision.AttackHitUserData.AttackData"
 -- part its DamageUserData stands for.
 local AD_PREFIX = "AttackData."
 local PART_KEY, SIDE_KEY = "DamageUserData.Parts", "DamageUserData.PartsSide"
+-- The attack's identity (AttackUserData), carried with a hit's values: the game that runs the
+-- hit takes the attack's own data from HitManager's catalog with it (getAttackData), so it does
+-- not need an attack of its own player's as a template (0.10.3, docs/RESEARCH.md 3.28).
+local AU_ID_KEY, AU_HASH_KEY = "AttackUserData._AttackHitDataID", "AttackUserData._KeyNameHash"
 local MAX_ATTACK_CLONES = 32 -- AttackData copies kept per template (one per kind of partner attack)
 local HIT_HOLD = 5.0 -- seconds a DamageInfo we built keeps an engine reference after the hit (Game:hold)
 -- DamageInfo values that only mean something in the game that made them are not copied.
@@ -112,6 +116,9 @@ function M.install(Game, H)
         self.erased_spawns = {} -- uid (or "id:<id>") -> spawn param we invalidated (enemy_erase)
         self.hit_events = {}
         self.fatal_events = {} -- finishers our player started on puppets (game_partner.lua)
+        -- Head/body updater address -> clock until which none of its parts breaks (an enemy whose
+        -- death the partner's game decided; puppets are checked by their own entries).
+        self.no_break = {}
         self.hit_stats = { seen = 0, by_player = 0, other_owner = 0, not_enemy = 0, clamped = 0, applied = 0,
             apply_failed = 0, kills_with_hit = 0, fields = 0, attack_clones = 0, parts_matched = 0,
             kill_decided = 0, deaths_forced = 0 }
@@ -126,6 +133,7 @@ function M.install(Game, H)
         for id in pairs(self.enemy_hidden) do self:park_body(id) end
         self.enemy_ctx, self.enemy_info, self.enemy_by_body = {}, {}, {}
         self.puppets, self.last_hits, self.hit_events, self.fatal_events = {}, {}, {}, {}
+        self.no_break = {}
         self.elim_scan = nil
     end
 
@@ -350,7 +358,10 @@ function M.install(Game, H)
                 end
             end
         end
-        self.puppets[id] = { go = head, upd = upd, drivers = drivers }
+        -- Its updaters' addresses: none of its parts breaks while it is a puppet (no_break_for).
+        local body_upd = self:call(ctx, "get_BodyUpdater")
+        self.puppets[id] = { go = head, upd = upd, drivers = drivers, upd_addr = upd and address_of(upd) or nil,
+            body_addr = body_upd and address_of(body_upd) or nil }
         -- Its finisher checks answer from the host's information (game_partner.lua).
         if upd ~= nil and self.watch_puppet_head ~= nil then self:watch_puppet_head(id, upd) end
         self:cap("enemy_puppet", true, ("head off, %d animation driver(s) off"):format(#drivers))
@@ -691,6 +702,18 @@ function M.install(Game, H)
                 out[#out + 1] = { h = P.hash(SIDE_KEY), t = P.HIT_VALUE.I32, v = tonumber(side) }
             end
         end
+        local au = self:call(info, "get_AttackUserData")
+        if au ~= nil then
+            local okI, aid = pcall(au.get_field, au, "_AttackHitDataID")
+            local okK, key = pcall(au.get_field, au, "_KeyNameHash")
+            if okI and tonumber(aid) ~= nil then
+                out[#out + 1] = { h = P.hash(AU_ID_KEY), t = P.HIT_VALUE.I32, v = math.tointeger(tonumber(aid)) or 0 }
+            end
+            if okK and tonumber(key) ~= nil then
+                out[#out + 1] = { h = P.hash(AU_HASH_KEY), t = P.HIT_VALUE.U32,
+                    v = (math.tointeger(tonumber(key)) or 0) & 0xFFFFFFFF }
+            end
+        end
         local ad = self:call(info, "get_AttackData")
         local ads = ad ~= nil and self:attack_schema() or nil
         if ads ~= nil then
@@ -872,7 +895,12 @@ function M.install(Game, H)
     -- lots for a head burst (lotteryBreakHead) and break the part (onPartsBreak ->
     -- requestPartsBreak -> triggerPartsBreakEffect): run from our replayed killing hit, the
     -- break effect crashed the game in WindManager.attachWindSettingEffect (re4.exe+0x326e37f,
-    -- three times, docs/RESEARCH.md 3.16). Our own player's hits mutilate as always.
+    -- three times, docs/RESEARCH.md 3.16). Nor on an enemy that is not ours to break: a puppet
+    -- (the host's enemy: its parts are the host's game's - our own shots on it break nothing
+    -- here) or an enemy whose death the partner's game decided, for a while after it (its
+    -- death runs over the next frames, after the hit). Our own player's hits on our own enemies
+    -- mutilate as always.
+    local NO_BREAK_AFTER_DEATH = 30.0 -- seconds an enemy killed for the partner's game breaks nothing
     -- { type, method, returns a Boolean }. Never a method whose code is a shared stub
     -- (CharacterHeadUpdater.onPartsBreak is the empty method of tens of thousands of types).
     local MUTILATION_METHODS = {
@@ -906,9 +934,15 @@ function M.install(Game, H)
             if okM and m ~= nil and (fn == nil or (fn ~= stub and not seen[fn])) then
                 if fn ~= nil then seen[fn] = true end
                 local returns_bool, skipped = spec[3], false
-                if pcall(Guard.hook, m, function()
+                if pcall(Guard.hook, m, function(args)
                     skipped = false
-                    if game.replaying and game.settings.enemy_replay_mutilation ~= true then
+                    if game.settings.enemy_replay_mutilation == true then return end
+                    local not_ours = game.replaying
+                    if not not_ours then
+                        local okA, a = pcall(sdk.to_int64, args[2])
+                        not_ours = okA and game:no_break_for(a)
+                    end
+                    if not_ours then
                         skipped = true
                         game.hit_stats.mutilations_skipped = (game.hit_stats.mutilations_skipped or 0) + 1
                         return sdk.PreHookResult.SKIP_ORIGINAL
@@ -922,6 +956,42 @@ function M.install(Game, H)
             end
         end
         self:cap("no_mutilation", hooked > 0, ("%d parts-break method(s) guarded on replayed hits"):format(hooked))
+    end
+
+    -- The addresses of enemy `id`'s head and body updaters (its parts-break methods run on them).
+    function Game:enemy_updater_addrs(id)
+        local ctx = self.enemy_ctx[id]
+        local out = {}
+        if ctx == nil then return out end
+        for _, getter in ipairs({ "get_HeadUpdater", "get_BodyUpdater" }) do
+            local u = self:call(ctx, getter)
+            local a = u and address_of(u)
+            if a ~= nil then out[#out + 1] = a end
+        end
+        return out
+    end
+
+    -- None of enemy `id`'s parts breaks for `seconds` (its death was the partner's game's).
+    function Game:no_break_mark(id, seconds)
+        local till = self.clock() + (seconds or NO_BREAK_AFTER_DEATH)
+        for _, a in ipairs(self:enemy_updater_addrs(id)) do
+            if (self.no_break[a] or -math.huge) < till then self.no_break[a] = till end
+        end
+    end
+
+    -- Whether the head/body updater at address `addr` must not break parts now: a puppet's, or
+    -- one marked by no_break_mark (marks expire: updaters are pooled and serve other enemies).
+    function Game:no_break_for(addr)
+        if addr == nil or addr == 0 then return false end
+        local till = self.no_break[addr]
+        if till ~= nil then
+            if till >= self.clock() then return true end
+            self.no_break[addr] = nil
+        end
+        for _, p in pairs(self.puppets) do
+            if p.upd_addr == addr or p.body_addr == addr then return true end
+        end
+        return false
     end
 
     -- Hits the local player landed on enemies since the last call:
@@ -1100,33 +1170,60 @@ function M.install(Game, H)
         end)()))
     end
 
-    -- One of the enemy's own damage colliders (its HitController's Colliders) and its
-    -- DamageUserData: the one of body part `part` (and side `side`) the shooter hit - the part
-    -- takes the hit's Break damage and picks the reaction (a head shot staggers, a knee shot
-    -- drops to the knee) - else the chest, else the first: collider, user data, matched | nil.
-    function Game:enemy_damage_collider(info, part, side)
-        local hc = info.body and self:get_component(info.body, "chainsaw.HitController")
+    -- The colliders of a HitController that carry damage data, as { {collidable, DamageUserData,
+    -- active}, ... }: those of its Colliders and those of its RequestSetCollider - where enemies
+    -- and the player keep their body's hit shapes (EnemyDamageUserData, PlayerDamageUserData:
+    -- RequestSetColliderUserData): the RequestSetCollider's request sets, each with its
+    -- collidables (getCollidableFromIndex), each collidable with its own user data, else the
+    -- request set's. `active`: false for a request set that is not registered now (Leon's
+    -- ArmorDamage or KidnappedDamage next to his Damage set).
+    function Game:damage_collidables(hc)
+        local out = {}
+        local function take(col, ud, active)
+            local tname = ud and self:still_valid(ud) and type_name_of(ud) or nil
+            if tname ~= nil and tname:find("DamageUserData", 1, true) then out[#out + 1] = { col, ud, active } end
+        end
         local cols = hc and self:call(hc, "get_Colliders")
         local n = cols and tonumber(self:call(cols, "getCollidersCount")) or 0
-        local best, best_score = nil, -1
         for i = 0, math.min(n, 128) - 1 do
             local col = self:call(cols, "getColliders", i)
-            local ud = col and self:call(col, "get_UserData")
-            local tname = ud and self:still_valid(ud) and type_name_of(ud) or nil
-            if tname ~= nil and tname:find("DamageUserData", 1, true) then
-                local okP, parts = pcall(ud.get_field, ud, "Parts")
-                local okS, s = pcall(ud.get_field, ud, "PartsSide")
-                parts = okP and tonumber(parts) or nil
-                s = okS and tonumber(s) or nil
-                local score = 0
-                if part ~= nil and parts == part then
-                    score = (side == nil or s == side) and 4 or 3
-                elseif parts == CHEST then
-                    score = 2
-                end
-                if score > best_score then best, best_score = { col, ud }, score end
-                if score == 4 then break end
+            take(col, col and self:call(col, "get_UserData"), true)
+        end
+        local rsc = hc and self:call(hc, "get_RequestSetCollider")
+        local sets = rsc and tonumber(self:call(rsc, "get_NumRequestSets")) or 0
+        for i = 0, math.min(sets, 64) - 1 do
+            local set_ud = self:call(rsc, "getRequestSetUserDataFromIndex(System.UInt32)", i)
+            local m = tonumber(self:call(rsc, "getNumCollidablesFromIndex(System.UInt32)", i)) or 0
+            local active = m > 0 and self:call(rsc, "isRegisteredRequestSetFromIndex(System.UInt32)", i) ~= false
+            for j = 0, math.min(m, 64) - 1 do
+                local col = self:call(rsc, "getCollidableFromIndex(System.UInt32, System.UInt32)", i, j)
+                if col ~= nil then take(col, self:call(col, "get_UserData") or set_ud, active) end
             end
+        end
+        return out
+    end
+
+    -- One of the enemy's own damage colliders and its DamageUserData: the one of body part
+    -- `part` (and side `side`) the shooter hit - the part takes the hit's Break damage and picks
+    -- the reaction (a head shot staggers, a knee shot drops to the knee) - else the chest, else
+    -- the first: collider, user data, matched | nil.
+    function Game:enemy_damage_collider(info, part, side)
+        local hc = info.body and self:get_component(info.body, "chainsaw.HitController")
+        local best, best_score = nil, -1
+        for _, c in ipairs(self:damage_collidables(hc)) do
+            local ud = c[2]
+            local okP, parts = pcall(ud.get_field, ud, "Parts")
+            local okS, s = pcall(ud.get_field, ud, "PartsSide")
+            parts = okP and tonumber(parts) or nil
+            s = okS and tonumber(s) or nil
+            local score = 0
+            if part ~= nil and parts == part then
+                score = (side == nil or s == side) and 4 or 3
+            elseif parts == CHEST then
+                score = 2
+            end
+            if score > best_score then best, best_score = c, score end
+            if score == 4 then break end
         end
         if best == nil then return nil, nil, false end
         return best[1], best[2], best_score >= 3
@@ -1144,14 +1241,12 @@ function M.install(Game, H)
         d = self:hold(d, HIT_HOLD) -- the game frees an unreferenced DamageInfo mid-hit (see Game:hold)
         self:write_damage_fields(d, fields)
         if not self:sanitize_damage_info(d, info.body, by) then return nil end
-        local weapon = tonumber(self:call(d, "get_WeaponID"))
-        local tpl = self:hit_template(weapon)
-        if tpl == nil then
+        local au, ad = self:hit_attack(d, fields)
+        if au == nil or ad == nil then
             self.hit_stats.no_template = (self.hit_stats.no_template or 0) + 1
             return nil
         end
-        local ad = self:attack_data_for(tpl, fields)
-        if not (pcall(d.call, d, "set_AttackUserData", tpl.au) and pcall(d.call, d, "set_AttackData", ad)) then
+        if not (pcall(d.call, d, "set_AttackUserData", au) and pcall(d.call, d, "set_AttackData", ad)) then
             return nil
         end
         if self:call(d, "get_AttackUserData") == nil or self:call(d, "get_AttackData") == nil then return nil end
@@ -1169,6 +1264,30 @@ function M.install(Game, H)
             return nil
         end
         return d
+    end
+
+    -- The AttackUserData and AttackData a hit we build carries: the attack's own data from
+    -- HitManager's catalog by the identity the shooter sent (the same data in both games), with
+    -- an AttackUserData of that identity; else a template of our player's (or another
+    -- character's) hits, carrying the shooter's attack values. nil, nil without either.
+    function Game:hit_attack(d, fields)
+        local weapon = tonumber(self:call(d, "get_WeaponID"))
+        local tpl = self:hit_template(weapon)
+        local aid, key = value_of(fields, AU_ID_KEY), value_of(fields, AU_HASH_KEY)
+        if aid ~= nil and aid >= 0 then
+            local hm = singleton("chainsaw.HitManager")
+            local cad = hm and self:call(hm, "getAttackData", aid, key or 0)
+            if cad ~= nil and self:still_valid(cad, ATTACK_DATA) then
+                local au = tpl and tpl.au
+                if au == nil and self.attack_user_data ~= nil then au = self:attack_user_data(aid, key or 0) end
+                if au ~= nil then
+                    self.hit_stats.catalog_attacks = (self.hit_stats.catalog_attacks or 0) + 1
+                    return au, cad
+                end
+            end
+        end
+        if tpl == nil then return nil, nil end
+        return tpl.au, self:attack_data_for(tpl, fields)
     end
 
     -- Runs a hit through the enemy's HitController (our own hook does not report it).
@@ -1218,6 +1337,7 @@ function M.install(Game, H)
             self.hit_stats.kill_decided = self.hit_stats.kill_decided + 1
         end
         self.perf:crumb("enemy.apply_hit", info.kind, "now")
+        if kill == true then self:no_break_mark(id, NO_BREAK_AFTER_DEATH) end -- the partner's kill
         local ok = self:run_hit(id, d)
         if ok then
             self.last_hits[id] = hit.fields
@@ -1243,8 +1363,14 @@ function M.install(Game, H)
         local hp = ctx and self:call(ctx, "get_HitPoint")
         if hp == nil then return false end
         self.perf:crumb("enemy.kill", info.kind, "now")
+        -- Its death runs over the next frames (a head-burst draw, the body thrown): nothing of it
+        -- breaks here, also once it is no longer a puppet.
+        self:no_break_mark(id, NO_BREAK_AFTER_DEATH)
         self:restore_puppet(id) -- its death needs its AI and animation driver
-        if self.settings.enemy_kill_with_hit ~= false then
+        -- With the partner's killing hit (enemy_kill_with_hit): its direction and kind of death.
+        -- Off by default since 0.11: run on a copy that was a puppet until this frame it crashed
+        -- the client's game (HitController.updateAttack, docs/RESEARCH.md 3.32).
+        if self.settings.enemy_kill_with_hit == true then
             -- Without the partner's values: a plain killing hit, from in front of it.
             local plain = fields == nil or #fields == 0
             local d = self:build_hit(info, plain and {} or fields, by or "partner")

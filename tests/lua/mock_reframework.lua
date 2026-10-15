@@ -331,6 +331,10 @@ end
 function typed_methods:get_elements()
     local out = {}
     for i = 1, rawget(self, "__size") do out[i] = self:get_element(i - 1) end
+    -- REFramework hands get_elements' C++ vector to Lua as a sol2 container (userdata), not a
+    -- table: with M.elements_container set, code that needs a table must use get_size /
+    -- get_element (0.11.0's menu read every array as empty).
+    if M.elements_container then return function() return out end end
     return out
 end
 function typed_methods:get_address() return rawget(self, "__addr") end
@@ -414,6 +418,28 @@ M.PREFAB = {
 
 -- The player's grab state (PlayerBaseContext.get_IsInGrappleDamage) and the way out of a grab
 -- (PlayerBodyUpdater.set_RequestCancelGrappleAction): their classes exist once install ends.
+-- The player's deaths without a hit (PlayerHeadUpdater.requestDead / onDead) and game overs
+-- (GameOverMediator.requestGameOver): recorded in world.player_deaths / world.game_overs.
+local function install_player_deaths()
+    local w = M.world
+    local ph = classes["chainsaw.PlayerHeadUpdater"]
+    for name, n in pairs({ requestDead = 2, onDead = 1 }) do
+        ph.methods[name] = make_method(name, n, function(self, a)
+            w.player_deaths = w.player_deaths or {}
+            w.player_deaths[#w.player_deaths + 1] = { head = self, via = name, arg = a }
+        end)
+        ph.method_order[#ph.method_order + 1] = name
+    end
+    if classes["chainsaw.GameOverMediator"] == nil then -- (a world mock has its own)
+        class("chainsaw.GameOverMediator", "System.Object", {
+            requestGameOver = { 1, function(_, req)
+                w.game_overs = w.game_overs or {}
+                w.game_overs[#w.game_overs + 1] = req
+            end, { "chainsaw.GameOverRequest" } },
+        })
+    end
+end
+
 local function install_player_grab()
     local pbc = classes["chainsaw.PlayerBaseContext"]
     pbc.methods.get_IsInGrappleDamage = make_method("get_IsInGrappleDamage", 0, function(self) return self.grabbed == true end,
@@ -716,6 +742,11 @@ function M.install(opts)
     -- NoDamage (HitPoint +0x19): the character takes no damage.
     hp_methods.get_NoDamage = { 0, function(self) return self.owner.no_damage == true end, {}, { ret = "System.Boolean" } }
     hp_methods.set_NoDamage = { 1, function(self, v) self.owner.no_damage = v end, { "System.Boolean" } }
+    -- Invincible (+0x18), NoDeath (+0x1a), Immortal (+0x1b).
+    for name, key in pairs({ Invincible = "invincible", NoDeath = "no_death", Immortal = "immortal" }) do
+        hp_methods["get_" .. name] = { 0, function(self) return self.owner[key] == true end, {}, { ret = "System.Boolean" } }
+        hp_methods["set_" .. name] = { 1, function(self, v) self.owner[key] = v end, { "System.Boolean" } }
+    end
     hp_methods.checkDead = { 1, function(self, d)
         local c = self.owner
         if c.no_damage or c.immortal or c.no_death or c.hp <= 0 then return false end
@@ -781,7 +812,11 @@ function M.install(opts)
         { Parts = "chainsaw.character.BodyParts", PartsSide = "chainsaw.character.BodyPartsSide" })
     class("chainsaw.collision.EnemyDamageUserData", "chainsaw.collision.DamageUserData", {},
         { Parts = "chainsaw.character.BodyParts", PartsSide = "chainsaw.character.BodyPartsSide" })
+    class("chainsaw.collision.PlayerDamageUserData", "chainsaw.collision.DamageUserData", {},
+        { Parts = "chainsaw.character.BodyParts", PartsSide = "chainsaw.character.BodyPartsSide" })
     class("chainsaw.collision.PressUserData", "System.Object", {})
+    class("via.physics.UserData", "System.Object", {})
+    class("via.physics.RequestSetColliderUserData", "via.physics.UserData", {})
     -- A character's colliders (HitController.get_Colliders): each with its user data.
     class("via.physics.Collider", "System.Object", {
         get_UserData = { 0, function(self) return self.user_data end },
@@ -897,8 +932,9 @@ function M.install(opts)
                 end
                 world.ragdoll_parts = info.data.DamageUserData.__fields.Parts
                 -- A villager's death draws lots for a head burst (Ch1c0HeadUpdaterCommon.onDead ->
-                -- lotteryBreakHead -> onPartsBreak -> Ch1c0BodyUpdaterCommon.requestPartsBreak).
-                local hu = M.new("chainsaw.Ch1c0HeadUpdaterCommon", { body = M.new("chainsaw.Ch1c0BodyUpdaterCommon") })
+                -- lotteryBreakHead -> onPartsBreak -> Ch1c0BodyUpdaterCommon.requestPartsBreak), on
+                -- its own head and body updaters.
+                local hu = M.villager_head(ctx)
                 local burst = hu:call("lotteryBreakHead", info)
                 if burst == true or (type(burst) == "number" and burst ~= 0) then
                     hu:call("onPartsBreak", info, 0, 0)
@@ -915,7 +951,7 @@ function M.install(opts)
                 attack_type = info.data.AttackType, hit_pos = info.data.HitPos, serial = info.data.SerialNo,
                 reaction_type = ad and ad.__fields._AttackType, reaction_power = ad and ad.__fields._AttackPower,
                 attack_data = ad, part = du and du.__fields.Parts, side = du and du.__fields.PartsSide,
-                pos = info.data.Position, dir = info.data.DamageDir }
+                user_data = du, pos = info.data.Position, dir = info.data.DamageDir }
             self.received = self.received or {}
             self.received[#self.received + 1] = rec
             if M.deferred_damage then
@@ -1535,6 +1571,7 @@ function M.install(opts)
     }
 
     M.files = {}
+    M.elements_container = opts.elements_container == true
     _G.json = {
         load_file = function(name) return M.files[name] end,
         dump_file = function(name, t) M.files[name] = t return true end,
@@ -1588,6 +1625,7 @@ function M.install(opts)
         color_edit = function(_, v) return false, v end,
     }
     install_player_grab()
+    install_player_deaths()
     return world
 end
 
@@ -1767,14 +1805,109 @@ function M.install_partner(world)
         ["isTrigger(System.UInt32)"] = { 1, function(self, h) return (self.pressed or {})[h] == true end,
             { "System.UInt32" }, { ret = "System.Boolean" } },
     })
+    -- via.physics.RequestSetCollider: request sets, each with its collidables, registered (in
+    -- the physics world while the component is on) or not. set = { id, cols, user_data,
+    -- registered }.
+    local function set_by_id(rsc, id)
+        for _, set in ipairs(rsc.sets or {}) do
+            if (set.id or 0) == id then return set end
+        end
+        return nil
+    end
+    class("via.physics.RequestSetCollider.RequestSetGroup", "System.Object", {
+        ["getRequestSetIdFromIndex(System.UInt32)"] = { 1, function(self, i)
+            local set = (self.rsc.sets or {})[i + 1]
+            return set and (set.id or i) or 0
+        end, { "System.UInt32" }, { ret = "System.UInt32" } },
+    })
+    class("via.physics.RequestSetCollider", "via.Component", {
+        ["getRequestSetGroups(System.UInt32)"] = { 1, function(self, i)
+            if i ~= 0 then return nil end
+            self.group = self.group or M.new("via.physics.RequestSetCollider.RequestSetGroup", { rsc = self })
+            return self.group
+        end, { "System.UInt32" } },
+        ["isRegisteredRequestSetFromIndex(System.UInt32)"] = { 1, function(self, i)
+            local set = (self.sets or {})[i + 1]
+            return set ~= nil and set.registered ~= false
+        end, { "System.UInt32" }, { ret = "System.Boolean" } },
+        ["registerRequestSet(System.UInt32)"] = { 1, function(self, id)
+            local set = set_by_id(self, id)
+            if set then set.registered = true end
+        end, { "System.UInt32" } },
+        ["unregisterRequestSet(System.UInt32)"] = { 1, function(self, id)
+            local set = set_by_id(self, id)
+            if set then set.registered = false end
+        end, { "System.UInt32" } },
+        get_NumRequestSets = { 0, function(self) return #(self.sets or {}) end, {}, { ret = "System.UInt32" } },
+        ["getRequestSetUserDataFromIndex(System.UInt32)"] = { 1, function(self, i)
+            local set = (self.sets or {})[i + 1]
+            return set and set.user_data
+        end, { "System.UInt32" } },
+        ["getNumCollidablesFromIndex(System.UInt32)"] = { 1, function(self, i)
+            local set = (self.sets or {})[i + 1]
+            return set and #set.cols or 0
+        end, { "System.UInt32" }, { ret = "System.UInt32" } },
+        ["getCollidableFromIndex(System.UInt32, System.UInt32)"] = { 2, function(self, i, j)
+            local set = (self.sets or {})[i + 1]
+            return set and set.cols[j + 1]
+        end, { "System.UInt32", "System.UInt32" } },
+    })
+    hc_cls.methods.get_RequestSetCollider = make_method("get_RequestSetCollider", 0, function(self) return self.request_set end)
+    hc_cls.method_order[#hc_cls.method_order + 1] = "get_RequestSetCollider"
     class("chainsaw.collision.GrappleUserData", "chainsaw.collision.AttackUserData", {},
         { _GrapplePriority = "chainsaw.collision.AttackPriority" })
+end
+
+-- Moves enemy `ctx`'s damage colliders from its HitController's Colliders into a
+-- RequestSetCollider, where the game's enemies keep them (EnemyDamageUserData is a
+-- RequestSetColliderUserData): request sets of `per_set` collidables each.
+function M.colliders_in_request_sets(ctx, per_set)
+    local hc = M.component(ctx.body, "chainsaw.HitController")
+    local cols = hc.colliders and hc.colliders.list or {}
+    local sets, cur = {}, nil
+    for _, c in ipairs(cols) do
+        if cur == nil or #cur.cols >= (per_set or 2) then
+            cur = { cols = {}, user_data = M.new("chainsaw.collision.PressUserData") }
+            sets[#sets + 1] = cur
+        end
+        cur.cols[#cur.cols + 1] = c
+    end
+    hc.request_set = M.new("via.physics.RequestSetCollider", { sets = sets })
+    hc.colliders = M.new("via.physics.Colliders", { list = {} })
+    return hc.request_set
 end
 
 -- Enemy `ctx`'s body updater (chainsaw.EnemyBodyUpdater, CharacterContext.get_BodyUpdater).
 function M.enemy_body_updater(ctx)
     if ctx.body_updater == nil then ctx.body_updater = M.add_component(ctx.body, "chainsaw.EnemyBodyUpdater", { ctx = ctx }) end
     return ctx.body_updater
+end
+
+-- Enemy `ctx`'s head and body updaters seen as a villager's (Ch1c0HeadUpdaterCommon,
+-- Ch1c0BodyUpdaterCommon): the same objects - same addresses - as get_HeadUpdater /
+-- get_BodyUpdater give, where the parts-break methods run.
+function M.villager_head(ctx)
+    if ctx.villager_head ~= nil then return ctx.villager_head end
+    local body = new("chainsaw.Ch1c0BodyUpdaterCommon")
+    if ctx.body ~= nil then body.__addr = M.enemy_body_updater(ctx).__addr end
+    local hu = new("chainsaw.Ch1c0HeadUpdaterCommon", { body = body })
+    if ctx.head_updater ~= nil then hu.__addr = ctx.head_updater.__addr end
+    ctx.villager_head = hu
+    return hu
+end
+
+-- The game runs `enemy`'s death over the next frames (its AI's death action, after the hit or
+-- entryDeadAction): a villager draws lots for a head burst then too, with the death's own
+-- (engine-owned) damage. Returns whether a part broke.
+function M.death_frame(enemy)
+    if enemy.dying == nil then return false end
+    local hu = M.villager_head(enemy)
+    local info = new("chainsaw.HitController.DamageInfo", { data = { Damage = 0 } })
+    info.engine_owned = true
+    local before = M.world.parts_broken
+    local burst = hu:call("lotteryBreakHead", info)
+    if burst == true or (type(burst) == "number" and burst ~= 0) then hu:call("onPartsBreak", info, 0, 0) end
+    return M.world.parts_broken > before
 end
 
 -- An attack's warning (EnemyActionSignInfo). opts: { sign, button, just, act, distance }
@@ -1785,11 +1918,51 @@ function M.sign_info(opts)
         _TargetAngleCheck = false, _Distance = opts.distance or 3 } })
 end
 
+-- The first DamageUserData of HitController `hc`: of its Colliders, else of its
+-- RequestSetCollider's registered request sets.
+function M.first_damage_ud(hc)
+    local function is_damage(ud) return ud ~= nil and ud.__type:find("DamageUserData", 1, true) ~= nil end
+    for _, c in ipairs(hc and hc.colliders and hc.colliders.list or {}) do
+        if is_damage(c.user_data) then return c.user_data end
+    end
+    for _, set in ipairs(hc and hc.request_set and hc.request_set.sets or {}) do
+        if set.registered ~= false then
+            for _, c in ipairs(set.cols) do
+                if is_damage(c.user_data) then return c.user_data end
+            end
+        end
+    end
+    return nil
+end
+
+-- Leon's colliders as ch0a0z0_body.pfb and ch0a0z0.rcol build them, on `body`: a
+-- via.physics.Colliders with one sphere without damage data, and a RequestSetCollider whose
+-- request sets hold his body's shapes - Damage (head, chest: PlayerDamageUserData), Press,
+-- Target, a kick (AttackUserData, not registered) and ArmorDamage (not registered).
+-- Returns the Colliders and the RequestSetCollider.
+function M.leon_colliders(body)
+    local function col(ud) return M.new("via.physics.Collider", { user_data = ud }) end
+    local function damage(part) return col(M.new("chainsaw.collision.PlayerDamageUserData",
+        { __fields = { Parts = part, PartsSide = 0 } })) end
+    local function set_ud() return M.new("via.physics.RequestSetColliderUserData") end
+    local cols = M.add_component(body, "via.physics.Colliders", { list = { col(M.new("via.physics.UserData")) } })
+    local rsc = M.add_component(body, "via.physics.RequestSetCollider", { sets = {
+        { id = 0, name = "Damage", registered = true, user_data = set_ud(), cols = { damage(1), damage(0) } },
+        { id = 1, name = "Press", registered = true, user_data = set_ud(),
+            cols = { col(M.new("chainsaw.collision.PressUserData")) } },
+        { id = 2, name = "Target", registered = true, user_data = set_ud(), cols = { col(M.new("via.physics.UserData")) } },
+        { id = 5, name = "NormalKick", registered = false, user_data = set_ud(),
+            cols = { col(M.new("chainsaw.collision.AttackUserData")) } },
+        { id = 18, name = "ArmorDamage", registered = false, user_data = set_ud(), cols = { damage(1), damage(0) } },
+    } })
+    return cols, rsc
+end
+
 -- A contact of `attacker_hc`'s attack on `go`'s first damage collider, the way the engine
 -- reports it (HitController.poolDamage, hooks around it). Returns whether it was pooled.
 function M.contact(attacker_hc, go)
     local hc = M.world.hit_controllers[go] or M.component(go, "chainsaw.HitController")
-    local du = hc and hc.colliders and hc.colliders.list[1] and hc.colliders.list[1].user_data
+    local du = M.first_damage_ud(hc)
     local before = #(M.world.pooled or {})
     attacker_hc:call("poolDamage", nil, M.new("chainsaw.collision.AttackUserData"), du, false)
     return #(M.world.pooled or {}) > before
@@ -1806,8 +1979,8 @@ function M.damage_colliders(type_name)
 end
 
 -- A HitController as the game constructs it (its Delegates and DamageCalcInfo exist).
-function M.add_hit_controller(go, ctx, cols)
-    return M.add_component(go, "chainsaw.HitController", { ctx = ctx, colliders = cols, __fields = {
+function M.add_hit_controller(go, ctx, cols, request_set)
+    return M.add_component(go, "chainsaw.HitController", { ctx = ctx, colliders = cols, request_set = request_set, __fields = {
         ["<Delegate>k__BackingField"] = M.new("chainsaw.HitController.Delegates"),
         ["<DamageCalcInfo>k__BackingField"] = M.new("chainsaw.HitController.DamageInfo") } })
 end
@@ -1834,7 +2007,7 @@ function M.enemy_attack(enemy, go, damage, opts)
         _AttackHitDataID = opts.attack_id or 1100, _KeyNameHash = opts.key or 0xABC } })
     local ad = M.new("chainsaw.collision.AttackHitUserData.AttackData", { __fields = { _AttackType = 4, _AttackPower = 1,
         _Option = opts.option or 0 } })
-    local du = damaged.colliders and damaged.colliders.list[1] and damaged.colliders.list[1].user_data or nil
+    local du = M.first_damage_ud(damaged)
     local owner = opts.owner or enemy.body
     local info = M.new("chainsaw.HitController.DamageInfo", { data = { Damage = damage, Wince = 20, Break = 0,
         Stopping = 0, DamageDir = M.vec(1, 0, 0), Position = M.vec(0, 1, 0), WeaponID = 0, IsCritical = false,
@@ -2361,7 +2534,7 @@ function M.make_player(pos, opts)
     -- What enemies see (a TargetMarker filed under the body's tag) and hit (its damage colliders).
     body.tag = "Player|Character"
     ctx.marker = M.add_component(body, "chainsaw.TargetMarker", { registrations = 1 })
-    ctx.hit_controller = M.add_hit_controller(body, ctx, M.damage_colliders())
+    ctx.hit_controller = M.add_hit_controller(body, ctx, M.leon_colliders(body))
     -- A recognisable animated pose: every joint turned a little around a different axis.
     for i, j in ipairs(body.transform.joints) do
         local a = 0.05 * i
@@ -2380,18 +2553,14 @@ function M.build_body_prefab(pos, name)
     M.add_component(body, "via.motion.Motion", { locked = M.motion_locked })
     M.add_component(body, "via.motion.MotionFsm2")
     M.add_component(body, "via.behaviortree.BehaviorTree")
-    M.add_component(body, "via.physics.Colliders")
     M.add_component(body, "chainsaw.CharacterBodyLogic")
     M.add_component(body, "chainsaw.WwiseContainerApp")
     M.add_component(body, "via.motion.Chain")
     -- What makes it a character once the mod gives it a context (game_partner.lua): its body
-    -- updater, its HitController (constructed: Delegates and DamageCalcInfo) and its damage
-    -- colliders (a component of their own, next to the other colliders).
+    -- updater, its HitController (constructed: Delegates and DamageCalcInfo) and its colliders:
+    -- the damage shapes in its RequestSetCollider, as Leon's (M.leon_colliders).
     M.add_component(body, "chainsaw.PlayerBodyUpdater")
-    local cols = M.damage_colliders()
-    cols.owner = body
-    body.components[#body.components + 1] = cols
-    M.add_hit_controller(body, nil, cols)
+    M.add_hit_controller(body, nil, M.leon_colliders(body))
     M.child(body, "cha000_00", { mesh = M.MESH.body, mdf = M.MDF.body, same_joints = true })
     M.child(body, "cha002_00", { mesh = M.MESH.jacket, mdf = M.MDF.jacket, same_joints = true })
     return body
@@ -2513,7 +2682,8 @@ function M.hit(enemy, damage, wince, attacker, opts)
         Damage = damage, Wince = wince or 10, Break = 0, Stopping = 0, DamageDir = vec(0, 0, -1),
         AttackOwnerObject = owner, AttackGameObject = owner or M.make_go("shot"), WeaponID = weapon, IsCritical = false,
         IsKill = hc:call("checkKill", damage), AttackType = 0, HitPos = vec(0, 1.6, 0), SerialNo = 777,
-        AttackUserData = new("chainsaw.collision.AttackUserData", { weapon = weapon }),
+        AttackUserData = new("chainsaw.collision.AttackUserData", { weapon = weapon,
+            __fields = { _AttackHitDataID = 2000 + weapon % 1000, _KeyNameHash = 0x5EED } }),
         AttackData = new("chainsaw.collision.AttackHitUserData.AttackData", { weapon = weapon, __fields = {
             _AttackType = opts.attack_type or 1, _AttackPower = opts.power or 2, _Option = 0, _Damage = damage,
             _Wince = wince or 10 } }),

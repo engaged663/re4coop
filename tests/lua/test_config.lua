@@ -142,6 +142,20 @@ T.run("unsafe_defaults_of_older_versions_are_reset_once", function()
     T.eq(Config.load(json).sync_cutscenes, false, "the player's own choice sticks")
 end)
 
+T.run("a_0_11_config_drops_the_partners_killing_hit_once", function()
+    -- Version 13 had enemy_kill_with_hit on: run on the client's copy, the host's killing hit
+    -- crashed the client's game (docs/RESEARCH.md 3.32).
+    local files = { [Config.FILE] = { config_version = 13, enemy_kill_with_hit = true, lobby_loadout = 5 } }
+    local json = fake_json(files)
+    local cfg = Config.load(json)
+    T.eq(cfg.enemy_kill_with_hit, false, "off")
+    T.eq(cfg.lobby_loadout, 5, "other choices kept")
+    T.eq(cfg.config_version, Config.VERSION, "upgraded")
+    cfg.enemy_kill_with_hit = true
+    Config.save(json, cfg)
+    T.eq(Config.load(json).enemy_kill_with_hit, true, "switched on again by the player: kept")
+end)
+
 T.run("a_0_9_0_config_gets_cutscenes_and_events_for_both_once", function()
     -- 0.9.0 kept cutscene replay experimental (off) and had no event triggers.
     local files = { [Config.FILE] = { config_version = 9, sync_cutscenes = false, sync_flags = false,
@@ -190,7 +204,7 @@ end)
 
 T.run("experimental_features_are_off_by_default", function()
     local cfg = Config.load(fake_json({}))
-    for _, k in ipairs({ "travel_reload", "stage_travel", "exp_force_routine" }) do
+    for _, k in ipairs({ "travel_reload", "stage_travel", "exp_force_routine", "invincible" }) do
         T.eq(cfg[k], false, k)
     end
     T.eq(cfg.sync_cutscenes, true, "cutscenes play for both")

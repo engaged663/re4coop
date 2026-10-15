@@ -679,6 +679,87 @@ T.run("a_partners_hit_runs_through_the_games_hit_code", function()
     T.check(not game:enemy_apply_hit(id, { damage = 5, fields = {} }), "nothing to run without values")
 end)
 
+T.run("a_partners_hit_finds_an_enemys_damage_colliders_in_its_request_sets", function()
+    -- 0.10.2 in the game: the client's shots on the host's enemies took HP but got no reaction,
+    -- and some left an enemy alive at no HP. A Ganado keeps its hit shapes in its
+    -- HitController's RequestSetCollider (EnemyDamageUserData is a RequestSetColliderUserData),
+    -- not in its Colliders: no damage data was found, the hit could not be run through the
+    -- game's hit code and fell back to taking HP alone (no_damage_data).
+    local game, world = fresh_game()
+    game:set_active(true)
+    game:read_player_state()
+    local list = game:list_enemies()
+    local e2 = world.enemies[2]
+    local id = list[2].id
+    mock.hit(world.enemies[1], 10, 5)
+    local fields = game:take_hit_events()[1].fields
+    mock.colliders_in_request_sets(e2, 2)
+    for _, f in ipairs(fields) do
+        if f.h == P.hash("Damage") then f.v = 40 end
+        if f.h == P.hash("Wince") then f.v = 30 end
+        if f.h == P.hash("DamageUserData.Parts") then f.v = 7 end
+        if f.h == P.hash("DamageUserData.PartsSide") then f.v = 2 end
+    end
+    T.check(game:enemy_apply_hit(id, { damage = 40, fields = fields }), "run")
+    local r = mock.component(e2.body, "chainsaw.HitController").received[1]
+    T.eq(r and r.wince, 30, "with its reaction")
+    T.eq(r and r.part, 7, "on the body part the shooter hit")
+    T.eq(r and r.side, 2, "and its side")
+    T.eq(e2.hp, 260, "the HP the game's own hit code took")
+    T.eq(game.hit_stats.no_damage_data or 0, 0, "damage data found")
+end)
+
+T.run("a_partners_hit_runs_before_our_player_ever_hit_anything", function()
+    -- The host's player had not shot yet: no attack data of its own to run the client's hit
+    -- with. The hit carries its attack's identity; the attack's own data comes from
+    -- HitManager's catalog (getAttackData).
+    local game, world = fresh_game()
+    game:set_active(true)
+    game:read_player_state()
+    local list = game:list_enemies()
+    local e2 = world.enemies[2]
+    local id = list[2].id
+    local ad = mock.new("chainsaw.collision.AttackHitUserData.AttackData", { __fields = { _AttackType = 4,
+        _AttackPower = 2, _Option = 0 } })
+    world.attack_catalog["3001:" .. tostring(0xBEEF)] = ad
+    local fields = {
+        { h = P.hash("Damage"), t = P.HIT_VALUE.I32, v = 70 },
+        { h = P.hash("Wince"), t = P.HIT_VALUE.F32, v = 40 },
+        { h = P.hash("DamageUserData.Parts"), t = P.HIT_VALUE.I32, v = 0 },
+        { h = P.hash("AttackUserData._AttackHitDataID"), t = P.HIT_VALUE.I32, v = 3001 },
+        { h = P.hash("AttackUserData._KeyNameHash"), t = P.HIT_VALUE.U32, v = 0xBEEF },
+    }
+    T.check(game:enemy_apply_hit(id, { damage = 70, fields = fields }), "run through the game's hit code")
+    local r = mock.component(e2.body, "chainsaw.HitController").received[1]
+    T.eq(r and r.attack_data, ad, "with the attack's own data from the catalog")
+    T.eq(r and r.reaction_power, 2, "its reaction power")
+    T.eq(game.hit_stats.catalog_attacks, 1, "counted")
+    T.eq(e2.hp, 230, "the HP the game's own hit code took")
+    -- A killing one kills, through the game's death (not HP alone).
+    fields[1].v = 999
+    T.check(game:enemy_apply_hit(id, { damage = 999, fields = fields }), "the killing hit runs")
+    local last = mock.component(e2.body, "chainsaw.HitController").received[2]
+    T.eq(last and last.kill, true, "marked as a kill")
+    T.eq(game.hit_stats.no_template or 0, 0, "never without attack data")
+end)
+
+T.run("our_hits_carry_their_attacks_identity", function()
+    local game, world = fresh_game()
+    game:set_active(true)
+    game:read_player_state()
+    game:list_enemies()
+    mock.hit(world.enemies[1], 10, 5)
+    local fields = game:take_hit_events()[1].fields
+    local aid, key
+    for _, f in ipairs(fields) do
+        if f.h == P.hash("AttackUserData._AttackHitDataID") then aid = f.v end
+        if f.h == P.hash("AttackUserData._KeyNameHash") then key = f.v end
+    end
+    T.check(aid ~= nil, "the attack's id")
+    T.check(key ~= nil, "and its key")
+    T.check(#fields <= P.MAX_HIT_FIELDS, "within one message's values")
+end)
+
 T.run("a_partners_hit_never_runs_without_attack_data", function()
     -- re4.exe crashed in HitController.playDamageSe: a hit we ran for the partner had no
     -- AttackUserData. Until our own player has hit something, a partner's hit and kill take
@@ -711,6 +792,7 @@ T.run("a_killing_hit_from_the_partner_never_throws_a_body_without_its_data", fun
     -- carries our body and the enemy's own (chest) damage data; an enemy without damage
     -- colliders dies through HitPoint.dead() instead.
     local game, world = fresh_game()
+    game.settings.enemy_kill_with_hit = true -- off by default since 0.11
     game:set_active(true)
     game:read_player_state()
     local list = game:list_enemies()
@@ -769,6 +851,7 @@ T.run("a_kill_from_the_partners_game_never_mutilates", function()
     -- replayed killing hit drew a head burst and its break effect crashed in
     -- WindManager.attachWindSettingEffect. Replayed hits only react and kill now.
     local game, world = fresh_game()
+    game.settings.enemy_kill_with_hit = true
     game:set_active(true)
     game:read_player_state()
     T.check(game:capabilities().no_mutilation.ok, "no_mutilation capability")
@@ -786,6 +869,48 @@ T.run("a_kill_from_the_partners_game_never_mutilates", function()
     mock.hit(world.enemies[1], 1000, 0)
     T.eq(world.parts_broken, 1, "our own kill still mutilates")
     T.eq(world.native_crashes, 0, "and does not crash")
+end)
+
+T.run("nothing_breaks_on_an_enemy_that_is_the_partners", function()
+    -- 0.11, the client after a start from the lobby (an assault rifle and a submachine gun):
+    -- heads burst with "partner's kills burst heads" off, and the game crashed in
+    -- HitController.updateAttack in the frame the host's kill was run here on a villager that
+    -- had been a puppet until then. The death of an enemy the partner's game killed runs over
+    -- the next frames, after any hit of ours; and a puppet is the host's to break.
+    local game, world = fresh_game()
+    game:set_active(true)
+    game:read_player_state()
+    local list = game:list_enemies()
+    local e1, e2 = world.enemies[1], world.enemies[2]
+    world.head_burst = true
+    -- The host's kill, by default without its killing hit: the AI dies (its death action).
+    game:enemy_set_puppet(list[2].id, true)
+    mock.hit(e1, 0, 0) -- attack data known (a hit would be possible)
+    game:take_hit_events()
+    local fields = { { h = P.hash("Wince"), t = P.HIT_VALUE.F32, v = 44 } }
+    T.check(game:enemy_kill(list[2].id, fields), "killed")
+    T.eq(e2.dying, "action", "by its death action, no hit run")
+    T.eq(mock.component(e2.body, "chainsaw.HitController").received, nil, "nothing through its hit code")
+    T.eq(game.hit_stats.kills_with_hit, 0, "no killing hit")
+    -- Its death, a frame later: the head-burst draw is skipped, on its head and body updaters.
+    local skipped = game.hit_stats.mutilations_skipped or 0
+    T.eq(mock.death_frame(e2), false, "no head burst on the partner's kill")
+    T.check((game.hit_stats.mutilations_skipped or 0) > skipped, "skipped")
+    T.eq(world.native_crashes, 0, "no crash")
+    -- 30 s later its (pooled) updaters break again for whatever enemy they serve.
+    clock_now = clock_now + 31
+    T.eq(mock.death_frame(e2), true, "the mark expired")
+    -- A puppet: our own shots on it break nothing (its parts are the host's game's).
+    game:enemy_set_puppet(list[1].id, true)
+    e1.dying = "hit"
+    T.eq(mock.death_frame(e1), false, "a puppet's parts never break here")
+    game:enemy_set_puppet(list[1].id, false)
+    T.eq(mock.death_frame(e1), true, "our own enemy breaks as always")
+    -- With the option on, the partner's kills break here again.
+    game.settings.enemy_replay_mutilation = true
+    game:enemy_set_puppet(list[1].id, true)
+    T.eq(mock.death_frame(e1), true, "enemy_replay_mutilation brings it back")
+    T.eq(world.native_crashes, 0, "still no crash")
 end)
 
 T.run("a_destroyed_game_object_is_never_asked_for_its_transform", function()
@@ -901,18 +1026,19 @@ T.run("the_partners_model_becomes_a_character_our_enemies_fight", function()
     local hc = mock.component(model, "chainsaw.HitController")
     T.eq(world.hit_controllers[model], hc, "its HitController can be hit")
     T.eq(hc.__fields["<ContextAccessor>k__BackingField"], upd, "and knows its body updater")
-    local damage_on, others_off = 0, 0
-    for _, c in ipairs(model.components) do
-        if c.__type == "via.physics.Colliders" then
-            if c.list and #c.list > 0 then
-                if c.enabled ~= false then damage_on = damage_on + 1 end
-            elseif c.enabled == false then
-                others_off = others_off + 1
-            end
-        end
-    end
-    T.eq(damage_on, 1, "its damage colliders on")
-    T.eq(others_off, 1, "its other colliders stay off")
+    -- Leon's damage shapes are in his RequestSetCollider (ch0a0z0.rcol), not in his Colliders.
+    local cols = mock.component(model, "via.physics.Colliders")
+    local rsc = mock.component(model, "via.physics.RequestSetCollider")
+    T.eq(cols.enabled, false, "his Colliders (no damage data) stay off")
+    T.check(rsc.enabled ~= false, "his RequestSetCollider on")
+    local registered = {}
+    for _, set in ipairs(rsc.sets) do registered[set.name] = set.registered ~= false end
+    T.eq(registered.Damage, true, "with his body's damage set")
+    T.eq(registered.Press, false, "no pushing things in our game")
+    T.eq(registered.Target, false, "no sensor shapes")
+    T.eq(registered.NormalKick, false, "no kick")
+    T.eq(registered.ArmorDamage, false, "one body: the other damage set stays out")
+    T.check(game.caps.partner_hits and game.caps.partner_hits.ok, "the capability says enemy blows land")
     -- It follows the partner; its marker registers once.
     clock_now = 2
     T.check(game:partner_target_update({ x = 11, y = 0, z = 5 }, { x = 0, y = 0, z = 0, w = 1 }, 700, 1000), "updated")
@@ -1245,8 +1371,37 @@ T.run("a_hit_from_the_hosts_enemy_runs_on_our_character_like_the_game_runs_one",
         "an attack we have no data for (and no template) is not run")
 end)
 
+T.run("a_hit_from_the_hosts_enemy_lands_on_our_characters_registered_damage_shapes", function()
+    -- Leon keeps his damage shapes in his RequestSetCollider (ch0a0z0.rcol), not in his
+    -- Colliders: looking only there, every hit from the host's enemies "failed". Of his damage
+    -- sets, the one registered now is used (ArmorDamage instead of Damage, say).
+    local game, world = fresh_game()
+    game:set_active(true)
+    game:read_player_state()
+    world.attack_catalog["1100:" .. tostring(0x77)] = mock.new("chainsaw.collision.AttackHitUserData.AttackData",
+        { __fields = { _AttackType = 4, _AttackPower = 0, _Option = 0 } })
+    local function hit(part)
+        return { attack_id = 1100, key_hash = 0x77, fields = {
+            { h = P.hash("Damage"), t = P.HIT_VALUE.I32, v = 100 },
+            { h = P.hash("DamageUserData.Parts"), t = P.HIT_VALUE.I32, v = part },
+            { h = P.hash("DamageUserData.PartsSide"), t = P.HIT_VALUE.I32, v = 0 } } }
+    end
+    local hc = world.player.hit_controller
+    local sets = {}
+    for _, set in ipairs(hc.request_set.sets) do sets[set.name] = set end
+    T.eq(#hc.colliders.list, 1, "(his Colliders: one shape without damage data)")
+    T.eq(game:player_take_hit(hit(0), nil), "applied", "applied")
+    T.eq(hc.received[1].user_data, sets.Damage.cols[2].user_data, "on the head of his Damage set")
+    sets.Damage.registered, sets.ArmorDamage.registered = false, true
+    T.eq(game:player_take_hit(hit(0), nil), "applied", "applied again")
+    T.eq(hc.received[2].user_data, sets.ArmorDamage.cols[2].user_data, "on the head of the set registered now")
+    T.eq(game:player_take_hit(hit(7), nil), "applied", "a body part he has no shape for")
+    T.eq(hc.received[3].user_data, sets.ArmorDamage.cols[1].user_data, "lands on the chest")
+end)
+
 T.run("a_death_from_the_partners_game_comes_with_its_killing_hit", function()
     local game, world = fresh_game()
+    game.settings.enemy_kill_with_hit = true -- off by default since 0.11
     game:set_active(true)
     game:read_player_state()
     local list = game:list_enemies()
@@ -1366,6 +1521,7 @@ T.run("a_death_without_the_partners_values_plays_at_once", function()
     -- must apply without the killing hit's values runs a plain killing hit; with no attack data
     -- at all, the AI is told to die (entryDeadAction).
     local game, world = fresh_game()
+    game.settings.enemy_kill_with_hit = true -- off by default since 0.11
     game:set_active(true)
     game:read_player_state()
     local list = game:list_enemies()
@@ -1595,6 +1751,46 @@ T.run("a_method_whose_body_is_a_shared_stub_is_never_hooked", function()
     world.enemies[2].fatal_ok = true
     game.partner_fatal_query = function() return P.PARTNER_INFO.KNOWN | P.PARTNER_INFO.FATAL, 0 end
     T.eq(world.enemies[2].head_updater:call("isEnableFatal", world.player), 1, "the hooked query answers from the host")
+end)
+
+T.run("invincibility_keeps_our_player_unhurt_and_alive_and_ends_as_it_found_it", function()
+    local game, world = fresh_game()
+    game:set_active(true)
+    game:read_player_state()
+    local me = world.player
+    me.hp, me.no_death = 400, true -- the game had NoDeath on already: it stays on afterwards
+    T.eq(game:set_invincible(true), true, "on")
+    T.eq(me.invincible and me.no_damage and me.no_death and me.immortal, true, "every HitPoint flag")
+    T.eq(me.hp, me.max_hp, "HP full")
+    local info = mock.new("chainsaw.HitController.DamageInfo", { data = { Damage = 5000 } })
+    local r = me.hit_controller:call("callbackCheckDamageHit", info)
+    T.check(r == false or r == 0, "a hit on our player does not land (the hook's false)")
+    local enemy_hc = mock.component(world.enemies[1].body, "chainsaw.HitController")
+    T.eq(enemy_hc:call("callbackCheckDamageHit", info), true, "an enemy's still does")
+    me.head_updater:call("requestDead", 3, nil)
+    me.head_updater:call("onDead", info)
+    T.eq(#(world.player_deaths or {}), 0, "no death without a hit")
+    local gom = mock.new("chainsaw.GameOverMediator")
+    gom:call("requestGameOver", mock.new("System.Object"))
+    T.eq(#(world.game_overs or {}), 0, "no game over")
+    me.hp = 10 -- something got through anyway
+    game:set_invincible(true)
+    T.eq(me.hp, me.max_hp, "refilled the next frame")
+    me.immortal = false -- an event cleared a flag
+    game:set_invincible(true)
+    T.eq(me.immortal, true, "set again")
+    local st = game:invincible_stats()
+    T.eq(st.blocked_hits, 1, "counted: hits")
+    T.eq(st.blocked_deaths, 2, "deaths")
+    T.eq(st.blocked_game_overs, 1, "game overs")
+    T.check(game:capabilities().invincible.ok, "Diagnostics")
+    -- Off: the flags as the game had them, everything lands again.
+    T.eq(game:set_invincible(false), false, "off")
+    T.eq(me.invincible or me.no_damage or me.immortal, false, "our flags gone")
+    T.eq(me.no_death, true, "the game's own kept")
+    T.eq(me.hit_controller:call("callbackCheckDamageHit", info), true, "hits land")
+    me.head_updater:call("requestDead", 3, nil)
+    T.eq(#(world.player_deaths or {}), 1, "deaths happen")
 end)
 
 T.run("hooks_absent_without_sdk_hook", function()

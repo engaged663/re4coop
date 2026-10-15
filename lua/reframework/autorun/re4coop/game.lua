@@ -2969,6 +2969,8 @@ require("re4coop.game_partner").install(Game, {
 })
 
 require("re4coop.game_give").install(Game, { singleton = singleton, find_type = find_type })
+require("re4coop.game_invincible").install(Game, { find_type = find_type, address_of = address_of })
 require("re4coop.game_save").install(Game, { singleton = singleton, find_type = find_type })
+require("re4coop.game_menu").install(Game, { singleton = singleton, find_type = find_type })
 
 return Game

@@ -216,6 +216,10 @@ local function draw_options(settings)
         checkbox(settings, "show_hud", "Show status HUD (top-left)")
 
         imgui.separator()
+        imgui.text_colored("Testing", COLOR_DIM)
+        checkbox(settings, "invincible", "Invincibility: no player takes damage, is grabbed or dies (also your partner's, while connected)")
+
+        imgui.separator()
         imgui.text_colored("Enemies and animals (the host's game runs every enemy; the client's shows them)", COLOR_DIM)
         checkbox(settings, "sync_enemies", "Sync enemies (every creature: villagers, dogs, bosses...)")
         checkbox(settings, "enemy_partner_target", "Host: your enemies see, hear, chase and attack your partner too (they are a second player in your game)")
@@ -229,7 +233,7 @@ local function draw_options(settings)
         checkbox(settings, "enemy_anim_lock", "...with their own animation state machine switched off")
         slider_int(settings, "enemy_anim_layers", "...animation layers sent per enemy", 1, 3)
         checkbox(settings, "enemy_hit_predict", "Client: your hits on them take HP at once (the host still decides deaths)")
-        checkbox(settings, "enemy_kill_with_hit", "Client: enemies the host's game kills die here from the same killing hit")
+        checkbox(settings, "enemy_kill_with_hit", "Client: enemies the host's game kills die here from the same killing hit (crashed the game)")
         checkbox(settings, "enemy_erase", "Enemies your partner already killed never appear in your game (no corpse)")
         checkbox(settings, "enemy_spawn_missing", "Client: enemies alive in the host's game appear in yours too (even if your save had them dead)")
         slider_float(settings, "enemy_interp_delay", "Enemy smoothing (seconds behind; higher = smoother, later)", 0.03, 0.4)
@@ -469,6 +473,20 @@ local function draw_diagnostics(session, game, session_status, puppet, perf)
                 imgui.text(("saves: ours %d (autosaves to slot %d: %d), sent %d | partner's %d -> saved here %d, already saved %d, gave up %d%s | join loads %d (co-op save used %d, menu asked %d)"):format(
                     c.own, sv.coop_slot or 0, c.redirected, c.sent, c.received, c.mirrored, c.same, c.given_up,
                     (sv.queued or 0) > 0 and " | 1 waiting" or "", c.join_loads, g.continue_swaps or 0, g.intents or 0))
+            end
+            if session_status.lobby then
+                local lb = session_status.lobby
+                local c = lb.counters
+                local s = lb.start
+                imgui.text(("lobby: screen %s, menu %s | starts %d, together %d (skipped %d), failed %d, loadouts given %d%s"):format(
+                    tostring(lb.screen or "-"), tostring(lb.menu_mode), c.starts, c.released, c.skipped, c.failed, c.loadouts,
+                    s and (" | start %d: ours %s, partner's %s%s"):format(s.id, P.LOAD_PHASE and tostring(s.phase) or "?",
+                        tostring(s.partner_phase), s.released and (" (" .. tostring(s.why) .. ")") or "") or ""))
+            end
+            local mc = game.menu and game.menu.counters
+            if mc then
+                imgui.text(("main menu: opened %d, lists %d, labels written %d, our entries chosen %d, input held %d frames, back %d"):format(
+                    mc.setups, mc.built, mc.texts, mc.decided, mc.blocked, mc.cancels))
             end
             sync_line("objects", session_status.objects)
             if session_status.travel then

@@ -26,6 +26,12 @@
 -- for a connected client whose co-op slot holds this session's progress, that slot (two copies
 -- of the game on one PC share their saves, and the newest may be the host's).
 --
+-- Games started from the lobby (lobby.lua, 0.11) play in a co-op save of their own: the host's
+-- chosen co-op file (a slot of its own, set_host_slot) takes the host's autosaves and the
+-- client's saves made for it, exactly as the client's co-op slot does for the client; the
+-- single-player autosave stays as it was. The lobby also loads a given slot through Continue
+-- (request_load).
+--
 -- Game contract:
 --   game:save_can() -> true | false, why       our game can start a save now
 --   game:save_now(slot) -> true | nil, why     starts a save through the game's own save flow
@@ -68,7 +74,27 @@ function SaveSync:reset()
     self.pending = nil -- { since, kind, next_try, why, noticed }: the partner saved, we have not yet
     self.copy = nil    -- { since, next_try, why }: the client saved elsewhere, its co-op slot follows
     self.join = nil    -- { at, coop, failed } | { none = true }: the load asked for while joining
-    self.coop_current = false -- client: the co-op slot holds this session's progress
+    -- The co-op slot (client's, or the host's lobby file) holds this session's progress.
+    self.coop_current = self.host_slot ~= nil
+    self.forced = nil  -- { slot, at }: the lobby asked Continue to load this slot
+end
+
+-- Host: the slot of the co-op file the lobby started (nil: saves go where the game puts them).
+function SaveSync:set_host_slot(slot)
+    self.host_slot = slot
+    if slot ~= nil then self.coop_current = true end
+end
+
+-- The lobby asks the game's Continue to load `slot` (see continue_slot).
+function SaveSync:request_load(slot, now)
+    self.forced = { slot = slot, at = now }
+end
+
+-- Our own co-op slot in this session: the client's, or the host's lobby file (nil without one).
+function SaveSync:my_coop_slot()
+    if self.role() == "client" then return self:coop_slot() end
+    if self.role() == "host" then return self.host_slot end
+    return nil
 end
 
 function SaveSync:enabled()
@@ -93,9 +119,15 @@ end
 -- The slot a save our game is starting goes to (called from the game's save flow): while
 -- connected, the client's autosaves go to its co-op slot.
 function SaveSync:redirect(slot)
-    if slot == SaveSync.AUTOSAVE_SLOT and self.role() == "client" and self.active() and self:enabled() then
+    if slot ~= SaveSync.AUTOSAVE_SLOT then return slot end
+    if self.role() == "client" and self.active() and self:enabled() then
         self.counters.redirected = self.counters.redirected + 1
         return self:coop_slot()
+    end
+    -- A host playing a lobby game: its co-op file takes its autosaves (also with the partner gone).
+    if self.role() == "host" and self.host_slot ~= nil then
+        self.counters.redirected = self.counters.redirected + 1
+        return self.host_slot
     end
     return slot
 end
@@ -105,7 +137,8 @@ end
 function SaveSync:on_local_save(slot, now, mirrored, from_slot)
     if slot == nil or slot < 0 or slot > SaveSync.CAMPAIGN_LIMIT then return end -- not the main story
     self.last_save, self.last_slot = now, slot
-    if self.role() == "client" and slot == self:coop_slot() and self.active() then self.coop_current = true end
+    local mine = self:my_coop_slot()
+    if mine ~= nil and slot == mine and (self.active() or self.role() == "host") then self.coop_current = true end
     if mirrored then
         self.counters.mirrored = self.counters.mirrored + 1
         return
@@ -120,7 +153,7 @@ function SaveSync:on_local_save(slot, now, mirrored, from_slot)
     local auto = (from_slot or slot) == SaveSync.AUTOSAVE_SLOT
     self.send(self.P.encode_save({ kind = auto and self.P.SAVE_KIND.AUTO or self.P.SAVE_KIND.MANUAL }), true)
     self.counters.sent = self.counters.sent + 1
-    if self.role() == "client" and slot ~= self:coop_slot() then
+    if mine ~= nil and slot ~= mine then
         self.copy = { since = now, next_try = now } -- a typewriter save: the co-op slot follows
     end
 end
@@ -143,7 +176,7 @@ end
 
 -- The slot our game saves into for the partner.
 function SaveSync:mirror_slot()
-    if self.role() == "host" then return SaveSync.AUTOSAVE_SLOT end
+    if self.role() == "host" then return self.host_slot or SaveSync.AUTOSAVE_SLOT end
     return self:coop_slot()
 end
 
@@ -203,7 +236,7 @@ function SaveSync:tick(now, game, ready)
             self.counters.given_up = self.counters.given_up + 1
         elseif try_save(self, now, game, ready, c) then
             self.counters.copies = self.counters.copies + 1
-            self.notify(("Your save is in your co-op slot too (slot %d)"):format(self:coop_slot()), "info")
+            self.notify(("Your save is in your co-op slot too (slot %d)"):format(self:mirror_slot()), "info")
         end
     end
 end
@@ -250,6 +283,9 @@ end
 -- slot holds this session's progress, after a game over too (two copies of the game on one PC
 -- share their saves: the newest save may be the host's).
 function SaveSync:continue_slot(now)
+    local f = self.forced
+    if f ~= nil and now - f.at <= 2 * JOIN_LOAD_TIMEOUT then return f.slot end
+    if self.host_slot ~= nil and self.coop_current and self.role() == "host" then return self.host_slot end
     local j = self.join
     if j ~= nil and j.coop and j.at ~= nil and now - j.at <= 2 * JOIN_LOAD_TIMEOUT then return self:coop_slot() end
     if self.coop_current and self.role() == "client" and self.active() and self:enabled() then
@@ -260,7 +296,7 @@ end
 
 function SaveSync:summary()
     return { counters = self.counters, queued = (self.pending ~= nil and 1 or 0) + (self.copy ~= nil and 1 or 0),
-        coop_slot = self:coop_slot() }
+        coop_slot = self:my_coop_slot() or self:coop_slot(), host_slot = self.host_slot }
 end
 
 return SaveSync

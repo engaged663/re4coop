@@ -56,12 +56,16 @@ Session rules:
 | `stats()` | Table: `rtt_ms, peer, peer_name, bytes_sent, bytes_recv, resends, reliable_in_flight, out_of_order, unordered_duplicates, …` |
 | `local_addresses()` | Array of this PC's LAN IPv4 addresses |
 | `time()` | Monotonic seconds (`os.clock` is CPU time, so don't use it for networking) |
-| `max_payload()`, `version()` | `1188`; `"0.10.2", 2` |
+| `max_payload()`, `version()` | `1188`; `"0.11.0", 2` |
 | `new_session()` | An independent session object with the same methods (tests/tools) |
 | `window_focused()` | Whether a window of this process is the foreground window (true off Windows): the Ashley key only counts while the game has the focus |
 
-## Game messages (game protocol version 14)
+## Game messages (game protocol version 15)
 
+Version 15 (mod 0.11.0) adds the lobby in the game's main menu and the synchronized start
+(`lobby.lua`, [RESEARCH.md](RESEARCH.md) section 3.31): LOBBY_SETTINGS (53) the host's choices,
+LOBBY_PLAYER (54) each player in the lobby, LOBBY_START (55) the agreed game, LOAD_STATE (56)
+how far each game is with loading it, LOAD_GO (57) both have loaded.
 Version 14 (mod 0.10.1) adds parries and grabs of the client's player in the host's game:
 ACTION_SIGN (49) carries a host enemy's warning to the client's character (the parry/dodge
 prompt), ENEMY_PARRY (50) the client's parry of a host enemy, PLAYER_GRAB (51) a host enemy's
@@ -105,7 +109,7 @@ The first byte is the message type. Formats use Lua `string.pack` notation.
 | Type | Name | Channel | Direction | Format |
 |---|---|---|---|---|
 | 1 | HELLO | reliable | both, on connect | `<B I2 s1 s1 s1 B`: type, game protocol version, mod version, player name, chapter/area, flags (1 = reply requested) |
-| 2 | PLAYER | unreliable, 20 Hz | both | `<B d fff ffff ff B I4 i4 i4`: time, position, rotation quaternion (x,y,z,w), HP, max HP, flags (1 dead, 2 cutscene, 4 aiming, 8 has stage, 16 has chapter, 32 waiting at a transition), area hash, `chainsaw.StageID` (valid with flag 8), `chainsaw.ChapterID` (valid with flag 16) |
+| 2 | PLAYER | unreliable, 20 Hz | both | `<B d fff ffff ff B I4 i4 i4`: time, position, rotation quaternion (x,y,z,w), HP, max HP, flags (1 dead, 2 cutscene, 4 aiming, 8 has stage, 16 has chapter, 32 waiting at a transition, 64 invincibility asked for: both players are invincible), area hash, `chainsaw.StageID` (valid with flag 8), `chainsaw.ChapterID` (valid with flag 16) |
 | 3 | *(retired)* | | | SKELETON in protocols 1–3 (the stick-figure ghost) |
 | 4 | *(retired)* | | | ENEMY_SNAPSHOT in protocols 1–8 |
 | 5 | *(retired)* | | | ENEMY_DAMAGE in protocols 1–8 |
@@ -155,6 +159,11 @@ The first byte is the message type. Formats use Lua `string.pack` notation.
 | 49 | ACTION_SIGN | unreliable, every frame of the warning | host → client | `<B I2 B I4 I4 i4 i4>`: net id, flags (1 just timing, 2 act timing, 4 angle check, 8 has uid), uid, kind hash, sign type (`chainsaw.ActionSignType`), button (`chainsaw.ActionSignButton`). A host enemy's attack warns the client's character (`EnemyActionSignUtility.sendActionSignInfo` to it, or the enemy's armed sign while its target is the client's character, within the sign's reach). The client hands it to its own player's head (`PlayerHeadUpdater.onHitActionSign`, its copy of the enemy as the owner) one enemy interpolation delay later, every frame until the host stops repeating it for 0.15 s |
 | 50 | ENEMY_PARRY | reliable | client → host | `<B I2 I4 I4 B i4>`: net id, uid, kind hash, kind (1 parry: `onParry`; 2 the press: `onParryInput`), sign type. The client's player parried its copy of a host enemy; the host runs `EnemyBodyUpdater.onParry` with the client's character on its enemy (it staggers) |
 | 51 | PLAYER_GRAB | reliable | host → client | `<B I2 I4 I4 B B B I4>`: net id, uid, kind hash, held (0 let go), presses that break free (0 = unknown: the client uses 8), knife (a knife breaks free), the grab's action hash. A host enemy holds the client's character (its `<GrappleTarget>`); repeated each second while it lasts, and when it changes; at most 15 s. Applied one enemy interpolation delay later |
+| 53 | LOBBY_SETTINGS | reliable | host → client | `<B I2 B B B B I2 i4 B I2 B>`: revision (changes with every choice), co-op save file (1-3), mode (0 new game, 1 continue the file's save), chapter (new game: 1-16; continue: 0 = where the save is, else the chapter to go to), difficulty (`chainsaw.CampaignManager.Difficulty`: 10 Assisted, 20 Standard, 30 Hardcore, 40 Professional), option bits (`Lobby.OPTIONS`: 1 enemies attack both, 2 one Ashley, 4 shared key items, 8 saves for both, 16 transition gate, 32 no pause, 64 giving items, 128 invincibility), the file's save: `ChapterID`, difficulty, save count, empty (1). Sent while the host's lobby screen is open, on every change and to a client that connects. A new revision makes the client confirm "ready" again |
+| 54 | LOBBY_PLAYER | reliable | both | `<B B B B s1>`: in the lobby screen, ready, loadout (`Lobby.LOADOUTS` id), name. When it changes and on connecting |
+| 55 | LOBBY_START | reliable | host → client | `<B I2 B B B B i4 i4>`: start id, mode, file, chapter (as in LOBBY_SETTINGS), difficulty, start point (`chainsaw.CampaignInitialSettingKey` of a new game: the chapter's start), `ChapterID` both play (the chosen chapter, or the one of the host's save). Both games start now: a new game from that start point (both the same), or the host's co-op save and the client's own co-op slot (in that chapter; without a co-op save, a new game from that chapter's start) |
+| 56 | LOAD_STATE | reliable, on change and every 1 s | both | `<B I2 B B>`: start id, phase (1 starting: still on the menu, 2 loading, 3 syncing: a client taking over the host's world, 4 ready: in the map and held, 5 playing, 6 failed: the start did not happen there), progress (0-100, unused). Drives the two loaders and the hold |
+| 57 | LOAD_GO | reliable | host → client | `<B I2>`: start id. Both games are ready: the client's map runs (the host's already does) |
 | 52 | GRAB_ESCAPE | reliable | client → host | `<B I2 I4 I4 B>`: net id, uid, kind hash, how (1 mashing, 2 the knife). The client's player broke free; the host enemy's escape check succeeds on its next update (else its grab is undone as a rejected one after 0.5 s) |
 
 `guid` is 16 raw bytes: the 32 hex digits of the canonical GUID string, in order. Scenario

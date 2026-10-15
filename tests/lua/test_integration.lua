@@ -585,6 +585,29 @@ T.run("the_hosts_enemies_see_and_attack_the_client_end_to_end", function()
     T.eq(client_game.enemies[3].killed_by, "self", "the client's own kill")
 end)
 
+T.run("invincibility_either_player_asks_for_covers_both", function()
+    -- The client's Options turn it on: the client's game makes its player invincible, and the
+    -- host's (the real adapter) its own, from the client's PLAYER flag.
+    client_game.invincible_calls = {}
+    function client_game:set_invincible(on)
+        self.invincible_calls[#self.invincible_calls + 1] = on
+        return on
+    end
+    client_settings.invincible = true
+    local ok = T.wait_until(function() return world.player.invincible == true end, step, 5)
+    T.check(ok, "the host's player is invincible")
+    T.eq(world.player.no_damage, true, "takes no damage")
+    T.eq(client_game.invincible_calls[#client_game.invincible_calls], true, "and the client's")
+    client_settings.invincible = false
+    ok = T.wait_until(function() return world.player.invincible ~= true end, step, 5)
+    T.check(ok, "off for the host too")
+    T.eq(client_game.invincible_calls[#client_game.invincible_calls], false, "and for the client")
+    run_for(0.5)
+    local n = #client_game.invincible_calls
+    run_for(0.5)
+    T.eq(#client_game.invincible_calls, n, "nothing more to do while off")
+end)
+
 T.run("key_items_exist_once", function()
     local COG, FUEL = 119235200, 119273600
     local cog_ctx = { category = 5, kind = 0, group = 31, index = 4 }

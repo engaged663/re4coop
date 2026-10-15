@@ -3,8 +3,8 @@
 
 local P = {}
 
-P.VERSION = 14           -- bump on any incompatible change to the layouts below
-P.MOD_VERSION = "0.10.2"
+P.VERSION = 15           -- bump on any incompatible change to the layouts below
+P.MOD_VERSION = "0.11.0"
 P.MAX_PAYLOAD = 1188     -- re4coop_net.max_payload(): biggest message one datagram carries
 
 P.T = {
@@ -63,6 +63,26 @@ P.T = {
     ENEMY_PARRY = 50,   -- reliable, client -> host: the client's player parried a host enemy's attack
     PLAYER_GRAB = 51,   -- reliable, host -> client: a host enemy holds the client's character (or let go)
     GRAB_ESCAPE = 52,   -- reliable, client -> host: the client's player broke free of a host enemy's hold
+    -- Protocol 15: the lobby in the game's own main menu, and the synchronized start (lobby.lua).
+    LOBBY_SETTINGS = 53, -- reliable, host -> client: the host's choices for the next game (save, chapter, difficulty, options)
+    LOBBY_PLAYER = 54,   -- reliable, both directions: the sender's player in the lobby (name, loadout, ready)
+    LOBBY_START = 55,    -- reliable, host -> client: both games start the agreed game now
+    LOAD_STATE = 56,     -- reliable, both directions: how far the sender's game is with loading the started game
+    LOAD_GO = 57,        -- reliable, host -> client: both games have loaded: the map starts now
+}
+
+-- LOBBY_SETTINGS / LOBBY_START: a new game, or the co-op save of the chosen file.
+P.LOBBY_MODE = { NEW = 0, CONTINUE = 1 }
+
+-- LOAD_STATE phases, in order (a later phase is further along).
+P.LOAD_PHASE = {
+    NONE = 0,
+    STARTING = 1,  -- the game was asked to start; still on the main menu
+    LOADING = 2,   -- left the menu: loading screen, no player yet
+    SYNCING = 3,   -- client: in the map, taking over the host's world / joining the host
+    READY = 4,     -- in the map and held until the partner is ready too
+    PLAYING = 5,   -- released: the map runs
+    FAILED = 6,    -- the start did not happen in this game (the partner stops waiting for it)
 }
 
 -- ASHLEY flags.
@@ -109,6 +129,7 @@ P.PLAYER_FLAGS = {
     HAS_STAGE = 8,     -- the message carries the player's chainsaw.StageID
     HAS_CHAPTER = 16,  -- the message carries the player's chainsaw.ChapterID
     GATE_WAITING = 32, -- the player is held at a transition until the partner arrives
+    INVINCIBLE = 64,   -- the sender's Options ask for invincibility: both players are invincible
 }
 
 -- ENEMY_STATE entry flags.
@@ -1076,6 +1097,44 @@ function P.encode_grab_escape(m)
         clamp_u32(m.kind_hash), (m.how or P.ESCAPE_KIND.MASH) & 0xFF)
 end
 
+-- m = { rev, file, mode, chapter, difficulty, options, save_chapter, save_difficulty, save_count, save_empty }
+-- file: the host's co-op save file (1-3); chapter: 1-16 (0 = where the save is); difficulty:
+-- chainsaw.CampaignManager.Difficulty (10-40); options: bits of Lobby.OPTIONS; save_*: what the
+-- chosen file holds (save_chapter is a chainsaw.ChapterID, 0 when empty).
+local LOBBY_SETTINGS_FORMAT = "<BI2BBBBI2i4BI2B"
+function P.encode_lobby_settings(m)
+    return string.pack(LOBBY_SETTINGS_FORMAT, P.T.LOBBY_SETTINGS, (m.rev or 0) & 0xFFFF, (m.file or 1) & 0xFF,
+        (m.mode or P.LOBBY_MODE.NEW) & 0xFF, (m.chapter or 0) & 0xFF, (m.difficulty or 20) & 0xFF,
+        (m.options or 0) & 0xFFFF, clamp_i32(m.save_chapter or 0), (m.save_difficulty or 0) & 0xFF,
+        math.max(0, math.min(0xFFFF, math.floor(m.save_count or 0))), m.save_empty == false and 0 or 1)
+end
+
+-- m = { in_lobby, ready, loadout, name }
+function P.encode_lobby_player(m)
+    return string.pack("<BBBBs1", P.T.LOBBY_PLAYER, m.in_lobby and 1 or 0, m.ready and 1 or 0,
+        (m.loadout or 0) & 0xFF, (m.name or ""):sub(1, 64))
+end
+
+-- m = { start_id, mode, file, chapter, difficulty, key, chapter_id }
+-- key: the chainsaw.CampaignInitialSettingKey a new game starts from; chapter_id: the
+-- chainsaw.ChapterID both games play (the chosen chapter, or the one the host's save is in).
+local LOBBY_START_FORMAT = "<BI2BBBBi4i4"
+function P.encode_lobby_start(m)
+    return string.pack(LOBBY_START_FORMAT, P.T.LOBBY_START, (m.start_id or 0) & 0xFFFF,
+        (m.mode or P.LOBBY_MODE.NEW) & 0xFF, (m.file or 1) & 0xFF, (m.chapter or 0) & 0xFF,
+        (m.difficulty or 20) & 0xFF, clamp_i32(m.key or 0), clamp_i32(m.chapter_id or 0))
+end
+
+-- m = { start_id, phase (P.LOAD_PHASE), progress (0-100) }
+function P.encode_load_state(m)
+    return string.pack("<BI2BB", P.T.LOAD_STATE, (m.start_id or 0) & 0xFFFF, (m.phase or 0) & 0xFF,
+        math.max(0, math.min(100, math.floor(m.progress or 0))))
+end
+
+function P.encode_load_go(m)
+    return string.pack("<BI2", P.T.LOAD_GO, (m.start_id or 0) & 0xFFFF)
+end
+
 -- The sender's game saved (P.SAVE_KIND): the receiver's game saves too. m = { kind }
 function P.encode_save(m)
     return string.pack("<BB", P.T.SAVE, (m.kind or P.SAVE_KIND.AUTO) & 0xFF)
@@ -1759,6 +1818,35 @@ decoders[P.T.PLAYER_GRAB] = function(data)
     local _, net_id, uid, kind_hash, held, struggles, knife, action = string.unpack(PLAYER_GRAB_FORMAT, data)
     return { net_id = net_id, uid = uid ~= 0 and uid or nil, kind_hash = kind_hash, held = held ~= 0,
         struggles = struggles, knife = knife ~= 0, action = action }
+end
+
+decoders[P.T.LOBBY_SETTINGS] = function(data)
+    local _, rev, file, mode, chapter, difficulty, options, save_chapter, save_difficulty, save_count, save_empty =
+        string.unpack(LOBBY_SETTINGS_FORMAT, data)
+    return { rev = rev, file = file, mode = mode, chapter = chapter, difficulty = difficulty, options = options,
+        save_chapter = save_chapter, save_difficulty = save_difficulty, save_count = save_count,
+        save_empty = save_empty ~= 0 }
+end
+
+decoders[P.T.LOBBY_PLAYER] = function(data)
+    local _, in_lobby, ready, loadout, name = string.unpack("<BBBBs1", data)
+    return { in_lobby = in_lobby ~= 0, ready = ready ~= 0, loadout = loadout, name = name }
+end
+
+decoders[P.T.LOBBY_START] = function(data)
+    local _, start_id, mode, file, chapter, difficulty, key, chapter_id = string.unpack(LOBBY_START_FORMAT, data)
+    return { start_id = start_id, mode = mode, file = file, chapter = chapter, difficulty = difficulty, key = key,
+        chapter_id = chapter_id }
+end
+
+decoders[P.T.LOAD_STATE] = function(data)
+    local _, start_id, phase, progress = string.unpack("<BI2BB", data)
+    return { start_id = start_id, phase = phase, progress = progress }
+end
+
+decoders[P.T.LOAD_GO] = function(data)
+    local _, start_id = string.unpack("<BI2", data)
+    return { start_id = start_id }
 end
 
 decoders[P.T.GRAB_ESCAPE] = function(data)

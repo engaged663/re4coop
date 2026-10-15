@@ -1709,6 +1709,259 @@ the addresses of a game update do not matter). A refused method has nothing to h
 enemy kind without its own finisher query offers no finisher in the host's game either.
 *Diagnostics* lists the refusals (`hook_guard`).
 
+### 3.28 v0.10.3: the client's shots on the host's enemies (reactions, kills)
+
+**Report.** With the host running every enemy, the client's shots took the enemies' HP and
+killed them, but they never reacted to them (no flinch, no stagger), and sometimes an enemy
+was left with almost no HP and did not die.
+
+**Cause.** The host runs a client's hit through the enemy's own hit code
+(`HitController.callbackDamageHit` with a `DamageInfo` built from the hit's values, §3.20):
+that is what plays the reaction and, for a hit marked `IsKill`, the death. Building it needs
+the enemy's damage collider and its `DamageUserData` (the body part), and attack data. Both
+failed, and the hit fell back to taking HP alone (`enemy_set_hp`) - no reaction - and to a
+death written by hand (`HitPoint.dead()` + `entryDeadAction`) when the HP ran out, which some
+states ignore: the enemy stayed alive at no HP. The client's research log showed it:
+`no_damage_data` 5 of 5, `kills_with_hit` 0, `deaths_forced` 5.
+1. The damage collider was looked for in `HitController.<Colliders>` (+0x190) only. An enemy
+   keeps its body's hit shapes in `HitController.<RequestSetCollider>` (+0x188,
+   `via.physics.RequestSetCollider`): `EnemyDamageUserData` derives from
+   `RequestSetColliderUserData`. Its request sets (`get_NumRequestSets`) each hold collidables
+   (`getNumCollidablesFromIndex`, `getCollidableFromIndex(set, index)`), each with its own user
+   data (`Collidable.get_UserData`), else the set's (`getRequestSetUserDataFromIndex`).
+2. The attack data came only from a template: a hit the host's own player had landed (§3.20).
+   Until the host's player had hit something, there was none.
+
+**Fix.** The damage colliders are those of both (`Game:damage_collidables`). A hit now carries
+its attack's identity (`AttackUserData._AttackHitDataID` and `_KeyNameHash`, as two more hit
+values); the game that runs it takes the attack's own data from `HitManager.getAttackData(id,
+key)` - the same in both games - with an `AttackUserData` of that identity (or the template's,
+when there is one), and uses a template only when the catalog has no such attack.
+
+### 3.29 v0.10.3: Leon's damage shapes are in his RequestSetCollider too
+
+**Question.** After §3.28: does the player keep his body's hit shapes in
+`HitController.<RequestSetCollider>` as the enemies do? Two player paths looked only at
+`<Colliders>`: the client running a host enemy's hit on its own Leon
+(`Game:player_damage_collider`, "failed" without a `DamageUserData`) and the host switching on
+the partner model's damage colliders (`Game:partner_hit_target`, which also fills the
+`poolDamage` filter that lets the host's own shots pass the model, §3.26).
+
+**Types alone do not decide.** Every damage user data derives from the request-set one:
+`PlayerDamageUserData` and `EnemyDamageUserData` → `chainsaw.collision.DamageUserData` →
+`HitUserDataRoot` → `via.physics.RequestSetColliderUserData` → `via.physics.UserData` (il2cpp
+dump). A `via.physics.Colliders` shape can carry any `UserData`, so the data files had to be read.
+
+**The data** (read from the game's own packages: `re_chunk_000.pak` + patches, KPKA v4 with an
+encrypted entry table, entry paths hashed with Murmur3 of the UTF-16 path; the format as
+[Ekey/REE.PAK.Tool](https://github.com/Ekey/REE.PAK.Tool) reads it; RSZ instance types resolved by
+the dump's `fqn` hashes):
+* `natives/stm/_chainsaw/appsystem/character/ch0a0z0/ch0a0z0_body.pfb.17` (patch 3): the body's
+  `via.physics.Colliders` holds **one** `via.physics.Collider` - a `SphereShape` with a plain
+  `via.physics.UserData`, no damage data. Its `via.physics.RequestSetCollider` has one
+  `RequestSetGroup` with `_Chainsaw/AppSystem/Character/ch0a0z0/Collider/ch0a0z0.rcol`. The
+  Ganado (`ch1c0z0_body.pfb.17`) has the same pair with `ch1c0z0.rcol` and `ch1c0z0Fat.rcol`.
+* `ch0a0z0.rcol.25`: 18 groups, 54 shapes, 22 request sets. Its user data: **29
+  `PlayerDamageUserData`**, 12 `AttackUserData`, 2 `TouchUserData`, 1 `PressUserData`, 32
+  `RequestSetColliderUserData` (the sets' own), 44 plain `UserData`. Groups: `Damage` (Head,
+  Body, L/R UpperArm, L/R Forearm, L/R Shin, L/R Foot), `ArmorDamage` (the same ten),
+  `KidnappedDamage` (Head, Body, both upper arms), `NearmissDamage` (Head, Center, Left, Right),
+  `GimmickDamage` (Body) - 29 damage shapes - and `Press`, `Target`, `TargetHolding`,
+  `TouchTarget`, `NpcTarget`, `AvoidSensor`, the kicks (`AttackLeg_L/R`, `RoundAttackLeg_L/R`,
+  `AttackGimmick`, `JumpAttackGimmick`). Request sets: `Damage`, `Press`, `Target`, `NpcTarget`,
+  `AvoidSensor`, `NormalKick`, `FatalKick`, `FatalRoundKick`, `AttackGimmick`, `Damage_Light`,
+  `Damage_Middle`, `Damage_Heavy`, `NearmissDamage`, `Push`, `FatalRoundKick_L`,
+  `KidnappedDamage`, `TargetHolding`, `FatalKick_R`, `ArmorDamage`, `TouchTarget`, `PushHeavy`,
+  `JumpAttackGimmick`.
+* The code agrees: `PlayerBodyUpdater` keeps its own `<RequestSetCollider>` (+0x370), and
+  `updateTargetCollider` (0x14164e200) finds a request set in it by `TargetColliderKey`
+  (`findRequestSetId(0, key)` then `getCollidable(0, id, 0)`) and resizes that shape's box.
+
+**So both paths never worked for Leon.** The client found no damage collider on its own Leon
+and returned "failed" for every hit of the host's enemies; the host switched on no damage
+collider on the model (its only `Colliders` shape has no damage data, and `sanitize` had turned
+its RequestSetCollider off with every `via.physics.*` component), so no enemy blow could land
+on the client's character, and the shot filter knew none of its `DamageUserData`.
+
+**Fix.**
+* `Game:damage_collidables` (§3.28) also says whether each request set is registered now
+  (`isRegisteredRequestSetFromIndex`). The client's `player_damage_collider` walks it: the
+  collider of the hit's body part and side, else the chest, else any, preferring a registered
+  set (Leon has `Damage` next to `ArmorDamage` and `KidnappedDamage`).
+* The host's `partner_hit_target` also takes the model's `via.physics.RequestSetCollider`:
+  of its request sets whose collidables all carry `DamageUserData`, the first of the most
+  collidables (`Damage`) is registered and every other set unregistered
+  (`getRequestSetGroups(0).getRequestSetIdFromIndex(i)` for the id, `registerRequestSet` /
+  `unregisterRequestSet`) - no press, sensor, touch or kick shapes in the host's game, and one
+  body for enemy blows (not also `NearmissDamage` or `ArmorDamage`); then the component is
+  switched on (off again on detach). The `DamageUserData` of every damage set go into the
+  `poolDamage` filter, so the host's shots still pass the model. The `partner_hits` capability
+  reports the sets kept on and the sets unregistered.
+
+**Not verified in the game.** Whether a request set that is not registered still lists its
+collidables (`getNumCollidablesFromIndex`) - if it does not, a model whose `Damage` set starts
+unregistered keeps none on, and `partner_hits` says "0 damage collider set(s) on".
+
+### 3.30 Invincibility for testing (0.10.3)
+
+**Request.** An option that makes both players invincible - no damage, no one-shot of any
+kind - to test things.
+
+**What the game offers** (il2cpp dump; addresses for the October 2026 build):
+* `chainsaw.HitPoint` flags `Invincible` (+0x18), `NoDamage` (+0x19), `NoDeath` (+0x1a) and
+  `Immortal` (+0x1b), with setters; `HitPoint.checkDead` (0x143408bc0) never kills with
+  NoDamage, Immortal or NoDeath on (§3.20).
+* `HitController.callbackCheckDamageHit(DamageInfo)` (0x140603160): the character's own "does
+  this hit land" (dodges, invincibility frames). `HitManager.hitSetting` stops there, before
+  the damage, the reaction and a grab (§3.25).
+* Deaths that do not go through HP: `PlayerHeadUpdater.requestDead(DeadType, Action<bool>)`
+  (0x141d63800) and `PlayerHeadUpdater.onDead(DamageInfo)` (0x141d359c0); any game over goes
+  through `GameOverMediator.requestGameOver(GameOverRequest)` (0x142e3a8a0).
+
+**Design** (`game_invincible.lua`). *Options → Testing → Invincibility* (`invincible`, off by
+default). While it is on in either game (PLAYER flag 64 carries it to the partner), each game
+makes its own player invincible, also playing alone: every frame its HitPoint's four flags are
+set (the game's own values are given back when it ends) and its HP is kept full; its
+HitController's check answers no (hooked: no blow, grab, explosion or trap lands - the
+client's replays of the host's enemies' hits are blocked as dodged); `requestDead` and
+`onDead` on its head are skipped and every game over is refused. *Diagnostics* `invincible`
+counts what was blocked.
+
+### 3.31 v0.11: the lobby in the game's own main menu
+
+**Request.** A "Multijugador" entry in the game's main menu, above Options. Choosing it
+replaces the menu's entries with "Host Game", "Join Game", "Multiplayer Options" and "Back".
+Host Game opens a lobby that looks like the game: chat, a chapter selector, a loadout selector,
+more multiplayer options, a co-op save of its own; the other player joins it, both must be
+ready to start. When the game starts, each map waits until both games have loaded it, with
+both players' loaders in the bottom left corner.
+
+**How the main menu works** (re4.exe, the October 2026 build: functions carved by `.pdata` and
+decompiled with REA/Ghidra; types and offsets from the il2cpp dump):
+
+| What | Where | Finding |
+|---|---|---|
+| Menu entries | `chainsaw.MainMenuGuiBehavior` | `_MenuList` (+0x1f0, serialized `MenuItem[]`: `_ActionType` +0x10, `_ItemText`/`PS`/`XB` GUIDs +0x18/+0x28/+0x38, `_GuideText`... +0x48), `ActualMenuList` (+0x1e8), the `via.gui.ScrollList` `ModeSelectList` (+0x228), `_OpenParam` (+0x208), `isDecided` (+0x220), `RequiemBannerBehavior` (+0x238). `chainsaw.MainMenuActionType`: Play 0, Extra 1, Bonus 2, Option 3, Exit 4, Mercenaries 5, Store 6-9 |
+| Opening | `GameStateMainMenu.update()` phase ShowMainMenu_Menu_Open (9), `applyGuiParam(OpenParam)` (0x141905a30) | Phase 9: `GuiManager.open(MainMenu)` with the state as the OpenParam applier once the window's controller is valid, then WaitMainMenu (10). `applyGuiParam`, only in step WaitOpen (a closed window): applies the parameters, step PreMove, then `setup()` and `draw()` - every time the menu opens (from the title, back from the story menu: LeaveStoryMenu → phase 3 → ... → 9). On an open window it does nothing |
+| Closing | `GuiManager.close(GuiType, Boolean, RenderOutputType)` (0x1402d23b0), `isOpen` | Play, Extra, Bonus, Store... close the window from `onDecidedMainMenu` with the generic `close<CloseParam>` (0x142809cb0); the plain overload goes through the same lookup of the GUI's controller by type (0x142809b70), without a close parameter (the main menu's is an empty stub). StartStoreFlow (13) waits for `isOpen(MainMenu, Default)` to be false before going on. In game, `isOpen` is false while the window is still closing: an `open` (phase 9) then does nothing |
+| Building the list | `setup()` (0x1419dead0) | A `List<MenuItem>` of the `_MenuList` entries `isAvliableAction` (0x14196d290) accepts (Extra and Mercenaries need their DLC, Exit the PC platform, 8/9/-1 never; **any other value: yes**) → `ToArray` → `ActualMenuList`; `ScrollList.set_ItemCount(n)` then `set_ItemMax(n)` (native 0x143ea6560 / 0x143ea65c0: they store +0x208 / +0x20c and rebuild the rows through the vtable when the list is live); `SelectionChanged` = `onSelectionChanged`. Also the extra-contents dialog and the "new" marks |
+| Row texts | `draw()` (0x141930e60) | For each row of `ScrollList.get_Items()`: `ActualMenuList[row.ListIndex (+0x1d4)]`, its label Text (looked up by name in the row) gets `MessageManager.getMessage(_ItemText)` (0x1435dd5b0), the "new" icon its state; then `showGeneralGuide(1, selected._GuideText)`. `onSelectionChanged` (0x1419a1320) plays the cursor sound and calls `draw()` |
+| Decide | `lateUpdateOnActive()` (0x141977bf0) | Step Move: on `GuiInputManager.isTrigger(Decide)` (0x14268be50, command 0xe1a9f42d) the selected entry's action (Extra / Mercenaries first check their DLC) → decide sound, `isDecided = true`, `OpenParam.OnDecided(action)`. Cancel is not read here (the main menu has no "back") |
+| The decision | `GameStateMainMenu.onDecidedMainMenu(MainMenuActionType)` (0x141b5bba0) | Stores `<MainMenuSelected>` (+0x74), switch on the action: Play → close the menu (`GuiManager.close(MainMenu)`), phase EnterStoryMenu (17); Option → phase ShowOption (23); Exit → dialog... An unknown action goes to the default branch (runs a delegate list) - so our entries are taken in a pre-hook before it runs |
+| New Game | `onDecidedStoryMenu` (0x141b5c350), `onDecidedDefficultySelectMenu(Difficulty)` (0x141b5bab0) | The story entry's attribute gives `_SelectedCampaignKey` (+0x80, `Nullable<CampaignInitialSettingKey>`: HasValue +0x80, value +0x84) → difficulty select; the difficulty writes `IngameSetupArgument` (+0xa0: `IsDifficultyChanged`, `Difficulty`) and goes to phase StartPointDecided (35) (Assisted also calls `OptionManager.setAssistedPlay`) |
+| Starting | `GameStateMainMenu.update()` (0x141bc2070) | Phase 35: `_IsNewGameStart` = true, `CampaignManager.initializeForStartingCampaign(_SelectedCampaignKey)` (0x142e053e0), `SaveDataManager.setPlayLoadData(false, 0)`, phase Decided (56); Decided waits for `isDeactivatedTitleSceneGui` (0x141b4d7f0: only the story menu, if one was opened, must be closed), fades and goes to the in-game setup with `IngameSetupArgument` when `<ModeMenuSelected>` (+0x78) is 0 |
+| Start points | `chainsaw.CampaignInitialSettingKey` | `Campaign1001_Master` (1, a new game) and `Campaign1001_ChpX_Y_Head` (4-21): every chapter's start, each `CampaignInitialSetting` with its chapter (`ChapterID` cp10_chpX_Y), flags and its own `_InventoryCatalogUserData`. Chapters 1-16 = ChapterIDs 21100, 21200, 21300, 22100 ... 25400 = keys 1 (Master), 7, 8, 9 ... 21 |
+| GUI helpers | `GuiManager.close(GuiType, bool, RenderOutputType)` (0x1402d23b0), `isOpen(GuiType, RenderOutputType, IGuiKey)` (0x14285c7e0), `ChainsawGuiBehaviorBase.setVisible(bool)` (0x1403a5780: the root panel's visible bit) | GuiType MainMenu 5, Loading 71; RenderOutputType Default 2 |
+| Menu commands | `chainsaw.GuiCommandType` | Decide 3786011693, Cancel 1883353458, MoveUp 201991506, MoveDown 2450535976, MoveLeft 4067573900, MoveRight 717819916 (keyboard, mouse buttons and pad alike) |
+| Save slots | `share.AppSaveSlot`, `AppSaveSlotUtil..cctor` (0x142f17e60) | Campaign 1001: 0 autosave, 1-20 the list, "limit" 99 - but `AllCampaign1001GameSaveSlotNo` holds only 0-20 (21 entries; 1011: 11, 1021: 21): slots past 20 are not registered, so co-op saves use list slots |
+| Slot contents | `SaveLoadMenuGuiManager.getSaveSlotInfoDetail(Int32)` (0x141782c90), via `HighwayGuiManager.get_SaveLoadMenuGuiManager` | `SaveSlotInfo`: `ChapterID` +0x14, `Stage` +0x18, `Difficulty` +0x20, `SaveCount` +0x24, `MainCampaignClearCount` +0x28 |
+| Loadout | `ItemIDDefine.getItemID(WeaponID)` (0x142345270), `ChainsawGuiUtil.generateItem(ItemID, count, durability, ammoId, ammoCount, changeId)` (0x14329e0d0) | A `WeaponItem` knows `get_UsableAmmoList()` and `get_DefaultAmmoMax()`; any `Item` its `get_StackMax()`; `CsInventoryController.add(Item, Default)` puts it in the case (§3.12) |
+
+**Design** (`lobby.lua` logic, `game_menu.lua` adapter, `lobby_ui.lua` screens, protocol 15):
+* **Our entries are the game's own entries.** A pre-hook on `setup()` replaces the window's
+  `_MenuList` - the serialized list `setup()` builds from - with the game's own entries (as the
+  window had them the first time we saw it) plus a `MenuItem` of our own (`_ActionType` 0x4D50,
+  made once and kept) above Options (else above Exit, else last), so the game itself builds
+  `ActualMenuList`, sizes the ScrollList, draws, animates and selects it (`isAvliableAction`
+  keeps any action type it does not know). A post-hook on `draw()` writes our label into the
+  row's label Text (its name learned from the game's rows: the one Text whose message differs
+  between them). A pre-hook on `onDecidedMainMenu` takes our actions before the game's switch.
+  "Multijugador" swaps our section (0x4D51-0x4D54) into the open menu, Back or Cancel (read in
+  `lateUpdateOnActive`'s pre-hook) the game's entries again - the very list `setup()` built for
+  them (filtered by `isAvliableAction`; without one, ours filtered by calling it): from the
+  session's frame, `ActualMenuList`, `set_ItemCount`/`set_ItemMax` (they rebuild the rows of a
+  live list), the cursor (first of our section, "Multijugador" back from it; never past the end
+  of the list it points into, since `lateUpdateOnActive` reads `ActualMenuList[cursor]`
+  unchecked), `draw()`; `_MenuList` follows for the next opening. A menu already open when the
+  script loads gets our list the same way once.
+* **0.11.0's menu was invisible** from the title on (only the button guide showed). Cause, from
+  the snapshot below: REFramework's `SystemArray.get_elements()` returns the C++ vector as a sol2
+  container (userdata), not a Lua table, and the adapter took anything but a table for an empty
+  array. The game's own entries read as none, so the list became our entry alone - one row
+  without a text (its label was never learned: no game rows to learn it from). Arrays are now
+  read with `get_size`/`get_element` when `get_elements` gives no table (as `Game:components`
+  and `reflect.each` always did); the tests' mock arrays answer `get_elements` with a container
+  too. A first fix that closed the window and set phase 9 to reopen it left the menu closed: the
+  game's `open` came while the window was still closing (`isOpen` already false) and did
+  nothing - so the menu is never closed by us.
+* **What the menu looks like** goes to `reframework/data/re4coop_menu.json` 2 s after each
+  opening or swap and when a swap fails: phase, the window's step, `_MenuList` and
+  `ActualMenuList` actions, ScrollList count/max/cursor, every row's index, visibility and texts,
+  the capabilities.
+* **Our screens cover the menu.** While the lobby, Join Game or Multiplayer Options is open
+  `lateUpdateOnActive` is skipped (no input reaches the menu) and our backdrop covers it. The
+  window is not hidden: 0.11.0 hid it with `ChainsawGuiBehaviorBase.setVisible(false)`, and
+  after the lobby the menu stayed invisible - a hidden window stops running
+  `lateUpdateOnActive`, the only sign of life the adapter used, so after a second it was
+  forgotten and never shown again. The adapter now also takes the main menu state's update as
+  a sign the window is there; our screens are REFramework ImGui, which gets the mouse and
+  keyboard with REFramework's own menu closed (REFramework.cpp: `ImGui_ImplWin32_WndProcHandler`
+  runs on every message), and the keyboard and pad come from the game's own menu commands.
+  Text boxes block the commands while typed in (the game sees the keys too). Only float style
+  variables are pushed (REFramework's `push_style_var` takes a float or a Vector2f; a push it
+  ignores would unbalance the pop) and style colors go as signed ints.
+* **Starting.** A new game: `_SelectedCampaignKey` written (+0x80/+0x84, REManagedObject
+  `write_*` writes at the object's address + offset, the same offsets the decompiled code
+  uses), the menu's choices as Play → New Game would set them, the menu window closed, then
+  `onDecidedDefficultySelectMenu(difficulty)` - the game's own path from phase 35 on, at the
+  chosen chapter's start point (both games start the same one). Continuing: the game intent
+  and `findContinueSave` (§3.15) load the slot the lobby asks for; a chapter other than the
+  save's goes through the chapter switch (§3.6). The host plays in its co-op file (setting
+  `coop_host_first_slot`, files 1-3 = slots 17-19 by default; the client keeps slot 20): its
+  autosaves and the saves it makes for the client go there, its single-player autosave is not
+  touched. A client without a co-op save starts a new game at the host's chapter, then joins
+  the host (world, warp) as always.
+* **The synchronized start.** Each game reports its phase (LOAD_STATE: starting, loading,
+  syncing - a client taking over the host's world and walking up to it -, ready). Once its
+  player has been in the map for 0.75 s with the loading screen gone (and, for a client
+  joining a saved game, the host's world taken over), a game is held: time scale 0, a veil and
+  the two loaders. The host sends LOAD_GO when both are ready; both run. A partner that
+  disconnects, fails to start or is skipped (the continue key after 15 s) is not waited for;
+  after `start_timeout` (120 s) nobody is. Then each player's loadout goes into their case.
+
+**Limits.** Not run in the game yet. The label's Text name is learned at run time; if it cannot
+be learned, every empty text of our rows gets the label. Our entries' guide line (the bottom
+description) is empty. The game's mouse cursor may be hidden under our screens (they draw
+their own ring). The loaders show phases, not percentages (the game gives no loading
+progress). A new game at a chapter start uses the game's own inventory for that chapter; the
+loadout adds to it.
+
+### 3.32 Heads bursting on the client and its crash after a start from the lobby (0.11)
+
+**Report.** A game started from the lobby (loadout "Asalto": submachine gun and assault rifle).
+On the client, enemies lost their heads although *Your partner's hits and kills also burst heads*
+(`enemy_replay_mutilation`) was off, and its game crashed.
+
+**Evidence.** `reframework/reframework_crash.dmp` (REFramework's own handler; Windows kept no
+dump): `c0000005` reading 0x2d in the engine's reference release (0x1439df024, next to
+0x1439df010) called from `Array.Clear` (0x143a70900) in `HitController.updateAttack`
+(0x14205a2f0) from `HitController.update`: after `HitManager.registerDamage` for each pooled hit,
+the controller clears its `DamageHitList` (+0x108, `List<collision.HitInfo>`) and one element was
+freed memory. The client's breadcrumbs end in the same frame with `enemy.ai restore`,
+`enemy.kill` (`Ch1c0z0Context`): the host's kill run on the client's copy of a villager that had
+been a puppet until that frame - the scenario of §3.16.
+
+**Cause, as far as established.** Until 0.10.2, `enemy_damage_collider` looked for the enemy's
+damage colliders in its `Colliders` only, where enemies have none (§3.29): `build_hit` gave up
+(no damage data) and the client's copies died through `HitPoint.dead()` and
+`entryDeadAction`, with no hit run. 0.10.3 found them in the `RequestSetCollider`, so for the first
+time since §3.16 the host's killing hit was really run on the client's copy - with the host's body
+part (a head shot) and break values - and the crash came back, in another place. Which object of
+the list was freed is not known (the heap is not in the dump). The head bursts came from parts
+breaks the guard of §3.16 did not cover: it skipped them only while our own call to
+`callbackDamageHit` ran, but a death runs over the next frames, and the client's own hits on
+puppets (full break values, only the damage clamped) broke parts the host's game decides.
+
+**Fix.**
+- `enemy_kill_with_hit` is off by default (config version 14 resets it once): the host's kills
+  die on the client the 0.10.2 way, `HitPoint.dead()` and the death action, no hit run. It can be
+  switched on again (Options; the label says it crashed the game).
+- Nothing breaks on an enemy that is not ours to break, while `enemy_replay_mutilation` is off:
+  the parts-break pre-hooks (§3.16) also skip when their updater (`this`) is a puppet's head or
+  body updater, or one of an enemy whose death the partner's game decided (`enemy_kill`, and on
+  the host a partner's hit marked IsKill) for 30 s - marks expire, heads and bodies are pooled.
+  Our own hits on our own enemies break parts as always.
+
 ## 4. Sync architecture
 
 ```
@@ -1757,7 +2010,9 @@ enemy kind without its own finisher query offers no finisher in the host's game 
     turns on the client); the client's game never kills a puppet. Finishers the client starts
     run on the host's enemy the same way; their prompts come from the host's enemy.
   * Deaths: the host announces each death with the killing hit (and whether it was the
-    client's); the client kills its copy with that hit where it died. The host's **graveyard**
+    client's); the client kills its copy where it died - its own death action, nothing of it
+    breaking (with the killing hit itself only if `enemy_kill_with_hit` is on: it crashed the
+    client, §3.32). The host's **graveyard**
     keeps every enemy dead in its world (also from its save), and an enemy dead in the host's
     world is killed or erased wherever it appears in the client's (§3.8).
   * Each player rolls their own loot from every enemy that dies in their game (§3.7).

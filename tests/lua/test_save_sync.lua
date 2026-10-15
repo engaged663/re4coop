@@ -96,6 +96,33 @@ T.run("a_client_autosave_goes_to_its_coop_slot_and_saves_the_host", function()
     T.eq(#pair.gb.saved, 1, "and the client only once")
 end)
 
+T.run("a_lobby_game_saves_the_host_into_its_coop_file", function()
+    local pair = make_pair()
+    pair.a:set_host_slot(18)
+    local to = pair:game_save("a", 0)
+    T.eq(to, 18, "the host's autosave goes to its co-op file (single-player autosave untouched)")
+    pair:step(20)
+    T.eq(pair.gb.saved[1], 20, "the client saved into its co-op slot")
+    -- The client's autosave makes the host save into its co-op file, not slot 0.
+    pair.now = pair.now + 30
+    pair:game_save("b", 0)
+    pair:step(20)
+    T.eq(pair.ga.saved[#pair.ga.saved], 18, "the host's save for the client goes to its co-op file")
+    -- A typewriter save of the host elsewhere: the co-op file follows.
+    pair.now = pair.now + 30
+    local before = #pair.ga.saved
+    pair:game_save("a", 3)
+    pair:step(20)
+    T.eq(pair.ga.saved[before + 1], 3, "the slot the host chose")
+    T.eq(pair.ga.saved[before + 2], 18, "then a copy into its co-op file")
+    -- Game over -> Continue reloads the co-op file; the lobby's own load asks for its slot.
+    T.eq(pair.a:continue_slot(pair.now), 18, "continue loads the co-op file")
+    pair.a:request_load(17, pair.now)
+    T.eq(pair.a:continue_slot(pair.now), 17, "the slot the lobby asked for")
+    pair.a:set_host_slot(nil)
+    T.eq(pair.a:redirect(0), 0, "outside a lobby game the autosave is the game's again")
+end)
+
 T.run("a_typewriter_save_stays_where_the_player_chose", function()
     local pair = make_pair({ coop_save_slot = 7 })
     T.eq(pair:game_save("b", 5), 5, "the client's own save into slot 5 stays there")
