@@ -107,6 +107,7 @@ Config.DEFAULTS = {
     gate_grace = 1.5,             -- seconds an event must last before it holds you (doors etc. don't)
     gate_radius = 10.0,           -- metres: a partner this close counts as arrived
     continue_key = 0x77,          -- F8: stop waiting and continue alone
+    fix_black_screen = true,      -- lift a transition/event fade still black 10 s after the game plays again
 
     -- partner character
     show_partner = true,               -- the partner's animated 3D character, built from their body prefab

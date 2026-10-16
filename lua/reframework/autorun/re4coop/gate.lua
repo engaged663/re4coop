@@ -14,12 +14,19 @@
 -- Holding is done by the caller (session.lua freezes the scene's time scale) and released
 -- when the partner is ready, when the player presses the continue key, or when the partner
 -- disconnects. Pure Lua, tested offline (tests/lua/test_gate.lua).
+--
+-- Never during our own transitions (s.transition: a chapter change, a game over, a load): the
+-- game runs them on timers and on what it loads, so a frozen one never finishes - the screen
+-- would stay black. The event our game plays as it comes out of one (the next part's first
+-- cutscene) is the transition's own and is let through; the chapter gate takes care of
+-- chapter starts.
 
 local Gate = {}
 Gate.__index = Gate
 
 local READY_NEAR_SECONDS = 1.0 -- partner within gate_radius this long counts as arrived
 local EVENT_RADIUS_FACTOR = 3  -- a partner's event counts if it is this many radii away at most
+local AFTER_TRANSITION = 10.0  -- an event starting this soon after our transition belongs to it
 
 local function dist(a, b)
     local dx, dy, dz = a.x - b.x, a.y - b.y, a.z - b.z
@@ -42,9 +49,10 @@ function Gate:reset()
     self.chapters_matched = false
     self.chapter_skipped = false
     self.last_release = nil     -- why the last hold ended (for the UI)
+    self.transition_end = nil   -- when our last transition ended (its event is let through)
 end
 
--- s = { connected, in_game, event, chapter, stage, pos,
+-- s = { connected, transition, in_game, event, chapter, stage, pos,
 --       partner_fresh, partner_event, partner_chapter, partner_stage, partner_pos,
 --       continue_pressed }
 local function same_stage(s)
@@ -97,6 +105,14 @@ function Gate:update(now, s)
 
     self:track_near(s, now)
 
+    if s.transition then
+        if self.holding ~= nil then self:release("loading") end
+        self.event_start = nil
+        self.event_decided = false
+        self.transition_end = now
+        return nil
+    end
+
     -- Chapter bookkeeping.
     if s.chapter ~= nil and s.partner_chapter ~= nil and s.partner_chapter == s.chapter then
         self.chapters_matched = true
@@ -138,7 +154,8 @@ function Gate:update(now, s)
     local grace = self.settings.gate_grace or 1.5
     if s.event and not self.event_decided and now - self.event_start >= grace then
         self.event_decided = true
-        if not self:partner_ready_for_event(s, now) then
+        local after_transition = self.transition_end ~= nil and self.event_start - self.transition_end <= AFTER_TRANSITION
+        if not after_transition and not self:partner_ready_for_event(s, now) then
             self.holding, self.hold_since = "event", now
             return self.holding
         end

@@ -25,6 +25,12 @@ Game.__index = Game
 
 local CHARACTER_MANAGER = "chainsaw.CharacterManager"
 local GUI_MANAGER = "chainsaw.GuiManager"
+local MAIN_MODE = "share.MainModeManager"
+local IN_GAME_STATE = "chainsaw.GameStateInGame"
+local CAMPAIGN_JUMPER = "chainsaw.CampaignJumper"
+local SAVE_DATA_MANAGER = "share.SaveDataManager"
+local FADE_MANAGER = "share.FadeManager"
+local CLAPPERBOARD = "chainsaw.ClapperboardMediator"
 local HIT_POINT = "chainsaw.HitPoint"
 local GUN = "chainsaw.Gun"
 
@@ -1070,6 +1076,7 @@ end
 function Game:begin_frame()
     self.frame_ctx = nil
     self.frame_cutscene = nil
+    self.frame_main = nil
     self:service_heads()
 end
 
@@ -1091,7 +1098,105 @@ function Game:is_cutscene()
     return c
 end
 
--- Returns { pos, rot, hp, max_hp, dead, cutscene, aiming, stage, chapter, id } or nil when
+-- The game's own state machine (share.MainModeManager, docs/RESEARCH.md 3.33): the current
+-- game state's IsInGame is true only in normal play (chainsaw.GameStateInGame). A chapter
+-- change (GameStateInGameChapterChange: the bell in the village ends chapter 1-1, the screen
+-- stays black while the next part loads), a game over or a save loading run other states,
+-- and our player's context can live on through them. { known, in_game, state } for the frame.
+function Game:main_state()
+    local m = self.frame_main
+    if m ~= nil then return m end
+    m = { known = false, in_game = true }
+    local mm = singleton(MAIN_MODE)
+    if mm ~= nil then
+        local ig = self:call(mm, "get_IsInGame")
+        if type(ig) == "boolean" then
+            m.known, m.in_game = true, ig
+            if not ig then
+                local t = self:call(mm, "get_CurrStateType")
+                local name = t ~= nil and self:call(t, "get_FullName") or nil
+                if type(name) == "string" then
+                    m.state = name
+                    if name == IN_GAME_STATE then m.in_game = true end
+                end
+            end
+        end
+    end
+    self.frame_main = m
+    return m
+end
+
+-- Our game is between two moments of play (chapter change, game over) with our player's
+-- context alive: nothing of the shared world may be applied to it now, and nobody may freeze
+-- or move it. (Menus and loading screens have no player context: they were never playable.)
+function Game:in_transition()
+    local m = self:main_state()
+    return m.known and not m.in_game and self:player_context() ~= nil
+end
+
+-- What a transition is doing, for the log when one lasts too long: the game state and its
+-- phase, the CampaignJumper's phase and whether the save system is busy.
+function Game:transition_detail()
+    local d = { state = self:main_state().state }
+    local mm = singleton(MAIN_MODE)
+    local ctl = mm and read_field(mm, "CurrentGameState")
+    local gs = ctl and read_field(ctl, "GameState")
+    if gs ~= nil then
+        d.state = d.state or type_name_of(gs)
+        d.phase = tonumber(read_field(gs, "<CurrPhase>k__BackingField"))
+    end
+    local cj = singleton(CAMPAIGN_JUMPER)
+    if cj ~= nil then d.jumper = tonumber(self:call(cj, "get_CurrentPhase")) end
+    local sdm = singleton(SAVE_DATA_MANAGER)
+    if sdm ~= nil then d.saving = self:call(sdm, "get_IsBusy") == true end
+    return d
+end
+
+-- The screen fades this mod watches (share.FadeManager.FadeType): the ones transitions and
+-- events darken. GUI (3), text (5), gimmick (6) and area-loading (7) fades are the game's
+-- own business at any time and are never touched.
+Game.WATCHED_FADES = { 0, 1, 2, 4 } -- INTER_GAMESTATE, GAMESTATE, CAMPAIGN_JUMPER, EVENT
+
+-- The watched fade types that are dark now (FadeManager.isFadeOut: fading or faded out).
+function Game:dark_fades()
+    local fm = singleton(FADE_MANAGER)
+    if fm == nil then return nil end
+    local out = {}
+    for _, t in ipairs(Game.WATCHED_FADES) do
+        if self:call(fm, "isFadeOut", t) == true then out[#out + 1] = t end
+    end
+    return out
+end
+
+-- Lifts one fade the way the game does when its transition ends (FadeManager.requestFadeIn).
+function Game:lift_fade(fade_type, seconds)
+    local fm = singleton(FADE_MANAGER)
+    if fm == nil then return false end
+    self.perf:crumb("fade_in", tostring(fade_type), true)
+    local ok = pcall(function()
+        fm:call("requestFadeIn(share.FadeManager.FadeType, System.Single, System.String, System.Action)",
+            fade_type, seconds or 0.5, nil, nil)
+    end)
+    return ok
+end
+
+-- A camera of the game's own is playing (ClapperboardMediator._Plays: one PlayWork per
+-- screen while a cutscene, a movie or a gimmick camera runs).
+function Game:camera_busy()
+    local clap = singleton(CLAPPERBOARD)
+    local plays = clap and read_field(clap, "_Plays")
+    if plays == nil then return false end
+    local busy = false
+    pcall(function()
+        local n = plays:get_size()
+        for i = 0, n - 1 do
+            if plays:get_element(i) ~= nil then busy = true break end
+        end
+    end)
+    return busy
+end
+
+-- Returns { pos, rot, hp, max_hp, dead, cutscene, transition, aiming, stage, chapter, id } or nil when
 -- there is no controllable player (title screen, loading). `id` identifies the player
 -- context object: a new one means the game (re)loaded.
 function Game:read_player_state()
@@ -1124,6 +1229,7 @@ function Game:read_player_state()
         st.dead = self:call(hp, "get_IsLive") == false
     end
     st.cutscene = self:is_cutscene()
+    st.transition = self:in_transition()
     st.stage = tonumber(self:call(ctx, "get_CurrentStageID"))
     st.chapter = tonumber(self:area_name()) -- CampaignManager.get_CurrentChapter (chainsaw.ChapterID)
     st.aiming = self:call(ctx, "get_IsHolding") == true

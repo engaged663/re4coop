@@ -151,8 +151,11 @@ function M.install(Game, H)
         return on == true
     end
 
-    -- Our game can start a save now: the save system is idle and nothing excludes saving.
+    -- Our game can start a save now: in normal play (never in the middle of a chapter change,
+    -- whose own autosave and loading wait for the save system), the save system idle and
+    -- nothing excluding saving.
     function Game:save_can()
+        if self.in_transition ~= nil and self:in_transition() then return false, "the game is changing chapter or loading" end
         local sdm = singleton(SAVE_MANAGER)
         if sdm == nil then return false, "no save system" end
         if self:call(sdm, "get_IsBusy") == true then return false, "the game is saving or loading" end

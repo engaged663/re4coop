@@ -7,7 +7,8 @@
 --     follows.
 --
 -- Adapter contract (world):
---   world:location() -> { chapter, stage, pos, yaw, loading=bool, playable=bool } | nil
+--   world:location() -> { chapter, stage, pos, yaw, loading=bool, playable=bool, transition=bool } | nil
+--     (transition: the game is changing chapter, over or loading - a travel waits it out)
 --   world:preload_stage(stage) -> bool
 --   world:warp(stage, pos, yaw) -> bool
 --   world:arm_chapter_switch(chapter) -> bool
@@ -116,7 +117,18 @@ function Travel:tick(now, world, partner)
     self.since = self.since or now
 
     if self.state == "start" then
+        -- Our game is changing chapter or reloading: decide once it plays again (its chapter is
+        -- the one it is changing to only then).
+        if loc ~= nil and loc.transition then return end
         local in_game = loc ~= nil and loc.playable and not loc.loading
+        -- A cutscene's join is a walk to where it took place, never a chapter switch: a
+        -- cutscene that ends a chapter has already taken both games to the next one.
+        if t.reason == "cutscene" and known(t.chapter) and loc ~= nil and known(loc.chapter) and loc.chapter ~= t.chapter then
+            self.result = "chapter changed"
+            self.state = "idle"
+            self.target = nil
+            return
+        end
         if known(t.chapter) and (loc == nil or (known(loc.chapter) and loc.chapter ~= t.chapter)) then
             if not world:arm_chapter_switch(t.chapter) then
                 return self:fail("chapter switching is not available", world)

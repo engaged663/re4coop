@@ -2366,8 +2366,12 @@ function World:location()
     local tf = body and R.call(body, "get_Transform")
     local rot = tf and R.call(tf, "get_Rotation")
     local cutscene = self.game:is_cutscene()
+    -- Between two moments of play (a chapter change, a game over: the player's context lives
+    -- on) the game counts as loading: nothing waits on it, travels, saves or replays now.
+    local transition = self.game.in_transition ~= nil and self.game:in_transition() or false
     return { chapter = chapter, stage = stage, pos = { x = pos.x, y = pos.y, z = pos.z }, yaw = yaw_of(rot),
-        loading = false, playable = not cutscene, cutscene = cutscene }
+        loading = transition, playable = not cutscene and not transition, cutscene = cutscene,
+        transition = transition or nil }
 end
 
 local function split_stage(stage)

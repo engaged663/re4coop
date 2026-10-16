@@ -1962,6 +1962,74 @@ puppets (full break values, only the damage clamped) broke parts the host's game
   the host a partner's hit marked IsKill) for 30 s - marks expire, heads and bodies are pooled.
   Our own hits on our own enemies break parts as always.
 
+### 3.33 The client's black screen after the bell in the village (0.11.1)
+
+**Report.** In the village, after the church bell rings and both players finish the cutscene,
+the host plays on normally while the client's screen stays completely black and the client
+cannot go on. The report came from a session over the internet (host and client on two PCs,
+`re4coop_breadcrumb_client.json`, `re2_framework_log.txt` of the client); the run with the
+bell itself left no log (REFramework overwrites it on every launch).
+
+**What the bell is.** The game data says so (`natives/stm/_chainsaw/event/resource/chapterchange/
+eventchapterchangeuserdata.user.2`, read with an RSZ reader built from the REFramework dump's
+field layouts): its first item is `PrevTimelineID 10012 → ChapterID 21200 (cp10_chp1_2), NextTimelineID
+10013`. `csa012` (`event/cs/csa012/csa012.user.2`: Leon, the villagers `ch2a3z0` with their
+sack variants and the chainsaw man `ch1b5z1`) is the bell, and it **ends a part of chapter 1**:
+
+| Function (address) | What it does |
+|---|---|
+| `PlayWorkTimeline.onRequestedPlay` (0x143962a20, `setupChapterChangeInfo` inlined) | Every timeline looks itself up in `EventChapterChangeUserData`: `isItemFromNextID(id)` → `_IsChapterStart` (0xb9), `getItemFromPrevID(id)` → `_ChapterChangeItem` (0xb0) and `_IsChapterEnd` (0xb8). So a replayed payload (§3.11) is a chapter end too |
+| `PlayWorkTimeline.end` (0x143908a00) | Unless the cause is `ClearInGame` (9): `requestNextChapter` (0x143974de0) → `MainModeManager.enqueueChangeGameState(GameStateInGameChapterChange, Argument(NextCampaign, …))` |
+| `GameStateInGameChapterChange.update` (0x141069230) | Phases 1-43 behind a black screen: pause, env scenes reserved and released (`EnvSceneUtil`, phase 6 with a timeout, phase 8 without), `CampaignManager.setChapter` (phase 10), characters, the chapter's autosave (phase 19, `startAutoSave`), then it **waits for `SaveDataManager.get_IsBusy()` to be false** (phases 20 and 37), activates the next part's scenes and only then goes back to `GameStateInGame` |
+| `CampaignJumper.updateLeaveStart` (0x1423ddac0) | A chapter start with a next event (21200 → `csa013`) skips the jumper's own fade-in and builds an `EventChapterChangeController` instead; `updateForChapterChangeData` (0x1423d99d0) plays the event once loaded |
+| `EventChapterChangeController.execSpecialOrderPlayTimeline` (0x1435d2490) | Requests the next event with `Option.Post = FreePost (1)`: through `calcRequest` (0x141913670) straight to `procRequest`, **not through `procPayloadPlay`** (so never reported to the partner, never "done"); its OnPlay/OnEnd fade the EVENT layer |
+| `PlayWorkTimeline.<onAcceptPlayTimeline>b__70_0` (0x1438e1990) | When a chapter-start timeline starts, it lifts the jumper's fade (`FadeManager.requestFadeIn`) |
+| `ClapperboardMediator.setupAndCheck` (0x1419df720) | Post `Auto` becomes `Once` for timelines and movies; only `Once` checks `_HasDone` |
+| `MainModeManager.get_IsInGame` (0x140852f30) | `CurrentGameState.GameState.get_IsInGame()`: true only for `GameStateInGame` (and the endings); false in the chapter change, the game over, a load |
+| `share.FadeManager` | One `FadeController` per `FadeType` (INTER_GAMESTATE 0, GAMESTATE 1, CAMPAIGN_JUMPER 2, GUI 3, EVENT 4, TEXT_CHANGE 5, GIMMICK 6, CAMPAIGN_MANAGER 7); `isFadeOut(type)` (0x14069bc90) = phase FadeOut_Wait/FadeOut_Idle; `requestFadeIn(type, seconds, owner, onComplete)` (0x142392cb0) goes straight to `FadeController.fadeIn` |
+
+**Why only the client.** Both games run that chapter change (the client's copy of `csa012` ends in
+it too), but through all of it the player's context lives on and `GuiManager.get_IsPlayingEvent`
+is false - so to the mod the game looked playable. The host is ahead (it rang the bell; the client
+replays it a moment later), so everything the host sends during its own change and right after it
+reaches the client while the client's change is still running:
+
+- the host's chapter-change autosave (SAVE): the client's mod could start a save into its co-op
+  slot in the middle of the change, which then waits on the save system (phases 20 and 37);
+- a partner who watched the bell from more than 30 m away was sent "where the cutscene took
+  place" as soon as it ended: stage requests (`requestToChangeStatus`) and `requestWarp` while the
+  change was releasing and loading the env scenes, and - the chapter having changed - a chapter
+  switch to the old chapter with a game over to reload it;
+- the host's flags (held only while the replay played), doors, breakables and traps were applied
+  to a world being unloaded; the host's next cutscene could be replayed into it;
+- the transition gate could freeze the client's game (time scale 0) at an event while the
+  partner was far away, and a frozen change never finishes (its phases count time).
+
+Which of these hit in the reported run is not known (no log of it); each of them acts on a game
+that is in the middle of unloading and loading itself, and none of them is needed then.
+
+**Fix (0.11.1).**
+- `Game:main_state()` / `in_transition()` (`share.MainModeManager.get_IsInGame`, the state's
+  name when not in game, once a frame): our game is in a transition when it is not in normal
+  play while our player's context exists (menus have none).
+- During a transition the location is "loading" (`transition = true`), `fresh_local_pos` is nil
+  (no enemies, items, prompts, Ashley), no save starts (`save_can`, `can_save_now`), the world
+  sync does nothing but hold the partner's flags (until 2 s after), messages that would touch the
+  world (flags, gimmicks, objects, doors, traps, mechanisms, cutscenes, triggers, enemy hits and
+  deaths) wait in the deferred queue until the game has played for a second, a replay of the
+  partner's cutscene lasts until the game plays again, no travel starts, and our PLAYER messages
+  carry CUTSCENE so the partner treats us as busy.
+- A cutscene's join is never a chapter switch: if the chapter changed (or our game went through a
+  transition) since the cutscene started, it is dropped.
+- The gate never holds during a transition (a hold is released, reason "loading") and lets
+  through an event that starts within 10 s after one (the next part's first cutscene).
+- `screen_watch.lua`: a transition or event fade (types 0, 1, 2, 4) still dark 10 s after the game
+  is back in normal play, with no event or camera of the game's running, no hold of ours and our
+  player alive, is lifted with `FadeManager.requestFadeIn` (up to 3 tries; option *Bring the
+  picture back...*, on by default). A transition still running after 45 s is written to the log
+  once with its state, phase, the jumper's phase and whether the save system is busy - what to
+  look at if a black screen ever comes back.
+
 ## 4. Sync architecture
 
 ```

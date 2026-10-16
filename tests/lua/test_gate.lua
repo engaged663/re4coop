@@ -158,6 +158,43 @@ T.run("partner_ahead_does_not_hold_us", function()
     T.eq(g:run(3), nil, "the player behind is never frozen")
 end)
 
+-- The bell in the village: the cutscene ends chapter 1-1 and the game changes chapter behind a
+-- black screen. A hold then froze that change (time scale 0), and the screen stayed black.
+T.run("our_transition_is_never_held_and_releases_a_hold", function()
+    local g = make()
+    g.s.event = true
+    g:run(2)
+    T.eq(g.gate.holding, "event", "held in a cutscene, partner far away")
+    g.s.event, g.s.transition = false, true -- the cutscene ended into the game's chapter change
+    T.eq(g:run(0.1), nil, "released at once")
+    T.eq(g.gate.last_release, "loading", "reason")
+    g.s.event = true -- whatever the game shows while it changes chapter
+    T.eq(g:run(10), nil, "never held during it")
+end)
+
+T.run("the_event_coming_out_of_a_transition_is_let_through", function()
+    local g = make()
+    g.s.transition = true
+    g:run(3)
+    g.s.transition = false
+    g:run(0.5)
+    g.s.event = true -- the next part's first cutscene; the partner is past it and 60 m away
+    T.eq(g:run(5), nil, "not held: it belongs to the transition")
+    g.s.event = false
+    g:run(15)
+    g.s.event = true -- a later cutscene is an ordinary one again
+    T.eq(g:run(2), "event", "held as before")
+end)
+
+T.run("no_chapter_hold_starts_during_our_transition", function()
+    local g = make()
+    g:run(1) -- chapters matched
+    g.s.transition, g.s.chapter = true, 21200 -- our chapter changed before the partner's
+    T.eq(g:run(3), nil, "not while the game is still changing it")
+    g.s.transition = false
+    T.eq(g:run(0.2), "chapter", "the chapter gate holds once we play in it")
+end)
+
 T.run("switched_off", function()
     local g = make({ transition_gate = false })
     g.s.event = true

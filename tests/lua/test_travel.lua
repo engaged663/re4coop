@@ -155,6 +155,37 @@ T.run("refused_warps_retry_then_fail", function()
     T.eq(#stuck.warps, 3, "three attempts")
 end)
 
+-- The bell in the village (cutscene that ends chapter 1-1): a client that watched it from far
+-- away was sent to where it took place - in the middle of its own chapter change.
+T.run("nothing_moves_while_the_game_changes_chapter", function()
+    local world = make_world({ loc = { chapter = 21100, stage = 40200, pos = { x = 0, y = 0, z = 0 }, loading = true,
+        playable = false, transition = true } })
+    local tr = make_travel({ travel_reload = true })
+    tr:request({ chapter = 21100, stage = 43300, pos = { x = 48, y = 2, z = -55 }, reason = "join" })
+    local now = run(tr, world, 5)
+    T.eq(tr.state, "start", "waits")
+    T.eq(#world.preloads + #world.warps, 0, "no stage requested, no warp")
+    T.eq(world.armed, nil, "no chapter switch armed")
+    T.eq(world.reloads, 0, "no reload")
+    world.loc = { chapter = 21100, stage = 40200, pos = { x = 0, y = 0, z = 0 }, playable = true }
+    run(tr, world, 6, nil, now)
+    T.eq(tr.result, "arrived", "goes once the game plays again")
+end)
+
+T.run("a_cutscene_join_never_switches_chapter", function()
+    -- The cutscene took place in 21100 and changed our game to 21200 when it ended.
+    local world = make_world({ loc = { chapter = 21200, stage = 40200, pos = { x = 0, y = 0, z = 0 }, playable = true } })
+    local tr, log = make_travel({ travel_reload = true })
+    tr:request({ chapter = 21100, stage = 40200, pos = { x = 50, y = 0, z = 0 }, reason = "cutscene" })
+    run(tr, world, 3)
+    T.eq(tr:busy(), false, "dropped")
+    T.eq(tr.result, "chapter changed", "why")
+    T.eq(world.armed, nil, "never armed")
+    T.eq(world.reloads, 0, "never a game over to reload the old chapter")
+    T.eq(#world.warps, 0, "no warp")
+    T.eq(#log.notes, 0, "nothing to tell")
+end)
+
 T.run("requests_without_a_destination_are_refused", function()
     local tr = make_travel()
     T.eq(tr:request({ reason = "join" }), false, "nothing to go to")

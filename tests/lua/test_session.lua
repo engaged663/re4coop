@@ -604,6 +604,131 @@ T.run("ashley_messages_are_recorded_even_while_loading", function()
     T.check(told(s, "Ashley now follows you"), "told")
 end)
 
+-- The game's own transitions for the fake game and world: game.transition (a chapter change,
+-- a game over), screen fades (game.fades[type] = true while dark) and the time scale.
+local function with_transitions(game, world)
+    game.fades, game.lifted, game.time_scale = {}, {}, 1.0
+    function game:read_player_state()
+        return { pos = self.pos, rot = { x = 0, y = 0, z = 0, w = 1 }, hp = 10, max_hp = 10, chapter = self.chapter,
+            stage = self.stage, id = self.ctx_id, cutscene = world.playing ~= nil, transition = self.transition == true }
+    end
+    function game:in_transition() return self.transition == true end
+    function game:transition_detail() return { state = "chainsaw.GameStateInGameChapterChange", phase = 20 } end
+    function game:dark_fades()
+        local out = {}
+        for t, v in pairs(self.fades) do if v then out[#out + 1] = t end end
+        table.sort(out)
+        return out
+    end
+    function game:lift_fade(t)
+        self.lifted[#self.lifted + 1] = t
+        self.fades[t] = nil
+        return true
+    end
+    function game:camera_busy() return world.playing ~= nil end
+    function game:get_time_scale() return self.time_scale end
+    function game:set_time_scale(v) self.time_scale = v end
+    function world:location()
+        local g = self.game
+        local tr = g.transition == true
+        return { chapter = g.chapter, stage = g.stage, pos = g.pos, yaw = 0, playable = not tr and self.playing == nil,
+            loading = tr, transition = tr or nil, cutscene = self.playing ~= nil }
+    end
+end
+
+-- The bell in the village (csa012) ends chapter 1-1: in the client's game too, its copy of the
+-- host's cutscene ends in the game's own chapter change, behind a black screen. Things the mod
+-- did to the client's game in the middle of it left the client's screen black for good.
+T.run("the_bells_chapter_change_runs_untouched_on_the_client", function()
+    local s, net, clock, game, world = make("client", { settings = { stage_travel = true, travel_reload = true } })
+    with_saves(s, game, clock)
+    with_transitions(game, world)
+    s.world_synced = true
+    local function host(flags, chapter)
+        net.push(player_msg(clock.t, chapter or 21100, 40200, { x = 80, y = 0, z = 0 }, flags))
+    end
+    for _ = 1, 5 do
+        clock.t = clock.t + 0.1
+        host()
+        s:update()
+    end
+    -- The host, 80 m away, rings the bell.
+    net.push(P.encode_cutscene({ camera = P.CAMERA.TIMELINE, id = 10012, screen = 3, owner_code = 77, end_portrayal = 5,
+        start_flags = {}, end_flags = {}, chapter = 21100, stage = 40200, pos = { x = 80, y = 0, z = 0 },
+        flags = P.CUTSCENE_FLAGS.LOCAL_TRIGGER }))
+    for _ = 1, 10 do
+        clock.t = clock.t + 0.1
+        host(P.PLAYER_FLAGS.CUTSCENE)
+        s:update()
+    end
+    T.eq(world.played[1] and world.played[1].id, 10012, "the bell plays here too")
+    -- It ends: our game changes chapter (black, the player's context alive).
+    world.playing = nil
+    game.transition, game.chapter = true, 21200
+    game.fades = { [2] = true, [4] = true }
+    -- The host, through its own change already, autosaves and sets flags meanwhile.
+    local g = "0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9"
+    net.push(P.encode_save({ kind = P.SAVE_KIND.AUTO }))
+    net.push(P.encode_flags({ { guid = g, value = true } })[1])
+    net.push(P.encode_doors({ { guid = "d0d0d0d0-0000-0000-0000-000000000001", open = true } })[1])
+    clock.t = clock.t + 0.1
+    s:update()
+    T.eq(#s.deferred, 2, "flags and doors kept for after the change")
+    local frozen = false
+    for _ = 1, 100 do
+        clock.t = clock.t + 0.1
+        host(0, 21200)
+        s:update()
+        if game.time_scale == 0 then frozen = true end
+    end
+    T.eq(frozen, false, "never frozen")
+    T.eq(#game.saved, 0, "no save in the middle of the chapter change")
+    T.eq(world.flags[g], nil, "the host's flags wait")
+    T.eq(world.armed, nil, "no chapter switch armed")
+    T.eq(world.reloads, 0, "no game over to reload")
+    T.near(game.pos.x, 0, 1e-6, "no warp to where the bell rang")
+    T.check(not told(s, "Joining your partner"), "no travel")
+    T.eq(#game.lifted, 0, "the black of the transition is the game's own")
+    local last
+    for _, m in ipairs(net.sent) do
+        if m.data:byte(1) == P.T.PLAYER then last = P.decode(m.data) end
+    end
+    T.check(last ~= nil and (last.flags & P.PLAYER_FLAGS.CUTSCENE) ~= 0, "the host sees us busy")
+    T.eq(s:status().transition, true, "in the status")
+    -- The game plays again, but the black stays (what the client saw).
+    game.transition = false
+    for _ = 1, 150 do
+        clock.t = clock.t + 0.1
+        host(0, 21200)
+        s:update()
+    end
+    T.check(#game.lifted >= 1, "the black was lifted")
+    T.check(told(s, "screen stayed black"), "and the player told")
+    T.eq(world.flags[g], true, "the host's flags applied once playing")
+    T.eq(#s.deferred, 0, "everything kept was handled")
+    T.eq(game.saved[1], 20, "the host's save made, in the co-op slot")
+    T.eq(world.armed, nil, "still no chapter switch: the bell took us to the next part")
+    T.check(not told(s, "Joining your partner"), "and no travel")
+    T.eq(s:status().screen.counters.transitions, 1, "one transition counted")
+end)
+
+T.run("a_hold_never_outlasts_our_transition", function()
+    local s, net, clock, game, world = make("client")
+    with_transitions(game, world)
+    world.playing = true -- a long cutscene of ours; the host is 60 m away and not in it
+    for _ = 1, 30 do
+        clock.t = clock.t + 0.1
+        net.push(player_msg(clock.t, 21100, 40200, { x = 60, y = 0, z = 0 }))
+        s:update()
+    end
+    T.eq(game.time_scale, 0, "held at the transition")
+    world.playing, game.transition = nil, true -- it ends into a chapter change
+    clock.t = clock.t + 0.1
+    s:update()
+    T.eq(game.time_scale, 1.0, "released: a frozen chapter change never finishes")
+    T.check(told(s, "loading"), "told why")
+end)
+
 T.run("shutdown_restores_everything", function()
     local pause = fake_pause()
     local s, net, _, game, world = make("client", { pause = pause })

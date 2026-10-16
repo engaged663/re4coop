@@ -139,8 +139,16 @@ function CutsceneSync:end_replay(now)
     self.on_replay(false, now)
 end
 
--- loc = { chapter, stage, pos, loading, playable }
+-- loc = { chapter, stage, pos, loading, playable, transition }
 function CutsceneSync:tick(now, world, loc, travel)
+    -- Our game is between two moments of play: a cutscene that ends a chapter (the bell in the
+    -- village ends chapter 1-1) goes on into the game's own chapter change, behind a black
+    -- screen. Our copy of the partner's cutscene lasts until the game plays again (their
+    -- flags keep waiting), nothing starts here and nobody travels.
+    if loc ~= nil and loc.transition then
+        if self.replay ~= nil then self.replay.transition = true end
+        return
+    end
     if next(self.skips) ~= nil and world.cutscene_skip ~= nil then self:apply_skips(now, world) end
     local playing = world:cutscene_playing()
     -- Our copy of the partner's cutscene: over once it played and stopped (or never began).
@@ -150,10 +158,22 @@ function CutsceneSync:tick(now, world, loc, travel)
             r.seen = true
         elseif r.seen or now - r.started > START_TIMEOUT then
             self:end_replay(now)
-            -- We watched it from far away: now join the partner where it happened.
-            if r.join ~= nil and travel ~= nil and not travel:busy() then
+            -- We watched it from far away: now join the partner where it happened - unless
+            -- it changed the chapter (both games start the next part at its own start point)
+            -- or we are not playing yet.
+            local j = r.join
+            if j ~= nil and loc ~= nil and loc.chapter ~= nil and j.chapter ~= nil and j.chapter >= 0
+                and loc.chapter ~= j.chapter then
+                self.log("cutscene %s: not joining the partner, it changed the chapter (%s -> %s)", r.key,
+                    tostring(j.chapter), tostring(loc.chapter))
+                j = nil
+            elseif j ~= nil and r.transition then
+                self.log("cutscene %s: not joining the partner, our game went through a transition", r.key)
+                j = nil
+            end
+            if j ~= nil and travel ~= nil and not travel:busy() then
                 self.notify("Joining your partner where the cutscene took place", "info")
-                travel:request(r.join)
+                travel:request(j)
             end
         end
     end

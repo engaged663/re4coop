@@ -290,6 +290,7 @@ local function draw_options(settings)
         checkbox(settings, "transition_gate", "Wait for the partner at cutscenes and chapter changes (F8 skips)")
         slider_float(settings, "gate_grace", "...only events longer than (s)", 0.2, 10.0, "%.1f")
         slider_float(settings, "gate_radius", "...partner counts as arrived within (m)", 3.0, 50.0, "%.0f")
+        checkbox(settings, "fix_black_screen", "Bring the picture back if the screen stays black after a chapter change or cutscene")
 
         imgui.separator()
         imgui.text_colored("Network", COLOR_DIM)
@@ -523,6 +524,13 @@ local function draw_diagnostics(session, game, session_status, puppet, perf)
             imgui.text(("transition gate: %s | chapter you %s, partner %s | last release: %s"):format(
                 g.holding and ("holding (" .. g.holding .. ")") or "open", tostring(session_status.local_chapter or "?"),
                 tostring(session_status.partner_chapter or "?"), tostring(g.last_release or "-")))
+        end
+        if session_status and session_status.screen then
+            local sc = session_status.screen
+            imgui.text(("game transitions: %s | %d so far, last %s s, %d over 45 s (%s) | black screens lifted: %d"):format(
+                sc.transition_for and ("in one for %.0f s"):format(sc.transition_for) or "playing",
+                sc.counters.transitions, sc.last_transition_length and ("%.1f"):format(sc.last_transition_length) or "-",
+                sc.counters.long_transitions, tostring(sc.last_detail or "-"), sc.counters.lifts))
         end
         imgui.separator()
         draw_models(session_status, game, puppet)

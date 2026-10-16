@@ -1223,6 +1223,42 @@ function M.install(opts)
     class("chainsaw.GuiManager", "System.Object", {
         get_IsPlayingEvent = { 0, function() return world.gui_event end },
     })
+    -- The game's state machine (share.MainModeManager): IsInGame is the current game state's,
+    -- true only for GameStateInGame. M.chapter_change() runs another state.
+    world.game_state = "chainsaw.GameStateInGame"
+    world.game_state_phase = 0
+    class("System.RuntimeType", "System.Object", {
+        get_FullName = { 0, function(self) return self.full_name end, {}, { ret = "System.String" } },
+    })
+    class("share.GameStateBase", "System.Object", {}, { ["<CurrPhase>k__BackingField"] = "System.Int32" })
+    class("share.MainModeManager.GameStateControl", "System.Object", {}, { GameState = "share.GameStateBase" })
+    class("share.MainModeManager", "System.Object", {
+        get_IsInGame = { 0, function()
+            if world.main_mode_broken then error("mock: MainModeManager unavailable") end
+            return world.game_state == "chainsaw.GameStateInGame"
+        end, {}, { ret = "System.Boolean" } },
+        get_CurrStateType = { 0, function() return new("System.RuntimeType", { full_name = world.game_state }) end,
+            {}, { ret = "System.Type" } },
+    }, { CurrentGameState = "share.MainModeManager.GameStateControl" })
+    world.singletons["share.MainModeManager"] = new("share.MainModeManager", { __fields = {
+        CurrentGameState = new("share.MainModeManager.GameStateControl", { __fields = {
+            GameState = new("share.GameStateBase", { __fields = { ["<CurrPhase>k__BackingField"] = 0 } }) } }) } })
+    class("chainsaw.CampaignJumper", "System.Object", {
+        get_CurrentPhase = { 0, function() return world.jumper_phase or 0 end, {}, { ret = "chainsaw.CampaignJumper.Phase" } },
+    })
+    world.singletons["chainsaw.CampaignJumper"] = new("chainsaw.CampaignJumper")
+    -- Screen fades by share.FadeManager.FadeType: world.fades[type] = true while it is dark.
+    world.fades, world.fade_ins = {}, {}
+    class("share.FadeManager", "System.Object", {
+        isFadeOut = { 1, function(_, t) return world.fades[t] == true end, { "share.FadeManager.FadeType" },
+            { ret = "System.Boolean" } },
+        ["requestFadeIn(share.FadeManager.FadeType, System.Single, System.String, System.Action)"] = { 4,
+            function(_, t, seconds)
+                world.fade_ins[#world.fade_ins + 1] = { type = t, seconds = seconds }
+                world.fades[t] = nil
+            end, { "share.FadeManager.FadeType", "System.Single", "System.String", "System.Action" } },
+    })
+    world.singletons["share.FadeManager"] = new("share.FadeManager")
     -- HighwayGuiManager.isItemWindowActive: the item window (attache case) is open.
     class("chainsaw.HighwayGuiManager", "System.Object", {
         isItemWindowActive = { 0, function() return world.inventory_open == true end, {}, { ret = "System.Boolean" } },
@@ -3627,6 +3663,26 @@ function M.start_cutscene(id, opts)
     local play_id = mediator:call("emitPlayID")
     mediator:call("procPayloadPlay", play_id, p)
     return play_id
+end
+
+-- The game changes chapter the way RE4 does at the end of a chapter-ending cutscene (the bell
+-- in the village: GameStateInGameChapterChange): another game state runs behind a black screen
+-- (CAMPAIGN_JUMPER and EVENT fades), the player's context lives on, the chapter changes.
+function M.chapter_change(next_chapter, phase)
+    local w = M.world
+    w.game_state = "chainsaw.GameStateInGameChapterChange"
+    w.singletons["share.MainModeManager"].__fields.CurrentGameState.__fields.GameState.__fields["<CurrPhase>k__BackingField"] = phase or 4
+    w.fades[2], w.fades[4] = true, true
+    if next_chapter ~= nil then w.chapter = next_chapter end
+end
+
+-- The chapter change hands the game back (GameStateInGame). lift = false: the black stays
+-- (what the client saw after the bell).
+function M.end_chapter_change(lift)
+    local w = M.world
+    w.game_state = "chainsaw.GameStateInGame"
+    w.singletons["share.MainModeManager"].__fields.CurrentGameState.__fields.GameState.__fields["<CurrPhase>k__BackingField"] = 0
+    if lift ~= false then w.fades[2], w.fades[4] = nil, nil end
 end
 
 -- The playing cutscene ends: its end flags are set and its data owner's scripted sequence

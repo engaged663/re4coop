@@ -115,8 +115,10 @@ end
 -- Holding the partner's flags (while their cutscene plays here)
 -------------------------------------------------------------------------------
 
+-- Holds until at least now + seconds (a shorter hold never cuts a longer one short).
 function FlagSync:hold(now, seconds)
-    self.hold_until = now + math.min(seconds or HOLD_MAX, HOLD_MAX)
+    local t = now + math.min(seconds or HOLD_MAX, HOLD_MAX)
+    if self.hold_until == nil or t > self.hold_until then self.hold_until = t end
 end
 
 function FlagSync:holding(now)

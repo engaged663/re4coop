@@ -39,6 +39,7 @@ local AshleySync = require("re4coop.ashley_sync")
 local PurposeSync = require("re4coop.purpose_sync")
 local TriggerSync = require("re4coop.trigger_sync")
 local Travel = require("re4coop.travel")
+local ScreenWatch = require("re4coop.screen_watch")
 local Lobby = require("re4coop.lobby")
 local Config = require("re4coop.config")
 local Perf = require("re4coop.perf")
@@ -74,6 +75,8 @@ local FOLLOW_CHAPTER_DELAY = 15.0 -- client: the host has been in a later chapte
 local RELOAD_GAP = 2.0          -- seconds without a player that mean the game (re)loaded
 local MAX_DEFERRED = 4000
 local SETTLE_AFTER_LOAD = 1.0   -- seconds in game before queued world/enemy messages are applied
+local TRANSITION_FLAG_HOLD = 2.0 -- the partner's flags wait this long after our transition ends
+local SCREEN_INTERVAL = 0.5     -- seconds between looks at the screen fades (screen_watch.lua)
 local STATUS_MAX_AGE = 0.1      -- status_cached(): seconds a computed status is reused
 local TAP_MAX = 1.0             -- seconds: the Ashley key held longer than this is not a tap
 local TAP_SETTLE = 0.25         -- seconds after the release the game must still have the focus
@@ -158,12 +161,18 @@ function Session.new(opts)
     self.last_location = -math.huge
     self.local_dead = false
     self.local_cutscene = false
+    self.local_transition = false -- our game is changing chapter, over or loading (game:in_transition)
     self.local_stage = nil
     self.local_chapter = nil
     self.local_loc = nil     -- world:location(): {chapter, stage, pos, yaw, loading, playable}
     self.player_id = nil     -- identity of the player context (a new one = the game reloaded)
     self.gate = Gate.new(opts.settings)
     self.held_scale = nil   -- time scale to restore while the gate holds us (nil = not holding)
+    -- Our game's transitions, and a screen they leave black (screen_watch.lua).
+    self.screen_watch = ScreenWatch.new({ settings = self.settings,
+        log = function(fmt, ...) self:log(fmt, ...) end,
+        notify = function(text, kind) self:add_message(text, kind) end })
+    self.last_screen_tick = -math.huge
     self.last_item_tick = -math.huge
     self.keys_down = {}
     self.left_behind = nil
@@ -777,6 +786,8 @@ function Session:update_gate(now)
     local before = self.gate.holding
     local hold = self.gate:update(now, {
         connected = self.partner_connected and self.compatible and not self.gate_disabled,
+        -- A chapter change or a reload of ours is never held: frozen, it could never finish.
+        transition = self.local_transition,
         in_game = mine ~= nil,
         event = self.local_cutscene,
         chapter = self.local_chapter,
@@ -805,6 +816,31 @@ function Session:update_gate(now)
     self:apply_hold(hold ~= nil)
 end
 
+-- Our transitions and the screen after them (screen_watch.lua): a transition or event fade
+-- still dark while our game plays again, with nothing of its own running, is lifted.
+function Session:update_screen(now)
+    local g = self.game
+    if g.in_transition == nil or g.dark_fades == nil or now - self.last_screen_tick < SCREEN_INTERVAL then return end
+    self.last_screen_tick = now
+    local transition = self.local_transition
+    local playing = not transition and self:fresh_local_pos(now) ~= nil and not self.local_dead
+    -- A hold of ours (gate, synchronized start) freezes the game on purpose: not a stuck screen.
+    local busy = self.local_cutscene or self.held_scale ~= nil
+        or (playing and g.camera_busy ~= nil and g:camera_busy())
+    local lift = self.screen_watch:tick(now, {
+        transition = transition,
+        detail = function() return g.transition_detail and g:transition_detail() or nil end,
+        playing = playing,
+        busy = busy,
+        dark = (playing and not busy) and g:dark_fades() or nil,
+    })
+    local done = {}
+    for _, t in ipairs(lift) do
+        if g:lift_fade(t, 0.5) then done[#done + 1] = t end
+    end
+    self.screen_watch:lifted(done, now)
+end
+
 -- Freezes (time scale 0) or restores the local game.
 function Session:apply_hold(want)
     local g = self.game
@@ -823,9 +859,12 @@ function Session:apply_hold(want)
 end
 
 -- The local player's position if it was read recently (nil on menus/loading screens).
+-- While our game changes chapter or reloads there is no player in the game either: the
+-- player's context lives on, but nothing may act on it (enemies, saves, items, prompts).
 function Session:fresh_local_pos(now)
     if self.last_local_pos == nil or self.last_local_pos_time == nil then return nil end
     if now - self.last_local_pos_time > LOCAL_POS_FRESH then return nil end
+    if self.local_transition then return nil end
     return self.last_local_pos
 end
 
@@ -926,6 +965,8 @@ function Session:status()
         local_chapter = self.local_chapter,
         partner_chapter = self.partner_state and self.partner_state.chapter or nil,
         gate = self.gate:summary(now),
+        transition = self.local_transition or nil,
+        screen = self.screen_watch:summary(now),
         continue_key_name = Session.key_name(self.settings.continue_key),
         world_sync_pending = self.world_sync_pending ~= nil,
     }
@@ -1089,8 +1130,20 @@ function Session:handle_event(ev, now)
             self:make_syncs()
         end
     elseif ev.type == "message" then
-        self:handle_message(ev.data, now)
+        -- Our game is changing chapter or reloading: what would touch its world waits until it
+        -- plays again, as while the game loop is not running (state that is resent anyway,
+        -- like enemy snapshots, goes through).
+        if not self:defer_in_transition(ev.data) then self:handle_message(ev.data, now) end
     end
+end
+
+-- Keeps a message that touches the world for after our transition; true if it was kept.
+function Session:defer_in_transition(data)
+    if not self.local_transition or type(data) ~= "string" or #self.deferred >= MAX_DEFERRED then return false end
+    local t = data:byte(1)
+    if t == nil or not (DEFER[t] or t == P.T.DOORS) then return false end
+    self.deferred[#self.deferred + 1] = data
+    return true
 end
 
 -- Host: a joining client wants our whole world.
@@ -1128,7 +1181,7 @@ function Session:handle_message(data, now)
     local T = P.T
     if m.type == T.FRAG then
         local full = self.reassembler:push(m)
-        if full ~= nil then
+        if full ~= nil and not self:defer_in_transition(full) then
             self:handle_message(full, now)
         end
         return
@@ -1241,13 +1294,16 @@ function Session:send_player_state(now)
     self.last_local_pos_time = now
     self.local_aiming = st.aiming and true or false
     self.local_cutscene = st.cutscene and true or false
+    self.local_transition = st.transition and true or false
     self.local_stage = st.stage
     self.local_chapter = st.chapter
     self:watch_teleport(now, st.pos)
 
     local flags = 0
     if st.dead then flags = flags | P.PLAYER_FLAGS.DEAD end
-    if st.cutscene then flags = flags | P.PLAYER_FLAGS.CUTSCENE end
+    -- To the partner a transition of ours (a chapter change, a game over) is an event: their
+    -- gate does not wait for us, nobody teleports to us and their enemies leave us alone.
+    if st.cutscene or st.transition then flags = flags | P.PLAYER_FLAGS.CUTSCENE end
     if st.aiming then flags = flags | P.PLAYER_FLAGS.AIMING end
     if self.gate.holding ~= nil then flags = flags | P.PLAYER_FLAGS.GATE_WAITING end
     if self.settings.invincible == true then flags = flags | P.PLAYER_FLAGS.INVINCIBLE end
@@ -1400,6 +1456,16 @@ end
 function Session:update_world(now)
     local world, s = self.world, self.settings
     if world == nil or self.flag_sync == nil then return end
+
+    if self.local_transition then
+        -- Our game is changing chapter or reloading (docs/RESEARCH.md 3.33): the partner's
+        -- world waits until it plays again - their flags are held, and nothing is applied,
+        -- replayed, saved or travelled to in the middle of the game's own loading.
+        self.flag_sync:hold(now, TRANSITION_FLAG_HOLD)
+        self.cutscene_sync:tick(now, world, self.local_loc, self.travel)
+        self.travel:tick(now, world, self:partner_location())
+        return
+    end
 
     if world.update then world:update() end
     self.flag_sync:tick(now, world)
@@ -1685,6 +1751,14 @@ function Session:update()
     self.frame = (self.frame or 0) + 1
     local t0 = perf:start()
     self:run_actions(true)
+    -- Our game's own transitions (a chapter change, a game over, a load), every frame: nothing
+    -- may act on the game from their first frame on.
+    local transition = self.game.in_transition ~= nil and self.game:in_transition() or false
+    if transition ~= self.local_transition then
+        self.local_transition = transition
+        self.last_location = -math.huge -- where we are means something else now: read it again
+        perf:crumb("transition", transition and "start" or "end", true)
+    end
     self:refresh_location(now)
     for _, ev in ipairs(self.net.poll()) do
         self:handle_event(ev, now)
@@ -1741,6 +1815,7 @@ function Session:update()
     else
         self.in_game_since = nil
     end
+    self:update_screen(now)
     perf:stop("update.player", t0)
 
     if s.share_character ~= false and self.game.avatar_descriptor then
