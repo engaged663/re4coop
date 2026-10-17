@@ -21,8 +21,11 @@
 -- console uses to start an activity from the system menu): the menus are skipped and
 -- Continue runs on its own. Continue loads the co-op slot when it holds a save (the save the
 -- client made in its last session with a host), else the latest save, and the chapter switch
--- (game_world.lua) puts it into the host's chapter; the join then takes over the host's world
--- and warps next to the host as always. Continue after a game over also loads the newest save:
+-- (game_world.lua) puts it into the host's chapter; the game then loads the host's part of the
+-- map and the client appears at the host's place (game_world.lua spawn, armed by the session),
+-- takes over the host's world and is next to the host. Without any save, a new game starts at
+-- the beginning of the host's chapter from the main menu, and comes back at the host's place
+-- the same way. Continue after a game over also loads the newest save:
 -- for a connected client whose co-op slot holds this session's progress, that slot (two copies
 -- of the game on one PC share their saves, and the newest may be the host's).
 --
@@ -73,7 +76,8 @@ end
 function SaveSync:reset()
     self.pending = nil -- { since, kind, next_try, why, noticed }: the partner saved, we have not yet
     self.copy = nil    -- { since, next_try, why }: the client saved elsewhere, its co-op slot follows
-    self.join = nil    -- { at, coop, failed } | { none = true }: the load asked for while joining
+    self.join = nil    -- { at, coop, failed } | { at, new = true } | { none = true }: the load asked for while joining
+    self.title_told = nil -- the player was told the title screen waits for a button (no save to load)
     -- The co-op slot (client's, or the host's lobby file) holds this session's progress.
     self.coop_current = self.host_slot ~= nil
     self.forced = nil  -- { slot, at }: the lobby asked Continue to load this slot
@@ -246,17 +250,35 @@ end
 -------------------------------------------------------------------------------
 
 -- Called every frame the game shows its title screen or main menu. ctx = { joining (the
--- client is joining the host), partner_in_game }. Returns true once: ask the game to load now.
+-- client is joining the host), partner_in_game, where ("title" | "menu"), can_start_new (the
+-- main menu can start a new game in the host's chapter) }. Returns, once, what the game must do
+-- now: "continue" (load a save) or "new" (there is none: a new game); nil otherwise.
 function SaveSync:menu_tick(now, ctx, game)
-    if self.role() ~= "client" or not ctx.joining or self.settings.auto_load_on_join == false then return false end
+    if self.role() ~= "client" or not ctx.joining or self.settings.auto_load_on_join == false then return nil end
     local j = self.join
     if j == nil then
-        if not ctx.partner_in_game then return false end
+        if not ctx.partner_in_game then return nil end
         if game == nil or game.any_save == nil or not game:any_save() then
+            if ctx.can_start_new then
+                self.join = { at = now, new = true }
+                self.counters.join_loads = self.counters.join_loads + 1
+                self.notify(("You have no saved game: starting a new one in %s's chapter..."):format(self.partner_name()),
+                    "info")
+                return "new"
+            end
+            if ctx.where == "title" then
+                -- The main menu can start one: the title screen only waits for a button.
+                if not self.title_told then
+                    self.title_told = true
+                    self.notify(("You have no saved game: press a button - a new game in %s's chapter starts from the main menu")
+                        :format(self.partner_name()), "info")
+                end
+                return nil
+            end
             self.join = { none = true }
             self.notify(("You have no saved game to load: start one (New Game), then load it to join %s")
                 :format(self.partner_name()), "warn")
-            return false
+            return nil
         end
         local coop = game.save_exists ~= nil and game:save_exists(self:coop_slot()) or false
         self.join = { at = now, coop = coop }
@@ -268,14 +290,14 @@ function SaveSync:menu_tick(now, ctx, game)
         else
             self.notify(("Loading your latest save into %s's game..."):format(self.partner_name()), "info")
         end
-        return true
+        return "continue"
     end
-    if j.at ~= nil and not j.failed and now - j.at > JOIN_LOAD_TIMEOUT then
+    if j.at ~= nil and not j.new and not j.failed and now - j.at > JOIN_LOAD_TIMEOUT then
         j.failed = true
         self.notify(("The save did not load - load one yourself (Continue or Load Game) to join %s")
             :format(self.partner_name()), "warn")
     end
-    return false
+    return nil
 end
 
 -- The slot Continue loads instead of the newest save (the game's own choice, nil): the co-op

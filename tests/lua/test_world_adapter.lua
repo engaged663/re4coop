@@ -624,16 +624,139 @@ T.run("chapter_switch_rewrites_the_next_load", function()
     T.check(w:arm_chapter_switch(22200), "armed")
     mock.load_save(21100)
     T.eq(world.chapter, 22200, "loaded into the target chapter")
-    T.eq(world.jump_sequence, 10, "with the chapter's jump sequence")
+    T.eq(world.jump_sequence, 0, "the save's opening field untouched (a SpecialOrderType, read for new games only)")
     mock.load_save(21300)
     T.eq(world.chapter, 21300, "one-shot: later loads untouched")
     T.check(w:arm_chapter_switch(21300), "armed for the chapter the save is in")
     mock.load_save(21300)
-    T.eq(world.jump_sequence, 0, "a save already in that chapter keeps its own checkpoint")
-    T.eq(w:trigger_reload(), false, "the automatic reload is experimental: off by default")
-    w.game.settings.travel_reload = true
-    T.check(w:trigger_reload(), "reload")
-    T.eq(world.game_over_requests, 1, "game over requested")
+    T.eq(world.chapter, 21300, "a save already in that chapter keeps its own checkpoint")
+    T.eq(w:trigger_reload(21200), false, "no in-game reload without a save to load")
+end)
+
+-- Where a loaded game puts the player: the campaign jump's locators (docs/RESEARCH.md 3.34).
+local HOST_SPOT = { chapter = 22200, stage = 46100, pos = { x = 300, y = -7, z = -10 }, rot = { x = 0, y = 0.6, z = 0, w = 0.8 } }
+
+T.run("spawn_loads_the_partners_place", function()
+    local w, game, world = fresh()
+    local spot = HOST_SPOT
+    w:install_hooks({ spawn_spot = function() return spot end })
+    T.check(game:capabilities().spawn_at_partner.ok, "capability")
+    T.check(w:arm_chapter_switch(22200) and w:arm_spawn(), "armed")
+    T.check(w:spawn_armed(), "spawn armed")
+    -- The client's save: Leon and Ashley together in the village, chapter 1-1.
+    mock.load_save(21100, { stage = 40200, pos = { x = 5, y = 0, z = 5 }, ashley = { pos = { x = 6, y = 0, z = 5 } } })
+    local order = mock.ingame_setup()
+    T.eq(world.chapter, 22200, "the host's chapter")
+    T.eq(world.stage, 46100, "the map loads around the host's stage")
+    T.near(world.player.pos.x, 300, 1e-6, "the player appears where the host stands")
+    T.near(world.player.pos.z, -10, 1e-6, "...")
+    local entries = order.__fields.CharacterEntryList.list
+    local ashley = entries[2].__fields.Locator.__fields
+    T.eq(ashley._Stage, 46100, "Ashley, who was with the player, comes along")
+    T.near(ashley._Position.x, 300, 1e-6, "next to the player")
+    T.near(entries[1].__fields.Locator.__fields._Rotation.y, 0.6, 1e-6, "facing the host's way")
+    T.eq(world.opening_played, false, "no chapter opening")
+    T.eq(w:spawn_armed(), false, "one jump only")
+    T.eq(w.spawn_last.moved, 2, "reported")
+    -- The next load (a death, a checkpoint) is the game's own again.
+    mock.load_save(22200, { stage = 46000, pos = { x = 1, y = 0, z = 1 } })
+    mock.ingame_setup()
+    T.eq(world.stage, 46000, "the save's own place")
+    T.near(world.player.pos.x, 1, 1e-6, "...")
+end)
+
+T.run("spawn_leaves_a_character_elsewhere_and_skips_a_new_games_opening", function()
+    local w, _, world = fresh()
+    w:install_hooks({ spawn_spot = function() return HOST_SPOT end })
+    mock.load_save(22200, { stage = 40200, pos = { x = 5, y = 0, z = 5 },
+        ashley = { stage = 41000, pos = { x = 90, y = 0, z = 9 } } })
+    world.initial_settings.__fields._SpecialJumpSequence = 4 -- a chapter start's opening
+    T.check(w:arm_spawn(), "armed")
+    local order = mock.ingame_setup(true) -- a new game at the chapter's start
+    T.eq(world.stage, 46100, "at the host's place")
+    T.eq(world.opening_played, false, "the opening is skipped: the host is past it")
+    local ashley = order.__fields.CharacterEntryList.list[2].__fields.Locator.__fields
+    T.eq(ashley._Stage, 41000, "a character somewhere else keeps its own place")
+    T.near(ashley._Position.x, 90, 1e-6, "...")
+    -- Not armed: the new game plays its opening.
+    mock.ingame_setup(true)
+    T.eq(world.opening_played, true, "the game's own start")
+end)
+
+T.run("spawn_without_a_known_place_or_too_late_changes_nothing", function()
+    local w, _, world = fresh()
+    local spot = nil
+    w:install_hooks({ spawn_spot = function() return spot end })
+    T.check(w:arm_spawn(), "armed")
+    mock.load_save(21100, { stage = 40200, pos = { x = 5, y = 0, z = 5 } })
+    mock.ingame_setup()
+    T.eq(world.stage, 40200, "the save's own place")
+    T.check(w.spawn_last ~= nil and w.spawn_last.moved == 0 and w.spawn_last.why ~= nil, "why reported")
+    T.eq(w:spawn_armed(), false, "used up")
+    spot = HOST_SPOT
+    T.check(w:arm_spawn(10), "armed for 10 s")
+    world.now = 11
+    T.eq(w:spawn_armed(), false, "expired")
+    mock.ingame_setup()
+    T.eq(world.stage, 40200, "an expired spawn changes nothing")
+    w:arm_spawn()
+    w:disarm_spawn()
+    mock.ingame_setup()
+    T.eq(world.stage, 40200, "a disarmed one neither")
+end)
+
+T.run("in_game_reload_loads_the_save_then_leaves_for_the_setup", function()
+    local w, game, world = fresh()
+    local slot = 20
+    w:install_hooks({ spawn_spot = function() return HOST_SPOT end, reload_slot = function() return slot end })
+    game:install_save_hooks({ redirect = function(s) return s end, on_save = function() end,
+        continue_slot = function() return nil end, on_menu = function() return false end })
+    T.check(game:capabilities().ingame_load.ok, "capability: " .. tostring(game:capabilities().ingame_load.detail))
+    slot = 7
+    T.eq(w:trigger_reload(22200), false, "an empty slot is refused")
+    T.eq(w.chapter_target, nil, "and nothing stays armed")
+    slot = 20
+    world.save_files[20] = { chapter = 21100, order = 1, stage = 40200, pos = { x = 5, y = 0, z = 5 } }
+    T.check(w:trigger_reload(22200), "reload started")
+    T.eq(world.play_load.slot, 20, "the slot marked for playing, the way Continue does")
+    T.eq(world.play_load.auto, false, "not the autosave")
+    T.eq(world.load_requests[1], 20, "load queued")
+    T.eq(game:ingame_load(20), nil, "one at a time")
+    T.eq(world.state_requests, nil, "still in game while the save is read")
+    for _ = 1, 6 do
+        world.now = world.now + 0.2
+        mock.save_system_tick()
+        game:ingame_load_tick()
+    end
+    local req = world.state_requests and world.state_requests[1]
+    T.check(req ~= nil, "the game leaves once the save is read")
+    T.eq(req.state, "chainsaw.GameStateInGameCleanup", "through the in-game cleanup")
+    T.eq(req.next, "chainsaw.GameStateIngameSetup", "to the in-game setup")
+    T.check(req.fix_exit and req.timeline_cleared, "the way the pause menu's Load Game leaves")
+    T.eq(game.ingame_loading.phase, "left", "done")
+    mock.run_ingame_reload()
+    T.eq(world.chapter, 22200, "in the host's chapter")
+    T.eq(world.stage, 46100, "at the host's place")
+    T.near(world.player.pos.x, 300, 1e-6, "...")
+    T.eq(w:reload_failed(), false, "no failure")
+end)
+
+T.run("an_in_game_load_that_cannot_be_read_gives_up", function()
+    local w, game, world = fresh()
+    w:install_hooks({ spawn_spot = function() return HOST_SPOT end, reload_slot = function() return 3 end })
+    game:install_save_hooks({ redirect = function(s) return s end, on_save = function() end,
+        continue_slot = function() return nil end, on_menu = function() return false end })
+    world.save_files[3] = { chapter = 21100, order = 1 }
+    world.load_fails = true
+    T.check(w:trigger_reload(22200), "started")
+    for _ = 1, 6 do
+        world.now = world.now + 0.2
+        mock.save_system_tick()
+        game:ingame_load_tick()
+    end
+    T.eq(game.ingame_loading.phase, "failed", "gave up")
+    T.eq(world.state_requests, nil, "the game never left")
+    T.eq(w:reload_failed(), true, "travel can tell")
 end)
 
 T.run("missing_world_types_disable_features_quietly", function()

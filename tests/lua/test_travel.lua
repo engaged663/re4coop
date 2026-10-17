@@ -22,7 +22,14 @@ local function make_world(opts)
     end
     function w:arm_chapter_switch(chapter) self.armed = chapter return true end
     function w:disarm_chapter_switch() self.armed = nil end
-    function w:trigger_reload() self.reloads = self.reloads + 1 return true end
+    -- The in-game Load Game into `chapter`, at the partner's place (refused: no save to load).
+    function w:trigger_reload(chapter)
+        self.reloads = self.reloads + 1
+        if opts.reload_refused then return false, "no saved game to load" end
+        self.reload_chapter = chapter
+        if chapter ~= nil then self.armed = chapter end
+        return true
+    end
     -- What the game does when the player picks Continue with a switch armed.
     function w:load()
         self.loc = { chapter = self.armed or (self.loc and self.loc.chapter), stage = 1, pos = { x = 0, y = 0, z = 0 },
@@ -104,18 +111,109 @@ T.run("other_chapter_reloads_then_syncs_then_warps", function()
     T.eq(tr.result, "arrived", "arrived")
 end)
 
-T.run("title_screen_waits_for_any_save_load", function()
+T.run("title_screen_leaves_the_load_to_the_join", function()
     local world = make_world({ loc = nil })
     local tr, log = make_travel()
     tr:request({ chapter = 23100, stage = 50100, pos = { x = 1, y = 2, z = 3 }, reason = "join" })
     local now = run(tr, world, 2)
     T.eq(world.armed, 23100, "armed")
     T.eq(world.reloads, 0, "no reload from the title screen")
-    T.check(noted(log, "Load any save"), "player told what to do")
+    T.check(not noted(log, "Load any save"), "the join's own load runs: nothing to ask of the player")
     world:load()
     run(tr, world, 6, nil, now)
     T.eq(world.loc.chapter, 23100, "in the partner's chapter")
     T.eq(world.loc.stage, 50100, "and next to them")
+    -- With the join's own load switched off, the player is told what to do.
+    local world2 = make_world({ loc = nil })
+    local tr2, log2 = make_travel({ auto_load_on_join = false })
+    tr2:request({ chapter = 23100, stage = 50100, pos = { x = 1, y = 2, z = 3 }, reason = "join" })
+    run(tr2, world2, 2)
+    T.check(noted(log2, "Load any save"), "player told what to do")
+end)
+
+-- A join in our own chapter, the partner in a part of the map our game has not loaded: the
+-- in-game reload loads it and puts us there (a plain warp would land in nothing).
+T.run("joining_where_the_partners_area_is_not_loaded_reloads_there", function()
+    local world = make_world({ loc = { chapter = 21100, stage = 40200, pos = { x = 0, y = 0, z = 0 }, playable = true } })
+    function world:stage_loaded(stage) return stage == 40200 end
+    local tr, log = make_travel()
+    tr:request({ chapter = 21100, stage = 43300, pos = { x = 48, y = 2, z = -55 }, reason = "join", sync = true })
+    local now = run(tr, world, 1)
+    T.eq(world.reloads, 1, "reload started")
+    T.eq(world.reload_chapter, 21100, "into our (the partner's) chapter")
+    T.eq(#world.warps, 0, "no warp into an area that is not there")
+    T.check(noted(log, "Loading your partner's area"), "player told")
+    now = run(tr, world, 3, nil, now)
+    T.eq(tr.state, "chapter", "waits for the reload, though the chapter already matches")
+    T.eq(log.syncs, 0, "no world sync before it")
+    world.loc = { chapter = 21100, loading = true, playable = false } -- the game leaves the map
+    now = run(tr, world, 1, nil, now)
+    -- The reload comes back where the partner is (game_world.lua spawn).
+    world.loc = { chapter = 21100, stage = 43300, pos = { x = 48, y = 2, z = -55 }, playable = true }
+    now = run(tr, world, 3, nil, now)
+    T.eq(log.syncs, 1, "then the partner's world")
+    tr:sync_done()
+    run(tr, world, 3, nil, now)
+    T.eq(tr.result, "arrived", "arrived")
+    T.eq(#world.warps, 0, "already next to the partner: no warp")
+end)
+
+T.run("joining_where_the_partners_area_is_loaded_warps", function()
+    local world = make_world({ loc = { chapter = 21100, stage = 40200, pos = { x = 0, y = 0, z = 0 }, playable = true } })
+    function world:stage_loaded() return true end
+    local tr = make_travel()
+    tr:request({ chapter = 21100, stage = 43300, pos = { x = 48, y = 2, z = -55 }, reason = "join" })
+    run(tr, world, 6)
+    T.eq(world.reloads, 0, "no reload")
+    T.eq(tr.result, "arrived", "warped")
+    -- Unknown (no stage information): the warp as before.
+    local world2 = make_world({ loc = { chapter = 21100, stage = 40200, pos = { x = 0, y = 0, z = 0 }, playable = true } })
+    function world2:stage_loaded() return nil end
+    local tr2 = make_travel()
+    tr2:request({ chapter = 21100, stage = 43300, pos = { x = 48, y = 2, z = -55 }, reason = "join" })
+    run(tr2, world2, 6)
+    T.eq(world2.reloads, 0, "no reload when unknown")
+    -- Only a join: a manual travel keeps the game's warp.
+    local world3 = make_world({ loc = { chapter = 21100, stage = 40200, pos = { x = 0, y = 0, z = 0 }, playable = true } })
+    function world3:stage_loaded() return false end
+    local tr3 = make_travel()
+    tr3:request({ chapter = 21100, stage = 43300, pos = { x = 48, y = 2, z = -55 }, reason = "manual" })
+    run(tr3, world3, 6)
+    T.eq(world3.reloads, 0, "no reload for a manual travel")
+end)
+
+T.run("a_reload_that_is_refused_or_never_starts_falls_back", function()
+    -- Refused (no save to load, switched off): another chapter asks the player.
+    local world = make_world({ loc = { chapter = 21100, stage = 40200, pos = { x = 0, y = 0, z = 0 }, playable = true },
+        reload_refused = true })
+    local tr, log = make_travel()
+    tr:request({ chapter = 22200, stage = 46100, pos = { x = 300, y = -7, z = -10 }, reason = "join" })
+    run(tr, world, 1)
+    T.eq(world.reloads, 1, "tried")
+    T.check(noted(log, "Load any save"), "the player is asked to load one")
+    T.eq(world.armed, 22200, "the load they make goes into the partner's chapter")
+    local off = make_world({ loc = { chapter = 21100, stage = 40200, pos = { x = 0, y = 0, z = 0 }, playable = true } })
+    local tr_off = make_travel({ join_reload = false })
+    tr_off:request({ chapter = 22200, stage = 46100, pos = { x = 300, y = -7, z = -10 }, reason = "join" })
+    run(tr_off, off, 1)
+    T.eq(off.reloads, 0, "switched off: no reload")
+    -- Started, but the game never leaves: in our chapter, the warp after all.
+    local stuck = make_world({ loc = { chapter = 21100, stage = 40200, pos = { x = 0, y = 0, z = 0 }, playable = true } })
+    function stuck:stage_loaded() return false end
+    local tr2 = make_travel()
+    tr2:request({ chapter = 21100, stage = 43300, pos = { x = 48, y = 2, z = -55 }, reason = "join" })
+    local now = run(tr2, stuck, 20)
+    T.eq(tr2.state, "chapter", "still waiting for it")
+    run(tr2, stuck, 30, nil, now)
+    T.eq(tr2.result, "arrived", "gave up waiting, then warped")
+    -- The load reports it gave up: no waiting at all.
+    local failed = make_world({ loc = { chapter = 21100, stage = 40200, pos = { x = 0, y = 0, z = 0 }, playable = true } })
+    function failed:stage_loaded() return false end
+    function failed:reload_failed() return true end
+    local tr3 = make_travel()
+    tr3:request({ chapter = 21100, stage = 43300, pos = { x = 48, y = 2, z = -55 }, reason = "join" })
+    run(tr3, failed, 5)
+    T.eq(tr3.result, "arrived", "warped at once")
 end)
 
 T.run("playing_in_the_wrong_chapter_offers_one_reload", function()
@@ -160,7 +258,7 @@ end)
 T.run("nothing_moves_while_the_game_changes_chapter", function()
     local world = make_world({ loc = { chapter = 21100, stage = 40200, pos = { x = 0, y = 0, z = 0 }, loading = true,
         playable = false, transition = true } })
-    local tr = make_travel({ travel_reload = true })
+    local tr = make_travel()
     tr:request({ chapter = 21100, stage = 43300, pos = { x = 48, y = 2, z = -55 }, reason = "join" })
     local now = run(tr, world, 5)
     T.eq(tr.state, "start", "waits")
@@ -175,7 +273,7 @@ end)
 T.run("a_cutscene_join_never_switches_chapter", function()
     -- The cutscene took place in 21100 and changed our game to 21200 when it ended.
     local world = make_world({ loc = { chapter = 21200, stage = 40200, pos = { x = 0, y = 0, z = 0 }, playable = true } })
-    local tr, log = make_travel({ travel_reload = true })
+    local tr, log = make_travel()
     tr:request({ chapter = 21100, stage = 40200, pos = { x = 50, y = 0, z = 0 }, reason = "cutscene" })
     run(tr, world, 3)
     T.eq(tr:busy(), false, "dropped")

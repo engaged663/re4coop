@@ -570,7 +570,9 @@ local function draw_lobby(dl, W, H, env, now, nav)
         grows = game_rows(env, view)
     else
         with_size(19, function()
-            local msg = host_playing and "El anfitrión ya está jugando (no está en su sala)."
+            local auto = s.auto_load_on_join ~= false
+            local msg = host_playing and (auto and "El anfitrión ya está jugando: entrando en su partida, apareces a su lado..."
+                    or "El anfitrión ya está jugando (no está en su sala).")
                 or "Esperando los datos de la sala del anfitrión..."
             for i, l in ipairs(wrap(msg, col_w)) do text(dl, x1 + px(4), y + (i - 1) * px(26), l, C.dim) end
         end)
@@ -789,6 +791,7 @@ local OPTION_GROUPS = {
         { "sync_gimmicks", "Puertas, cerraduras, palancas y puzles" },
         { "sync_purposes", "El objetivo más avanzado para los dos" },
         { "follow_host_chapter", "Seguir al anfitrión al siguiente capítulo" },
+        { "auto_load_on_join", "Al unirte a una partida en curso, aparecer junto al anfitrión" },
     } },
 }
 

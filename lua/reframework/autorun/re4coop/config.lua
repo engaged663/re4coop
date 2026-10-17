@@ -75,7 +75,8 @@ Config.DEFAULTS = {
     -- joining and travelling
     auto_travel = true,         -- client: on joining, load the host's chapter and appear next to them
     follow_host_chapter = true, -- client: follow the host into the next chapter if you do not get there yourself
-    auto_load_on_join = true,   -- client: joining from the title screen / main menu loads a save at once (the co-op slot, else the latest)
+    auto_load_on_join = true,   -- client: joining a host who plays, from the menus or the lobby, loads at once at the host's place (the co-op slot, else the latest save, else a new game)
+    join_reload = true,         -- client: in game, a host in another chapter or in a part of the map not loaded here is joined through the game's own Load Game, at the host's place
 
     -- saving
     sync_saves = true,          -- a save either game makes (autosave or typewriter) makes the partner's game save too
@@ -124,7 +125,7 @@ Config.DEFAULTS = {
     perf_file = true,  -- write the measurements to reframework/data/re4coop_perf.json every 10 s
 
     -- experimental: features that change the game in ways not proven safe yet (off by default)
-    travel_reload = false,       -- load the partner's chapter by triggering game over -> Continue
+    -- (Gone in 0.11.2: travel_reload, game over -> Continue - join_reload loads in game instead.)
     stage_travel = false,        -- teleports to another stage preload it and use the game's warp
     exp_force_routine = false,   -- break objects by forcing their state machine into a "broken" state
     enemy_replay_mutilation = false, -- the partner's hits (and kills) may also burst heads and break limbs here (crashed the game)

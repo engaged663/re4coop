@@ -4,7 +4,7 @@ An open-source [REFramework](https://github.com/praydog/REFramework) mod that co
 copies of **Resident Evil 4 (2023)** directly by IP address over UDP, so two players can go
 through the campaign together on a LAN, or over the internet with a forwarded port or a VPN.
 
-> **Status: v0.11.1, experimental.** (0.11.1: **no more black screen for the client after the bell in the village** - a cutscene that ends a chapter part sends both games through their own chapter change, and the mod no longer saves, travels, freezes or applies the partner's world in the middle of it; a screen left black after one is brought back ([why and how](docs/RESEARCH.md#333-the-clients-black-screen-after-the-bell-in-the-village-0111)); 0.11: **Multijugador in the game's own main menu** - Host Game / Join Game / Multiplayer Options, a lobby with chat, co-op saves, chapter, difficulty, options and loadouts, and both maps starting together once both have loaded ([why and how](docs/RESEARCH.md#331-v011-the-lobby-in-the-games-own-main-menu)); 0.10.3: the host's enemies react to the client's shots and die from them; 0.10.2 fixed the client running at 2 fps.) v0.10 gives **every enemy to the host**: nothing is shared
+> **Status: v0.11.2, experimental.** (0.11.2: **a client who joins late appears next to the host** - from the title screen, the main menu or Join Game (the lobby gives way by itself when the host is playing) the client's game loads straight into the host's chapter and part of the map, at the host's place; without a save it starts a new game at the start of the host's chapter part; already in game, it reloads there through the game's own Load Game instead of asking for a save ([why and how](docs/RESEARCH.md#334-a-late-client-loads-straight-into-the-hosts-place-0112)); 0.11.1: **no more black screen for the client after the bell in the village** - a cutscene that ends a chapter part sends both games through their own chapter change, and the mod no longer saves, travels, freezes or applies the partner's world in the middle of it; a screen left black after one is brought back ([why and how](docs/RESEARCH.md#333-the-clients-black-screen-after-the-bell-in-the-village-0111)); 0.11: **Multijugador in the game's own main menu** - Host Game / Join Game / Multiplayer Options, a lobby with chat, co-op saves, chapter, difficulty, options and loadouts, and both maps starting together once both have loaded ([why and how](docs/RESEARCH.md#331-v011-the-lobby-in-the-games-own-main-menu)); 0.10.3: the host's enemies react to the client's shots and die from them; 0.10.2 fixed the client running at 2 fps.) v0.10 gives **every enemy to the host**: nothing is shared
 > and nothing changes hands - the host's game runs every enemy's AI, and the client's game shows
 > it moving, turning and animating exactly like it. The client's player is **a second player in
 > the host's game** ([why and how](docs/RESEARCH.md#325-v010-the-client-as-a-second-player-in-the-hosts-game)):
@@ -126,11 +126,14 @@ How it works and why: [docs/RESEARCH.md](docs/RESEARCH.md). Wire format: [docs/P
 * Thrown grenades, bullet impacts and blood on enemies happen only in the thrower's/shooter's
   game. Sounds the engine plays internally (outside the reflected `trigger` calls) may not be
   replayed; *Diagnostics* counts what gets through.
-* Joining while you play another chapter, or following the host into the next one, needs a
-  save load: load any save (or pick *Continue* after a game over) and it goes into the host's
-  chapter. With *Experimental → Load the partner's chapter automatically* the mod triggers it.
-  Joining from the title screen or the main menu loads on its own. With no save at all, start a
-  New Game first.
+* Joining late (0.11.2, not run in the game yet) loads on its own wherever you are: from the
+  title screen, the main menu or Join Game your game loads your co-op save (else your latest)
+  into the host's chapter, at the host's place; with no save at all a new game starts at the
+  beginning of the host's chapter part (Standard difficulty unless the host's lobby chose
+  another). Playing another chapter, or a part of the host's chapter far away, your game reloads
+  that save in game the way the pause menu's *Load Game* does and you appear next to the host -
+  progress since that save is not kept. Following the host into the next chapter works the same
+  way. Both can be switched off in *Options → Joining and travelling*.
 * Saving for both (0.9.1) has not run in the game yet. A save from the partner waits until your
   game can save (no cutscene, no loading screen, not dying; the client also waits until it holds
   the host's world) and is dropped after 90 s. The client's co-op slot restarts at its own last

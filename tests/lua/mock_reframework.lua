@@ -186,6 +186,16 @@ end
 M.class = class
 M.classes = classes
 
+-- Adds methods ({ key = {nparams, fn, param_types, opts} }) to a class defined elsewhere.
+local function add_methods(name, methods)
+    local td = classes[name]
+    for key, spec in pairs(methods) do
+        if td.methods[key] == nil then td.method_order[#td.method_order + 1] = key end
+        td.methods[key] = make_method(key, spec[1], spec[2], spec[3], spec[4])
+    end
+end
+M.add_methods = add_methods
+
 -- An enum type: its literals are static fields.
 local function enum(name, values)
     if classes["System.Enum"] == nil then class("System.Enum", "System.Object", {}) end
@@ -3300,10 +3310,32 @@ function M.install_world(world, opts)
             ("%08x-0000-0000-0000-000000000000"):format(id)), disp = 3.0, mediate = false, delay = 0.0 })
     end
 
-    -- Chapter loads go through CampaignManager.loadGameSaveData(GameData).
+    -- Chapter loads go through CampaignManager.loadGameSaveData(GameData); the in-game setup then
+    -- builds its campaign jump with createCampaignJumperOrderFromInitialSettings (M.ingame_setup):
+    -- each character appears at its locator, and the map loads around the base character's
+    -- (docs/RESEARCH.md 3.34).
+    class("chainsaw.GameLocator", "System.Object", {
+        ["set_Position(via.vec3)"] = { 1, function(self, v) self.__fields._Position = vec(v.x, v.y, v.z) end,
+            { "via.vec3" } },
+        ["set_Rotation(via.Quaternion)"] = { 1, function(self, q) self.__fields._Rotation = quat(q.x, q.y, q.z, q.w) end,
+            { "via.Quaternion" } },
+    }, { _Stage = "chainsaw.StageID", _Position = "via.vec3", _Rotation = "via.Quaternion" })
+    class("chainsaw.CampaignInitialSetting.CharacterProperty", "System.Object", {},
+        { _Character = "chainsaw.CharacterKindID", _Locator = "chainsaw.GameLocator" })
     class("chainsaw.CampaignInitialSetting", "System.Object", {}, { _Chapter = "chainsaw.ChapterID",
-        _SpecialJumpSequence = "chainsaw.CampaignJumper.Order.SpecialOrderType" })
+        _SpecialJumpSequence = "chainsaw.CampaignJumper.Order.SpecialOrderType",
+        _CharacterList = "chainsaw.CampaignInitialSetting.CharacterProperty[]" })
+    class("chainsaw.CampaignJumper.Order.CharacterEntry", "System.Object", {},
+        { Property = "chainsaw.CampaignCharacterProperty", Locator = "chainsaw.GameLocator" })
+    class("chainsaw.CampaignJumper.Order", "System.Object", {}, { Chapter = "chainsaw.ChapterID",
+        CharacterEntryList = "chainsaw.CampaignJumper.Order.CharacterEntry[]", LoadBaseCharacter = "System.Int32",
+        SpecialJumpSequence = "chainsaw.CampaignJumper.Order.SpecialOrderType", IsChapterStart = "System.Boolean" })
     class("chainsaw.CampaignManager.GameData", "System.Object", {}, { _InitialSettings = "chainsaw.CampaignInitialSetting" })
+    local function copy_locator(src)
+        local f = src.__fields
+        return new("chainsaw.GameLocator", { __fields = { _Stage = f._Stage, _Position = vec(f._Position.x, f._Position.y,
+            f._Position.z), _Rotation = quat(f._Rotation.x, f._Rotation.y, f._Rotation.z, f._Rotation.w) } })
+    end
     class("chainsaw.CampaignManager", "System.Object", {
         get_CurrentChapter = { 0, function() return world.chapter or 1 end, {}, { ret = "chainsaw.ChapterID" } },
         get_CurrentDifficulty = { 0, function() return 20 end },
@@ -3316,8 +3348,30 @@ function M.install_world(world, opts)
             local init = data.__fields._InitialSettings
             world.chapter = init.__fields._Chapter
             world.jump_sequence = init.__fields._SpecialJumpSequence
+            world.initial_settings = init
             world.loads = world.loads + 1
         end, { "chainsaw.CampaignManager.GameData" } },
+        -- Order(InitialSettings): each character's entry with a copy of its locator, the base
+        -- character the first (getPL1Index); a new game's jump also gets the setting's opening.
+        createCampaignJumperOrderFromInitialSettings = { 4, function(_, _, _, _, special)
+            local init = world.initial_settings
+            if init == nil then return nil end
+            local entries = {}
+            local list = init.__fields._CharacterList
+            for _, prop in ipairs(list and list.list or {}) do
+                entries[#entries + 1] = new("chainsaw.CampaignJumper.Order.CharacterEntry", { __fields = {
+                    Property = prop, Locator = copy_locator(prop.__fields._Locator) } })
+            end
+            local order = new("chainsaw.CampaignJumper.Order", { __fields = { Chapter = init.__fields._Chapter,
+                CharacterEntryList = M.array(entries), LoadBaseCharacter = 0, SpecialJumpSequence = 0,
+                IsChapterStart = false } })
+            if special then
+                order.__fields.SpecialJumpSequence = init.__fields._SpecialJumpSequence
+                order.__fields.IsChapterStart = true
+            end
+            return order
+        end, { "System.Boolean", "System.Boolean", "System.Boolean", "System.Boolean" },
+            { ret = "chainsaw.CampaignJumper.Order" } },
     })
     -- Saving and loading (docs/RESEARCH.md 3.15). Every save goes through
     -- SaveFlowController.start(slot, args); SaveDataManager.requestStartSaveGameDataFlow is a
@@ -3348,8 +3402,49 @@ function M.install_world(world, opts)
         requestStartSaveGameDataFlow = { 2, function(_, slot, args)
             return world.save_flow:call("start", slot, args)
         end, { "System.Int32", "share.GameSaveRequestArgs" } },
+        -- Loading (docs/RESEARCH.md 3.34): the request is queued, read while the system is busy
+        -- (M.save_system_tick), then waits as LoadedGamedataApplyable for the in-game setup.
+        ["setPlayLoadData(System.Boolean, System.Int32)"] = { 2, function(_, auto, slot)
+            world.play_load = { auto = auto, slot = slot }
+        end, { "System.Boolean", "System.Int32" } },
+        ["enqueueLoadRequest(System.Int32, share.SaveLoadRequestArgs)"] = { 2, function(_, slot, args)
+            assert(type(slot) == "number", "slot must be a number")
+            assert(args ~= nil and args.__type == "share.GameLoadRequestArgs", "game load request args")
+            world.load_requests = world.load_requests or {}
+            world.load_requests[#world.load_requests + 1] = slot
+            world.load_queue = slot
+        end, { "System.Int32", "share.SaveLoadRequestArgs" } },
+        get_LoadedGamedataApplyable = { 0, function() return world.loaded_applyable == true end, {},
+            { ret = "System.Boolean" } },
+        get_LastLoadSuccessedGameSlot = { 0, function() return world.loaded_slot or -1 end, {}, { ret = "System.Int32" } },
     })
+    class("share.SaveLoadRequestArgs", "System.Object", {})
+    class("share.GameLoadRequestArgs", "share.SaveLoadRequestArgs", {})
     world.singletons["share.SaveDataManager"] = new("share.SaveDataManager")
+    -- Leaving the game for a load (the pause menu's Load Game): HighwayGuiManager
+    -- .setFixInGameStateExit, ClapperboardMediator.clearRequestTimeline, then
+    -- MainModeManager.requestToChangeGameState(GameStateInGameCleanup, Argument{NextState}).
+    class("chainsaw.GameStateIngameSetup", "System.Object", {})
+    class("chainsaw.GameStateInGameCleanup", "System.Object", {})
+    class("share.GameStateArgument", "System.Object", {})
+    class("chainsaw.GameStateInGameCleanup.Argument", "share.GameStateArgument", {}, { Reset = "System.Boolean",
+        NextState = "System.Type", IsFromEnding = "System.Boolean", IsDifficultyChanged = "System.Boolean",
+        Difficulty = "chainsaw.CampaignManager.Difficulty" })
+    add_methods("share.MainModeManager", {
+        ["requestToChangeGameState(System.Type, share.GameStateArgument)"] = { 2, function(_, t, arg)
+            world.state_requests = world.state_requests or {}
+            world.state_requests[#world.state_requests + 1] = { state = t and t.name,
+                next = arg and arg.__fields.NextState and arg.__fields.NextState.name, fix_exit = world.fix_exit,
+                timeline_cleared = world.timeline_cleared }
+        end, { "System.Type", "share.GameStateArgument" } },
+    })
+    add_methods("chainsaw.HighwayGuiManager", {
+        setFixInGameStateExit = { 0, function() world.fix_exit = true end },
+        get_SaveLoadMenuGuiManager = { 0, function() return world.save_menu end },
+    })
+    add_methods("chainsaw.ClapperboardMediator", {
+        clearRequestTimeline = { 0, function() world.timeline_cleared = true end },
+    })
     class("chainsaw.gui.SaveSlotInfo", "System.Object", {}, { SlotIndex = "System.Int32", ChapterID = "chainsaw.ChapterID" })
     class("chainsaw.gui.SaveSlotInfoDetail", "System.Object", {
         get_IsEmpty = { 0, function(self) return self.__fields["<IsEmpty>k__BackingField"] end },
@@ -3777,15 +3872,77 @@ function M.menu_frame(where)
     if detail == nil or detail.__fields["<IsEmpty>k__BackingField"] then return nil end
     local slot = detail.__fields["<Info>k__BackingField"].__fields.SlotIndex
     w.loaded_slot = slot
-    M.load_save(w.save_files[slot].chapter)
+    M.load_save(w.save_files[slot].chapter, w.save_files[slot])
+    M.ingame_setup()
     return slot
 end
 
 -- The game loads a save (Continue / Load) of `chapter` through CampaignManager.loadGameSaveData.
-function M.load_save(chapter)
-    local init = new("chainsaw.CampaignInitialSetting", { __fields = { _Chapter = chapter, _SpecialJumpSequence = 0 } })
+-- where = { stage, pos, ashley = { stage, pos } }: where the save's characters stood (default:
+-- stage 40100 at the origin, Leon alone).
+function M.load_save(chapter, where)
+    where = where or {}
+    local function character(kind, stage, pos)
+        local loc = new("chainsaw.GameLocator", { __fields = { _Stage = stage, _Position = vec(pos.x, pos.y, pos.z),
+            _Rotation = quat(0, 0, 0, 1) } })
+        return new("chainsaw.CampaignInitialSetting.CharacterProperty", { __fields = { _Character = kind, _Locator = loc } })
+    end
+    local list = { character(0, where.stage or 40100, where.pos or vec(0, 0, 0)) }
+    if where.ashley then
+        list[2] = character(1, where.ashley.stage or where.stage or 40100, where.ashley.pos or vec(1, 0, 0))
+    end
+    local init = new("chainsaw.CampaignInitialSetting", { __fields = { _Chapter = chapter, _SpecialJumpSequence = 0,
+        _CharacterList = M.array(list) } })
     local data = new("chainsaw.CampaignManager.GameData", { __fields = { _InitialSettings = init } })
     M.world.singletons["chainsaw.CampaignManager"]:call("loadGameSaveData", data)
+end
+
+-- The in-game setup after a load or a new game: builds the campaign jump and runs it - the map
+-- loads around the base character's locator, the player appears at it. Returns the jump.
+function M.ingame_setup(new_game)
+    local w = M.world
+    local order = w.singletons["chainsaw.CampaignManager"]:call("createCampaignJumperOrderFromInitialSettings", true,
+        true, true, new_game == true)
+    if order == nil then return nil end
+    local f = order.__fields
+    local base = f.CharacterEntryList.list[f.LoadBaseCharacter + 1].__fields.Locator.__fields
+    w.stage, w.jumps, w.last_order = base._Stage, (w.jumps or 0) + 1, order
+    w.opening_played = f.SpecialJumpSequence ~= 0 or f.IsChapterStart == true
+    if w.player ~= nil then
+        local p = w.player.pos -- moved in place: the body follows the same table
+        p.x, p.y, p.z = base._Position.x, base._Position.y, base._Position.z
+        w.player.stage = base._Stage
+    end
+    return order
+end
+
+-- The save system's work of a frame: a queued load is read (the system busy for a frame), then
+-- waits to be applied.
+function M.save_system_tick()
+    local w = M.world
+    if w.load_queue == nil then return end
+    if not w.save_busy then
+        w.save_busy = true
+        return
+    end
+    w.save_busy = false
+    if w.save_files[w.load_queue] ~= nil and not w.load_fails then
+        w.loaded_applyable, w.applyable_slot = true, w.load_queue
+    end
+    w.load_queue = nil
+end
+
+-- The state change the in-game load asked for runs: the cleanup unloads the map, the in-game
+-- setup applies the loaded save and runs its campaign jump. Returns the jump.
+function M.run_ingame_reload()
+    local w = M.world
+    local req = w.state_requests and w.state_requests[#w.state_requests]
+    assert(req ~= nil and req.state == "chainsaw.GameStateInGameCleanup", "no cleanup requested")
+    assert(req.next == "chainsaw.GameStateIngameSetup", "the cleanup must lead to the in-game setup")
+    local slot = w.applyable_slot
+    w.loaded_applyable, w.applyable_slot, w.loaded_slot = false, nil, slot
+    M.load_save(w.save_files[slot].chapter, w.save_files[slot])
+    return M.ingame_setup()
 end
 
 -- A breakable or animal in the scene, with the GameObject GUID from the scene file. Animals

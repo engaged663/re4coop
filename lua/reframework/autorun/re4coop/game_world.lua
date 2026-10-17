@@ -10,8 +10,7 @@
 --     (Prefecture/Location/EnvSceneManager.requestToChangeStatus + CharacterManager
 --     .requestWarp with a StageIdentifier); PlayerContext.get_CurrentStageID;
 --     CampaignManager.get_CurrentChapter and the chapter switch through
---     CampaignManager.loadGameSaveData; GameOverManager mediator requestGameOver; scene
---     findComponents and GameObject GUIDs.
+--     CampaignManager.loadGameSaveData; scene findComponents and GameObject GUIDs.
 --   * In this mod's own research dump (v0.5): GimmickManager.pushDirtyList (a gimmick
 --     changed state, hooked in game.lua), CampaignManager.get_CurrentStageIdentifier.
 --   * Read in re4.exe's code (docs/RESEARCH.md 3.11): flag changes through
@@ -31,6 +30,10 @@
 --     through each PortrayalParam's triggerProcess (end effects later, from
 --     PortrayalSettings.Param.onFinish); PurposeManager.updateMainPurpose(PurposeGuiItem)
 --     shows a new objective (only one of higher priority).
+--   * Read in re4.exe's code too (docs/RESEARCH.md 3.34): a loaded game's campaign jump
+--     (CampaignManager.createCampaignJumperOrderFromInitialSettings) loads the map around its
+--     base character's GameLocator and puts each character at its own; reloading in game is
+--     the pause menu's Load Game (game_save.lua).
 -- Every lookup is cached and every engine call is pcall'ed; missing pieces switch the
 -- corresponding feature off and show up in the Diagnostics panel.
 
@@ -141,12 +144,10 @@ local TERMINAL = { "break", "broken", "dead", "death", "die", "destroy", "crash"
 local KILL_METHODS = { "requestBreak", "requestDead", "forceBreak", "forceDead", "breakObject", "requestDestroy",
     "onBreak", "dead", "setDead", "kill", "die" }
 
--- ChapterID -> CampaignJumper special jump sequence (main campaign), from RE4R-AP-Wizard.
-World.CHAPTER_JUMP = {
-    [21100] = 6, [21200] = 7, [21300] = 8, [22100] = 9, [22200] = 10, [22300] = 11,
-    [23100] = 12, [23200] = 13, [23300] = 14, [24100] = 15, [24200] = 16, [24300] = 17,
-    [25100] = 18, [25200] = 19, [25300] = 20, [25400] = 21,
-}
+-- How long an armed spawn at the partner waits for the game to build its campaign jump.
+World.SPAWN_TTL = 180.0
+local ORDER = "chainsaw.CampaignJumper.Order"
+local LOCATOR = "chainsaw.GameLocator"
 
 local function lower(s) return tostring(s or ""):lower() end
 
@@ -174,7 +175,7 @@ function World.new(game, log)
     self.game = game
     self.log = log or function() end
     self.r = R.new(self.log)
-    self.callbacks = {}      -- on_flag(guid, value, pulse), on_cutscene(ev), on_trigger(ev)
+    self.callbacks = {}      -- on_flag(guid, value, pulse), on_cutscene(ev), on_trigger(ev), spawn_spot(), reload_slot()
     self.applying = false    -- we are setting a flag ourselves (its change event is ours)
     self.applying_cutscene = false
     self.applying_trigger = false
@@ -204,6 +205,8 @@ function World.new(game, log)
     self.comp_guid = {}      -- component address -> guid
     self.animal_frozen = {}  -- guid -> {core, go, how}: animals whose state machine we took off the update
     self.chapter_target = nil
+    self.spawn_until = nil   -- the next campaign jump puts our player at the partner's (arm_spawn)
+    self.spawn_last = nil    -- { at, moved, why, stage }: what the last armed jump did
     self:probe()
     return self
 end
@@ -399,6 +402,15 @@ function World:probe()
     self.load_save_m = r:find_method(CAMPAIGN, function(i) return i.name == "loadGameSaveData" and #i.params == 1 end)
     self:cap("chapter_switch", self.load_save_m ~= nil,
         self.load_save_m and "CampaignManager.loadGameSaveData" or "not found")
+    -- Where a loaded game puts the player (docs/RESEARCH.md 3.34): the in-game setup builds its
+    -- campaign jump with createCampaignJumperOrderFromInitialSettings; the jump loads the map
+    -- around its base character's locator (stage, position) and puts every character at its own.
+    self.order_m = r:find_method(CAMPAIGN, function(i)
+        return i.name == "createCampaignJumperOrderFromInitialSettings" and #i.params == 4 end)
+    local spawn_ok = self.order_m ~= nil and r:type(ORDER) ~= nil and r:type(LOCATOR) ~= nil
+    self:cap("spawn_at_partner", spawn_ok, spawn_ok and "CampaignJumper.Order locators (in-game setup)"
+        or "no createCampaignJumperOrderFromInitialSettings")
+    if not spawn_ok then self.order_m = nil end
 end
 
 function World:install_hooks(callbacks)
@@ -524,7 +536,10 @@ function World:install_hooks(callbacks)
     self:cap("mechanisms", mech_hooked == 2, ("%d of 2 hooked (PortrayalSettings.call, GmBase.setGmFlag)"):format(mech_hooked))
     self:install_mute_hooks()
 
-    -- Chapter switch: rewrite the chapter of the next save load when armed.
+    -- Chapter switch: rewrite the chapter of the next save load when armed. (Not the save's
+    -- _SpecialJumpSequence, as 0.6-0.11 did after RE4R-AP-Wizard: it is a SpecialOrderType, a
+    -- chapter opening, and the in-game setup only reads it for a new game - docs/RESEARCH.md
+    -- 3.34. Where the player appears is the campaign jump's locator: see the spawn below.)
     if self.load_save_m ~= nil then
         local base = self.load_save_m.static and 2 or 3
         r:hook(self.load_save_m, function(args)
@@ -541,11 +556,19 @@ function World:install_hooks(callbacks)
                 return -- the save is already in that chapter: keep its own checkpoint
             end
             local ok1 = self:set_field_any(init, "chainsaw.CampaignInitialSetting", "_Chapter", chapter)
-            local jump = World.CHAPTER_JUMP[chapter]
-            if jump ~= nil then
-                self:set_field_any(init, "chainsaw.CampaignInitialSetting", "_SpecialJumpSequence", jump)
-            end
             self.log(("chapter switch applied: %d (%s)"):format(chapter, tostring(ok1)))
+        end)
+    end
+
+    -- Spawn at the partner: when armed, the campaign jump the in-game setup builds next (after
+    -- a save loaded or a new game started) puts our player where the partner is.
+    if self.order_m ~= nil then
+        r:hook(self.order_m, function() end, function(retval)
+            if self.spawn_until ~= nil then
+                local ok, err = pcall(self.on_order_built, self, retval)
+                if not ok then self.log("spawn at partner failed: " .. tostring(err)) end
+            end
+            return retval
         end)
     end
 end
@@ -2465,19 +2488,135 @@ function World:disarm_chapter_switch()
     self.chapter_target = nil
 end
 
--- Game over -> the player picks Continue -> the checkpoint load runs through
--- CampaignManager.loadGameSaveData, which the armed chapter switch redirects.
-function World:trigger_reload()
-    if self:setting("travel_reload") ~= true then return false end
-    local gom = self.r:singleton(GAME_OVER)
-    local mediator = gom and R.call(gom, "get_Mediator")
-    if mediator == nil then return false end
-    self:crumb("world.trigger_reload", nil, true)
-    local ok = pcall(function()
-        local req = self.game:hold(sdk.create_instance("chainsaw.GameOverRequest"), 30.0)
-        mediator:call("requestGameOver", req)
-    end)
-    return ok
+-- Spawn at the partner (docs/RESEARCH.md 3.34): the next campaign jump the in-game setup
+-- builds (a save loaded, a new game started, from the menus or in game) loads the partner's
+-- map and puts our player at the partner's place. The place is asked for when the jump is
+-- built (callbacks.spawn_spot() -> { stage, pos = {x,y,z}, rot = {x,y,z,w} | yaw } or nil), so
+-- it is where the partner is then. One jump only; forgotten after `seconds`.
+function World:arm_spawn(seconds)
+    if self.order_m == nil then return false end
+    self.spawn_until = self:now() + (seconds or World.SPAWN_TTL)
+    return true
+end
+
+function World:disarm_spawn()
+    self.spawn_until = nil
+end
+
+function World:spawn_armed()
+    return self.spawn_until ~= nil and self:now() <= self.spawn_until
+end
+
+-- Post-hook of createCampaignJumperOrderFromInitialSettings while a spawn is armed.
+function World:on_order_built(retval)
+    local until_t = self.spawn_until
+    self.spawn_until = nil -- one jump only, whatever happens
+    if until_t == nil or self:now() > until_t then return end
+    local order = R.arg_obj(retval)
+    local cb = self.callbacks or {}
+    local spot = cb.spawn_spot and cb.spawn_spot() or nil
+    local moved, why = 0, nil
+    if order == nil then
+        why = "the game built no jump"
+    elseif spot == nil or spot.pos == nil or spot.stage == nil then
+        why = "the partner's place is unknown"
+    else
+        moved, why = self:apply_spawn(order, spot)
+    end
+    self.spawn_last = { at = self:now(), moved = moved, why = why, stage = spot and spot.stage }
+    self.counters.spawns = (self.counters.spawns or 0) + (moved > 0 and 1 or 0)
+    self:crumb("world.spawn_at_partner", ("%d moved %s"):format(moved, tostring(why or "")), true)
+    if moved > 0 then
+        self.log(("spawn at partner: stage %s, %d character(s) moved"):format(tostring(spot.stage), moved))
+    else
+        self.log("spawn at partner not applied: " .. tostring(why))
+    end
+end
+
+local function quat_of(spot)
+    local q = spot.rot
+    if q ~= nil and q.w ~= nil then return q end
+    local h = (spot.yaw or 0) * 0.5
+    return { x = 0, y = math.sin(h), z = 0, w = math.cos(h) }
+end
+
+-- Writes a GameLocator: stage, position, rotation. true when the position reads back.
+function World:set_locator(loc, spot)
+    self:set_field_any(loc, LOCATOR, "_Stage", spot.stage)
+    local p = spot.pos
+    local function at_spot()
+        local v = R.get(loc, "_Position")
+        return v ~= nil and type(v.x) == "number" and math.abs(v.x - p.x) < 0.01 and math.abs(v.z - p.z) < 0.01
+    end
+    if not (R.set(loc, "_Position", Vector3f.new(p.x, p.y, p.z)) and at_spot()) then
+        R.call(loc, "set_Position(via.vec3)", Vector3f.new(p.x, p.y, p.z))
+    end
+    local q = quat_of(spot)
+    if not R.set(loc, "_Rotation", Quaternion.new(q.w, q.x, q.y, q.z)) then
+        R.call(loc, "set_Rotation(via.Quaternion)", Quaternion.new(q.w, q.x, q.y, q.z))
+    end
+    return at_spot() and R.number(R.get(loc, "_Stage")) == spot.stage
+end
+
+-- Moves a campaign jump's characters to `spot`: the base character (the map loads around its
+-- locator) and every character that was in its stage with it (Ashley at its side); the others
+-- keep their own place. No chapter-start opening runs (the partner is past it). Returns the
+-- number of characters moved, and why none was.
+function World:apply_spawn(order, spot)
+    local entries = {}
+    R.each(R.get(order, "CharacterEntryList"), function(e) entries[#entries + 1] = e end)
+    if #entries == 0 then return 0, "the jump has no characters" end
+    local base = R.number(R.get(order, "LoadBaseCharacter")) or 0
+    if base < 0 or base >= #entries then base = 0 end
+    local base_loc = R.get(entries[base + 1], "Locator")
+    if base_loc == nil then return 0, "the player has no place in the jump" end
+    local from_stage = R.number(R.get(base_loc, "_Stage"))
+    local moved = 0
+    for i, e in ipairs(entries) do
+        local loc = R.get(e, "Locator")
+        local with_player = i == base + 1 or (from_stage ~= nil and R.number(R.get(loc, "_Stage")) == from_stage)
+        if loc ~= nil and with_player and self:set_locator(loc, spot) then moved = moved + 1 end
+    end
+    if moved == 0 then return 0, "the locators could not be written" end
+    self:set_field_any(order, ORDER, "SpecialJumpSequence", 0)
+    R.set(order, "IsChapterStart", false)
+    return moved
+end
+
+-- The partner's stage is part of the map our game has loaded (CharacterManager.isActive; nil:
+-- unknown).
+function World:stage_loaded(stage)
+    if stage == nil or stage < 0 then return nil end
+    local cm = self.r:singleton(CHARACTER_MANAGER)
+    local v = cm and R.call(cm, "isActive", stage)
+    if type(v) ~= "boolean" then return nil end
+    return v
+end
+
+-- Our game, in game, loads a save the way the pause menu's Load Game does, into `chapter`, and
+-- comes back at the partner's place (docs/RESEARCH.md 3.34). The slot is the session's choice
+-- (callbacks.reload_slot()). true, or false and why.
+function World:trigger_reload(chapter)
+    local cb = self.callbacks or {}
+    local slot = cb.reload_slot and cb.reload_slot() or nil
+    if slot == nil then return false, "no saved game to load" end
+    if self.game == nil or self.game.ingame_load == nil then return false, "loading in game is not available" end
+    if chapter ~= nil and not self:arm_chapter_switch(chapter) then return false, "chapter switching is not available" end
+    local ok, why = self.game:ingame_load(slot)
+    if not ok then
+        if chapter ~= nil then self:disarm_chapter_switch() end
+        return false, why
+    end
+    self:arm_spawn()
+    self:crumb("world.trigger_reload", tostring(slot), true)
+    return true
+end
+
+-- The in-game load trigger_reload started gave up (the save could not be read, or the game
+-- would not leave).
+function World:reload_failed()
+    local l = self.game and self.game.ingame_loading
+    return l ~= nil and l.phase == "failed"
 end
 
 -------------------------------------------------------------------------------

@@ -77,6 +77,8 @@ local MAX_DEFERRED = 4000
 local SETTLE_AFTER_LOAD = 1.0   -- seconds in game before queued world/enemy messages are applied
 local TRANSITION_FLAG_HOLD = 2.0 -- the partner's flags wait this long after our transition ends
 local SCREEN_INTERVAL = 0.5     -- seconds between looks at the screen fades (screen_watch.lua)
+local JOIN_NEW_TIMEOUT = 60.0   -- seconds a new game to join the host may wait for the main menu
+local HOST_PLAYING_AGE = 3.0    -- seconds: a host PLAYER message this fresh means the host is in game
 local STATUS_MAX_AGE = 0.1      -- status_cached(): seconds a computed status is reused
 local TAP_MAX = 1.0             -- seconds: the Ashley key held longer than this is not a tap
 local TAP_SETTLE = 0.25         -- seconds after the release the game must still have the focus
@@ -261,6 +263,10 @@ function Session.new(opts)
                     self.trigger_sync:on_local_trigger(ev, self.clock(), self:event_location())
                 end
             end,
+            -- Joining at the host's place: where the next loaded game puts us, and the save an
+            -- in-game reload loads.
+            spawn_spot = function() return self:host_spawn_spot() end,
+            reload_slot = function() return self:reload_slot() end,
         })
     end
 
@@ -319,9 +325,12 @@ function Session:reset_peer()
     self.world_sync_pending = nil
     self.world_synced = false -- client: the host's world state arrived at least once
     self.chapter_ahead_since = nil
+    self.host_spot = nil      -- client: where the host last stood in play (spawn at the host)
+    self.join_new = nil       -- client: a new game to start from the main menu (joining without a save)
     self.deferred = {} -- queued messages belonged to the previous partner
     if self.travel then self.travel:cancel("partner left") end
     if self.save_sync then self.save_sync:reset() end
+    if self.world and self.world.disarm_spawn then self.world:disarm_spawn() end
 end
 
 -- Creates the per-role sync modules (nothing while not in a session).
@@ -1018,6 +1027,10 @@ function Session:status()
         if self.world.counters then st.world_events = self.world.counters end
         st.world_last_not_event = self.world.last_not_event
         if self.travel then st.travel = self.travel:status() end
+        -- Joining at the host's place: the armed spawn, what the last one did, an in-game load.
+        st.join = { spawn_armed = self.world.spawn_armed ~= nil and self.world:spawn_armed() or false,
+            spawn_last = self.world.spawn_last, ingame_load = self.game.ingame_loading,
+            host_spot = self.host_spot and { chapter = self.host_spot.chapter, stage = self.host_spot.stage } or nil }
     end
     if self.pause and self.pause.status then st.pause = self.pause:status() end
     if self.save_sync then
@@ -1215,6 +1228,12 @@ function Session:handle_message(data, now)
         local prev = self.partner_state
         self.partner_state = m
         self.interp:push(m.time, now, m)
+        -- Where the partner stands in play (not dead, in a cutscene or a transition): the place a
+        -- joining client's game loads and puts it at.
+        local busy = P.PLAYER_FLAGS.DEAD | P.PLAYER_FLAGS.CUTSCENE
+        if (m.flags & busy) == 0 and m.stage ~= nil and m.chapter ~= nil then
+            self.host_spot = { chapter = m.chapter, stage = m.stage, pos = m.pos, rot = m.rot, at = now }
+        end
         local dead = (m.flags & P.PLAYER_FLAGS.DEAD) ~= 0
         if prev ~= nil and dead and (prev.flags & P.PLAYER_FLAGS.DEAD) == 0 then
             self:add_message((self.partner_name or "Partner") .. " is down!", "error")
@@ -1496,7 +1515,15 @@ function Session:update_world(now)
     if self.role == "client" and partner ~= nil and not self.travel:busy() then
         if self.join_travel_pending then
             -- Joining: load the host's chapter if needed, take over its world, then warp to it.
-            if self.travel:request({ chapter = partner.chapter, stage = partner.stage, pos = partner.pos,
+            -- In the menus (no player yet) the join's own load runs first (on_menu): it needs
+            -- the join still pending to happen, and it already loads the host's place.
+            if self:fresh_local_pos(now) == nil then
+                if s.auto_load_on_join == false and partner.chapter ~= nil then
+                    -- The player loads a save themself: it goes into the host's chapter and place.
+                    world:arm_chapter_switch(partner.chapter)
+                    if world.arm_spawn and not world:spawn_armed() then world:arm_spawn() end
+                end
+            elseif self.travel:request({ chapter = partner.chapter, stage = partner.stage, pos = partner.pos,
                 yaw = partner.yaw, reason = "join", sync = true, follow = true }) then
                 self.join_travel_pending = false
                 self:add_message("Joining your partner's game...", "info")
@@ -1560,15 +1587,86 @@ function Session:on_menu(where)
     local lobby = self.lobby
     if lobby ~= nil and (lobby.start ~= nil or (lobby:is_open() and not lobby.join_running)) then return false end
     local age = self.interp:age(now)
-    local partner_in_game = self.partner_state ~= nil and age ~= nil and age < 3.0
+    local partner_in_game = self.partner_state ~= nil and age ~= nil and age < HOST_PLAYING_AGE
     local joining = self.role == "client" and self.partner_connected and self.compatible
         and (self.join_travel_pending or self.sync_on_join)
-    local want = self.save_sync:menu_tick(now, { joining = joining, partner_in_game = partner_in_game }, self.game)
-    if want and self.join_travel_pending and self.world ~= nil and self.travel ~= nil
-        and self.partner_state.chapter ~= nil then
-        self.world:arm_chapter_switch(self.partner_state.chapter) -- into the host's chapter
+    local chapter = self.partner_state and self.partner_state.chapter
+    local action = self.save_sync:menu_tick(now, { joining = joining, partner_in_game = partner_in_game, where = where,
+        can_start_new = where == "menu" and self.game.menu_start_new ~= nil and Lobby.head_key_of_id(chapter) ~= nil },
+        self.game)
+    if action ~= nil and self.join_travel_pending and self.world ~= nil and self.travel ~= nil and chapter ~= nil then
+        if action == "continue" then self.world:arm_chapter_switch(chapter) end -- into the host's chapter
+        -- The game loads the host's part of the map and puts us at the host's place.
+        if self.world.arm_spawn then self.world:arm_spawn() end
     end
-    return want
+    if action == "new" then self.join_new = { at = now, chapter = chapter } end
+    return action == "continue"
+end
+
+-- Client: where the host last stood in play, for the next game we load (game_world.lua spawn):
+-- { chapter, stage, pos, rot } or nil (unknown, or the host has changed chapter since).
+function Session:host_spawn_spot()
+    if self.role ~= "client" then return nil end
+    local s = self.host_spot
+    if s == nil then return nil end
+    local cur = self.partner_state
+    if cur ~= nil and cur.chapter ~= nil and cur.chapter ~= s.chapter then return nil end
+    return { chapter = s.chapter, stage = s.stage, pos = { x = s.pos.x, y = s.pos.y, z = s.pos.z },
+        rot = s.rot and { x = s.rot.x, y = s.rot.y, z = s.rot.z, w = s.rot.w } or nil }
+end
+
+-- Client: the save an in-game reload into the host's game loads: our co-op save with the host,
+-- else the save we loaded this time, else the newest.
+function Session:reload_slot()
+    local g = self.game
+    if g == nil or g.save_exists == nil then return nil end
+    local coop = self.save_sync and self.save_sync:coop_slot()
+    if coop ~= nil and g:save_exists(coop) then return coop end
+    local last = g.last_loaded_slot and g:last_loaded_slot()
+    if last ~= nil and g:save_exists(last) then return last end
+    return g.continue_save_slot and g:continue_save_slot() or nil
+end
+
+-- Client: the host's player is in its game (its PLAYER stream is fresh; in its lobby or the
+-- menus it has no player), not in its lobby.
+function Session:host_playing(now)
+    if self.role ~= "client" or not (self.partner_connected and self.compatible) or self.partner_state == nil then
+        return false
+    end
+    local age = self.interp:age(now)
+    if age == nil or age >= HOST_PLAYING_AGE then return false end
+    local p = self.lobby and self.lobby.partner
+    return p == nil or not p.in_lobby
+end
+
+-- Client joining from the main menu without any save: a new game at the start of the host's
+-- chapter part, once the main menu waits for a choice (it comes back at the host's place).
+function Session:update_join(now)
+    local j = self.join_new
+    if j == nil then return end
+    if self.role ~= "client" or not (self.partner_connected and self.compatible) then
+        self.join_new = nil
+        return
+    end
+    if now - j.at > JOIN_NEW_TIMEOUT then
+        self.join_new = nil
+        self:add_message("Could not start a new game to join your partner - start one yourself (New Game)", "warn")
+        return
+    end
+    local g = self.game
+    local ok_st, st = pcall(g.menu_status, g)
+    if not ok_st or st == nil or not st.ready then return end
+    self.join_new = nil
+    local key = Lobby.head_key_of_id(j.chapter) or 1
+    local remote = self.lobby and self.lobby.remote
+    local difficulty = remote and remote.difficulty
+    if not Lobby.difficulty_valid(difficulty) then difficulty = self.settings.lobby_difficulty end
+    if not Lobby.difficulty_valid(difficulty) then difficulty = 20 end
+    if self.world and self.world.arm_spawn then self.world:arm_spawn() end
+    local ok, why = g:menu_start_new(key, difficulty)
+    if not ok then
+        self:add_message("Could not start a new game to join your partner: " .. tostring(why), "warn")
+    end
 end
 
 -- Reliable world/enemy messages received while the game loop was not running. They are
@@ -1686,6 +1784,8 @@ function Session:update_lobby(now)
     local lobby, g = self.lobby, self.game
     if lobby == nil then return end
     if g.menu_tick then g:menu_tick({ mode = lobby.menu_mode, covered = lobby:covers_menu() }) end
+    -- A client whose host is already playing goes straight into the host's game.
+    if lobby:is_open() and self.role == "client" then lobby:auto_join(now, self:host_playing(now)) end
     if lobby:is_open() then
         if g.gui_commands and not self.ui_text_active then lobby:push_nav(g:gui_commands()) end
         if self.role == "host" and lobby:in_lobby() and g.save_slot_info
@@ -1786,6 +1886,9 @@ function Session:update()
     perf:stop("update.net", t0)
     t0 = perf:start()
     self:update_lobby(now)
+    self:update_join(now)
+    -- An in-game load into the host's game (travel) leaves the game once the save is read.
+    if self.game.ingame_load_tick then self.game:ingame_load_tick() end
     perf:stop("update.lobby", t0)
     if not active then
         -- Game events from before the partner joined are stale by the time we sync.

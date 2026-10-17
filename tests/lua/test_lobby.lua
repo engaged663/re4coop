@@ -356,6 +356,49 @@ T.run("client_brought_into_the_hosts_lobby_and_joining_a_game_in_progress", func
     T.eq(c2.join_running, true, "the old join from the menu may run")
 end)
 
+T.run("a_client_joins_a_host_already_playing_on_its_own", function()
+    local host, client, _, _, notes = pair()
+    client:open(Lobby.SCREEN.LOBBY)
+    T.eq(client:auto_join(0, false), false, "not while the host is not playing")
+    T.eq(client:auto_join(1, true), false, "not at the first sign")
+    T.eq(client:auto_join(1.2, false), false, "an interruption starts over")
+    T.eq(client:auto_join(1.3, true), false, "...")
+    T.eq(client:auto_join(1.9, true), true, "the host keeps playing: join")
+    T.eq(client.join_running, true, "the join of a game in progress runs")
+    T.eq(client.screen, nil, "the lobby gave way")
+    T.eq(client.counters.auto_joins, 1, "counted")
+    local told = false
+    for _, n in ipairs(notes.c) do
+        if n.text:find("ya está jugando") then told = true end
+    end
+    T.check(told, "the player is told")
+    T.eq(client:auto_join(3, true), false, "once")
+    -- Never for the host, never with the setting off, never while a lobby start runs.
+    host:open(Lobby.SCREEN.LOBBY)
+    T.eq(host:auto_join(0, true), false, "host")
+    T.eq(host:auto_join(1, true), false, "host")
+    local _, c2 = pair(nil, { auto_load_on_join = false })
+    c2:open(Lobby.SCREEN.LOBBY)
+    c2:auto_join(0, true)
+    T.eq(c2:auto_join(1, true), false, "switched off")
+    T.eq(c2.screen, Lobby.SCREEN.LOBBY, "the lobby stays (the button joins)")
+    local _, c3 = pair()
+    c3:open(Lobby.SCREEN.OPTIONS, "menu")
+    c3:auto_join(0, true)
+    T.eq(c3:auto_join(1, true), false, "not over the options screen")
+end)
+
+T.run("start_points_for_a_late_join", function()
+    T.eq(Lobby.head_key_of_id(21100), 6, "chapter 1-1: its own start, not the very beginning")
+    T.eq(Lobby.head_key_of_id(21200), 7, "chapter 2")
+    T.eq(Lobby.head_key_of_id(22200), 10, "chapter 5")
+    T.eq(Lobby.head_key_of_id(25400), 21, "chapter 16")
+    T.eq(Lobby.head_key_of_id(20100), 4, "the drive")
+    T.eq(Lobby.head_key_of_id(21000), 5, "the first house")
+    T.eq(Lobby.head_key_of_id(99999), nil, "unknown")
+    T.eq(Lobby.head_key_of_id(nil), nil, "none")
+end)
+
 -------------------------------------------------------------------------------
 -- Two sessions end to end (fake wire, fake games with a main menu)
 -------------------------------------------------------------------------------
@@ -532,6 +575,88 @@ T.run("two_sessions_menu_lobby_ready_start_and_load_together", function()
     T.check(cgame.given ~= nil and #cgame.given == 2, "the client's loadout given")
     T.eq(hgame.given, nil, "the host chose none")
     T.eq(cworld.armed, nil, "no chapter switch left armed")
+end)
+
+-- A host already playing (it hosted from the REFramework menu, or its lobby game runs): a
+-- client that joins from Multijugador -> Join Game goes straight into the host's game - no
+-- button, no save to pick - and comes back at the host's place.
+local function late_join(client_saves, settings)
+    local clock = { t = 0 }
+    local hs, hnet, hgame = make_session("Leon", clock)
+    local cs, cnet, cgame, cworld = make_session("Ada", clock, settings)
+    for slot, chapter in pairs(client_saves or {}) do cgame.saves[slot] = { chapter = chapter } end
+    function cgame:any_save() return next(self.saves) ~= nil end
+    cworld.spawns = 0
+    function cworld:arm_spawn() self.spawns = self.spawns + 1 return true end
+    function cworld:spawn_armed() return false end
+    -- The host plays in chapter 5 (22200).
+    hgame.in_menu, hgame.loading, hgame.chapter, hgame.stage = false, false, 22200, 46100
+    hgame.pos = { x = 300, y = -7, z = -10 }
+    hs:queue("host")
+    local function deliver()
+        for _ = 1, 3 do
+            for _, b in ipairs(hnet.sent) do cnet.inbox[#cnet.inbox + 1] = { type = "message", data = b } end
+            for _, b in ipairs(cnet.sent) do hnet.inbox[#hnet.inbox + 1] = { type = "message", data = b } end
+            hnet.sent, cnet.sent = {}, {}
+        end
+    end
+    local function frame(dt)
+        clock.t = clock.t + (dt or 0.1)
+        hs:update()
+        cs:update()
+        deliver()
+    end
+    frame()
+    T.eq(hs.role, "host", "hosting")
+    -- Client: Multijugador -> Join Game -> connect.
+    cgame.menu_h.on_decide(Lobby.ACTION.MULTIPLAYER)
+    cgame.menu_h.on_decide(Lobby.ACTION.JOIN)
+    cs:queue("join", "127.0.0.1")
+    frame()
+    hnet.st, cnet.st = "connected", "connected"
+    hnet.peer_name, cnet.peer_name = "Ada", "Leon"
+    hnet.inbox[#hnet.inbox + 1] = { type = "connected", name = "Ada", peer = "127.0.0.1:2" }
+    cnet.inbox[#cnet.inbox + 1] = { type = "connected", name = "Leon", peer = "127.0.0.1:1" }
+    for _ = 1, 20 do frame() end
+    return { clock = clock, hs = hs, cs = cs, cgame = cgame, cworld = cworld, frame = frame }
+end
+
+T.run("a_late_client_goes_straight_into_the_hosts_game", function()
+    local j = late_join({ [3] = 21100 })
+    local cs, cgame, cworld = j.cs, j.cgame, j.cworld
+    T.eq(cs.lobby.screen, nil, "no lobby to wait in: the host is playing")
+    T.eq(cs.lobby.join_running, true, "the join of the game in progress runs on its own")
+    T.check(cs.join_travel_pending, "the join waits for the load")
+    -- The game's main menu asks the session every frame: Continue, into the host's place.
+    T.eq(cs:on_menu("menu"), true, "Continue now")
+    T.eq(cworld.armed, 22200, "into the host's chapter")
+    T.eq(cworld.spawns, 1, "at the host's place")
+    T.eq(cs:on_menu("menu"), false, "once")
+    T.eq(#cgame.starts, 0, "no new game")
+    -- The host's place is the one its game reported while playing.
+    local spot = cs:host_spawn_spot()
+    T.check(spot ~= nil and spot.stage == 46100 and spot.chapter == 22200, "the host's stage and chapter")
+    T.near(spot.pos.x, 300, 1e-6, "and position")
+end)
+
+T.run("a_late_client_without_a_save_starts_a_new_game_in_the_hosts_chapter", function()
+    local j = late_join({})
+    local cs, cgame, cworld = j.cs, j.cgame, j.cworld
+    T.eq(cs.lobby.screen, nil, "joined at once")
+    T.eq(cs:on_menu("menu"), false, "nothing to Continue")
+    j.frame()
+    T.eq(#cgame.starts, 1, "a new game")
+    T.eq(cgame.starts[1].kind, "new", "...")
+    T.eq(cgame.starts[1].key, 10, "at the start of the host's chapter part (5)")
+    T.eq(cgame.starts[1].difficulty, 20, "standard difficulty")
+    T.eq(cworld.spawns, 2, "at the host's place (armed for the start too)")
+    T.check(cs.join_travel_pending, "then the host's world and the host, once in game")
+end)
+
+T.run("with_the_automatic_load_off_the_lobby_keeps_its_button", function()
+    local j = late_join({ [3] = 21100 }, { auto_load_on_join = false })
+    T.eq(j.cs.lobby.screen, Lobby.SCREEN.LOBBY, "the lobby stays")
+    T.eq(j.cs.lobby.join_running, false, "nothing runs on its own")
 end)
 
 T.run("session_continue_start_loads_the_coop_slots", function()

@@ -204,13 +204,13 @@ end)
 T.run("joining_from_the_menu_loads_the_coop_save_once", function()
     local pair = make_pair()
     local b, g = pair.b, pair.gb
-    T.eq(b:menu_tick(0, { joining = true, partner_in_game = false }, g), false, "not before the host is in game")
+    T.eq(b:menu_tick(0, { joining = true, partner_in_game = false }, g), nil, "not before the host is in game")
     g.files[3] = true
     g.files[20] = true
-    T.eq(b:menu_tick(1, { joining = true, partner_in_game = true }, g), true, "the host plays: load now")
+    T.eq(b:menu_tick(1, { joining = true, partner_in_game = true }, g), "continue", "the host plays: load now")
     T.eq(b:continue_slot(2), 20, "Continue loads the co-op slot")
     T.check(pair:told("b", "co%-op save %(slot 20%)"), "told")
-    T.eq(b:menu_tick(2, { joining = true, partner_in_game = true }, g), false, "asked once")
+    T.eq(b:menu_tick(2, { joining = true, partner_in_game = true }, g), nil, "asked once")
     T.eq(b:continue_slot(200), 20, "a game over later reloads it too")
     pair.connected = false
     T.eq(b:continue_slot(200), nil, "not once the session is over")
@@ -218,14 +218,14 @@ T.run("joining_from_the_menu_loads_the_coop_save_once", function()
     b:menu_tick(40, { joining = true, partner_in_game = true }, g)
     T.check(pair:told("b", "did not load"), "a load that never happened is reported")
     -- The host never loads anything this way.
-    T.eq(pair.a:menu_tick(1, { joining = true, partner_in_game = true }, pair.ga), false, "host")
+    T.eq(pair.a:menu_tick(1, { joining = true, partner_in_game = true }, pair.ga), nil, "host")
 end)
 
 T.run("joining_without_a_coop_save_loads_the_latest", function()
     local pair = make_pair()
     local b, g = pair.b, pair.gb
     g.files[3] = true
-    T.eq(b:menu_tick(1, { joining = true, partner_in_game = true }, g), true, "load")
+    T.eq(b:menu_tick(1, { joining = true, partner_in_game = true }, g), "continue", "load")
     T.eq(b:continue_slot(2), nil, "the game's own choice (the latest save)")
     T.check(pair:told("b", "latest save"), "told")
 end)
@@ -244,20 +244,39 @@ T.run("a_game_over_reloads_the_clients_coop_save_once_it_holds_this_session", fu
     T.eq(b:continue_slot(7), nil, "a new session starts over")
 end)
 
-T.run("joining_without_any_save_asks_for_a_new_game", function()
+T.run("joining_without_any_save_starts_a_new_game_from_the_main_menu", function()
     local pair = make_pair()
-    T.eq(pair.b:menu_tick(1, { joining = true, partner_in_game = true }, pair.gb), false, "nothing to load")
+    local b, g = pair.b, pair.gb
+    -- The title screen cannot start one: it waits for a button (told once).
+    T.eq(b:menu_tick(1, { joining = true, partner_in_game = true, where = "title" }, g), nil, "nothing on the title")
+    T.eq(b:menu_tick(1.1, { joining = true, partner_in_game = true, where = "title" }, g), nil, "still nothing")
+    T.check(pair:told("b", "press a button"), "told to go on to the main menu")
+    T.eq(#pair.msgs.b, 1, "once")
+    -- The main menu starts a new game in the host's chapter.
+    T.eq(b:menu_tick(2, { joining = true, partner_in_game = true, where = "menu", can_start_new = true }, g), "new",
+        "a new game")
+    T.check(pair:told("b", "starting a new one"), "told")
+    T.eq(b:menu_tick(3, { joining = true, partner_in_game = true, where = "menu", can_start_new = true }, g), nil,
+        "asked once")
+    T.eq(b:continue_slot(3), nil, "Continue is not involved")
+    b:menu_tick(60, { joining = true, partner_in_game = true, where = "menu", can_start_new = true }, g)
+    T.check(not pair:told("b", "did not load"), "no 'the save did not load' for a new game")
+end)
+
+T.run("joining_without_any_save_and_no_way_to_start_one_asks_for_a_new_game", function()
+    local pair = make_pair()
+    T.eq(pair.b:menu_tick(1, { joining = true, partner_in_game = true, where = "menu" }, pair.gb), nil, "nothing to load")
     T.check(pair:told("b", "no saved game"), "told")
     T.eq(#pair.msgs.b, 1, "once")
-    pair.b:menu_tick(2, { joining = true, partner_in_game = true }, pair.gb)
+    pair.b:menu_tick(2, { joining = true, partner_in_game = true, where = "menu" }, pair.gb)
     T.eq(#pair.msgs.b, 1, "not every frame")
 end)
 
 T.run("loading_on_join_can_be_switched_off", function()
     local pair = make_pair({ auto_load_on_join = false })
     pair.gb.files[3] = true
-    T.eq(pair.b:menu_tick(1, { joining = true, partner_in_game = true }, pair.gb), false, "off")
-    T.eq(pair.b:menu_tick(1, { joining = false, partner_in_game = true }, pair.gb), false, "not joining")
+    T.eq(pair.b:menu_tick(1, { joining = true, partner_in_game = true }, pair.gb), nil, "off")
+    T.eq(pair.b:menu_tick(1, { joining = false, partner_in_game = true }, pair.gb), nil, "not joining")
 end)
 
 -------------------------------------------------------------------------------
@@ -405,6 +424,130 @@ T.run("a_client_with_no_save_is_asked_to_start_one", function()
         if m.text:find("no saved game") then told = true end
     end
     T.check(told, "told to start a game")
+end)
+
+local function told(s, pattern)
+    for _, m in ipairs(s.messages) do
+        if m.text:find(pattern) then return true end
+    end
+    return false
+end
+
+-------------------------------------------------------------------------------
+-- Joining late, at the host's place (docs/RESEARCH.md 3.34): real Session, game and world
+-------------------------------------------------------------------------------
+
+local HOST_STAGE, HOST_POS = 46100, { x = 300, y = -7, z = -10 }
+
+local function host_plays(net, chapter, flags)
+    net.inbox[#net.inbox + 1] = { type = "message", data = P.encode_player({ time = 1, pos = HOST_POS,
+        rot = { x = 0, y = 0.6, z = 0, w = 0.8 }, hp = 10, max_hp = 10, chapter = chapter or HOST_CHAPTER,
+        stage = HOST_STAGE, flags = flags or 0 }) }
+end
+
+-- One game frame, the way the entry script runs it.
+local function frame(s)
+    s.game:begin_frame()
+    s:update()
+end
+
+local function sent(net, t)
+    local n = 0
+    for _, m in ipairs(net.sent) do
+        if m.data:byte(1) == t then n = n + 1 end
+    end
+    return n
+end
+
+-- 0.11.1 and before: in the main menu the session's own loop runs, and its join travel started
+-- with the host's first message - the join was no longer pending when the menu asked, so
+-- Continue never ran and the player had to load a save themself.
+T.run("a_client_joining_in_the_main_menu_loads_straight_into_the_hosts_place", function()
+    local s, net, clock, world = client_on_title()
+    world.game_state, world.player = "chainsaw.GameStateMainMenu", nil
+    world.save_files[3] = { chapter = 21100, order = 2, stage = 40200, pos = { x = 5, y = 0, z = 5 } }
+    net.inbox[#net.inbox + 1] = { type = "connected", name = "Host", peer = "127.0.0.1" }
+    for _ = 1, 10 do
+        clock.t = clock.t + 0.1
+        host_plays(net)
+        frame(s) -- the main menu's frames: the game thread runs the session
+    end
+    T.check(s.join_travel_pending, "the join waits for its own load (no travel before our game plays)")
+    T.eq(s.travel:busy(), false, "no travel yet")
+    world.player = mock.make_player({ x = 0, y = 0, z = 0 }) -- the player the load brings
+    T.eq(mock.menu_frame("menu"), 3, "Continue loaded the client's latest save")
+    T.eq(world.chapter, HOST_CHAPTER, "into the host's chapter")
+    T.eq(world.stage, HOST_STAGE, "the host's part of the map")
+    T.near(world.player.pos.x, HOST_POS.x, 1e-6, "at the host's place")
+    T.near(world.player.pos.z, HOST_POS.z, 1e-6, "...")
+    -- In game: the join takes over the host's world; it is already next to the host.
+    world.game_state = "chainsaw.GameStateInGame"
+    for _ = 1, 50 do
+        clock.t = clock.t + 0.1
+        host_plays(net)
+        frame(s)
+    end
+    T.eq(sent(net, P.T.WORLD_REQUEST), 1, "the host's world asked for")
+    T.eq(s.join_travel_pending, false, "joined")
+end)
+
+T.run("a_client_joining_while_the_host_is_in_a_cutscene_spawns_where_the_host_last_played", function()
+    local s, net, clock, world = client_on_title()
+    world.game_state, world.player = "chainsaw.GameStateMainMenu", nil
+    world.save_files[3] = { chapter = 21100, order = 2 }
+    net.inbox[#net.inbox + 1] = { type = "connected", name = "Host", peer = "127.0.0.1" }
+    clock.t = clock.t + 0.1
+    host_plays(net)
+    frame(s)
+    -- Then a cutscene: its camera position is no place to stand.
+    HOST_POS = { x = 900, y = 50, z = 900 }
+    for _ = 1, 5 do
+        clock.t = clock.t + 0.1
+        host_plays(net, HOST_CHAPTER, P.PLAYER_FLAGS.CUTSCENE)
+        frame(s)
+    end
+    HOST_POS = { x = 300, y = -7, z = -10 }
+    world.player = mock.make_player({ x = 0, y = 0, z = 0 })
+    T.eq(mock.menu_frame("menu"), 3, "loaded")
+    T.near(world.player.pos.x, 300, 1e-6, "where the host last stood in play")
+end)
+
+T.run("a_client_joining_in_game_from_another_chapter_reloads_at_the_hosts_place", function()
+    local s, net, clock, world = client_on_title()
+    world.game_state = "chainsaw.GameStateInGame"
+    world.player = mock.make_player({ x = 0, y = 0, z = 0 })
+    world.stage, world.chapter = 40200, 21100
+    world.save_files[3] = { chapter = 21100, order = 2 }  -- its own game
+    world.save_files[20] = { chapter = 21300, order = 1 } -- its co-op save with the host
+    net.inbox[#net.inbox + 1] = { type = "connected", name = "Host", peer = "127.0.0.1" }
+    for _ = 1, 30 do
+        clock.t = clock.t + 0.1
+        host_plays(net, 22200)
+        frame(s)
+        mock.save_system_tick()
+    end
+    T.eq(world.load_requests and world.load_requests[1], 20, "its co-op save is read in game")
+    T.check(world.state_requests ~= nil, "then the game leaves the map, the way Load Game does")
+    T.eq(world.game_over_requests, 0, "no game over")
+    T.check(not told(s, "Load any save"), "nothing asked of the player")
+    -- The game unloads the map and loads the save into the host's chapter, at the host's place.
+    world.game_state = "chainsaw.GameStateInGameCleanup"
+    for _ = 1, 5 do
+        clock.t = clock.t + 0.1
+        host_plays(net, 22200)
+        frame(s)
+    end
+    mock.run_ingame_reload()
+    world.game_state = "chainsaw.GameStateInGame"
+    T.eq(world.chapter, 22200, "the host's chapter")
+    T.eq(world.stage, HOST_STAGE, "the host's part of the map")
+    T.near(world.player.pos.x, HOST_POS.x, 1e-6, "next to the host")
+    for _ = 1, 50 do
+        clock.t = clock.t + 0.1
+        host_plays(net, 22200)
+        frame(s)
+    end
+    T.eq(sent(net, P.T.WORLD_REQUEST), 1, "then the host's world")
 end)
 
 T.finish()

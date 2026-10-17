@@ -42,6 +42,10 @@ Lobby.CHAPTERS = {
 }
 -- ChapterIDs before chapter 1's first part (the drive, the first house) count as chapter 1.
 local EXTRA_CHAPTER_IDS = { [20100] = 1, [21000] = 1 }
+-- Their own start points (Campaign1001_Chp0_1_Head, Campaign1001_Chp1_0_Head), and chapter 1's
+-- first part's (Campaign1001_Chp1_1_Head): a new game that joins a host there starts at them,
+-- not at the very beginning (Campaign1001_Master).
+local HEAD_KEYS = { [20100] = 4, [21000] = 5, [21100] = 6 }
 
 Lobby.DIFFICULTIES = {
     { id = 10, label = "Asistido" },
@@ -84,6 +88,7 @@ local START_TIMEOUT = 45.0   -- seconds the game may stay on the menu after bein
 local RELEASED_SHOWN = 2.5   -- seconds the loaders stay on screen once the map runs
 local FINISH_AFTER = 60.0    -- seconds after the start the lobby forgets it (loadout given or not)
 local LOADOUT_DELAY = 1.5    -- seconds after the start, in control of the player, before the loadout
+local AUTO_JOIN_DELAY = 0.5  -- seconds the host must be seen playing before a client joins its game
 
 local PHASE_LABEL = {
     [0] = "Esperando...", "Preparando la partida...", "Cargando el mapa...", "Sincronizando con el anfitrión...",
@@ -134,7 +139,8 @@ function Lobby.new(opts)
     self.actions = {}         -- for session.lua (take_action)
     self.nav = {}             -- menu commands (decide, cancel, up, ...) for lobby_ui.lua
     self.join_running = false -- client: join the host's game in progress (the old join from the menu)
-    self.counters = { starts = 0, released = 0, skipped = 0, failed = 0, loadouts = 0 }
+    self.host_playing_since = nil -- client: since when the host is seen playing (auto_join)
+    self.counters = { starts = 0, released = 0, skipped = 0, failed = 0, loadouts = 0, auto_joins = 0 }
     return self
 end
 
@@ -155,6 +161,17 @@ end
 function Lobby.key_of_id(chapter_id)
     local n = Lobby.chapter_of_id(chapter_id)
     return n and Lobby.CHAPTERS[n].key or nil
+end
+
+-- The start point of that very chapter part (chainsaw.CampaignInitialSettingKey
+-- Campaign1001_ChpX_Y_Head), for a new game joining a host who plays there; nil if unknown.
+function Lobby.head_key_of_id(chapter_id)
+    if chapter_id == nil then return nil end
+    if HEAD_KEYS[chapter_id] then return HEAD_KEYS[chapter_id] end
+    for _, c in ipairs(Lobby.CHAPTERS) do
+        if c.id == chapter_id then return c.key end
+    end
+    return nil
 end
 
 function Lobby.difficulty_valid(id)
@@ -246,6 +263,25 @@ function Lobby:join_game_in_progress()
     self.join_running = true
     self.me.ready = false
     self:send_player()
+end
+
+-- Client, every game frame: a host who is already playing (not in its lobby) is joined at once,
+-- the moment our screens show it (setting auto_load_on_join): the game then loads straight into
+-- the host's place. host_playing: the host's player is in its game. true when it joined now.
+function Lobby:auto_join(now, host_playing)
+    local screen_ok = self.screen == Lobby.SCREEN.LOBBY or self.screen == Lobby.SCREEN.JOIN
+    if self.role() ~= "client" or not self.active() or not host_playing or not screen_ok or self.start ~= nil
+        or self.join_running or self.settings.auto_load_on_join == false then
+        self.host_playing_since = nil
+        return false
+    end
+    self.host_playing_since = self.host_playing_since or now
+    if now - self.host_playing_since < AUTO_JOIN_DELAY then return false end
+    self.host_playing_since = nil
+    self:join_game_in_progress()
+    self.counters.auto_joins = self.counters.auto_joins + 1
+    self.notify(("%s ya está jugando: entrando en su partida, apareces a su lado..."):format(self.partner_name()), "info")
+    return true
 end
 
 function Lobby:set_menu_mode(mode)

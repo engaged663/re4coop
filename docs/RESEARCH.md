@@ -394,8 +394,8 @@ type/fields exist in the game's type database, method names are found at runtime
 | Pauses | `share.PauseManager` with `Dictionary<UInt32, PauseParameter {TargetUpdate, TargetDraw}>`, `PauseType` and `chainsaw.PauseManagerCustom.CustomPause` enums; `PauseLayer` = {Self 1, Inventory 2, Map 4, …} (§3.5) | Dump | Neutralising menu pauses (their targets set to 0 while in a session, restored afterwards), optionally refusing the requests |
 | Location | `PlayerContext.get_CurrentStageID()`, `CampaignManager.get_CurrentChapter()` (ChapterID 21100 = chapter 1 … 25400 = chapter 16) | Live (AP Wizard, this mod's dump) | Where each player is |
 | Warp | `Prefecture/Location/EnvSceneManager.requestToChangeStatus(id, Nullable<EnvSceneStatus> = 3, priority 1)` (prefecture = stage / 1000, location = prefecture × 1000), then `CharacterManager.requestWarp(ContextID, Nullable<vec3>, Nullable<Quaternion>, StageIdentifier.setup(location, stage, 0))` | Live (AP Wizard typewriter warps; technique by JumperDenfer, Nexus 5923) | Travelling to the partner in another stage |
-| Chapter switch | Hook `CampaignManager.loadGameSaveData(GameData)`: set `_InitialSettings._Chapter` and `_SpecialJumpSequence` (6 = chapter 1 … 21 = chapter 16) before the load runs | Live (AP Wizard chapter select) | Loading the host's chapter |
-| Reload | `GameOverManager.get_Mediator().requestGameOver(new GameOverRequest)` → *Continue* reloads through `loadGameSaveData` | Live (AP Wizard DeathLink) | Starting the chapter switch without the menu |
+| Chapter switch | Hook `CampaignManager.loadGameSaveData(GameData)`: set `_InitialSettings._Chapter` and `_SpecialJumpSequence` (6 = chapter 1 … 21 = chapter 16) before the load runs (0.11.2: `_Chapter` only - those values are start-point keys, and the place comes from the campaign jump's locator, §3.34) | Live (AP Wizard chapter select) | Loading the host's chapter |
+| Reload | `GameOverManager.get_Mediator().requestGameOver(new GameOverRequest)` → *Continue* reloads through `loadGameSaveData` (0.11.2: replaced by the pause menu's Load Game, §3.34) | Live (AP Wizard DeathLink) | Starting the chapter switch without the menu |
 | Enemy AI | `CharacterContext.get_HeadGameObject()` (the AI "head": think, targeting, `HateController`) vs the body (§3.5); `via.GameObject.set_UpdateSelf(bool)` | Engine + this mod's dump | Switching a mirrored enemy's AI off |
 | Enemy animation | `via.motion.Motion.getLayer(0)` → `get_MotionBankID/get_MotionID/get_Frame`, `changeMotion(UInt32, UInt32, Single, Single, InterpolationMode, InterpolationCurve)` | Confirmed (EMV Engine) | Mirroring the owner's animation |
 | REFramework | `SystemArray:get_element` returns boxed values for primitive arrays (`System.Array.GetValue`); `arr[i] = sdk.create_uint32(v)` writes through `SetValue`; `sdk.to_valuetype(ptr, "System.Guid")` reads a struct argument in a hook | Source | Reading/writing flag words and attribute bytes; GUID hook arguments |
@@ -2029,6 +2029,88 @@ that is in the middle of unloading and loading itself, and none of them is neede
   picture back...*, on by default). A transition still running after 45 s is written to the log
   once with its state, phase, the jumper's phase and whether the save system is busy - what to
   look at if a black screen ever comes back.
+
+### 3.34 A late client loads straight into the host's place (0.11.2)
+
+**Request.** When the client joins a host who is already playing, its game must load the host's
+map and place on its own and put the client there - not make the player open a save and press
+Continue first.
+
+**Why it did not.** Four things, in the order the player met them:
+
+- **In the main menu the join never loaded anything.** The session's own loop runs in the main
+  menu (LateUpdateBehavior), and its join travel started with the host's first PLAYER message:
+  `join_travel_pending` was already false when the menu's update asked `on_menu` (§3.15) whether
+  to load, so Continue never ran - only the title screen (where only the render-thread loop
+  runs) ever loaded on its own. The travel, with no player yet, armed the chapter switch and
+  told the player "Load any save (or press Continue) to join your partner's chapter".
+- **The lobby waited for a button.** A client that connects from Join Game lands in the lobby,
+  which offered "Unirse a su partida en curso" when the host was playing; and a client without
+  any save was told to start one.
+- **A client already in game** whose host was in another chapter got the same "Load any save"
+  (the game-over reload was experimental and off), and in another part of the same chapter it
+  was teleported to the host's position - into an area its game had not loaded unless the
+  experimental stage warp was on.
+- **And a load never put the client at the host's place.** The chapter switch rewrote the save's
+  `_Chapter` and `_SpecialJumpSequence` (after RE4R-AP-Wizard), but the place a loaded game starts
+  at is somewhere else, and `_SpecialJumpSequence` is not what it was taken for (below): the
+  client started where its own save was, in the host's chapter, and was warped afterwards.
+
+**Where a loaded game puts the player** (re4.exe of October 2026, functions carved by `.pdata`
+and decompiled with REA/Ghidra; types and offsets from the il2cpp dump):
+
+| What | Where | Finding |
+|---|---|---|
+| The saved place | `CampaignManager.saveGameSaveData` (0x142e41e30) | Copies `InitialSettings` into the save (`CampaignInitialSetting.copyFrom`), then rebuilds `_CharacterList`: one `CharacterProperty` per playable character, its `_Locator` (`chainsaw.GameLocator`: `_Stage` +0x10, `_Position` +0x20, `_Rotation` +0x30) written from that character's `CharacterContext` `<LastValidStageID>` (+0x1e0), `<LastValidPosition>` (+0x1c0), `<LastValidRotation>` (+0x1d0); `_SpecialJumpSequence` = 0 |
+| Loading it | `CampaignManager.loadGameSaveData` (0x142e0f9f0) | Chapter (+0x30) from `_InitialSettings._Chapter`; `InitialSettings` (+0x40) = a new `CampaignInitialSetting` `copyFrom` the save's (the character list and locators included) |
+| The in-game setup | `GameStateIngameSetup.update` (0x141a04810) | Phase 3 waits for the save system and goes on to 5 when `SaveDataManager.<LoadedGamedataApplyable>` (+0x19) (a save was read), else 4 (a new game, `special` = 1). Phase 5 `applyLoadedGameSaveData`; a normal save goes to phase 8 with `special` = 0 (a just-cleared save: 6/7). Phase 0xe: `createCampaignJumperOrderFromInitialSettings(unload, fade, pause, special)`, `Order.Entrypoint` = IngameSetup, `requestJumpExec` |
+| The jump | `createCampaignJumperOrderFromInitialSettings` (0x142dcc390), `CampaignJumper.Order..ctor(CampaignInitialSetting)` (0x141abdd00) | One `CharacterEntry` per `CharacterProperty`: `Property` copied, `Locator` = a new `GameLocator` `CopyFrom` the property's; `LoadBaseCharacter` = `getPL1Index()`. Only with `special`: `SpecialJumpSequence` = the setting's, `IsChapterStart` = 1 |
+| Its map | `CampaignJumper.transitLoadLocationStageScene` (0x1423c2910) | The base character's entry (`CharacterEntryList[LoadBaseCharacter]`): the chapter scene manager gets `Order.Chapter` and the locator's stage; `EnvSceneRequesterByLoadInfo` loads around `StageIdentifier(locator stage, locator position)` (ctor 0x14154c370). The characters are created at their own locators |
+| The opening | `SpecialOrderType` (None 0, Champaign01_Opening 1 ... Champaign54_Opening 9), `checkExistSpecialOrder` (0x14231fe80) | A special order runs when `Order.SpecialJumpSequence` ≠ 0, or `IsChapterStart` and the chapter's `EventChapterChangeUserData` item has a next event. The values AP Wizard wrote (6-21) are `CampaignInitialSettingKey`s - `Campaign1001_Chp1_1_Head` 6 ... `Chp5_4_Head` 21 - not `SpecialOrderType`s, and for a save load the setup never reads them |
+| Start points | `chainsaw.CampaignInitialSettingKey`, `chainsaw.ChapterID` | `Campaign1001_Chp0_1_Head` 4 (`cp10_chp0_1` 20100), `Chp1_0_Head` 5 (`cp10_chp1_0` 21000), `Chp1_1_Head` 6 (21100) ... `Chp5_4_Head` 21 (25400) |
+
+**How the game loads in game** (the pause menu's Load Game):
+
+| What | Where | Finding |
+|---|---|---|
+| Reading a save | Main menu Continue, `GameStateMainMenu.update` (0x141bc2b90), `SaveDataManager.setPlayLoadData(Boolean, Int32)` (0x142fe3490), `enqueueLoadRequest(Int32, SaveLoadRequestArgs)` (0x142f82160) | `findContinueSave` → `EnvSceneManager.exists(stage)` → `setPlayLoadData(slot == 0, slot)` (`TempPlayLoadData`: auto +0x10, slot +0x14) → `enqueueLoadRequest(slot, args)`: a request (+0x20 = 1, a load) with `args.getCopy()` (abstract: a concrete `share.GameLoadRequestArgs`) queued for the save system. `SaveLoadMenuGuiBehavior.lateUpdateOnActive` queues the typewriter's and the pause menu's loads the same way |
+| Leaving the game | `InGameMenuGuiBehavior.<decideActLoadGameData>b__47_1` (0x141f17df0), the pause menu's load callback | `HighwayGuiManager.setFixInGameStateExit()` (0x143169be0), `ClapperboardMediator.clearRequestTimeline()`, a `GameStateInGameCleanup.Argument` (`NextState` +0x18, `IsDifficultyChanged` +0x21, `Difficulty` +0x24 = 10), `MainModeManager.enqueueChangeGameState(GameStateInGameCleanup, argument)` (0x14281b250; the public `requestToChangeGameState` 0x14085b2a0 is a jump to it), `closeMenu` |
+| The cleanup | `GameStateInGameCleanup.setup` (0x141438b60), `update` (0x14145d460) | Takes the argument (checks its type), unloads scenes and characters, closes the GUI; phase 0x13: `NextState` = `GameStateIngameSetup` → `enqueueChangeGameState(GameStateIngameSetup, IngameSetupArgument{IsDifficultyChanged, Difficulty})`; other next states go to the menus |
+
+**Design (0.11.2).**
+- **Spawn at the host** (`game_world.lua`): a post-hook on
+  `createCampaignJumperOrderFromInitialSettings`. While armed (`arm_spawn`, one jump, 180 s), it
+  asks the session where the host is (`spawn_spot`: the last PLAYER message in which the host was
+  neither dead nor in a cutscene or transition, with its stage and chapter, unless the host has
+  changed chapter since) and writes the jump's base locator (stage, position, rotation) and the
+  locators of the characters that were in the base's stage (Ashley at the player's side), sets
+  `SpecialJumpSequence` 0 and `IsChapterStart` false (no chapter opening: the host is past it).
+  The game then loads the host's part of the map and creates the client there. A save made later
+  records the client's own last valid place again; a death or a checkpoint loads the game's own.
+- **The chapter switch** only rewrites `_Chapter` now.
+- **From the menus**: the join travel starts only once our game has a player; in the menus the
+  join's own load runs (`on_menu`: Continue with the co-op slot, else the newest save, the
+  chapter switch and the spawn armed). Without any save, a new game starts from the main menu at
+  the start point of the host's chapter part (`Lobby.head_key_of_id`, the difficulty of the
+  host's lobby or Standard), the spawn armed; on the title screen the player is told to press a
+  button (the title only waits for one). In the lobby a client whose host is playing (its PLAYER
+  stream fresh, not in its lobby) for half a second joins at once (`Lobby:auto_join`); the button
+  stays for `auto_load_on_join` off.
+- **In game** (`travel.lua`, setting `join_reload`, on): a join or a follow into another chapter,
+  or a join into a part of our chapter our game has not loaded (`CharacterManager.isActive(stage)`
+  false), reloads in game the way the pause menu's Load Game does (`Game:ingame_load`: our co-op
+  slot, else the slot we loaded, else the newest; `ingame_load_tick` leaves for the cleanup →
+  in-game setup once the save is read) with the chapter switch and the spawn armed; the travel
+  waits for the game to leave the map and come back, then takes over the host's world as always.
+  A load that cannot be read or never leaves falls back (the warp in our chapter, "Load any save"
+  in another). The game-over reload (`travel_reload`, experimental) is gone.
+
+**Limits.** Not run in the game yet. The host's place is its body position as sent in PLAYER
+(on a ladder or mid-jump the client may drop a little). A new game for a client without saves
+uses the chapter's start inventory and Standard difficulty unless the host's lobby said otherwise.
+The client's own characters other than Leon that were in another stage keep their place. Found in
+passing, not changed: a lobby start that continues a save in another chapter (the lobby's
+chapter jump) also starts at the save's own place, not at the chapter's start.
 
 ## 4. Sync architecture
 

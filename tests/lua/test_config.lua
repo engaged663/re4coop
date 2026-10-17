@@ -129,7 +129,8 @@ T.run("unsafe_defaults_of_older_versions_are_reset_once", function()
     local json = fake_json(files)
     local cfg = Config.load(json)
     T.eq(cfg.sync_cutscenes, true, "cutscenes for both: the 0.9.1 default")
-    T.eq(cfg.travel_reload, false, "automatic reload back to off")
+    T.eq(cfg.travel_reload, nil, "the game-over reload is gone (0.11.2)")
+    T.eq(cfg.join_reload, true, "joining in game loads the host's place")
     T.eq(cfg.stage_travel, false, "stage warp back to off")
     T.near(cfg.interp_delay, 0.066, 1e-9, "new interpolation delay")
     T.eq(cfg.snapshot_hz, 20, "new snapshot rate")
@@ -204,9 +205,11 @@ end)
 
 T.run("experimental_features_are_off_by_default", function()
     local cfg = Config.load(fake_json({}))
-    for _, k in ipairs({ "travel_reload", "stage_travel", "exp_force_routine", "invincible" }) do
+    for _, k in ipairs({ "stage_travel", "exp_force_routine", "invincible" }) do
         T.eq(cfg[k], false, k)
     end
+    T.eq(cfg.auto_load_on_join, true, "a late join loads at once")
+    T.eq(cfg.join_reload, true, "and in game too")
     T.eq(cfg.sync_cutscenes, true, "cutscenes play for both")
     T.eq(cfg.sync_triggers, true, "scripted events run for both")
     T.eq(cfg.hit_ownership, nil, "0.7's ownership switches are gone")

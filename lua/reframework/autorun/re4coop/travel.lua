@@ -2,9 +2,12 @@
 --   * Same chapter: preload the partner's stage, then warp next to them (a live warp, the
 --     same technique RE4 uses internally: CharacterManager.requestWarp with a StageIdentifier).
 --   * Other chapter (or still on the title screen): the next save load is redirected into
---     the partner's chapter. Optionally the load is triggered right away (game over ->
---     Continue). Once the chapter is running, the world state is synchronised and the warp
---     follows.
+--     the partner's chapter. In game, the load starts right away (the game's own Load Game,
+--     setting join_reload) and comes back at the partner's place; on the title screen or in
+--     the menus the join's own load does it (save_sync.lua). Once the chapter is running, the
+--     world state is synchronised and the warp follows (if still needed).
+--   * Joining in the same chapter while the partner's part of the map is not loaded here: the
+--     same reload, so the player never lands in an area that is not there.
 --
 -- Adapter contract (world):
 --   world:location() -> { chapter, stage, pos, yaw, loading=bool, playable=bool, transition=bool } | nil
@@ -13,7 +16,9 @@
 --   world:warp(stage, pos, yaw) -> bool
 --   world:arm_chapter_switch(chapter) -> bool
 --   world:disarm_chapter_switch()
---   world:trigger_reload() -> bool
+--   world:trigger_reload(chapter) -> true | false, why   (in game: load into `chapter` at the partner's place)
+--   world:reload_failed() -> bool                          (optional: that load gave up)
+--   world:stage_loaded(stage) -> bool | nil                (optional: the stage is part of our loaded map)
 
 local Travel = {}
 Travel.__index = Travel
@@ -25,7 +30,9 @@ local VERIFY_TIME = 6.0
 local SETTLE_TIME = 2.0      -- after a load, wait this long before syncing/warping
 local SYNC_TIMEOUT = 15.0
 local CHAPTER_TIMEOUT = 600.0
+local RELOAD_START_TIMEOUT = 35.0 -- seconds an in-game reload may take to leave the game
 local MAX_TRIES = 3
+local LOAD_YOURSELF = "Load any save (or press Continue) to join your partner's chapter"
 
 local function dist(a, b)
     local dx, dy, dz = a.x - b.x, a.y - b.y, a.z - b.z
@@ -69,7 +76,28 @@ function Travel:request(target)
     self.armed = false
     self.armed_chapter = nil
     self.reload_tried = false
+    self.wait_reload = nil
     self.result = nil
+    return true
+end
+
+-- In game: reloads our game into the partner's chapter, at the partner's place (the world's
+-- in-game Load Game). true once it started.
+function Travel:reload(now, world, t)
+    if self.settings.join_reload == false then return false end
+    local ok, why = world:trigger_reload(known(t.chapter) and t.chapter or nil)
+    if not ok then
+        self.log("reload into the partner's game refused: %s", tostring(why))
+        return false
+    end
+    if known(t.chapter) then
+        self.armed = true
+        self.armed_chapter = t.chapter
+    end
+    self.reload_tried = true
+    self.wait_reload = { since = now, left = false }
+    self.notify("Loading your partner's area - you will appear next to them", "info")
+    self:set_state("chapter", now)
     return true
 end
 
@@ -136,14 +164,21 @@ function Travel:tick(now, world, partner)
             self.armed = true
             self.armed_chapter = t.chapter
             self.reload_tried = in_game
-            if in_game and self.settings.travel_reload ~= false and world:trigger_reload() then
-                self.notify("Loading your partner's chapter... (choose Continue / Retry if asked)", "warn")
-            else
-                self.notify("Load any save (or press Continue) to join your partner's chapter", "warn")
+            if in_game then
+                if self:reload(now, world, t) then return end
+                self.notify(LOAD_YOURSELF, "warn")
+            elseif self.settings.auto_load_on_join == false then
+                -- In the menus the join loads a save on its own (save_sync.lua), unless switched off.
+                self.notify(LOAD_YOURSELF, "warn")
             end
             return self:set_state("chapter", now)
         end
         if not in_game then return end
+        -- Joining in our chapter, but the partner's part of the map is not loaded here: load it.
+        if t.reason == "join" and known(t.stage) and loc.stage ~= t.stage and world.stage_loaded ~= nil
+            and world:stage_loaded(t.stage) == false and self:reload(now, world, t) then
+            return
+        end
         return self:set_state(t.sync and "sync_wait" or "preload", now)
     end
 
@@ -151,10 +186,26 @@ function Travel:tick(now, world, partner)
         if now - self.since > CHAPTER_TIMEOUT then
             return self:fail("the chapter was not loaded", world)
         end
+        -- Our in-game reload: wait until the game has left the map, then for it to play again.
+        local w = self.wait_reload
+        if w ~= nil and not w.left then
+            if loc == nil or loc.loading or loc.transition then
+                w.left = true
+            elseif now - w.since > RELOAD_START_TIMEOUT or (world.reload_failed ~= nil and world:reload_failed()) then
+                self.wait_reload = nil
+                self.log("the reload into the partner's game did not start")
+                if known(t.chapter) and known(loc.chapter) and loc.chapter ~= t.chapter then
+                    self.notify(LOAD_YOURSELF, "warn")
+                end
+            else
+                return
+            end
+        end
         local in_game = loc ~= nil and loc.playable and not loc.loading
         if in_game and (not known(t.chapter) or loc.chapter == t.chapter) then
             if self.armed then world:disarm_chapter_switch() end
             self.armed = false
+            self.wait_reload = nil
             self.arrived_at = self.arrived_at or now
             if now - self.arrived_at >= SETTLE_TIME then
                 self.arrived_at = nil
@@ -164,16 +215,14 @@ function Travel:tick(now, world, partner)
         end
         self.arrived_at = nil
         if in_game then
-            -- Playing, but still in another chapter: (re)arm and offer the reload once.
+            -- Playing, but still in another chapter: (re)arm and reload once.
             if self.armed_chapter ~= t.chapter then
                 self.armed = world:arm_chapter_switch(t.chapter)
                 self.armed_chapter = t.chapter
             end
-            if not self.reload_tried and self.settings.travel_reload ~= false then
+            if not self.reload_tried then
                 self.reload_tried = true
-                if world:trigger_reload() then
-                    self.notify("Loading your partner's chapter... (choose Continue / Retry if asked)", "warn")
-                end
+                if not self:reload(now, world, t) then self.notify(LOAD_YOURSELF, "warn") end
             end
         end
         return

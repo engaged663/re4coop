@@ -263,7 +263,8 @@ local function draw_options(settings)
         imgui.text_colored("Joining and travelling", COLOR_DIM)
         checkbox(settings, "auto_travel", "Client: on joining, go to the host's chapter and area")
         checkbox(settings, "follow_host_chapter", "Client: follow the host into the next chapter")
-        checkbox(settings, "auto_load_on_join", "Client: joining from the title screen loads your co-op save (or your latest) at once")
+        checkbox(settings, "auto_load_on_join", "Client: joining a host who plays loads straight into the host's place (co-op save, else your latest, else a new game)")
+        checkbox(settings, "join_reload", "Client: in game, a host in another chapter or area is reached through the game's own Load Game")
 
         imgui.separator()
         imgui.text_colored("Saving", COLOR_DIM)
@@ -307,7 +308,6 @@ local function draw_options(settings)
         imgui.separator()
         imgui.text_colored("Experimental (may crash the game - off by default)", COLOR_WARN)
         checkbox(settings, "stage_travel", "Teleports to another area preload it and use the game's warp")
-        checkbox(settings, "travel_reload", "Load the partner's chapter automatically (game over -> Continue)")
         checkbox(settings, "exp_force_routine", "Break objects by forcing their state machine")
         checkbox(settings, "enemy_replay_mutilation", "Your partner's hits and kills also burst heads and break limbs in your game (crashed the game)")
         imgui.tree_pop()
@@ -493,6 +493,16 @@ local function draw_diagnostics(session, game, session_status, puppet, perf)
             if session_status.travel then
                 imgui.text(("travel: %s (%s)"):format(session_status.travel.state, tostring(session_status.travel.result or "-")))
             end
+            local jn = session_status.join
+            if jn then
+                local last, load = jn.spawn_last, jn.ingame_load
+                imgui.text(("join at the host's place: %s; last %s; in-game load %s; host seen at %s"):format(
+                    jn.spawn_armed and "armed" or "-",
+                    last and ("%d moved%s"):format(last.moved or 0, last.why and (" (" .. tostring(last.why) .. ")") or "") or "-",
+                    load and ("slot %s %s%s"):format(tostring(load.slot), tostring(load.phase),
+                        load.why and (" (" .. tostring(load.why) .. ")") or "") or "-",
+                    jn.host_spot and ("chapter %s stage %s"):format(tostring(jn.host_spot.chapter), tostring(jn.host_spot.stage)) or "-"))
+            end
             if session_status.pause then
                 local pz = session_status.pause
                 imgui.text(("no-pause: %s, mode %s, %d pause types neutralised, %d requests refused"):format(
@@ -542,7 +552,7 @@ local function draw_diagnostics(session, game, session_status, puppet, perf)
                 flags = session_status.flags, gimmicks = session_status.gimmicks, objects = session_status.objects,
                 cutscenes = session_status.cutscenes, triggers = session_status.triggers,
                 world_events = session_status.world_events, world_last_not_event = session_status.world_last_not_event,
-                travel = session_status.travel, pause = session_status.pause,
+                travel = session_status.travel, join = session_status.join, pause = session_status.pause,
                 local_stage = session_status.local_stage, partner_stage = session_status.partner_stage,
                 character_sent = session_status.avatar_tx, character_received = session_status.avatar_rx,
                 partner_model = puppet and puppet:status() or nil,
