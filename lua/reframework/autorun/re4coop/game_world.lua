@@ -34,6 +34,10 @@
 --     (CampaignManager.createCampaignJumperOrderFromInitialSettings) loads the map around its
 --     base character's GameLocator and puts each character at its own; reloading in game is
 --     the pause menu's Load Game (game_save.lua).
+--   * Read in re4.exe's code too (docs/RESEARCH.md 3.35): a chapter part's start is its
+--     CampaignInitialSetting in EnvSceneStructureDB's start point catalog
+--     (getCampaignInitialSetting(CampaignInitialSettingKey)); the game's own chapter change
+--     builds its jump from it with IsChapterStart set.
 -- Every lookup is cached and every engine call is pcall'ed; missing pieces switch the
 -- corresponding feature off and show up in the Diagnostics panel.
 
@@ -148,6 +152,7 @@ local KILL_METHODS = { "requestBreak", "requestDead", "forceBreak", "forceDead",
 World.SPAWN_TTL = 180.0
 local ORDER = "chainsaw.CampaignJumper.Order"
 local LOCATOR = "chainsaw.GameLocator"
+local ENV_DB = "chainsaw.EnvSceneStructureDB"
 
 local function lower(s) return tostring(s or ""):lower() end
 
@@ -206,7 +211,8 @@ function World.new(game, log)
     self.animal_frozen = {}  -- guid -> {core, go, how}: animals whose state machine we took off the update
     self.chapter_target = nil
     self.spawn_until = nil   -- the next campaign jump puts our player at the partner's (arm_spawn)
-    self.spawn_last = nil    -- { at, moved, why, stage }: what the last armed jump did
+    self.spawn_start = nil   -- { chapter, key, point }: ...or at a chapter's start (arm_chapter_start)
+    self.spawn_last = nil    -- { at, kind, moved, why, stage, chapter }: what the last armed jump did
     self:probe()
     return self
 end
@@ -411,6 +417,13 @@ function World:probe()
     self:cap("spawn_at_partner", spawn_ok, spawn_ok and "CampaignJumper.Order locators (in-game setup)"
         or "no createCampaignJumperOrderFromInitialSettings")
     if not spawn_ok then self.order_m = nil end
+    -- Where a chapter part starts (docs/RESEARCH.md 3.35): its CampaignInitialSetting in the start
+    -- point catalog, the one the game's own chapter change and a new game start it from.
+    self.start_setting_m = r:find_method(ENV_DB, function(i)
+        return i.name == "getCampaignInitialSetting" and #i.params == 1 end)
+    local start_ok = self.order_m ~= nil and self.start_setting_m ~= nil
+    self:cap("chapter_start", start_ok, start_ok and "EnvSceneStructureDB.getCampaignInitialSetting (start points)"
+        or "no start point catalog")
 end
 
 function World:install_hooks(callbacks)
@@ -561,7 +574,8 @@ function World:install_hooks(callbacks)
     end
 
     -- Spawn at the partner: when armed, the campaign jump the in-game setup builds next (after
-    -- a save loaded or a new game started) puts our player where the partner is.
+    -- a save loaded or a new game started) puts our player where the partner is - or, for the
+    -- lobby's chapter jump, at that chapter's start.
     if self.order_m ~= nil then
         r:hook(self.order_m, function() end, function(retval)
             if self.spawn_until ~= nil then
@@ -2496,40 +2510,123 @@ end
 function World:arm_spawn(seconds)
     if self.order_m == nil then return false end
     self.spawn_until = self:now() + (seconds or World.SPAWN_TTL)
+    self.spawn_start = nil -- the partner's place, not a chapter's start
     return true
 end
 
 function World:disarm_spawn()
     self.spawn_until = nil
+    self.spawn_start = nil
 end
 
 function World:spawn_armed()
     return self.spawn_until ~= nil and self:now() <= self.spawn_until
 end
 
+local function locator_spot(loc)
+    if loc == nil then return nil end
+    local stage = R.number(R.get(loc, "_Stage"))
+    local p, q = R.get(loc, "_Position"), R.get(loc, "_Rotation")
+    if stage == nil or p == nil or type(p.x) ~= "number" then return nil end
+    local rot = (q ~= nil and type(q.w) == "number") and { x = q.x, y = q.y, z = q.z, w = q.w } or nil
+    return { stage = stage, pos = { x = p.x, y = p.y, z = p.z }, rot = rot }
+end
+
+-- Where the game starts chapter part `key` (chainsaw.CampaignInitialSettingKey, the
+-- Campaign1001_ChpX_Y_Head of Lobby.head_key_of_id): its CampaignInitialSetting in the start point
+-- catalog, read as plain numbers - { key, chapter, stage, pos, rot, chars = { [CharacterKindID] =
+-- { stage, pos, rot } } } with the player's (PL1) place first - or nil and why.
+function World:start_point(key)
+    if self.start_setting_m == nil then return nil, "no start point catalog" end
+    if key == nil then return nil, "no start point for that chapter" end
+    local db = self.r:singleton(ENV_DB)
+    if db == nil then return nil, "the start point catalog is not loaded" end
+    local setting = R.call(db, "getCampaignInitialSetting", key)
+    if setting == nil then return nil, ("start point %s is not in the catalog"):format(tostring(key)) end
+    local props = {}
+    R.each(R.get(setting, "_CharacterList"), function(p) props[#props + 1] = p end)
+    -- The player: getPL1Index (the Player1 role), else the first character.
+    local pl1 = R.number(R.call(setting, "getPL1Index"))
+    if pl1 == nil or pl1 < 0 or pl1 >= #props then
+        pl1 = 0
+        for i, p in ipairs(props) do
+            if R.number(R.get(p, "_DefaultRole")) == 0 then pl1 = i - 1 break end
+        end
+    end
+    local point, chars = nil, {}
+    for i, p in ipairs(props) do
+        local spot = locator_spot(R.get(p, "_Locator"))
+        local kind = R.number(R.get(p, "_Character"))
+        if spot ~= nil and kind ~= nil and chars[kind] == nil then chars[kind] = spot end
+        if i == pl1 + 1 and spot ~= nil then point = { stage = spot.stage, pos = spot.pos, rot = spot.rot } end
+    end
+    if point == nil then return nil, "the start point has no place for the player" end
+    point.key, point.chapter, point.chars = key, R.number(R.get(setting, "_Chapter")), chars
+    return point
+end
+
+-- The lobby's chapter jump (docs/RESEARCH.md 3.35): the next campaign jump - the continued save,
+-- which the chapter switch loads into `chapter` - starts at that chapter's start point `key`, the
+-- way the game's own chapter change starts a chapter: the start point's locators and
+-- IsChapterStart (the chapter's opening event plays), no new-game special order. The start point
+-- is read now (the catalog is there in the main menu), else when the jump is built. One jump only;
+-- forgotten after `seconds`. An arm_spawn (the partner's place) replaces it.
+function World:arm_chapter_start(chapter, key, seconds)
+    if self.order_m == nil or self.start_setting_m == nil or chapter == nil or key == nil then return false end
+    self.spawn_start = { chapter = chapter, key = key, point = (self:start_point(key)) }
+    self.spawn_until = self:now() + (seconds or World.SPAWN_TTL)
+    return true
+end
+
+-- Forgets an armed chapter start (a spawn at the partner stays armed).
+function World:disarm_chapter_start()
+    if self.spawn_start == nil then return end
+    self.spawn_start = nil
+    self.spawn_until = nil
+end
+
+-- The place an armed chapter start puts the jump at, or nil and why.
+function World:chapter_start_spot(order, start)
+    local point, why = start.point, nil
+    if point == nil then point, why = self:start_point(start.key) end
+    if point == nil then return nil, why end
+    -- Only into the chapter it was armed for (the chapter switch rewrote the save's chapter).
+    local chapter = R.number(R.get(order, "Chapter"))
+    if chapter ~= start.chapter then
+        return nil, ("the jump is into chapter %s, not %s"):format(tostring(chapter), tostring(start.chapter))
+    end
+    point.chapter_start = true
+    return point
+end
+
 -- Post-hook of createCampaignJumperOrderFromInitialSettings while a spawn is armed.
 function World:on_order_built(retval)
-    local until_t = self.spawn_until
-    self.spawn_until = nil -- one jump only, whatever happens
+    local until_t, start = self.spawn_until, self.spawn_start
+    self.spawn_until, self.spawn_start = nil, nil -- one jump only, whatever happens
     if until_t == nil or self:now() > until_t then return end
     local order = R.arg_obj(retval)
     local cb = self.callbacks or {}
-    local spot = cb.spawn_spot and cb.spawn_spot() or nil
-    local moved, why = 0, nil
+    local spot, moved, why = nil, 0, nil
     if order == nil then
         why = "the game built no jump"
-    elseif spot == nil or spot.pos == nil or spot.stage == nil then
-        why = "the partner's place is unknown"
+    elseif start ~= nil then
+        spot, why = self:chapter_start_spot(order, start)
     else
-        moved, why = self:apply_spawn(order, spot)
+        spot = cb.spawn_spot and cb.spawn_spot() or nil
+        if spot == nil or spot.pos == nil or spot.stage == nil then why = "the partner's place is unknown" end
     end
-    self.spawn_last = { at = self:now(), moved = moved, why = why, stage = spot and spot.stage }
+    if spot ~= nil and why == nil then moved, why = self:apply_spawn(order, spot) end
+    local kind = start ~= nil and "chapter start" or "spawn at partner"
+    self.spawn_last = { at = self:now(), kind = kind, moved = moved, why = why, stage = spot and spot.stage,
+        chapter = start and start.chapter }
     self.counters.spawns = (self.counters.spawns or 0) + (moved > 0 and 1 or 0)
-    self:crumb("world.spawn_at_partner", ("%d moved %s"):format(moved, tostring(why or "")), true)
+    self:crumb(start ~= nil and "world.chapter_start" or "world.spawn_at_partner",
+        ("%d moved %s"):format(moved, tostring(why or "")), true)
     if moved > 0 then
-        self.log(("spawn at partner: stage %s, %d character(s) moved"):format(tostring(spot.stage), moved))
+        self.log(("%s: %sstage %s, %d character(s) moved"):format(kind,
+            start and ("chapter %s, "):format(tostring(start.chapter)) or "", tostring(spot.stage), moved))
     else
-        self.log("spawn at partner not applied: " .. tostring(why))
+        self.log(("%s not applied: %s"):format(kind, tostring(why)))
     end
 end
 
@@ -2559,9 +2656,12 @@ function World:set_locator(loc, spot)
 end
 
 -- Moves a campaign jump's characters to `spot`: the base character (the map loads around its
--- locator) and every character that was in its stage with it (Ashley at its side); the others
--- keep their own place. No chapter-start opening runs (the partner is past it). Returns the
--- number of characters moved, and why none was.
+-- locator), a character the spot has a place of its own for (spot.chars, by CharacterKindID: a
+-- chapter start's Ashley), and every other character that was in the base's stage with it
+-- (Ashley at its side); the others keep their own place. The opening: at the partner's place
+-- none (the partner is past it); at a chapter's start (spot.chapter_start) what the game's own
+-- chapter change sets - IsChapterStart, so the chapter's opening event plays, and no special
+-- order (that is a new game's). Returns the number of characters moved, and why none was.
 function World:apply_spawn(order, spot)
     local entries = {}
     R.each(R.get(order, "CharacterEntryList"), function(e) entries[#entries + 1] = e end)
@@ -2574,12 +2674,19 @@ function World:apply_spawn(order, spot)
     local moved = 0
     for i, e in ipairs(entries) do
         local loc = R.get(e, "Locator")
-        local with_player = i == base + 1 or (from_stage ~= nil and R.number(R.get(loc, "_Stage")) == from_stage)
-        if loc ~= nil and with_player and self:set_locator(loc, spot) then moved = moved + 1 end
+        local to = nil
+        if i == base + 1 then
+            to = spot
+        else
+            local kind = R.number(R.get(R.get(e, "Property"), "_Character"))
+            to = spot.chars and kind ~= nil and spot.chars[kind] or nil
+            if to == nil and from_stage ~= nil and R.number(R.get(loc, "_Stage")) == from_stage then to = spot end
+        end
+        if loc ~= nil and to ~= nil and self:set_locator(loc, to) then moved = moved + 1 end
     end
     if moved == 0 then return 0, "the locators could not be written" end
     self:set_field_any(order, ORDER, "SpecialJumpSequence", 0)
-    R.set(order, "IsChapterStart", false)
+    R.set(order, "IsChapterStart", spot.chapter_start == true)
     return moved
 end
 

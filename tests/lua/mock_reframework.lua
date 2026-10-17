@@ -3321,7 +3321,8 @@ function M.install_world(world, opts)
             { "via.Quaternion" } },
     }, { _Stage = "chainsaw.StageID", _Position = "via.vec3", _Rotation = "via.Quaternion" })
     class("chainsaw.CampaignInitialSetting.CharacterProperty", "System.Object", {},
-        { _Character = "chainsaw.CharacterKindID", _Locator = "chainsaw.GameLocator" })
+        { _Character = "chainsaw.CharacterKindID", _DefaultRole = "chainsaw.CampaignInitialSetting.CharacterProperty.Role",
+            _Locator = "chainsaw.GameLocator" })
     class("chainsaw.CampaignInitialSetting", "System.Object", {}, { _Chapter = "chainsaw.ChapterID",
         _SpecialJumpSequence = "chainsaw.CampaignJumper.Order.SpecialOrderType",
         _CharacterList = "chainsaw.CampaignInitialSetting.CharacterProperty[]" })
@@ -3331,6 +3332,36 @@ function M.install_world(world, opts)
         CharacterEntryList = "chainsaw.CampaignJumper.Order.CharacterEntry[]", LoadBaseCharacter = "System.Int32",
         SpecialJumpSequence = "chainsaw.CampaignJumper.Order.SpecialOrderType", IsChapterStart = "System.Boolean" })
     class("chainsaw.CampaignManager.GameData", "System.Object", {}, { _InitialSettings = "chainsaw.CampaignInitialSetting" })
+    -- The start point catalog (docs/RESEARCH.md 3.35): CampaignInitialSettingKey -> the chapter
+    -- part's CampaignInitialSetting. world.start_points[key] = { chapter, special, chars = {
+    -- { kind, stage, pos, rot } } } (Leon first); defaults from the game's own
+    -- leveldesign/initialsettings/chpX-Y.user.2. world.start_catalog_off: not loaded.
+    world.start_points = {
+        [6] = { chapter = 21100, special = 2, chars = {
+            { kind = 100000, stage = 40500, pos = vec(-256.70, 5.09, 26.02), rot = quat(0, 0.074, 0, 0.997) } } },
+        [7] = { chapter = 21200, special = 3, chars = {
+            { kind = 100000, stage = 44410, pos = vec(3.825, -6.087, 231.462), rot = quat(0, 0.999, 0, -0.042) } } },
+        [10] = { chapter = 22200, special = 5, chars = {
+            { kind = 100000, stage = 45401, pos = vec(98.72, 16.24, 94.59), rot = quat(0, 0.594, 0, 0.804) },
+            { kind = 200030, stage = 45401, pos = vec(97.55, 16.21, 96.54), rot = quat(0, -0.736, 0, 0.677) } } },
+    }
+    class("chainsaw.EnvSceneStructureDB", "System.Object", {
+        getCampaignInitialSetting = { 1, function(_, key)
+            local sp = world.start_points[key]
+            if sp == nil or world.start_catalog_off then return nil end
+            world.start_point_reads = (world.start_point_reads or 0) + 1
+            local list = {}
+            for i, c in ipairs(sp.chars) do
+                local loc = new("chainsaw.GameLocator", { __fields = { _Stage = c.stage, _Position = vec(c.pos.x, c.pos.y,
+                    c.pos.z), _Rotation = quat(c.rot.x, c.rot.y, c.rot.z, c.rot.w) } })
+                list[i] = new("chainsaw.CampaignInitialSetting.CharacterProperty", { __fields = { _Character = c.kind,
+                    _DefaultRole = i == 1 and 0 or 10, _Locator = loc } })
+            end
+            return new("chainsaw.CampaignInitialSetting", { __fields = { _Chapter = sp.chapter,
+                _SpecialJumpSequence = sp.special, _CharacterList = M.array(list) } })
+        end, { "chainsaw.CampaignInitialSettingKey" }, { ret = "chainsaw.CampaignInitialSetting" } },
+    })
+    world.singletons["chainsaw.EnvSceneStructureDB"] = new("chainsaw.EnvSceneStructureDB")
     local function copy_locator(src)
         local f = src.__fields
         return new("chainsaw.GameLocator", { __fields = { _Stage = f._Stage, _Position = vec(f._Position.x, f._Position.y,
@@ -3879,7 +3910,9 @@ end
 
 -- The game loads a save (Continue / Load) of `chapter` through CampaignManager.loadGameSaveData.
 -- where = { stage, pos, ashley = { stage, pos } }: where the save's characters stood (default:
--- stage 40100 at the origin, Leon alone).
+-- stage 40100 at the origin, Leon alone). Leon is CharacterKindID ch0_a0z0 (100000), Ashley
+-- ch2_a1z0 (200030).
+M.LEON_KIND, M.ASHLEY_KIND = 100000, 200030
 function M.load_save(chapter, where)
     where = where or {}
     local function character(kind, stage, pos)
@@ -3887,9 +3920,9 @@ function M.load_save(chapter, where)
             _Rotation = quat(0, 0, 0, 1) } })
         return new("chainsaw.CampaignInitialSetting.CharacterProperty", { __fields = { _Character = kind, _Locator = loc } })
     end
-    local list = { character(0, where.stage or 40100, where.pos or vec(0, 0, 0)) }
+    local list = { character(M.LEON_KIND, where.stage or 40100, where.pos or vec(0, 0, 0)) }
     if where.ashley then
-        list[2] = character(1, where.ashley.stage or where.stage or 40100, where.ashley.pos or vec(1, 0, 0))
+        list[2] = character(M.ASHLEY_KIND, where.ashley.stage or where.stage or 40100, where.ashley.pos or vec(1, 0, 0))
     end
     local init = new("chainsaw.CampaignInitialSetting", { __fields = { _Chapter = chapter, _SpecialJumpSequence = 0,
         _CharacterList = M.array(list) } })
@@ -3908,6 +3941,9 @@ function M.ingame_setup(new_game)
     local base = f.CharacterEntryList.list[f.LoadBaseCharacter + 1].__fields.Locator.__fields
     w.stage, w.jumps, w.last_order = base._Stage, (w.jumps or 0) + 1, order
     w.opening_played = f.SpecialJumpSequence ~= 0 or f.IsChapterStart == true
+    -- (CampaignJumper.updateLeaveStart: a special order is a new game's opening; IsChapterStart
+    -- plays the chapter's opening event, as the game's own chapter change does.)
+    w.special_order, w.chapter_start = f.SpecialJumpSequence, f.IsChapterStart == true
     if w.player ~= nil then
         local p = w.player.pos -- moved in place: the body follows the same table
         p.x, p.y, p.z = base._Position.x, base._Position.y, base._Position.z

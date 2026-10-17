@@ -498,7 +498,9 @@ local function draw_diagnostics(session, game, session_status, puppet, perf)
                 local last, load = jn.spawn_last, jn.ingame_load
                 imgui.text(("join at the host's place: %s; last %s; in-game load %s; host seen at %s"):format(
                     jn.spawn_armed and "armed" or "-",
-                    last and ("%d moved%s"):format(last.moved or 0, last.why and (" (" .. tostring(last.why) .. ")") or "") or "-",
+                    last and ("%s%d moved%s"):format(
+                        last.kind == "chapter start" and ("chapter %s start: "):format(tostring(last.chapter)) or "",
+                        last.moved or 0, last.why and (" (" .. tostring(last.why) .. ")") or "") or "-",
                     load and ("slot %s %s%s"):format(tostring(load.slot), tostring(load.phase),
                         load.why and (" (" .. tostring(load.why) .. ")") or "") or "-",
                     jn.host_spot and ("chapter %s stage %s"):format(tostring(jn.host_spot.chapter), tostring(jn.host_spot.stage)) or "-"))

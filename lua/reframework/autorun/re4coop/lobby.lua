@@ -124,7 +124,7 @@ function Lobby.new(opts)
         file = math.max(1, math.min(Lobby.FILES, math.floor(tonumber(s.lobby_file) or 1))),
         mode = self.P.LOBBY_MODE.CONTINUE,
         chapter = math.max(1, math.min(#Lobby.CHAPTERS, math.floor(tonumber(s.lobby_chapter) or 1))),
-        jump = 0, -- continuing a save: 0 = where the save is, else the chapter to go to
+        jump = 0, -- continuing a save: 0 = where the save is, else the chapter to start (from its start)
         difficulty = Lobby.difficulty_valid(s.lobby_difficulty) and s.lobby_difficulty or 20,
     }
     self.saves = {}           -- host: [file] = { empty, chapter_id, difficulty, count } (from the game)
@@ -420,7 +420,8 @@ function Lobby:cycle_mode()
     self:bump()
 end
 
--- New game: the chapter it starts in (1-16). Continuing: 0 (where the save is) or a chapter.
+-- New game: the chapter it starts in (1-16). Continuing: 0 (where the save is) or a chapter,
+-- which the save starts from its start point (docs/RESEARCH.md 3.35).
 function Lobby:cycle_chapter(d)
     if not editable(self) then return end
     if self:mode() == self.P.LOBBY_MODE.NEW then
@@ -594,7 +595,9 @@ function Lobby:request_start(now)
         local c = cfg.jump > 0 and Lobby.CHAPTERS[cfg.jump] or nil
         params.chapter = cfg.jump
         params.chapter_id = c and c.id or info.chapter_id or 0
-        params.key = Lobby.key_of_id(params.chapter_id) or 1
+        -- A client without a co-op save starts a new game there: at the start of that very
+        -- chapter part, where a chapter jump puts the host too (not chapter 1's prologue).
+        params.key = Lobby.head_key_of_id(params.chapter_id) or 1
     end
     self.send(P.encode_lobby_start(params), true)
     self:begin_start(params, now)

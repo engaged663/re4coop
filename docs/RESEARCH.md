@@ -1906,10 +1906,10 @@ decompiled with REA/Ghidra; types and offsets from the il2cpp dump):
   `onDecidedDefficultySelectMenu(difficulty)` - the game's own path from phase 35 on, at the
   chosen chapter's start point (both games start the same one). Continuing: the game intent
   and `findContinueSave` (§3.15) load the slot the lobby asks for; a chapter other than the
-  save's goes through the chapter switch (§3.6). The host plays in its co-op file (setting
-  `coop_host_first_slot`, files 1-3 = slots 17-19 by default; the client keeps slot 20): its
-  autosaves and the saves it makes for the client go there, its single-player autosave is not
-  touched. A client without a co-op save starts a new game at the host's chapter, then joins
+  save's goes through the chapter switch (§3.6), at that chapter's start (§3.35). The host
+  plays in its co-op file (setting `coop_host_first_slot`, files 1-3 = slots 17-19 by default;
+  the client keeps slot 20): its autosaves and the saves it makes for the client go there, its
+  single-player autosave is not touched. A client without a co-op save starts a new game at the host's chapter, then joins
   the host (world, warp) as always.
 * **The synchronized start.** Each game reports its phase (LOAD_STATE: starting, loading,
   syncing - a client taking over the host's world and walking up to it -, ready). Once its
@@ -2109,8 +2109,64 @@ and decompiled with REA/Ghidra; types and offsets from the il2cpp dump):
 (on a ladder or mid-jump the client may drop a little). A new game for a client without saves
 uses the chapter's start inventory and Standard difficulty unless the host's lobby said otherwise.
 The client's own characters other than Leon that were in another stage keep their place. Found in
-passing, not changed: a lobby start that continues a save in another chapter (the lobby's
-chapter jump) also starts at the save's own place, not at the chapter's start.
+passing: a lobby start that continues a save in another chapter (the lobby's chapter jump) also
+started at the save's own place, not at the chapter's start - fixed in §3.35.
+
+### 3.35 The lobby's chapter jump starts at the chapter's start (0.11.2)
+
+**Problem.** In the lobby, *Continuar* with *Capítulo N* (instead of *Donde está el guardado*)
+loaded the co-op save into chapter N - at the save's own place. The chapter switch only rewrites
+`_Chapter` (§3.34), and a loaded game starts where its campaign jump's locators say, which for a
+save are the characters' last valid places: a place of another chapter's map, in chapter N. Host
+and client each started at their own save's place.
+
+**Where the game starts a chapter** (re4.exe of October 2026, functions carved by `.pdata` and
+decompiled with REA/Ghidra; the game's data read from the paks with the RSZ layouts of the dump):
+
+| What | Where | Finding |
+|---|---|---|
+| The start point catalog | `CampaignInitialSettingEntryCatalog.registerCatalog` (0x141d5f760), `EnvSceneStructureDB.getCampaignInitialSetting(CampaignInitialSettingKey)` (0x142187110) | Each `_Entries` item (`_Key` +0x10, `_UserData` +0x18, `_Index` +0x20) registers `_UserData._CampaignInitialSettingList[_Index]` under its key in `EnvSceneStructureDB.CampaignInitialSettingDictionary` (+0x50; the class is an `AppSingleton`); the getter is a locked `TryGetValue`. The catalog lives in `appsystem/scene/maincontents/catalog_1st.scn`: `Campaign1001_Chp1_1_Head` (6) → `LevelDesign/InitialSettings/Chp1-1.user`, 7 → `Chp1-2.user` ... in key order |
+| A new game | `CampaignManager.initializeForStartingCampaign(key)` (0x142e053e0) | `getCampaignInitialSetting(key)`, `IsNewGame` = 1, then `startCampaign(key, setting._Campaign, setting)` (0x142e6b4a0) - run by the main menu's New Game (phase 35, §3.31), so the catalog is there in the main menu |
+| **The game's own chapter change** | `GameStateInGameChapterChange.update` (0x141069230; `createCampaignOrder` 0x140fac800, inlined at 0x141069f48) | `getCampaignInitialSetting(_StateArgument.NextCampaignInitialSettingKey)` → `new CampaignJumper.Order(setting)` (every character of the setting at its locator, §3.34), `UnloadScene` = 1, `Pause` = `IsNeedCJPause`, `Fade` = 0, **`IsChapterStart` = 1**, `SpecialJumpSequence` left 0 → `CampaignJumper.requestJumpExec(order, …)` |
+| Which key starts which chapter | `event/resource/chapterchange/eventchapterchangeuserdata.user.2` (`EventChapterChangeUserData.Item`: `NextCampaign` +0x10, `ChapterID` +0x14, `NextMovieID` +0x20, `NextTimelineID` +0x24) | 21100 → 6, 21200 → 7, 21300 → 8, 22100 → 9 ... 25400 → 21: what `Lobby.head_key_of_id` gives. An opening event (a next timeline or movie) for 21100 (timeline 10157), 21200 (10013), 22100, 22200, 22300, 24100, 24200, 24300, 25100, 25200 and 25400; none for 21300, 23100, 23200, 23300 and 25300 |
+| The opening | `CampaignJumper.checkExistSpecialOrder` (0x14231fe80), `updateLeaveStart` (0x1423ddac0), `getChapterChangeItem(ChapterID)` (0x142341680) | A special start when `Order.SpecialJumpSequence` ≠ 0, or `IsChapterStart` and the order's chapter has an item with a next event. Then `SpecialJumpSequence` 2 (`Champaign11_Opening`) asks `GameSituationManager.requestInhibit` for five inhibit types; with the item an `EventChapterChangeController(item)` is built and loaded (the pause ended, the fade); with `IsChapterStart` the jumper's fade goes out (the event fades back in) |
+| The start points | `leveldesign/initialsettings/chpX-Y.user.2` | One `CampaignInitialSetting` each: `_Chapter`, `_SpecialJumpSequence` (chp1-1 2, chp1-2 3, chp2-1 4, chp2-2 5, chp4-2 6, chp5-1 7, chp5-2 8, chp5-4 9, the others 0: the `ChampaignXY_Opening` of a new game there), `_CharacterList` (Leon `ch0_a0z0` 100000, role Player1, with his `_Locator`; chp2-2 also Ashley `ch2_a1z0` 200030, role Partner, next to him), `_FlagList`. Chapter 2 (chp1-2), for instance: stage 44410 at (3.83, -6.09, 231.46) |
+
+**Design (0.11.2).**
+- A lobby start that continues a co-op save with a chapter jump arms, besides the chapter switch,
+  a **chapter start** in both games that continue a save (`World:arm_chapter_start(chapter,
+  Lobby.head_key_of_id(chapter))`): host and client go to the same start point. The start point is
+  read from the game's catalog when armed (the main menu), else when the jump is built, and kept
+  as plain numbers.
+- The post-hook of the spawn (§3.34) then does with the save's jump what the game's own chapter
+  change does: the base character's locator (stage, position, rotation) becomes the start point's
+  player's; a character the start point lists (Ashley at chapter 5's start) goes to its own place
+  there; another character that was at the player's side in the save comes along; the others keep
+  theirs. `IsChapterStart` is set and `SpecialJumpSequence` stays 0.
+- Only a jump into the chapter it was armed for (`Order.Chapter`) is changed - a load the chapter
+  switch did not put there is left alone. A save already in that chapter starts from the start
+  too: *Capítulo N* is the start of chapter N for both players, *Donde está el guardado* keeps the
+  save's own place.
+- **The opening plays.** Decided: the chapter's opening event, through `IsChapterStart` - what a
+  player who reaches that chapter sees, what the game's own chapter change does, and what both
+  players see when the lobby starts a new game at that chapter. Not the new game's special order
+  (`SpecialJumpSequence`, e.g. chapter 1-1's inhibits): a continued save is not a new game. Each
+  game plays the event on its own (`EventChapterChangeController` posts `FreePost`, never through
+  `procPayloadPlay`: not replayed to the partner, §3.33), as for a new game from the lobby.
+- A client without a co-op save starts a new game at that same start point: the lobby's start key
+  for a continued game is now `Lobby.head_key_of_id` (for chapter 1 `Campaign1001_Chp1_1_Head`,
+  where the host's jump starts, not `Campaign1001_Master`, the prologue).
+- A spawn at the partner (`arm_spawn`) replaces an armed chapter start; each game forgets both
+  once its lobby start is over. Diagnostics: "join at the host's place … last chapter N start: k
+  moved"; the log says `chapter start: chapter N, stage S, k character(s) moved` or `chapter start
+  not applied: why`.
+
+**Limits.** Not run in the game yet. Only the place and the opening are the chapter's: the save's
+scenario flags, items and characters stay the save's - the game's own chapter change sets none of
+the start point's `_FlagList` either (progress has set them by then) - so after a jump back or
+ahead the world may not match the chapter (a door open, a key item missing). A character the start
+point lists but the save does not hold (Ashley at chapter 5's start from a save before she joins)
+is not created; Ashley from a later save comes along to an earlier chapter's start.
 
 ## 4. Sync architecture
 

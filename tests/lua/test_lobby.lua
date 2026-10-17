@@ -250,6 +250,26 @@ T.run("start_continue_carries_the_save_and_the_jump", function()
     T.eq(ca.params.chapter, 0, "no chapter jump")
 end)
 
+T.run("a_chapter_jump_to_chapter_1_starts_a_clients_new_game_at_chapter_1_1", function()
+    local host, client, pump = pair()
+    host:open(Lobby.SCREEN.LOBBY)
+    client:open(Lobby.SCREEN.LOBBY)
+    host:set_saves({ { empty = true }, { empty = false, chapter_id = 23200, difficulty = 20, count = 9 }, { empty = true } })
+    host:cycle_file(1)
+    host:cycle_chapter(1)
+    pump()
+    host:set_ready(true)
+    client:set_ready(true)
+    pump()
+    T.eq(host:request_start(0), true, "started")
+    pump()
+    local _, ca = host:take_action(), client:take_action()
+    T.eq(ca.params.chapter, 1, "jump to chapter 1")
+    T.eq(ca.params.chapter_id, 21100, "chapter 1-1")
+    -- Where the host's save starts (chapter 1-1's start point), not the prologue of a whole new game.
+    T.eq(ca.params.key, 6, "Campaign1001_Chp1_1_Head, not Campaign1001_Master")
+end)
+
 T.run("a_partner_that_fails_or_leaves_is_not_waited_for", function()
     local host, client, pump, _, notes = pair()
     host:open(Lobby.SCREEN.LOBBY)
@@ -487,6 +507,8 @@ local function fake_world(game)
     function w:warp(stage, pos) self.game.pos = pos return true end
     function w:arm_chapter_switch(c) self.armed = c return true end
     function w:disarm_chapter_switch() self.armed = nil end
+    function w:arm_chapter_start(c, key) self.start_armed = { chapter = c, key = key } return true end
+    function w:disarm_chapter_start() self.start_armed = nil end
     return w
 end
 
@@ -699,7 +721,88 @@ T.run("session_continue_start_loads_the_coop_slots", function()
     T.eq(cgame.starts[1].kind, "new", "the client has no co-op save: a new game...")
     T.eq(cgame.starts[1].key, 13, "...in the host's chapter (8)")
     T.eq(cworld.armed, 23200, "a save it loads would go into the host's chapter")
+    T.eq(cworld.start_armed, nil, "where the host's save is: no chapter start")
     T.eq(cs.join_travel_pending, true, "then it joins the host (world, warp)")
+end)
+
+-- The lobby's chapter jump on a continued save (docs/RESEARCH.md 3.35): both games load their
+-- co-op save into the chapter chosen, at its start point - the same place for both.
+local function lobby_jump(client_coop_chapter, jump)
+    local clock = { t = 0 }
+    local hs, hnet, hgame, hworld = make_session("Leon", clock, { start_sync = false })
+    local cs, cnet, cgame, cworld = make_session("Ada", clock)
+    hgame.saves[18] = { chapter = 23200 }
+    if client_coop_chapter then cgame.saves[20] = { chapter = client_coop_chapter } end
+    local function deliver()
+        for _ = 1, 3 do
+            for _, b in ipairs(hnet.sent) do cnet.inbox[#cnet.inbox + 1] = { type = "message", data = b } end
+            for _, b in ipairs(cnet.sent) do hnet.inbox[#hnet.inbox + 1] = { type = "message", data = b } end
+            hnet.sent, cnet.sent = {}, {}
+        end
+    end
+    local function frame()
+        clock.t = clock.t + 0.1
+        hs:update()
+        cs:update()
+        deliver()
+    end
+    hgame.menu_h.on_decide(Lobby.ACTION.HOST)
+    cs:queue("join", "127.0.0.1")
+    frame()
+    hnet.st, cnet.st = "connected", "connected"
+    hnet.inbox[#hnet.inbox + 1] = { type = "connected", name = "Ada", peer = "x" }
+    cnet.inbox[#cnet.inbox + 1] = { type = "connected", name = "Leon", peer = "y" }
+    for _ = 1, 30 do frame() end
+    hs.lobby:cycle_file(1) -- file 2 = slot 18 (a save in chapter 8)
+    for _ = 1, 25 do frame() end
+    hs.lobby:cycle_chapter(jump)
+    for _ = 1, 5 do frame() end
+    hs.lobby:set_ready(true)
+    cs.lobby:set_ready(true)
+    frame()
+    frame()
+    T.eq(hs.lobby:request_start(clock.t), true, "start")
+    for _ = 1, 3 do frame() end
+    return { hs = hs, cs = cs, hgame = hgame, cgame = cgame, hworld = hworld, cworld = cworld, frame = frame }
+end
+
+T.run("a_lobby_chapter_jump_starts_both_saves_at_the_chapters_start", function()
+    local j = lobby_jump(23100, 5) -- the client's co-op save in chapter 7; the host jumps to chapter 5
+    T.eq(j.hgame.starts[1].kind, "continue", "the host continues its co-op save")
+    T.eq(j.hworld.armed, 22200, "into chapter 5")
+    T.check(j.hworld.start_armed ~= nil and j.hworld.start_armed.chapter == 22200, "at its start...")
+    T.eq(j.hworld.start_armed.key, 10, "...Campaign1001_Chp2_2_Head")
+    T.eq(j.cgame.starts[1].kind, "continue", "the client continues its own co-op save")
+    T.eq(j.cworld.armed, 22200, "into the same chapter")
+    T.check(j.cworld.start_armed ~= nil and j.cworld.start_armed.key == 10, "at the same start")
+    -- Once a game runs, its chapter switch and chapter start are forgotten.
+    j.hgame.loading = false
+    j.hgame.chapter = 22200
+    for _ = 1, 20 do j.frame() end
+    T.eq(j.hs.lobby.start.released, true, "the host runs (it chose not to wait)")
+    T.eq(j.hworld.start_armed, nil, "the host's chapter start disarmed")
+    T.eq(j.hworld.armed, nil, "and the chapter switch")
+    T.check(j.cworld.start_armed ~= nil, "the client's stays until its own start runs")
+    j.cs.lobby:release(j.cs.clock(), "skipped")
+    j.frame()
+    T.eq(j.cworld.start_armed, nil, "then it is forgotten too")
+end)
+
+T.run("a_lobby_chapter_jump_without_a_coop_save_starts_the_client_new_there", function()
+    local j = lobby_jump(nil, 1) -- the host jumps to chapter 1
+    T.eq(j.hworld.armed, 21100, "the host's save into chapter 1-1")
+    T.eq(j.hworld.start_armed.key, 6, "at chapter 1-1's start (Campaign1001_Chp1_1_Head)")
+    T.eq(j.cgame.starts[1].kind, "new", "the client: a new game...")
+    T.eq(j.cgame.starts[1].key, 6, "...from the same start point, not the prologue")
+    T.eq(j.cworld.start_armed, nil, "a new game starts there by itself")
+end)
+
+T.run("continuing_where_the_save_is_arms_no_chapter_start", function()
+    local j = lobby_jump(23100, 0)
+    T.eq(j.hworld.armed, nil, "the host's save where it is")
+    T.eq(j.hworld.start_armed, nil, "...at its own place")
+    T.eq(j.cworld.armed, 23200, "the client's save into the host's save's chapter")
+    T.eq(j.cworld.start_armed, nil, "at its own place, then the join walks it to the host")
 end)
 
 T.finish()

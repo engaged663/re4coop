@@ -1722,6 +1722,20 @@ function Session:lobby_synced()
     return self.world == nil or self.world_synced or self.world_sync_pending == nil
 end
 
+-- A continued save goes into the lobby's chapter (p.chapter_id). With a chapter jump (p.chapter,
+-- the lobby's "Capítulo N") it starts at that chapter's start point, as the game's own chapter
+-- change starts a chapter (game_world.lua, docs/RESEARCH.md 3.35) - the same place in both games.
+function Session:arm_lobby_chapter(p)
+    local w = self.world
+    if w == nil or p.chapter_id == nil or p.chapter_id == 0 then return end
+    w:arm_chapter_switch(p.chapter_id)
+    self.lobby_chapter_armed = true
+    if (p.chapter or 0) > 0 and w.arm_chapter_start ~= nil
+        and not w:arm_chapter_start(p.chapter_id, Lobby.head_key_of_id(p.chapter_id)) then
+        self:add_message("La partida empezará donde está el guardado: el juego no da el inicio del capítulo", "warn")
+    end
+end
+
 -- A start the lobby agreed on: start the game here. a = { role, params, slot }
 function Session:run_lobby_action(a, now)
     if a.kind ~= "start" then return end
@@ -1738,9 +1752,8 @@ function Session:run_lobby_action(a, now)
         if p.mode == NEW then
             ok, why = g:menu_start_new(p.key, p.difficulty)
         else
-            if p.chapter ~= nil and p.chapter > 0 and self.world ~= nil then
-                self.world:arm_chapter_switch(p.chapter_id) -- the save, in the chapter chosen
-                self.lobby_chapter_armed = true
+            if p.chapter ~= nil and p.chapter > 0 then
+                self:arm_lobby_chapter(p) -- the save, at the start of the chapter chosen
             end
             self.save_sync:request_load(a.slot, now)
             ok, why = g:menu_continue(a.slot)
@@ -1752,10 +1765,16 @@ function Session:run_lobby_action(a, now)
             self.world_synced = true
             ok, why = g:menu_start_new(p.key, p.difficulty)
         else
-            -- Our own progress with the host (its co-op slot) in the host's chapter, then the
-            -- usual join: the host's world, next to the host.
+            -- Our own progress with the host (its co-op slot) in the host's chapter (at its start
+            -- with a chapter jump, where the host starts too), then the usual join: the host's
+            -- world, next to the host.
             local slot = self.save_sync:coop_slot()
-            if self.world ~= nil and p.chapter_id ~= nil and p.chapter_id ~= 0 then
+            local continuing = g:save_exists(slot)
+            if continuing then
+                self:arm_lobby_chapter(p)
+            elseif self.world ~= nil and p.chapter_id ~= nil and p.chapter_id ~= 0 then
+                -- (A new game starts at the chapter's start by itself; a save loaded later goes
+                -- into the host's chapter.)
                 self.world:arm_chapter_switch(p.chapter_id)
                 self.lobby_chapter_armed = true
             end
@@ -1766,7 +1785,7 @@ function Session:run_lobby_action(a, now)
                     self.sync_on_join = true
                 end
             end
-            if g:save_exists(slot) then
+            if continuing then
                 self.save_sync:request_load(slot, now)
                 ok, why = g:menu_continue(slot)
             else
@@ -1826,6 +1845,7 @@ function Session:update_lobby(now)
     if s ~= nil and s.released and self.lobby_chapter_armed and self.world ~= nil then
         self.lobby_chapter_armed = false
         self.world:disarm_chapter_switch() -- the load it was for is done
+        if self.world.disarm_chapter_start then self.world:disarm_chapter_start() end
     end
     local loc = self.local_loc
     local playable = in_game and not self.local_cutscene and not self.local_dead
