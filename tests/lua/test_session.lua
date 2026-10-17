@@ -772,4 +772,20 @@ T.run("shutdown_restores_everything", function()
     T.eq(world.armed, nil, "no chapter switch left armed")
 end)
 
+T.run("a_partner_on_another_release_is_named_once", function()
+    local s, net = make("client")
+    net.push(P.encode_hello({ name = "Host" }))
+    s:update_network_only()
+    T.check(not told(s, "update both"), "same release: nothing to say")
+    net.push(P.encode_hello({ name = "Host", mod_version = "0.11.3" }))
+    net.push(P.encode_hello({ name = "Host", mod_version = "0.11.3" }))
+    s:update_network_only()
+    T.check(s.compatible, "same protocol: still connected")
+    local n = 0
+    for _, m in ipairs(s.messages) do
+        if m.text:find("re4coop 0.11.3", 1, true) then n = n + 1 end
+    end
+    T.eq(n, 1, "the other release named once")
+end)
+
 T.finish()

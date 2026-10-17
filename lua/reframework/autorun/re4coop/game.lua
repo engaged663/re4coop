@@ -1222,7 +1222,7 @@ end
 -- execEnd with cause Request on every screen's controller).
 function Game:end_camera(play_id)
     local clap = singleton(CLAPPERBOARD)
-    if clap == nil or play_id == nil then return false end
+    if clap == nil or play_id == nil or play_id == 0 then return false end -- 0 would end every camera
     self.perf:crumb("camera_end", tostring(play_id), true)
     local ok = pcall(function() clap:call("requestEnd(System.UInt32)", play_id) end)
     return ok

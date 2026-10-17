@@ -2211,11 +2211,10 @@ watchdog never fired: the stuck camera and event counted as a cutscene still pla
   (the start fade over) and all of that has held for 1 s; only then `InputSkip`. "done" if ours
   was skipped already (both players skipped: dropped), "missing" if it is not playing here (kept
   10 s, or while a replay of it is on its way; 60 s at most).
-- A cutscene is one cutscene whatever camera reported it: the sync's keys are the ID alone, and
-  `cutscene_done` asks `_HasDone` as movie and as timeline (a movie request is recorded as its
-  timeline), so a partner's `2:10153` is never replayed over our `1:10153`.
+- A partner's skip finds our copy by its number whatever camera kind reported it (a movie
+  request plays, and is skipped as, the timeline of the same number).
 - `screen_watch.lua` watches every skip (a camera with `DoneSkip`): if 15 s later the skipped
-  camera is still there or a fade layer (INTER_GAMESTATE, GAMESTATE, CAMPAIGN_JUMPER, GUI, EVENT)
+  camera is still there or a fade layer (INTER_GAMESTATE, GAMESTATE, CAMPAIGN_JUMPER, EVENT)
   has been dark without a break for half that time - no transition, no other camera - it ends the
   skipped cameras (`ClapperboardMediator.requestEnd(playid)`, 0x1419b8160, what gimmicks use) and
   lifts those layers (`FadeManager.requestFadeIn`, one count each), logs the layers' phases and
@@ -2224,6 +2223,24 @@ watchdog never fired: the stuck camera and event counted as a cutscene still pla
 
 **Limits.** Not run in the game yet. The rescue lifts one count per layer; a layer with more left
 stays dark (the log line shows the counts). A skip a player makes by hand is untouched.
+
+**0.11.4.** The players reported that with 0.11.3 cutscenes no longer synchronised at all and the
+games drifted apart. The log of that run shows no error and no cutscene line - 0.11.3 logged
+none of its decisions - so the exact path is not established. Two 0.11.3 changes could hold a
+partner's cutscene or skip back without a trace, and both are undone or bounded:
+- the start path is 0.11.2's again (keys "camera:id", `cutscene_done` asks the reported camera
+  kind only); only skips match by number;
+- a skip no longer needs the skip prompt (`DispUI`) and no longer waits on the EVENT layer for
+  ever: once our copy can be skipped (`canSkip`, which `procRequest`'s key makes possible for
+  replays too) it waits for the layer to be lit and a hold's time, but `SKIP_FORCE` (4 s) after
+  it became skippable it is applied regardless;
+- every decision is logged ("cutscene c:id from the partner", "...replayed here", "...not
+  replayed: ...", "...ours already played it ...", "...the partner skipped it", "...the
+  partner's skip waits (why)", "...applied here after N s", "...we skipped it"), so the next
+  report shows what each game did with each cutscene;
+- the post-skip rescue leaves the GUI layer alone (its resting state is not known);
+- a partner on another release of the mod (same protocol, so it connects) is named once on
+  screen and in the log: two releases can treat a cutscene or a skip differently.
 
 ## 4. Sync architecture
 

@@ -101,7 +101,7 @@ T.run("black_long_after_a_skip_is_rescued_once", function()
     local w, logs, notes = make()
     local rescue_at, rescue
     for t = 0, 40, 0.5 do
-        local _, r = w:tick(t, after_skip({ SKIPPED }, { 3, 4 }))
+        local _, r = w:tick(t, after_skip({ SKIPPED }, { 2, 4 }))
         if r ~= nil then
             T.check(rescue == nil, "only once")
             rescue_at, rescue = t, r
@@ -112,7 +112,7 @@ T.run("black_long_after_a_skip_is_rescued_once", function()
     T.near(rescue_at, ScreenWatch.SKIP_STUCK, 0.01, "after SKIP_STUCK")
     T.eq(rescue.end_cameras[1], 7, "the skipped camera is ended")
     T.eq(#rescue.lift, 2, "two layers lifted")
-    T.eq(rescue.lift[1], 3, "GUI")
+    T.eq(rescue.lift[1], 2, "CAMPAIGN_JUMPER")
     T.eq(rescue.lift[2], 4, "EVENT")
     T.eq(rescue.what, "1:10153", "named")
     T.check(logs[#logs]:find("4=2/2", 1, true) ~= nil, "the fade layers written to the log")

@@ -1597,24 +1597,12 @@ function World:cutscene_playing()
 end
 
 -- Whether this save already played that camera (ClapperboardMediator.checkHasDone).
--- procPayloadPlay records the camera it built: a movie request that played its timeline
--- (the PC case) is "done" as a timeline, so both kinds are asked for.
 function World:cutscene_done(camera, id)
     local m, mgr = self.cs_done_m, self.r:singleton(CLAP)
     if m == nil or mgr == nil then return nil end
-    camera = camera or P.CAMERA.TIMELINE
-    local kinds = { camera }
-    if camera == P.CAMERA.MOVIE then kinds[2] = P.CAMERA.TIMELINE
-    elseif camera == P.CAMERA.TIMELINE then kinds[2] = P.CAMERA.MOVIE end
-    local answer = nil
-    for _, kind in ipairs(kinds) do
-        local ok, v = pcall(m.method.call, m.method, mgr, kind, id)
-        if ok and type(v) == "boolean" then
-            if v then return true end
-            answer = false
-        end
-    end
-    return answer
+    local ok, v = pcall(m.method.call, m.method, mgr, camera or P.CAMERA.TIMELINE, id)
+    if ok and type(v) == "boolean" then return v end
+    return nil
 end
 
 -- Elements of a value-type array: the array object keeps its count at 0x1C and its elements
@@ -1801,46 +1789,52 @@ local function same_cutscene(cam_a, cam_b)
 end
 
 -- A partner's skip is applied the way a player skips (docs/RESEARCH.md 3.36): never before the
--- player here could. The skip fades the EVENT layer out and the end fades it in again; that
--- layer counts its fade-outs, so a skip that lands while the cutscene's own start fade still
--- holds it dark (the first frames it can be skipped: what 0.11.2 did) leaves one fade-out
--- that nothing ever lifts - a black screen after the cutscene. A player has to hold the skip
--- button for a moment after its prompt shows; we wait as long.
-World.SKIP_SETTLE = 1.0
-local EVENT_FADE = 4 -- share.FadeManager.FadeType.EVENT
+-- player here could. A player only gets the skip prompt once the cutscene plays (procSkip opens
+-- it on the first frame PlayWork.canSkip holds) and then has to hold the button; 0.11.2 set
+-- InputSkip while our copy was still loading, so the game skipped it on its very first frame -
+-- and the screen stayed black after it. Event fades (the EVENT layer) count their fade-outs; a
+-- skip while the cutscene's own fade still holds that layer dark is the case to avoid.
+World.SKIP_HOLD = 1.0   -- seconds the cutscene must have been skippable here (the button's hold)
+World.SKIP_FORCE = 4.0  -- skippable this long: applied even if the EVENT layer is still dark
+local EVENT_FADE = 4    -- share.FadeManager.FadeType.EVENT
 
--- Skips that camera here the way our skip button does: InputSkip on its PlayWork, once it can
--- be skipped (PlayWork.canSkip: the event is playing), its start fade is over (the EVENT
--- layer lit) and both have held for SKIP_SETTLE seconds.
--- "skipped" | "waiting" (it plays here but not yet skippable) | "done" (already skipped here)
--- | "missing" (not playing here) | "failed".
+-- Skips that camera here the way our skip button does: InputSkip on its PlayWork once it has
+-- been skippable for SKIP_HOLD seconds with the EVENT layer lit (or SKIP_FORCE seconds at all).
+-- Returns "skipped" | "waiting", why | "done" (skipped here already) | "missing" (not playing
+-- here) | "failed".
 function World:cutscene_skip(camera, id, now)
     now = now or self:now()
     self.skip_ready = self.skip_ready or {}
     local live = {}
-    local result = "missing"
+    local result, why = "missing", nil
     for _, p in ipairs(self:play_works()) do
         local a = address_of(p.work)
         live[a] = true
         if result == "missing" and p.id == id and same_cutscene(p.camera, camera) then
+            local st = self.skip_ready[a]
             if R.get(p.work, "DoneSkip") == true then
                 result = "done"
+            elseif R.call(p.work, "canSkip") == false then
+                -- Still loading (or a camera the game does not let skip): like a player, wait.
+                self.skip_ready[a] = nil
+                result, why = "waiting", "not skippable yet"
             else
-                local can = R.call(p.work, "canSkip")
-                local dark = self.game ~= nil and self.game.fade_dark ~= nil and self.game:fade_dark(EVENT_FADE)
-                if can == false or dark or R.get(p.work, "DispUI") == false then
-                    self.skip_ready[a] = nil
-                    result = "waiting"
-                elseif self.skip_ready[a] == nil or now - self.skip_ready[a] < World.SKIP_SETTLE then
-                    self.skip_ready[a] = self.skip_ready[a] or now
-                    result = "waiting"
-                else
+                if st == nil then
+                    st = { since = now }
+                    self.skip_ready[a] = st
+                end
+                local lit = not (self.game ~= nil and self.game.fade_dark ~= nil and self.game:fade_dark(EVENT_FADE))
+                if lit then st.lit = st.lit or now else st.lit = nil end
+                local held = now - st.since
+                if (st.lit ~= nil and now - st.lit >= World.SKIP_HOLD) or held >= World.SKIP_FORCE then
                     self:crumb("world.cutscene_skip", ("%d:%d"):format(p.camera, id))
                     if not R.set(p.work, "InputSkip", true) then return "failed" end
                     self.skips_applied = self.skips_applied or {}
                     self.skips_applied[a] = true
                     self.skip_ready[a] = nil
                     result = "skipped"
+                else
+                    result, why = "waiting", lit and "holding the skip button" or "its fade is still dark"
                 end
             end
         end
@@ -1848,7 +1842,7 @@ function World:cutscene_skip(camera, id, now)
     for a in pairs(self.skip_ready) do
         if not live[a] then self.skip_ready[a] = nil end
     end
-    return result
+    return result, why
 end
 
 -------------------------------------------------------------------------------

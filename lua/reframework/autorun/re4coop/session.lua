@@ -77,7 +77,7 @@ local MAX_DEFERRED = 4000
 local SETTLE_AFTER_LOAD = 1.0   -- seconds in game before queued world/enemy messages are applied
 local TRANSITION_FLAG_HOLD = 2.0 -- the partner's flags wait this long after our transition ends
 local SCREEN_INTERVAL = 0.5     -- seconds between looks at the screen fades (screen_watch.lua)
-local SKIP_FADES = { 0, 1, 2, 3, 4 } -- fade layers a skipped cutscene can leave dark (GUI included)
+local SKIP_FADES = { 0, 1, 2, 4 } -- fade layers a skipped cutscene can leave dark (never the GUI's own)
 local JOIN_NEW_TIMEOUT = 60.0   -- seconds a new game to join the host may wait for the main menu
 local HOST_PLAYING_AGE = 3.0    -- seconds: a host PLAYER message this fresh means the host is in game
 local STATUS_MAX_AGE = 0.1      -- status_cached(): seconds a computed status is reused
@@ -1233,6 +1233,13 @@ function Session:handle_message(data, now)
                 :format(m.mod_version, m.version, P.MOD_VERSION, P.VERSION), "error")
         else
             self.compatible = true
+            -- Same protocol, another release: it connects, but the two games can still handle a
+            -- cutscene or a save differently. Said once per partner version.
+            if m.mod_version ~= P.MOD_VERSION and m.mod_version ~= "?" and self.warned_mod_version ~= m.mod_version then
+                self.warned_mod_version = m.mod_version
+                self:add_message(("Partner runs re4coop %s, you run %s - update both to the same version")
+                    :format(m.mod_version, P.MOD_VERSION), "warn")
+            end
             local mine = self.game:area_name() or ""
             if m.area ~= "" and mine ~= "" and m.area ~= mine and not self.join_travel_pending then
                 self:add_message(("Partner is in '%s', you are in '%s' - load the same chapter"):format(m.area, mine), "warn")

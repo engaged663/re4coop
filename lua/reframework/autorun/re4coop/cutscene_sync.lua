@@ -47,12 +47,16 @@ local function dist(a, b)
     return math.sqrt(dx * dx + dy * dy + dz * dz)
 end
 
--- One cutscene, whatever kind of camera asked for it: a movie request plays the timeline of
--- the same number on PC, and the game reports its start as a movie and its skip as a timeline.
 local function key_of(ev)
-    return tostring(ev.id)
+    return tostring(ev.camera or 1) .. ":" .. tostring(ev.id)
 end
 CutsceneSync.key_of = key_of
+
+-- A movie request plays the timeline of the same number on PC: the game reports its start as a
+-- movie and its skip as a timeline (docs/RESEARCH.md 3.36). Skips match by the number alone.
+local function id_of(k)
+    return tostring(k):match(":(%-?%d+)$") or tostring(k)
+end
 
 -- opts: { role, protocol, settings, send(bytes, reliable), log(fmt, ...), notify(text, kind), on_replay }
 function CutsceneSync.new(opts)
@@ -103,6 +107,7 @@ function CutsceneSync:on_local_start(ev, now, loc)
     end
     self.sent[k] = now
     loc = loc or {}
+    self.log("cutscene %s started here: sent to the partner", k)
     self.send(self.P.encode_cutscene({
         camera = ev.camera, id = ev.id, screen = ev.screen, owner_code = ev.owner_code,
         end_portrayal = ev.end_portrayal, start_flags = ev.start_flags, end_flags = ev.end_flags, coords = ev.coords,
@@ -118,8 +123,10 @@ function CutsceneSync:on_cutscene(m, now)
     local k = key_of(m)
     local seen = self.played[k]
     if seen ~= nil and now - seen < SEEN_WINDOW then
+        self.log("cutscene %s from the partner: ours already played it %.0f s ago", k, now - seen)
         return -- both triggered it, or we already watched it
     end
+    self.log("cutscene %s from the partner (chapter %s, stage %s)", k, tostring(m.chapter), tostring(m.stage))
     for _, p in ipairs(self.pending) do
         if key_of(p.ev) == k then return end
     end
@@ -205,6 +212,7 @@ function CutsceneSync:tick(now, world, loc, travel)
         self.played[k] = now
         table.remove(self.pending, 1)
         self.counters.already_seen = self.counters.already_seen + 1
+        self.log("cutscene %s not replayed: this game has already played it", k)
         return
     end
     if playing then return end -- let the current one finish
@@ -217,6 +225,7 @@ function CutsceneSync:tick(now, world, loc, travel)
     -- games at the same time. A player who was far away joins the partner when it ends.
     local ok, why = world:cutscene_play(ev)
     if ok then
+        self.log("cutscene %s replayed here%s", k, far and " (we were far away)" or "")
         self.played[k] = now
         self.counters.played = self.counters.played + 1
         table.remove(self.pending, 1)
@@ -240,6 +249,7 @@ function CutsceneSync:on_local_skip(ev, now)
     if t ~= nil and now - t < SKIP_WINDOW then return false end -- the partner's skip we applied
     self.send(self.P.encode_cutscene_skip({ camera = ev.camera, id = ev.id }), true)
     self.counters.skips_sent = self.counters.skips_sent + 1
+    self.log("cutscene %s: we skipped it (sent to the partner)", k)
     return true
 end
 
@@ -247,16 +257,19 @@ function CutsceneSync:on_skip(m, now)
     if not self:enabled() or self.settings.sync_skips == false then return end
     self.counters.skips_received = self.counters.skips_received + 1
     self.skips[key_of(m)] = { ev = { camera = m.camera, id = m.id }, time = now }
+    self.log("cutscene %s: the partner skipped it", key_of(m))
     for k, t in pairs(self.skipped) do
         if now - t > SKIP_WINDOW then self.skipped[k] = nil end
     end
 end
 
--- A replay of that cutscene is on its way here (waiting, or started and not seen ending).
+-- A replay of that cutscene (by its number) is on its way here (waiting, or started and not
+-- seen ending).
 function CutsceneSync:replay_coming(k)
-    if self.replay ~= nil and self.replay.key == k then return true end
+    local id = id_of(k)
+    if self.replay ~= nil and id_of(self.replay.key) == id then return true end
     for _, p in ipairs(self.pending) do
-        if key_of(p.ev) == k then return true end
+        if tostring(p.ev.id) == id then return true end
     end
     return false
 end
@@ -270,18 +283,21 @@ function CutsceneSync:apply_skips(now, world)
             self.skips[k] = nil
             self.log("cutscene %s: the partner's skip expired (never skippable here)", k)
         else
-            local r = world:cutscene_skip(s.ev.camera, s.ev.id, now)
+            local r, why = world:cutscene_skip(s.ev.camera, s.ev.id, now)
             if r == "skipped" then
                 self.skips[k] = nil
                 self.skipped[k] = now
                 self.counters.skips_applied = self.counters.skips_applied + 1
-                if now - s.time > 0.5 then
-                    self.log("cutscene %s: the partner's skip applied after %.1f s", k, now - s.time)
-                end
+                self.log("cutscene %s: the partner's skip applied here after %.1f s", k, now - s.time)
             elseif r == "done" or r == "failed" then
                 self.skips[k] = nil
+                self.log("cutscene %s: the partner's skip not applied (%s)", k, r == "done" and "skipped here already" or "failed")
             elseif r == "missing" and now - s.time > SKIP_MISSING and not self:replay_coming(k) then
                 self.skips[k] = nil -- it played and ended here, or never comes
+                self.log("cutscene %s: the partner's skip dropped (not playing here)", k)
+            elseif r == "waiting" and why ~= s.why then
+                s.why = why
+                self.log("cutscene %s: the partner's skip waits (%s)", k, tostring(why))
             end
         end
     end

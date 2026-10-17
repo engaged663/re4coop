@@ -415,13 +415,26 @@ T.run("a_partners_skip_waits_until_a_player_here_could_skip", function()
     T.eq(world.fades[4], nil, "the picture is back")
 end)
 
+T.run("a_skip_never_waits_forever_on_a_dark_event_layer", function()
+    local w, game, world = fresh()
+    mock.start_cutscene(500)
+    mock.update_cutscene_skip()
+    world.fades[4] = true -- the layer stays dark while it plays
+    local applied
+    for t = 0, 10, 0.25 do
+        local r, why = w:cutscene_skip(1, 500, t)
+        if r == "skipped" then applied = t break end
+        T.eq(why, "its fade is still dark", "says why it waits")
+    end
+    T.near(applied, 4.0, 0.01, "applied after SKIP_FORCE all the same")
+end)
+
 T.run("a_movie_and_its_timeline_are_one_cutscene", function()
     local w, game, world = fresh()
     world.movie_timelines = true -- PC: a movie request plays the timeline of the same number
     mock.start_cutscene(10153, { camera = 2 })
-    T.eq(w:cutscene_done(2, 10153), true, "done, asked as the movie")
-    T.eq(w:cutscene_done(1, 10153), true, "and as its timeline")
-    T.eq(w:cutscene_done(2, 10154), false, "another one is not")
+    T.eq(w:cutscene_done(1, 10153), true, "the game records the timeline it played")
+    T.eq(w:cutscene_done(1, 10154), false, "another one is not")
     local cams = game:cameras()
     T.eq(#cams, 1, "one camera")
     T.eq(cams[1].camera, 1, "built as a timeline")

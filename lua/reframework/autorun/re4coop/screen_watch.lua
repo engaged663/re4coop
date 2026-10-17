@@ -15,8 +15,8 @@
 -- (tests/lua/test_screen_watch.lua).
 --
 -- After a skipped cutscene (docs/RESEARCH.md 3.36) it also looks for a screen that stays black:
--- when, SKIP_STUCK seconds after the skip, the skipped camera is still there or a fade layer
--- (GUI included) has been dark for half that time without a break - with no transition and no
+-- when, SKIP_STUCK seconds after the skip, the skipped camera is still there or a transition or
+-- event fade has been dark for half that time without a break - with no transition and no
 -- other camera running - it hands back a rescue: end the skipped cameras still there and lift
 -- those layers.
 --
