@@ -77,6 +77,7 @@ local MAX_DEFERRED = 4000
 local SETTLE_AFTER_LOAD = 1.0   -- seconds in game before queued world/enemy messages are applied
 local TRANSITION_FLAG_HOLD = 2.0 -- the partner's flags wait this long after our transition ends
 local SCREEN_INTERVAL = 0.5     -- seconds between looks at the screen fades (screen_watch.lua)
+local SKIP_FADES = { 0, 1, 2, 3, 4 } -- fade layers a skipped cutscene can leave dark (GUI included)
 local JOIN_NEW_TIMEOUT = 60.0   -- seconds a new game to join the host may wait for the main menu
 local HOST_PLAYING_AGE = 3.0    -- seconds: a host PLAYER message this fresh means the host is in game
 local STATUS_MAX_AGE = 0.1      -- status_cached(): seconds a computed status is reused
@@ -833,21 +834,38 @@ function Session:update_screen(now)
     self.last_screen_tick = now
     local transition = self.local_transition
     local playing = not transition and self:fresh_local_pos(now) ~= nil and not self.local_dead
+    local cams = (playing and g.cameras ~= nil) and g:cameras() or nil
     -- A hold of ours (gate, synchronized start) freezes the game on purpose: not a stuck screen.
     local busy = self.local_cutscene or self.held_scale ~= nil
-        or (playing and g.camera_busy ~= nil and g:camera_busy())
-    local lift = self.screen_watch:tick(now, {
+    if cams ~= nil then
+        busy = busy or #cams > 0
+    elseif playing and g.camera_busy ~= nil then
+        busy = busy or g:camera_busy()
+    end
+    local sw = self.screen_watch
+    local lift, rescue = sw:tick(now, {
         transition = transition,
         detail = function() return g.transition_detail and g:transition_detail() or nil end,
         playing = playing,
         busy = busy,
         dark = (playing and not busy) and g:dark_fades() or nil,
+        cameras = cams,
+        dark_all = (playing and sw:watching_skip(cams)) and g:dark_fades(SKIP_FADES) or nil,
     })
     local done = {}
     for _, t in ipairs(lift) do
         if g:lift_fade(t, 0.5) then done[#done + 1] = t end
     end
-    self.screen_watch:lifted(done, now)
+    sw:lifted(done, now)
+    if rescue ~= nil then
+        -- Still black long after a skipped cutscene: end what is left of it and lift its fades.
+        local report = g.fade_report ~= nil and g:fade_report() or nil
+        for _, id in ipairs(rescue.end_cameras) do
+            if g.end_camera ~= nil then g:end_camera(id) end
+        end
+        for _, t in ipairs(rescue.lift) do g:lift_fade(t, 0.5) end
+        sw:rescued(rescue, now, report)
+    end
 end
 
 -- Freezes (time scale 0) or restores the local game.

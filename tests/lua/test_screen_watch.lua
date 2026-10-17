@@ -90,4 +90,65 @@ T.run("a_long_transition_is_logged_once_with_what_it_does", function()
     T.check(w:summary(100).transition_for > 99, "still in it")
 end)
 
+-- After a skip: the camera, skipped, still there and the EVENT layer dark (0.11.2's stuck skip).
+local SKIPPED = { camera = 1, id = 10153, skipped = true, play_id = 7, address = 0x100 }
+
+local function after_skip(cams, dark_all)
+    return { transition = false, playing = true, busy = #cams > 0, cameras = cams, dark_all = dark_all, dark = {} }
+end
+
+T.run("black_long_after_a_skip_is_rescued_once", function()
+    local w, logs, notes = make()
+    local rescue_at, rescue
+    for t = 0, 40, 0.5 do
+        local _, r = w:tick(t, after_skip({ SKIPPED }, { 3, 4 }))
+        if r ~= nil then
+            T.check(rescue == nil, "only once")
+            rescue_at, rescue = t, r
+            w:rescued(r, t, "4=2/2")
+        end
+    end
+    T.check(rescue ~= nil, "rescued")
+    T.near(rescue_at, ScreenWatch.SKIP_STUCK, 0.01, "after SKIP_STUCK")
+    T.eq(rescue.end_cameras[1], 7, "the skipped camera is ended")
+    T.eq(#rescue.lift, 2, "two layers lifted")
+    T.eq(rescue.lift[1], 3, "GUI")
+    T.eq(rescue.lift[2], 4, "EVENT")
+    T.eq(rescue.what, "1:10153", "named")
+    T.check(logs[#logs]:find("4=2/2", 1, true) ~= nil, "the fade layers written to the log")
+    T.eq(#notes, 1, "the player told")
+    T.eq(w.counters.skip_rescues, 1, "counted")
+end)
+
+T.run("an_ordinary_skip_is_left_alone", function()
+    local w = make()
+    -- The skip fades the EVENT layer out for a moment, the camera ends, the picture comes back.
+    for t = 0, 1.5, 0.5 do
+        local _, r = w:tick(t, after_skip({ SKIPPED }, { 4 }))
+        T.eq(r, nil, "no rescue while it skips")
+    end
+    for t = 2, 40, 0.5 do
+        local lift, r = w:tick(t, after_skip({}, {}))
+        T.eq(r, nil, "none afterwards")
+        T.eq(#lift, 0, "nothing lifted")
+    end
+    T.eq(w.counters.skips_watched, 1, "watched")
+end)
+
+T.run("a_skip_into_a_chapter_change_or_the_next_cutscene_is_not_rescued", function()
+    local w = make()
+    w:tick(0, after_skip({ SKIPPED }, { 4 }))
+    for t = 0.5, 40, 0.5 do
+        local _, r = w:tick(t, { transition = true, dark = { 2, 4 } }) -- the bell: a chapter change follows
+        T.eq(r, nil, "the transition's black is the game's own")
+    end
+    local w2 = make()
+    w2:tick(0, after_skip({ SKIPPED }, { 4 }))
+    local NEXT = { camera = 1, id = 10154, skipped = false, play_id = 8, address = 0x200 }
+    for t = 0.5, 40, 0.5 do
+        local _, r = w2:tick(t, after_skip({ NEXT }, { 4 }))
+        T.eq(r, nil, "the next cutscene owns the screen")
+    end
+end)
+
 T.finish()

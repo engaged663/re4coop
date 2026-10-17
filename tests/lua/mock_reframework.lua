@@ -2308,17 +2308,33 @@ end
 
 -- ClapperboardMediator.procSkip: a skip input on a camera that can be skipped skips it; it
 -- ends a frame later (after its fade).
+-- ClapperboardMediator.procSkip each frame, with the EVENT layer the way the game counts it
+-- (FadeController._RefCounter): a skip fades that layer out and the end fades it in once; a
+-- skip that lands while the cutscene's start fade still holds the layer dark adds a fade-out
+-- nothing lifts, and the cutscene's own fade-in never comes - it stays black (rec.stuck).
 function M.update_cutscene_skip()
     local w = M.world
     local rec = w and w.current_cutscene
     if rec == nil or rec.work == nil then return end
     local f = rec.work.__fields
+    rec.age = (rec.age or 0) + 1
+    local playing = rec.age >= (rec.load_frames or 0)
+    if rec.holds_event_fade and not rec.stuck and rec.age >= (rec.load_frames or 0) + (rec.fade_frames or 0) then
+        rec.holds_event_fade = false
+        w.fades[4] = nil -- the start fade is over: the cutscene is on screen
+    end
+    if playing and rec.can_skip and not f.DoneSkip then f.DispUI = true end
     if f.DoneSkip then
+        if rec.stuck then return end
         rec.skipped = true
         w.skips = (w.skips or 0) + 1
         M.end_cutscene()
-    elseif f.InputSkip and rec.can_skip then
+    elseif f.InputSkip and rec.can_skip and playing then
         f.DoneSkip = true
+        if w.fades[4] then
+            rec.stuck = true -- its skip fade-out never completes: the camera stays, the layer stays dark
+            w.stuck_skips = (w.stuck_skips or 0) + 1
+        end
     end
 end
 
@@ -3128,9 +3144,15 @@ function M.install_world(world, opts)
     world.played, world.has_done, world.play_id, world.continued = {}, {}, 0, {}
     -- The camera playing on a screen: the skip button sets InputSkip; procSkip (each frame)
     -- skips it when it can be skipped (DoneSkip), and it ends after the skip fade.
+    -- canSkip: the event is playing (past world.cutscene_load_frames); DispUI: the skip prompt is up.
     class("chainsaw.ClapperboardMediator.PlayWork", "System.Object", {
         get_CameraID = { 0, function(self) return self.cam_id end, {}, { ret = "System.Int32" } },
-    }, { CamType = "System.Int32", DoneSkip = "System.Boolean", InputSkip = "System.Boolean" })
+        get_PlayID = { 0, function(self) return self.play_id end, {}, { ret = "System.UInt32" } },
+        canSkip = { 0, function(self)
+            local rec = self.rec
+            return rec ~= nil and rec.can_skip and (rec.age or 0) >= (rec.load_frames or 0)
+        end, {}, { ret = "System.Boolean" } },
+    }, { CamType = "System.Int32", DoneSkip = "System.Boolean", InputSkip = "System.Boolean", DispUI = "System.Boolean" })
     class("chainsaw.ClapperboardMediator.PlayWorkTimeline", "chainsaw.ClapperboardMediator.PlayWork", {})
     local function flag_infos(arr)
         local out = {}
@@ -3157,15 +3179,34 @@ function M.install_world(world, opts)
             end
             world.played[#world.played + 1] = rec
             world.current_cutscene = rec
-            rec.work = new("chainsaw.ClapperboardMediator.PlayWorkTimeline", { cam_id = f.ID, __fields = {
-                CamType = f.CameraType, DoneSkip = false, InputSkip = false } })
+            -- On PC a movie request plays the timeline of the same number (world.movie_timelines).
+            local built = (world.movie_timelines and f.CameraType == 2) and 1 or f.CameraType
+            rec.work = new("chainsaw.ClapperboardMediator.PlayWorkTimeline", { cam_id = f.ID, play_id = id, rec = rec,
+                __fields = { CamType = built, DoneSkip = false, InputSkip = false, DispUI = false } })
             rec.can_skip = not world.unskippable
+            -- It loads for a few frames, then plays; its start fade holds the EVENT layer dark for
+            -- a few more (world.cutscene_load_frames / cutscene_start_fade_frames, 0 by default).
+            rec.age, rec.load_frames, rec.fade_frames = 0, world.cutscene_load_frames or 0, world.cutscene_start_fade_frames or 0
+            if rec.load_frames + rec.fade_frames > 0 then
+                world.fades[4] = true
+                rec.holds_event_fade = true
+            end
             world.singletons["chainsaw.ClapperboardMediator"].__fields._Plays =
                 typed_array("chainsaw.ClapperboardMediator.PlayWork", { rec.work })
             world.gui_event = true
             for _, fi in ipairs(rec.start_flags) do set_flag_info(fi) end
-            world.has_done[("%d:%d"):format(f.CameraType, f.ID)] = true
+            world.has_done[("%d:%d"):format(built, f.ID)] = true
         end, { "System.UInt32", PAYLOAD } },
+        -- ClapperboardMediator.requestEnd(UInt32 playid): that camera ends (a skip stuck on its
+        -- fade-out included); its fades stay as they are.
+        ["requestEnd(System.UInt32)"] = { 1, function(_, play_id)
+            local rec = world.current_cutscene
+            world.camera_ends = (world.camera_ends or 0) + 1
+            if rec ~= nil and rec.play_id == play_id then
+                rec.ended_by_request = true
+                M.end_cutscene()
+            end
+        end, { "System.UInt32" } },
         emitPlayID = { 0, function()
             world.play_id = world.play_id + 1
             return world.play_id

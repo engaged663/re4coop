@@ -741,6 +741,49 @@ T.run("a_skip_reaches_a_cutscene_that_starts_later", function()
     T.eq(pair.client:summary().skips_waiting, nil, "forgotten")
 end)
 
+-- docs/RESEARCH.md 3.36: a skip that landed in our copy's first frames left the screen black.
+-- The adapter answers "waiting" until a player here could skip it; the skip waits that long.
+T.run("a_skip_waits_until_our_copy_can_be_skipped", function()
+    local pair = cutscene_pair()
+    pair.host_world:game_plays_cutscene({ camera = 2, id = 10153 }) -- reported as a movie
+    pair:step(30, pair.tick)
+    local cw = pair.client_world
+    local plain = cw.cutscene_skip
+    local asked, ready_at = 0, pair.now + 2.0
+    function cw:cutscene_skip(camera, id, now)
+        asked = asked + 1
+        T.eq(id, 10153, "same cutscene")
+        if now < ready_at then return "waiting" end
+        return plain(self, 2, id)
+    end
+    pair.host_world:player_skips()
+    pair:step(5, pair.tick)
+    T.eq(pair.client:summary().skips_waiting, 1, "waits while the copy cannot be skipped")
+    T.eq(cw.skips, nil, "not skipped yet")
+    pair:step(40, pair.tick)
+    T.eq(cw.skips and cw.skips[1], "2:10153", "skipped once it can be")
+    T.eq(pair.client.counters.skips_applied, 1, "counted")
+    T.eq(pair.client:summary().skips_waiting, nil, "nothing waits")
+    T.check(asked > 2, "asked again while waiting")
+end)
+
+T.run("a_skip_of_a_cutscene_skipped_here_already_is_dropped", function()
+    local pair = cutscene_pair()
+    function pair.client_world:cutscene_skip() return "done" end
+    pair.client:on_skip({ camera = 1, id = 77 }, pair.now)
+    pair:step(2, pair.tick)
+    T.eq(pair.client:summary().skips_waiting, nil, "dropped: both skipped it")
+    T.eq(pair.client.counters.skips_applied, 0, "nothing applied")
+    -- A skip of one that is neither playing nor coming here waits only a little.
+    pair.client_world.cutscene_skip = function() return "missing" end
+    pair.client:on_skip({ camera = 1, id = 78 }, pair.now)
+    pair:step(2, pair.tick)
+    T.eq(pair.client:summary().skips_waiting, 1, "waits a moment for our copy")
+    pair.now = pair.now + 11
+    pair:step(2, pair.tick)
+    T.eq(pair.client:summary().skips_waiting, nil, "then forgotten")
+end)
+
 T.run("skips_can_be_switched_off", function()
     local pair = cutscene_pair()
     pair.client.settings.sync_skips = false

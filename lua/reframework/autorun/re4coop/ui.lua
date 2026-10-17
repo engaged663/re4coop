@@ -543,6 +543,8 @@ local function draw_diagnostics(session, game, session_status, puppet, perf)
                 sc.transition_for and ("in one for %.0f s"):format(sc.transition_for) or "playing",
                 sc.counters.transitions, sc.last_transition_length and ("%.1f"):format(sc.last_transition_length) or "-",
                 sc.counters.long_transitions, tostring(sc.last_detail or "-"), sc.counters.lifts))
+            imgui.text(("skipped cutscenes watched: %d | black after a skip, brought back: %d (%s)"):format(
+                sc.counters.skips_watched or 0, sc.counters.skip_rescues or 0, tostring(sc.last_rescue or "-")))
         end
         imgui.separator()
         draw_models(session_status, game, puppet)

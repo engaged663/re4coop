@@ -1157,15 +1157,75 @@ end
 -- own business at any time and are never touched.
 Game.WATCHED_FADES = { 0, 1, 2, 4 } -- INTER_GAMESTATE, GAMESTATE, CAMPAIGN_JUMPER, EVENT
 
--- The watched fade types that are dark now (FadeManager.isFadeOut: fading or faded out).
-function Game:dark_fades()
+-- The watched fade types (or `types`) that are dark now (FadeManager.isFadeOut: fading or
+-- faded out).
+function Game:dark_fades(types)
     local fm = singleton(FADE_MANAGER)
     if fm == nil then return nil end
     local out = {}
-    for _, t in ipairs(Game.WATCHED_FADES) do
+    for _, t in ipairs(types or Game.WATCHED_FADES) do
         if self:call(fm, "isFadeOut", t) == true then out[#out + 1] = t end
     end
     return out
+end
+
+-- One fade layer is dark now.
+function Game:fade_dark(fade_type)
+    local fm = singleton(FADE_MANAGER)
+    return fm ~= nil and self:call(fm, "isFadeOut", fade_type) == true
+end
+
+-- Every fade layer's phase and fade-out count, for the log ("t=phase/count ..."):
+-- FadeManager._FadeControllers[type]._Phase (0 lit, 1 fading out, 2 dark, 3 fading in) and
+-- its _RefCounter (a SyncRefCounter: the count at +0x10; each fadeOut adds one, each fadeIn
+-- takes one, the layer only lights again at zero).
+function Game:fade_report()
+    local fm = singleton(FADE_MANAGER)
+    local ctls = fm and read_field(fm, "_FadeControllers")
+    if ctls == nil then return "?" end
+    local parts = {}
+    pcall(function()
+        for i = 0, ctls:get_size() - 1 do
+            local c = ctls:get_element(i)
+            if c ~= nil then
+                local phase = tonumber(read_field(c, "_Phase"))
+                local rc = read_field(c, "_RefCounter")
+                local n = rc ~= nil and rc.read_dword ~= nil and rc:read_dword(0x10) or nil
+                parts[#parts + 1] = ("%d=%s/%s"):format(i, tostring(phase), tostring(n))
+            end
+        end
+    end)
+    return table.concat(parts, " ")
+end
+
+-- The game's cameras playing now (ClapperboardMediator._Plays): { camera, id, skipped (DoneSkip),
+-- play_id, address } each.
+function Game:cameras()
+    local out = {}
+    local clap = singleton(CLAPPERBOARD)
+    local plays = clap and read_field(clap, "_Plays")
+    if plays == nil then return out end
+    pcall(function()
+        for i = 0, plays:get_size() - 1 do
+            local w = plays:get_element(i)
+            if w ~= nil then
+                out[#out + 1] = { camera = tonumber(read_field(w, "CamType")), id = tonumber(self:call(w, "get_CameraID")),
+                    skipped = read_field(w, "DoneSkip") == true, play_id = tonumber(self:call(w, "get_PlayID")),
+                    address = address_of(w) }
+            end
+        end
+    end)
+    return out
+end
+
+-- Ends one camera the way gimmicks end theirs (ClapperboardMediator.requestEnd(UInt32 playid):
+-- execEnd with cause Request on every screen's controller).
+function Game:end_camera(play_id)
+    local clap = singleton(CLAPPERBOARD)
+    if clap == nil or play_id == nil then return false end
+    self.perf:crumb("camera_end", tostring(play_id), true)
+    local ok = pcall(function() clap:call("requestEnd(System.UInt32)", play_id) end)
+    return ok
 end
 
 -- Lifts one fade the way the game does when its transition ends (FadeManager.requestFadeIn).

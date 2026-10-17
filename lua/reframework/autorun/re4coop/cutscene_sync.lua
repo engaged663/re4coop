@@ -17,12 +17,13 @@
 --   world:cutscene_playing() -> true | nil
 --   world:cutscene_done(camera, id) -> bool|nil   (this save already played it: never twice)
 --   world:cutscene_play(ev) -> bool, why          (ev as P.encode_cutscene / the decoded message)
---   world:cutscene_skip(camera, id) -> "skipped" | "missing" | "failed"
+--   world:cutscene_skip(camera, id, now) -> "skipped" | "waiting" | "done" | "missing" | "failed"
 --
 -- Skips: when one player skips a cutscene (the game's skip button), the same cutscene is
--- skipped in the partner's game too - now if it plays there, or as soon as it starts there
--- (a replay still waiting, or the partner's own copy starting a moment later). The game skips
--- it the way its own button does, so a cutscene that cannot be skipped there is not.
+-- skipped in the partner's game too - once a player there could skip it: playing, its start
+-- fade over, its skip prompt up for a moment (a skip that landed in the cutscene's first frames
+-- left the screen black, docs/RESEARCH.md 3.36). The game skips it the way its own button does,
+-- so a cutscene that cannot be skipped there is not.
 -- Travel (optional): travel:request(target) / travel:busy()
 -- opts.on_replay(started, now): a replay of the partner's cutscene started / ended here
 
@@ -38,15 +39,18 @@ local MAX_TRIES = 5
 local MAX_PENDING = 4
 local FAR = 30.0
 local START_TIMEOUT = 15.0   -- a replay that never shows up as playing here counts as over
-local SKIP_WINDOW = 90.0     -- a partner's skip waits this long for the cutscene to play here
+local SKIP_WINDOW = 60.0     -- a partner's skip waits at most this long for the cutscene to be skippable here
+local SKIP_MISSING = 10.0    -- ...and this long for it to start here, unless a replay of it is on its way
 
 local function dist(a, b)
     local dx, dy, dz = a.x - b.x, a.y - b.y, a.z - b.z
     return math.sqrt(dx * dx + dy * dy + dz * dz)
 end
 
+-- One cutscene, whatever kind of camera asked for it: a movie request plays the timeline of
+-- the same number on PC, and the game reports its start as a movie and its skip as a timeline.
 local function key_of(ev)
-    return tostring(ev.camera or 1) .. ":" .. tostring(ev.id)
+    return tostring(ev.id)
 end
 CutsceneSync.key_of = key_of
 
@@ -248,19 +252,36 @@ function CutsceneSync:on_skip(m, now)
     end
 end
 
--- Partner skips: applied as soon as that cutscene plays here.
+-- A replay of that cutscene is on its way here (waiting, or started and not seen ending).
+function CutsceneSync:replay_coming(k)
+    if self.replay ~= nil and self.replay.key == k then return true end
+    for _, p in ipairs(self.pending) do
+        if key_of(p.ev) == k then return true end
+    end
+    return false
+end
+
+-- Partner skips: applied once that cutscene plays here and a player here could skip it
+-- (world:cutscene_skip waits for that: docs/RESEARCH.md 3.36). Dropped when ours was skipped
+-- already, or when it never comes.
 function CutsceneSync:apply_skips(now, world)
     for k, s in pairs(self.skips) do
         if now - s.time > SKIP_WINDOW then
             self.skips[k] = nil
+            self.log("cutscene %s: the partner's skip expired (never skippable here)", k)
         else
-            local r = world:cutscene_skip(s.ev.camera, s.ev.id)
-            if r ~= "missing" then
+            local r = world:cutscene_skip(s.ev.camera, s.ev.id, now)
+            if r == "skipped" then
                 self.skips[k] = nil
-                if r == "skipped" then
-                    self.skipped[k] = now
-                    self.counters.skips_applied = self.counters.skips_applied + 1
+                self.skipped[k] = now
+                self.counters.skips_applied = self.counters.skips_applied + 1
+                if now - s.time > 0.5 then
+                    self.log("cutscene %s: the partner's skip applied after %.1f s", k, now - s.time)
                 end
+            elseif r == "done" or r == "failed" then
+                self.skips[k] = nil
+            elseif r == "missing" and now - s.time > SKIP_MISSING and not self:replay_coming(k) then
+                self.skips[k] = nil -- it played and ended here, or never comes
             end
         end
     end

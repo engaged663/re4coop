@@ -712,6 +712,36 @@ T.run("the_bells_chapter_change_runs_untouched_on_the_client", function()
     T.eq(s:status().screen.counters.transitions, 1, "one transition counted")
 end)
 
+-- A skip that already went wrong (docs/RESEARCH.md 3.36): the skipped camera stays, its event
+-- stays on and the EVENT layer dark. The old watchdog took that for a cutscene still playing.
+T.run("a_cutscene_left_black_by_a_skip_is_brought_back", function()
+    local s, net, clock, game, world = make("client", { settings = { transition_gate = false } })
+    with_transitions(game, world)
+    game.ended, game.cams = {}, {}
+    function game:cameras() return self.cams end
+    function game:end_camera(id)
+        self.ended[#self.ended + 1] = id
+        self.cams = {}
+        world.playing = nil
+        return true
+    end
+    function game:fade_report() return "4=2/2" end
+    world.playing = true
+    game.cams = { { camera = 1, id = 10153, skipped = true, play_id = 7, address = 1 } }
+    game.fades = { [4] = true }
+    for _ = 1, 200 do
+        clock.t = clock.t + 0.1
+        net.push(player_msg(clock.t, 21100, 40200, { x = 1, y = 0, z = 0 }))
+        s:update()
+    end
+    T.eq(game.ended[1], 7, "the stuck skipped camera was ended")
+    T.eq(#game.ended, 1, "once")
+    T.eq(game.lifted[1], 4, "the EVENT layer lifted")
+    T.eq(game.fades[4], nil, "the picture is back")
+    T.check(told(s, "skipped cutscene"), "the player told")
+    T.eq(s:status().screen.counters.skip_rescues, 1, "counted")
+end)
+
 T.run("a_hold_never_outlasts_our_transition", function()
     local s, net, clock, game, world = make("client")
     with_transitions(game, world)

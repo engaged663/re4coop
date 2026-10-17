@@ -56,11 +56,15 @@ Session rules:
 | `stats()` | Table: `rtt_ms, peer, peer_name, bytes_sent, bytes_recv, resends, reliable_in_flight, out_of_order, unordered_duplicates, …` |
 | `local_addresses()` | Array of this PC's LAN IPv4 addresses |
 | `time()` | Monotonic seconds (`os.clock` is CPU time, so don't use it for networking) |
-| `max_payload()`, `version()` | `1188`; `"0.11.2", 2` |
+| `max_payload()`, `version()` | `1188`; `"0.11.3", 2` |
 | `new_session()` | An independent session object with the same methods (tests/tools) |
 | `window_focused()` | Whether a window of this process is the foreground window (true off Windows): the Ashley key only counts while the game has the focus |
 
 ## Game messages (game protocol version 15)
+
+Mod 0.11.3 keeps version 15: a CUTSCENE_SKIP is applied only once the receiving game could skip
+that cutscene itself, and a cutscene is one cutscene whatever camera kind (movie or timeline)
+reported it ([RESEARCH.md](RESEARCH.md) section 3.36).
 
 Mod 0.11.2 keeps version 15 too: a client joining late now loads straight into the host's
 place ([RESEARCH.md](RESEARCH.md) section 3.34), from the PLAYER messages it already gets (the

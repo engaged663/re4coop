@@ -2168,6 +2168,63 @@ ahead the world may not match the chapter (a door open, a key item missing). A c
 point lists but the save does not hold (Ashley at chapter 5's start from a save before she joins)
 is not created; Ashley from a later save comes along to an earlier chapter's start.
 
+### 3.36 The black screen after a skipped cutscene (0.11.3)
+
+**Report.** The black screen of §3.33 kept happening; the players then saw what it needs: it only
+comes right after a cutscene is skipped. The client's screen (sometimes the host's) stays black
+when the cutscene ends.
+
+**Evidence.** The client's breadcrumbs of the run (0.11.2, chapter 1 at stage 40501):
+`world.cutscene_play 2:10153` (the host's cutscene 10153 started here as its replay), then 42
+frames (about half a second) later `world.cutscene_skip 1:10153` (the host's skip set InputSkip on
+our copy), then 30 s of nothing but scans until the host's game went away; no `fade_in` from the
+0.11.1 watchdog. `csa153` is a short Leon/villager timeline; `mva153` is in `MovieDefine.ID` but
+has no movie file: the level asks for the movie and `procPayloadPlay` plays the timeline of the
+same number (its CameraMovie path falls through to a CameraTimeline when the movie catalog says
+so), records it in `_HasDone` as a *timeline*, and the PlayWork's `CamType` is Timeline - so the
+start is reported as `2:10153` and the skip as `1:10153`.
+
+What re4.exe does with a skip (addresses of this build):
+
+| Function (address) | What it does |
+|---|---|
+| `ClapperboardMediator.procSkip` (0x1419b28a0) | Each frame, for a PlayWork not yet skipped: if `canSkip()` it opens the skip prompt (`DispUI`) and, if `InputSkip` is set, skips at once: `DoneSkip = 1`, `onRequestedSkip()` |
+| `PlayWorkTimeline.canSkip` / `canSkipAndPause` (0x14065d3c0 / 0x1438f41a0) | The flow item allows skipping (`_IsSkip`), no auto-walk, and the event work is `Playing` (7) or `Pause` (9) - true from the first frame it plays |
+| `PlayWorkTimeline.onRequestedSkip` (0x1439631b0) → `TimelineEventMediator.requestSkip` (0x142e3d9f0) → `TimelineEventWork.changeEventPhase(Skip)` (0x142f6def0) | `AppEventCommandRequester.skip(owner, id, finishAction, onCompletedFadeOutAction)` (0x1414412b0): the skip fades the screen out, jumps, and the end fades it in |
+| `AppEventFade.requestFadeOut` / `requestFadeIn` (0x142fd82f0 / 0x1402f3a30) | Every event fade is FadeType EVENT (4) |
+| `share.FadeController.fadeOut` / `fadeIn` (0x141f680c0 / 0x141f67f10) | The layer **counts** its fade-outs (`_RefCounter`, +0x78): a fade-out only starts - and only takes its completion callback - when the count becomes 1 and the layer is not already dark; a fade-in only lights the layer when the count is back at 0 |
+| `EventPauseSkipGuiBehavior` | The skip prompt: the player holds the button (`getInitSkipButtonHoldTime`) before its callback sets `InputSkip` |
+
+So a player can never skip in a cutscene's first moment: the prompt opens on the first frame
+`canSkip()` holds and then has to be held. 0.11.2 applied a partner's skip by setting `InputSkip`
+as soon as our copy's PlayWork existed - while it was still loading - and `procSkip` then skipped
+on the very first playing frame, inside the cutscene's own start fade (`csa153`: a 0.5 s fade on
+each side). The skip's fade-out landed on a layer still dark from the start fade: the counts no
+longer match what the cutscene's end lifts, and the skip's own fade-out callback is not taken -
+the EVENT layer stays dark after the cutscene (and the event may never finish). The host hits it
+when the client skips first and the host's copy is the one that just started. The 0.11.1
+watchdog never fired: the stuck camera and event counted as a cutscene still playing.
+
+**Fix (0.11.3).**
+- A partner's skip is applied the way a player skips: `World:cutscene_skip` answers "waiting"
+  until our copy's PlayWork `canSkip()`, its skip prompt is up (`DispUI`), the EVENT layer is lit
+  (the start fade over) and all of that has held for 1 s; only then `InputSkip`. "done" if ours
+  was skipped already (both players skipped: dropped), "missing" if it is not playing here (kept
+  10 s, or while a replay of it is on its way; 60 s at most).
+- A cutscene is one cutscene whatever camera reported it: the sync's keys are the ID alone, and
+  `cutscene_done` asks `_HasDone` as movie and as timeline (a movie request is recorded as its
+  timeline), so a partner's `2:10153` is never replayed over our `1:10153`.
+- `screen_watch.lua` watches every skip (a camera with `DoneSkip`): if 15 s later the skipped
+  camera is still there or a fade layer (INTER_GAMESTATE, GAMESTATE, CAMPAIGN_JUMPER, GUI, EVENT)
+  has been dark without a break for half that time - no transition, no other camera - it ends the
+  skipped cameras (`ClapperboardMediator.requestEnd(playid)`, 0x1419b8160, what gimmicks use) and
+  lifts those layers (`FadeManager.requestFadeIn`, one count each), logs the layers' phases and
+  counts (`Game:fade_report`) and tells the player. Diagnostics: "skipped cutscenes watched",
+  "black after a skip, brought back".
+
+**Limits.** Not run in the game yet. The rescue lifts one count per layer; a layer with more left
+stays dark (the log line shows the counts). A skip a player makes by hand is untouched.
+
 ## 4. Sync architecture
 
 ```

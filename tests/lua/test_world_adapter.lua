@@ -358,22 +358,83 @@ T.run("cutscene_skips_are_seen_and_applied_like_the_skip_button", function()
     T.eq(skips[1].id, 100, "camera id")
     mock.update_cutscene_skip() -- it ends after its fade
     T.eq(world.current_cutscene, nil, "over")
-    -- The partner's skip here: through the same input, and not reported back.
+    -- The partner's skip here: through the same input, once a player could, and not reported back.
     mock.start_cutscene(200)
-    T.eq(w:cutscene_skip(1, 999), "missing", "not that cutscene")
-    T.eq(w:cutscene_skip(1, 200), "skipped", "skip requested")
+    mock.update_cutscene_skip() -- playing: its skip prompt shows
+    T.eq(w:cutscene_skip(1, 999, 10.0), "missing", "not that cutscene")
+    T.eq(w:cutscene_skip(1, 200, 10.0), "waiting", "not at once: a player holds the button first")
+    T.eq(w:cutscene_skip(1, 200, 10.5), "waiting", "still holding")
+    T.eq(w:cutscene_skip(1, 200, 11.1), "skipped", "skip requested")
     mock.update_cutscene_skip()
     w:update()
     mock.update_cutscene_skip()
     T.eq(world.skips, 2, "skipped by the game")
     T.eq(#skips, 1, "our application is not reported")
+    T.eq(w:cutscene_skip(1, 200, 12.0), "missing", "over")
     -- A cutscene the game does not let skip keeps playing.
     world.unskippable = true
     mock.start_cutscene(300)
-    w:cutscene_skip(1, 300)
-    mock.update_cutscene_skip()
-    mock.update_cutscene_skip()
+    for t = 20, 23, 0.5 do
+        T.eq(w:cutscene_skip(1, 300, t), "waiting", "never skippable here")
+        mock.update_cutscene_skip()
+    end
     T.check(world.current_cutscene ~= nil, "still playing")
+end)
+
+-- The black screen after a skip (docs/RESEARCH.md 3.36): the partner skipped a cutscene that our
+-- game had only just started (a replay of theirs). 0.11.2 set InputSkip at once; the game skips
+-- at the first frame it can, while the cutscene's start fade still holds the EVENT layer dark,
+-- and that fade-out is never lifted.
+T.run("a_partners_skip_waits_until_a_player_here_could_skip", function()
+    local w, game, world = fresh()
+    world.cutscene_load_frames, world.cutscene_start_fade_frames = 4, 6
+    -- What 0.11.2 did: InputSkip right away.
+    mock.start_cutscene(10153)
+    mock.press_skip()
+    for _ = 1, 30 do mock.update_cutscene_skip() end
+    T.eq(world.stuck_skips, 1, "the mock reproduces the stuck skip")
+    T.eq(world.fades[4], true, "black")
+    T.check(world.current_cutscene ~= nil, "and the cutscene never ends")
+    mock.end_cutscene()
+    world.fades[4] = nil
+    -- Now: the skip waits for the cutscene to play, its start fade to end and the prompt's hold.
+    mock.start_cutscene(10154)
+    local t, applied_at, fade_over_at = 100.0, nil, nil
+    for frame = 1, 60 do
+        local r = w:cutscene_skip(1, 10154, t)
+        if r == "skipped" and applied_at == nil then applied_at = t end
+        mock.update_cutscene_skip()
+        if fade_over_at == nil and not world.fades[4] then fade_over_at = t end
+        t = t + 0.1
+        if world.current_cutscene == nil then break end
+    end
+    T.eq(world.stuck_skips, 1, "no new stuck skip")
+    T.check(applied_at ~= nil and fade_over_at ~= nil and applied_at - fade_over_at >= 0.95,
+        "applied a hold's time after the start fade: " .. tostring(applied_at) .. " / " .. tostring(fade_over_at))
+    T.eq(world.current_cutscene, nil, "skipped and over")
+    T.eq(world.fades[4], nil, "the picture is back")
+end)
+
+T.run("a_movie_and_its_timeline_are_one_cutscene", function()
+    local w, game, world = fresh()
+    world.movie_timelines = true -- PC: a movie request plays the timeline of the same number
+    mock.start_cutscene(10153, { camera = 2 })
+    T.eq(w:cutscene_done(2, 10153), true, "done, asked as the movie")
+    T.eq(w:cutscene_done(1, 10153), true, "and as its timeline")
+    T.eq(w:cutscene_done(2, 10154), false, "another one is not")
+    local cams = game:cameras()
+    T.eq(#cams, 1, "one camera")
+    T.eq(cams[1].camera, 1, "built as a timeline")
+    T.eq(cams[1].id, 10153, "its id")
+    T.eq(cams[1].skipped, false, "not skipped")
+    mock.update_cutscene_skip()
+    T.eq(w:cutscene_skip(2, 10153, 1.0), "waiting", "a skip reported as the movie finds its timeline")
+    T.eq(w:cutscene_skip(2, 10153, 2.1), "skipped", "and skips it")
+    mock.update_cutscene_skip()
+    T.eq(w:cutscene_skip(2, 10153, 2.2), "done", "skipped here already: nothing to wait for")
+    T.check(game:end_camera(cams[1].play_id), "a camera can be ended")
+    T.eq(world.current_cutscene, nil, "ended (ClapperboardMediator.requestEnd)")
+    T.eq(game:fade_dark(4), false, "EVENT layer lit")
 end)
 
 T.run("doors_are_read_and_held_open_for_the_partner", function()
