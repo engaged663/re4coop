@@ -18,7 +18,9 @@
 -- when, SKIP_STUCK seconds after the skip, the skipped camera is still there or a transition or
 -- event fade has been dark for half that time without a break - with no transition and no
 -- other camera running - it hands back a rescue: end the skipped cameras still there and lift
--- those layers.
+-- those layers. A camera with the skipped one's number is no other camera: it is the game
+-- showing that cutscene again (a request it queued behind it, docs/RESEARCH.md 3.37), and it is
+-- ended with it.
 --
 -- tick(now, s) with s = {
 --   transition = bool,           our game is between two moments of play
@@ -159,7 +161,7 @@ end
 -- once if the screen is still black (or the skipped camera still there) SKIP_STUCK seconds on.
 function ScreenWatch:watch_skip(now, s)
     local cams = s.cameras or {}
-    local live, skipped, other = {}, {}, false
+    local live, skipped, again, other = {}, {}, {}, false
     for _, c in ipairs(cams) do
         if c.address ~= nil then live[c.address] = true end
         if c.skipped then
@@ -167,12 +169,19 @@ function ScreenWatch:watch_skip(now, s)
             if c.address ~= nil and not self.skips_seen[c.address] then
                 self.skips_seen[c.address] = true
                 if self.skip == nil then
-                    self.skip = { since = now, what = ("%s:%s"):format(tostring(c.camera), tostring(c.id)) }
+                    self.skip = { since = now, id = c.id, what = ("%s:%s"):format(tostring(c.camera), tostring(c.id)) }
                     self.counters.skips_watched = self.counters.skips_watched + 1
                 end
             end
-        else
-            other = true
+        end
+    end
+    for _, c in ipairs(cams) do
+        if not c.skipped then
+            if self.skip ~= nil and c.id ~= nil and c.id == self.skip.id then
+                again[#again + 1] = c -- the same cutscene again: the game's queued second showing
+            else
+                other = true
+            end
         end
     end
     for a in pairs(self.skips_seen) do
@@ -207,8 +216,10 @@ function ScreenWatch:watch_skip(now, s)
     if next(stuck) == nil and #skipped == 0 then return nil end -- dark only for a moment: wait
     w.done = true
     local ends = {}
-    for _, c in ipairs(skipped) do
-        if c.play_id ~= nil then ends[#ends + 1] = c.play_id end
+    for _, list in ipairs({ skipped, again }) do
+        for _, c in ipairs(list) do
+            if c.play_id ~= nil then ends[#ends + 1] = c.play_id end
+        end
     end
     self.counters.skip_rescues = self.counters.skip_rescues + 1
     return { end_cameras = ends, lift = sorted_keys(stuck), what = w.what }

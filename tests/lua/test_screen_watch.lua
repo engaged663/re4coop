@@ -151,4 +151,28 @@ T.run("a_skip_into_a_chapter_change_or_the_next_cutscene_is_not_rescued", functi
     end
 end)
 
+-- docs/RESEARCH.md 3.37: the game's queued second showing of the skipped cutscene starts inside
+-- the skip's fade and never plays - the same number, not skipped, the screen black.
+T.run("a_second_showing_of_the_skipped_cutscene_is_ended_with_it", function()
+    local w = make()
+    local COPY = { camera = 1, id = 10153, skipped = false, play_id = 9, address = 0x300 }
+    w:tick(0, after_skip({ SKIPPED }, { 4 }))
+    local rescue_at, rescue
+    for t = 0.5, 40, 0.5 do
+        local _, r = w:tick(t, after_skip({ COPY }, { 4 }))
+        if r ~= nil and rescue == nil then rescue_at, rescue = t, r end
+    end
+    T.check(rescue ~= nil, "rescued: the same cutscene again is no other cutscene")
+    T.near(rescue_at, ScreenWatch.SKIP_STUCK, 0.01, "after SKIP_STUCK")
+    T.eq(rescue.end_cameras[1], 9, "the second showing is ended")
+    T.eq(rescue.lift[1], 4, "the EVENT layer lifted")
+    -- A second showing on screen is a cutscene playing, not a black screen.
+    local w2 = make()
+    w2:tick(0, after_skip({ SKIPPED }, { 4 }))
+    for t = 0.5, 40, 0.5 do
+        local _, r = w2:tick(t, after_skip({ COPY }, {}))
+        T.eq(r, nil, "left alone")
+    end
+end)
+
 T.finish()

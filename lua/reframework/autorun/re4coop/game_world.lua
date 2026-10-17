@@ -22,7 +22,8 @@
 --   * Read in re4.exe's code too: the gimmick table through GimmickManager.saveGameSaveData,
 --     applied gimmick by gimmick (findContext, GimmickContext.loadSaveDataFromManager,
 --     pushDirtyList); cutscene skips through ClapperboardMediator._Plays (PlayWork.InputSkip /
---     DoneSkip).
+--     DoneSkip); a replayed movie recorded as seen through ClapperboardMediator.setHasDone
+--     (docs/RESEARCH.md 3.37).
 --   * Found in the game's type database: gimmick _Routine states.
 --   * Read in re4.exe's code too (docs/RESEARCH.md 3.24): GmBase.setGmFlag(value, trigger, args)
 --     writes the gimmick flag and runs the gimmick's own onChangeGmFlag (its reaction: the
@@ -59,6 +60,8 @@ local GIM_SAVE = "chainsaw.GimmickContext.SaveData"
 local CLAP = "chainsaw.ClapperboardMediator"
 local PAYLOAD_PLAY = "chainsaw.ClapperboardMediator.PayloadPlay"
 local PLAY_WORK = "chainsaw.ClapperboardMediator.PlayWork"
+local CAMERA_BASE = "chainsaw.ClapperboardMediator.CameraBase"
+local CAMERA_MOVIE = "chainsaw.ClapperboardMediator.CameraMovie"
 local GM_DOOR = "chainsaw.GmDoor"
 local FLAG_INFO = "chainsaw.ScenarioFlagManager.FlagInfo"
 local COORD_PACK = "chainsaw.PlayerCoordSetting.Pack"
@@ -199,7 +202,8 @@ function World.new(game, log)
     self.replayed = {}       -- PortrayalSettings address -> until: sequences we replayed (their end effects muted)
     self.reacting = false    -- a gimmick reacts to the partner's change (gimmick_react)
     self.counters = { flag_events = 0, cutscene_events = 0, trigger_events = 0, trigger_not_event = 0,
-        skip_events = 0, gimmicks_applied = 0, gimmicks_waiting = 0, gimmick_reactions = 0, muted_effects = 0 }
+        skip_events = 0, gimmicks_applied = 0, gimmicks_waiting = 0, gimmick_reactions = 0, muted_effects = 0,
+        cutscene_repeats = 0, movies_marked_seen = 0 }
     self.gim_waiting = {}    -- ctx_key -> {item, since}: partner gimmicks whose context is not set up here yet
     self.skips_seen = {}     -- PlayWork address -> true: skips already reported
     self.doors = {}          -- GameObject GUID -> {comp, go, pos, kind}: the doors of the loaded areas
@@ -362,6 +366,8 @@ function World:probe()
     self.cs_proc_m = r:find_method(CLAP, function(i) return i.name == "procPayloadPlay" and params_are(i, { "System.UInt32", PAYLOAD_PLAY }) end)
     self.cs_emit_m = r:find_method(CLAP, function(i) return i.name == "emitPlayID" and #i.params == 0 end)
     self.cs_done_m = r:find_method(CLAP, function(i) return i.name == "checkHasDone" and params_are(i, { "System.Int32", "System.Int32" }) end)
+    -- setHasDone(CameraBase) records a camera as seen, as procPayloadPlay does for the one it built.
+    self.cs_set_done_m = r:find_method(CLAP, function(i) return i.name == "setHasDone" and params_are(i, { CAMERA_BASE }) end)
     local cs_ok = self.cs_proc_m ~= nil and self.cs_emit_m ~= nil and r:type(PAYLOAD_PLAY) ~= nil
     self:cap("cutscenes", cs_ok, cs_ok and "ClapperboardMediator.procPayloadPlay (PayloadPlay)"
         or (self.cs_proc_m == nil and "no procPayloadPlay" or "no emitPlayID / PayloadPlay"))
@@ -468,7 +474,15 @@ function World:install_hooks(callbacks)
             local ev = self:read_payload(R.arg_obj(args[base + 1]))
             if ev ~= nil then
                 self.counters.cutscene_events = self.counters.cutscene_events + 1
-                pcall(cb, ev)
+                local ok, verdict = pcall(cb, ev)
+                -- Our game asked again for the cutscene it is showing (or just showed) as the
+                -- partner's copy: procRequest would queue it behind that copy and show it a
+                -- second time (docs/RESEARCH.md 3.37). Neither played nor queued.
+                if ok and verdict == "repeat" then
+                    self.counters.cutscene_repeats = self.counters.cutscene_repeats + 1
+                    self:crumb("world.cutscene_repeat", ("%d:%d"):format(ev.camera, ev.id), true)
+                    return sdk.PreHookResult.SKIP_ORIGINAL
+                end
             end
         end)
     end
@@ -1732,6 +1746,24 @@ function World:cutscene_play(ev)
     local played = pcall(self.cs_proc_m.method.call, self.cs_proc_m.method, mgr, play_id, p)
     self.applying_cutscene = false
     if not played then return false, "procPayloadPlay failed" end
+    if ev.camera == P.CAMERA.MOVIE then self:mark_movie_seen(ev.id) end
+    return true
+end
+
+-- procPayloadPlay records the camera it built as seen (_HasDone). A movie request that PC
+-- plays as the timeline of the same number goes in as that timeline (1, id), never as the
+-- movie (2, id): our own game's request of the same movie then passed the play-once check
+-- (setupAndCheck), and procRequest queued it behind our copy for a second showing - which,
+-- started inside the fade of a skip, stayed black (docs/RESEARCH.md 3.37). The movie is
+-- recorded too, as the game records a movie it plays as a movie.
+function World:mark_movie_seen(id)
+    local mgr = self.r:singleton(CLAP)
+    if mgr == nil or self.cs_set_done_m == nil then return false end
+    local cam = R.new_instance(CAMERA_MOVIE)
+    if cam == nil or not R.set(cam, "MovieID", id) then return false end
+    if not pcall(self.cs_set_done_m.method.call, self.cs_set_done_m.method, mgr, cam) then return false end
+    self.counters.movies_marked_seen = self.counters.movies_marked_seen + 1
+    self:crumb("world.cutscene_seen", ("2:%d"):format(id))
     return true
 end
 

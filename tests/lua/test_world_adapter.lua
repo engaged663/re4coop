@@ -450,6 +450,70 @@ T.run("a_movie_and_its_timeline_are_one_cutscene", function()
     T.eq(game:fade_dark(4), false, "EVENT layer lit")
 end)
 
+-- The black after the bell (docs/RESEARCH.md 3.37), as the client's log of 0.11.4 shows it: our
+-- copy of the host's 2:10011 played; 2 s later our own game asked for 2:10011 itself; the
+-- host's skip ended our copy, and the game started its queued second showing inside the skip's
+-- fade - which never played and never lit the screen.
+T.run("our_games_own_request_of_the_partners_movie_is_no_second_showing", function()
+    local w, game, world = fresh()
+    world.movie_timelines = true -- PC: the movie request plays the timeline of the same number
+    world.skip_fade_frames = 5
+    local mediator = world.singletons["chainsaw.ClapperboardMediator"]
+    local function payload(id)
+        return mock.new("chainsaw.ClapperboardMediator.PayloadPlay", { __fields = { CameraType = 2, ID = id,
+            Screen = 0, DataOwnerCode = 0xFFFFFFFF, EndPortrayal = 0 } })
+    end
+    local function skip_and_settle()
+        mock.update_cutscene_skip()
+        mock.press_skip()
+        for _ = 1, 20 do mock.update_cutscene_skip() end
+    end
+    -- What happened: the copy played as the game's own procPayloadPlay call (all 0.11.4 did).
+    mediator:call("procPayloadPlay", mediator:call("emitPlayID"), payload(10011))
+    T.eq(w:cutscene_done(1, 10011), true, "the game recorded the timeline it played")
+    T.eq(w:cutscene_done(2, 10011), false, "but not the movie")
+    T.check(mock.start_cutscene(10011, { camera = 2 }) ~= 0, "so our game's own request passed the play-once check")
+    T.eq(#world.queued, 1, "and procRequest queued it behind our copy")
+    skip_and_settle()
+    T.eq(world.stuck_starts, 1, "the mock reproduces the second showing stuck inside the skip's fade")
+    T.eq(world.fades[4], true, "black")
+    T.check(world.current_cutscene ~= nil, "with its camera there for good")
+    game:end_camera(world.current_cutscene.play_id)
+    game:lift_fade(4, 0.5)
+    -- Now: our copy records the movie as seen too; the game refuses its own request.
+    T.check(w:cutscene_play({ camera = 2, id = 10012 }), "our copy of the partner's movie")
+    T.eq(w:cutscene_done(2, 10012), true, "recorded as the movie too")
+    T.eq(w.counters.movies_marked_seen, 1, "counted")
+    local refused = world.refused_requests or 0
+    T.eq(mock.start_cutscene(10012, { camera = 2 }), 0, "our game's own request is refused as seen")
+    T.eq(world.refused_requests, refused + 1, "by the play-once check")
+    T.eq(#world.queued, 0, "nothing queued")
+    skip_and_settle()
+    T.eq(world.stuck_starts, 1, "no new stuck showing")
+    T.eq(world.current_cutscene, nil, "skipped and over")
+    T.eq(world.fades[4], nil, "the picture is back")
+end)
+
+T.run("a_repeat_the_sync_names_is_neither_played_nor_queued", function()
+    local w, _, world = fresh()
+    world.movie_timelines = true
+    local seen, verdict = {}, nil
+    w:install_hooks({ on_cutscene = function(ev) seen[#seen + 1] = ev return verdict end })
+    w.cs_set_done_m = nil -- the movie could not be recorded as seen
+    T.check(w:cutscene_play({ camera = 2, id = 10011 }), "our copy of the partner's movie")
+    T.eq(w:cutscene_done(2, 10011), false, "not recorded as the movie")
+    verdict = "repeat"
+    T.check(mock.start_cutscene(10011, { camera = 2 }) ~= 0, "our game asks for it again")
+    T.eq(#seen, 1, "reported to the sync")
+    T.eq(#world.queued, 0, "dropped before procRequest could queue it")
+    T.eq(w.counters.cutscene_repeats, 1, "counted")
+    T.eq(world.current_cutscene.play_id, 1, "our copy plays on")
+    -- Any other answer lets the game go on as usual.
+    verdict = nil
+    mock.start_cutscene(10013, { camera = 1 })
+    T.eq(#world.queued, 1, "another cutscene queues behind it as the game does")
+end)
+
 T.run("doors_are_read_and_held_open_for_the_partner", function()
     local w, game, world = fresh()
     T.eq(game:capabilities().doors.ok, true, "GmDoor keep-open slots found")

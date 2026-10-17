@@ -24,6 +24,12 @@
 -- fade over, its skip prompt up for a moment (a skip that landed in the cutscene's first frames
 -- left the screen black, docs/RESEARCH.md 3.36). The game skips it the way its own button does,
 -- so a cutscene that cannot be skipped there is not.
+--
+-- Both games run the same level, so the game whose copy is the partner's often asks for the
+-- same cutscene itself a moment later (its own trigger or timer). Its game would queue that
+-- request behind our copy and show the cutscene a second time; started inside the fade of a
+-- skip, that second showing stayed black for good (docs/RESEARCH.md 3.37). on_local_start
+-- answers "repeat" for it and the adapter drops it.
 -- Travel (optional): travel:request(target) / travel:busy()
 -- opts.on_replay(started, now): a replay of the partner's cutscene started / ended here
 
@@ -41,6 +47,7 @@ local FAR = 30.0
 local START_TIMEOUT = 15.0   -- a replay that never shows up as playing here counts as over
 local SKIP_WINDOW = 60.0     -- a partner's skip waits at most this long for the cutscene to be skippable here
 local SKIP_MISSING = 10.0    -- ...and this long for it to start here, unless a replay of it is on its way
+local REPEAT_WINDOW = 60.0   -- our game asking for a cutscene its partner's copy ended this recently: a repeat
 
 local function dist(a, b)
     local dx, dy, dz = a.x - b.x, a.y - b.y, a.z - b.z
@@ -81,21 +88,37 @@ function CutsceneSync:reset()
     self.sent = {}      -- key -> time we announced it
     self.played = {}    -- key -> time we played or triggered it
     self.replay = nil   -- {key, started, seen}: our copy of the partner's cutscene
+    self.replayed = {}  -- cutscene number -> time our copy of it ended after playing here
     self.skips = {}     -- key -> {ev, time}: partner skips waiting for that cutscene to play here
     self.skipped = {}   -- key -> time we skipped it for the partner (not reported back)
     self.counters = { sent = 0, received = 0, played = 0, dropped = 0, already_seen = 0, skips_sent = 0,
-        skips_received = 0, skips_applied = 0 }
+        skips_received = 0, skips_applied = 0, repeats = 0 }
 end
 
 function CutsceneSync:enabled()
     return self.settings.sync_cutscenes ~= false
 end
 
+-- Our game asks for a cutscene it is showing - or showed a moment ago - as the partner's copy.
+function CutsceneSync:is_repeat(ev, now)
+    local id = tostring(ev.id)
+    if self.replay ~= nil and id_of(self.replay.key) == id then return true end
+    local t = self.replayed[id]
+    return t ~= nil and now - t < REPEAT_WINDOW
+end
+
 -- The local game started a cutscene (adapter hook on procPayloadPlay).
 -- ev = { camera, id, screen, owner_code, end_portrayal, start_flags, end_flags, coords }
+-- Returns true when it was sent to the partner, "repeat" when it must not play here (the
+-- partner's copy of it is that cutscene here), false otherwise.
 function CutsceneSync:on_local_start(ev, now, loc)
     if not self:enabled() or ev == nil or ev.id == nil then return false end
     local k = key_of(ev)
+    if self:is_repeat(ev, now) then
+        self.counters.repeats = self.counters.repeats + 1
+        self.log("cutscene %s: our game asked for it again after the partner's copy - not shown twice", k)
+        return "repeat"
+    end
     self.played[k] = now
     for i = #self.pending, 1, -1 do
         if key_of(self.pending[i].ev) == k then table.remove(self.pending, i) end -- we reached it ourselves
@@ -145,7 +168,9 @@ function CutsceneSync:drop(i, why)
 end
 
 function CutsceneSync:end_replay(now)
-    if self.replay == nil then return end
+    local r = self.replay
+    if r == nil then return end
+    if r.seen and now ~= nil then self.replayed[id_of(r.key)] = now end
     self.replay = nil
     self.on_replay(false, now)
 end

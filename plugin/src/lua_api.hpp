@@ -7,7 +7,7 @@ struct lua_State;
 
 namespace re4coop {
 
-constexpr const char* kVersion = "0.11.4";
+constexpr const char* kVersion = "0.11.5";
 
 // Pushes the API table onto the stack (luaopen_* convention). Returns 1.
 int open_lua_api(lua_State* L);

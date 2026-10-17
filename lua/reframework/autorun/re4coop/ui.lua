@@ -454,8 +454,8 @@ local function draw_diagnostics(session, game, session_status, puppet, perf)
             sync_line("event triggers", session_status.triggers)
             if session_status.world_events then
                 local we = session_status.world_events
-                imgui.text(("seen in our game: flag changes %d, cutscenes %d, skips %d, event triggers %d (other triggers %d%s)"):format(
-                    we.flag_events or 0, we.cutscene_events or 0, we.skip_events or 0, we.trigger_events or 0,
+                imgui.text(("seen in our game: flag changes %d, cutscenes %d (asked again for the partner's, dropped: %d), skips %d, event triggers %d (other triggers %d%s)"):format(
+                    we.flag_events or 0, we.cutscene_events or 0, we.cutscene_repeats or 0, we.skip_events or 0, we.trigger_events or 0,
                     we.trigger_not_event or 0,
                     session_status.world_last_not_event and (", last: " .. session_status.world_last_not_event) or ""))
                 imgui.text(("partner gimmick states applied here: %d (%d wait for their area), %d reacted live, %d partner effects muted"):format(

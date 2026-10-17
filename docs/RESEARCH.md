@@ -2242,6 +2242,72 @@ partner's cutscene or skip back without a trace, and both are undone or bounded:
 - a partner on another release of the mod (same protocol, so it connects) is named once on
   screen and in the log: two releases can treat a cutscene or a skip differently.
 
+### 3.37 The black screen after skipping the bell: a second showing (0.11.5)
+
+**Report.** With 0.11.4 cutscenes synchronised again, but right after the host skipped the
+cutscene at the bell in the village the client's screen showed the loading indicator for a
+second and then stayed black for good (the game still running, 84 fps).
+
+**Evidence.** The client's `re2_framework_log.txt` (0.11.4 logs every cutscene decision):
+
+```
+22:14:34.835 cutscene 2:10011 from the partner (chapter 21100, stage 40200)
+22:14:35.169 cutscene 2:10011 replayed here
+22:14:36.742 cutscene 1:10011: the partner skipped it
+22:14:36.745 cutscene 1:10011: the partner's skip waits (holding the skip button)
+22:14:37.359 cutscene 2:10011 started here: sent to the partner
+22:14:37.748 cutscene 1:10011: the partner's skip applied here after 1.0 s
+```
+
+Every earlier cutscene of the run played and was skipped in both games. The fifth line is the
+client's *own* game asking for the movie `mva011` (played as `csa011`, §3.36) 2.2 s after our
+copy of the host's had started - its own level logic (a trigger or the village's timer; the log
+does not say which) fired a moment after the host's, as both games run the same level. After the
+skip: no line from either watchdog, only the partner model rebuilt (as after every cutscene).
+
+What re4.exe does with that second request (addresses of this build):
+
+| Function (address) | What it does |
+|---|---|
+| `ClapperboardMediator.requestPlayWithID` (0x1419baa60) → `setupAndCheck` (0x1419df720) | Post `Auto` becomes `Once` for timelines and movies; a `Once` request whose camera's (type, number) is in `_HasDone` is refused (`Option.fireOnFailed`, play id 0) |
+| `calcRequest` (0x141913670) | A `Once` request loses its OnPlay/OnEnd/OnFailed callbacks and goes into a PayloadPlay for `procPayloadPlay` |
+| `procPayloadPlay` (0x1419b1ae0) | A movie whose dynamic resource data names a timeline (`TimelineEventResourceManager.getDynamicResourceData`) is built as a `CameraTimeline` of the same number; `procRequest` for each camera controller; then **the built camera's** (type, number) goes into `_HasDone` - (1, 10011) for `mva011`, never (2, 10011) |
+| `procRequest` (0x1419b1ef0) | A `CameraTimeline` requested while a PlayWork is on that screen is dropped if its number is one of 20 listed (10009, 10010, 10015, 10017, 10023, 10110, 10111, 10113, 10117, 10119, 10140, 10150, 10156, 20106, 20107, 20116-20118, 20131, 20133); any other is **queued**: a `ReserveWork` in `_Reserves[screen]` |
+| `updateWork` (0x141a281f0) | Once the screen has no PlayWork and the player's camera is back, the first `ReserveWork` goes through `procRequest`: the queued cutscene plays |
+| `execEndBase` (0x141939600) | At a camera's end: its OnEnd, its end flags (`requestSetFlag`) and its next step (`PortrayalSettings.call(EndPortrayal)` on the data owner) |
+| `setHasDone` (0x1419c7700) | Puts a camera's (`CameraType`, `CameraID`) in `_HasDone`; `CameraMovie` answers 2 and its `MovieID` |
+
+So for a timeline the game refuses the second request itself (our copy's `procPayloadPlay` put
+its number in `_HasDone`), but a movie request played as a timeline is recorded under the
+timeline's key and the same movie asked for again passes the check. Our copy was playing, so
+`procRequest` queued the second request; the host's skip ended our copy, and on the next frame
+`updateWork` started the second showing - inside the skip's own fade. It never played: the
+loading indicator, then black, its camera on the screen for good. (That last step is inferred: by
+§3.36 a cutscene asking for its start fade-out while the EVENT layer is still dark is counted and
+never called back; the log has no line for it.) Neither watchdog acted: the post-skip watch
+(§3.36) took the second showing for the next cutscene and stopped, and the transition watchdog
+(§3.33) does nothing while one of the game's cameras plays. The queued request would also have
+shown the cutscene twice without a skip; and the queued showing came before anything the
+level asked for after the bell (the end of chapter part 1-1, §3.33), so the client could not
+have gone on.
+
+**Fix (0.11.5).**
+- `World:cutscene_play` records a replayed movie as seen as a movie too (`setHasDone` with a
+  `CameraMovie` of that number), as the game records a movie it plays as a movie: our game's own
+  request of it is then refused by the game's own play-once check, as for a timeline.
+- The `procPayloadPlay` hook asks the sync about every request of our game's;
+  `CutsceneSync:on_local_start` answers "repeat" for a cutscene whose number is our copy of the
+  partner's - playing, or ended less than a minute ago after it showed here - and the hook skips
+  the call: neither played nor queued, not announced to the partner ("cutscene c:id: our game
+  asked for it again after the partner's copy - not shown twice"). Our copy is that cutscene in
+  our game: its end sets the end flags and runs the next step of the same data owner.
+- `screen_watch.lua`: a camera with the skipped one's number is that cutscene again, not the next
+  one: the watch goes on, and its rescue ends it too.
+
+**Limits.** Not run in the game yet. What the level does with a refused request (its OnFailed)
+is the game's own path - the one a timeline already took whenever both games set the same
+cutscene off.
+
 ## 4. Sync architecture
 
 ```

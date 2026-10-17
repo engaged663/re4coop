@@ -772,6 +772,28 @@ T.run("shutdown_restores_everything", function()
     T.eq(world.armed, nil, "no chapter switch left armed")
 end)
 
+-- docs/RESEARCH.md 3.37: the adapter's hook hears from the session that our game's own request
+-- is the partner's cutscene again, and drops it.
+T.run("our_games_second_request_of_the_partners_cutscene_is_answered_repeat", function()
+    local s, net, clock, _, world = make("client")
+    net.push(player_msg(0.1, 21100, 40200, { x = 2, y = 0, z = 0 }))
+    net.push(P.encode_cutscene({ camera = P.CAMERA.MOVIE, id = 10011, chapter = 21100, stage = 40200,
+        pos = { x = 2, y = 0, z = 0 }, flags = P.CUTSCENE_FLAGS.LOCAL_TRIGGER }))
+    for i = 1, 30 do
+        clock.t = i * 0.1
+        s:update()
+    end
+    T.eq(world.played[1] and world.played[1].id, 10011, "our copy of the bell plays")
+    local sent = #net.sent
+    local verdict = world.cb.on_cutscene({ camera = 2, id = 10011, screen = 0, start_flags = {}, end_flags = {}, coords = {} })
+    T.eq(verdict, "repeat", "our game's own request of it is a repeat")
+    for i = sent + 1, #net.sent do
+        T.check(net.sent[i].data:byte(1) ~= P.T.CUTSCENE, "not announced to the host")
+    end
+    T.eq(world.cb.on_cutscene({ camera = 1, id = 10157, screen = 0, start_flags = {}, end_flags = {}, coords = {} }), true,
+        "another cutscene of ours goes to the host")
+end)
+
 T.run("a_partner_on_another_release_is_named_once", function()
     local s, net = make("client")
     net.push(P.encode_hello({ name = "Host" }))

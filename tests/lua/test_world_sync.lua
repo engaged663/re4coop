@@ -784,6 +784,48 @@ T.run("a_skip_of_a_cutscene_skipped_here_already_is_dropped", function()
     T.eq(pair.client:summary().skips_waiting, nil, "then forgotten")
 end)
 
+-- docs/RESEARCH.md 3.37: both games run the same level, so ours asked for the host's cutscene
+-- itself while our copy of it played (its own trigger or timer); the game queued that request
+-- and showed the cutscene a second time.
+T.run("our_game_asking_again_for_the_partners_cutscene_is_a_repeat", function()
+    local pair = cutscene_pair()
+    local logs = {}
+    pair.client.log = function(fmt, ...) logs[#logs + 1] = string.format(fmt, ...) end
+    local BELL = { camera = 2, id = 10011 }
+    pair.host_world:game_plays_cutscene(BELL)
+    pair:step(30, pair.tick)
+    T.eq(#pair.client_world.played, 1, "our copy of the host's cutscene plays")
+    T.eq(pair.client:on_local_start({ camera = 2, id = 10011 }, pair.now, pair.client_loc), "repeat",
+        "our game asks for it again meanwhile")
+    T.eq(pair.client:on_local_start({ camera = 1, id = 10011 }, pair.now, pair.client_loc), "repeat", "by its number")
+    pair:step(5, pair.tick)
+    T.eq(pair.client.counters.sent, 0, "never announced to the host")
+    T.eq(pair.client.counters.repeats, 2, "counted")
+    T.check(logs[#logs]:find("not shown twice", 1, true) ~= nil, "logged")
+    -- Our copy ends; the game asks again a little later: still that copy's cutscene.
+    pair.client_world.playing = nil
+    pair:step(2, pair.tick)
+    pair.now = pair.now + 30
+    T.eq(pair.client:on_local_start(BELL, pair.now, pair.client_loc), "repeat", "half a minute after it ended")
+    -- Another cutscene, or the same one long after: our game's own, as always.
+    T.eq(pair.client:on_local_start({ camera = 1, id = 10013 }, pair.now, pair.client_loc), true, "another one is sent")
+    pair.now = pair.now + 61
+    T.eq(pair.client:on_local_start(BELL, pair.now, pair.client_loc), true, "a minute on it is the game's own again")
+end)
+
+T.run("a_copy_that_never_showed_here_does_not_hold_our_own_back", function()
+    local pair = cutscene_pair()
+    function pair.client_world:cutscene_play(ev) self.played[#self.played + 1] = ev return true end -- never shows
+    pair.host_world:game_plays_cutscene({ camera = 2, id = 10011 })
+    pair:step(30, pair.tick)
+    T.eq(#pair.client_world.played, 1, "asked to play")
+    pair.now = pair.now + 16
+    pair:step(2, pair.tick) -- START_TIMEOUT: it counts as over
+    T.eq(pair.client:summary().replaying, nil, "over")
+    T.eq(pair.client:on_local_start({ camera = 2, id = 10011 }, pair.now, pair.client_loc), true,
+        "our game's own request goes ahead")
+end)
+
 T.run("skips_can_be_switched_off", function()
     local pair = cutscene_pair()
     pair.client.settings.sync_skips = false

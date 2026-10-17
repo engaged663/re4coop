@@ -249,9 +249,11 @@ function Session.new(opts)
                     self.flag_sync:on_local_flag(guid, value, self.clock(), pulse)
                 end
             end,
+            -- "repeat": our game asked again for the partner's cutscene it is showing; the
+            -- adapter keeps the game from showing it twice.
             on_cutscene = function(ev)
                 if self.cutscene_sync and self.partner_connected and self.compatible then
-                    self.cutscene_sync:on_local_start(ev, self.clock(), self:event_location())
+                    return self.cutscene_sync:on_local_start(ev, self.clock(), self:event_location())
                 end
             end,
             on_cutscene_skip = function(ev)

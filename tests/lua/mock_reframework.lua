@@ -1266,6 +1266,7 @@ function M.install(opts)
             function(_, t, seconds)
                 world.fade_ins[#world.fade_ins + 1] = { type = t, seconds = seconds }
                 world.fades[t] = nil
+                if t == 4 then world.event_fade_held = nil end
             end, { "share.FadeManager.FadeType", "System.Single", "System.String", "System.Action" } },
     })
     world.singletons["share.FadeManager"] = new("share.FadeManager")
@@ -2312,10 +2313,33 @@ end
 -- (FadeController._RefCounter): a skip fades that layer out and the end fades it in once; a
 -- skip that lands while the cutscene's start fade still holds the layer dark adds a fade-out
 -- nothing lifts, and the cutscene's own fade-in never comes - it stays black (rec.stuck).
+--
+-- A skipped camera that ends fades the EVENT layer back in over world.skip_fade_frames frames
+-- (0 by default). A request queued behind it starts once the screen is free
+-- (ClapperboardMediator.updateWork); one that starts inside that fade asks for its own start
+-- fade-out while the layer is still dark - the count goes up, nothing calls it back - so it
+-- never plays and the layer never lights (rec.stuck_start; the black after the bell,
+-- docs/RESEARCH.md 3.37).
 function M.update_cutscene_skip()
     local w = M.world
-    local rec = w and w.current_cutscene
-    if rec == nil or rec.work == nil then return end
+    if w == nil then return end
+    if (w.skip_fade_left or 0) > 0 then
+        w.skip_fade_left = w.skip_fade_left - 1
+        if w.skip_fade_left == 0 and not w.event_fade_held then w.fades[4] = nil end
+    end
+    if w.current_cutscene == nil and w.queued ~= nil and #w.queued > 0 then
+        local q = table.remove(w.queued, 1)
+        M.start_camera(q)
+        if (w.skip_fade_left or 0) > 0 then
+            q.stuck_start = true
+            w.event_fade_held = true
+            w.fades[4] = true
+            w.stuck_starts = (w.stuck_starts or 0) + 1
+        end
+        return
+    end
+    local rec = w.current_cutscene
+    if rec == nil or rec.work == nil or rec.stuck_start then return end
     local f = rec.work.__fields
     rec.age = (rec.age or 0) + 1
     local playing = rec.age >= (rec.load_frames or 0)
@@ -2329,6 +2353,10 @@ function M.update_cutscene_skip()
         rec.skipped = true
         w.skips = (w.skips or 0) + 1
         M.end_cutscene()
+        if (w.skip_fade_frames or 0) > 0 then
+            w.fades[4] = true
+            w.skip_fade_left = w.skip_fade_frames
+        end
     elseif f.InputSkip and rec.can_skip and playing then
         f.DoneSkip = true
         if w.fades[4] then
@@ -3150,10 +3178,20 @@ function M.install_world(world, opts)
         get_PlayID = { 0, function(self) return self.play_id end, {}, { ret = "System.UInt32" } },
         canSkip = { 0, function(self)
             local rec = self.rec
-            return rec ~= nil and rec.can_skip and (rec.age or 0) >= (rec.load_frames or 0)
+            return rec ~= nil and rec.can_skip and not rec.stuck_start and (rec.age or 0) >= (rec.load_frames or 0)
         end, {}, { ret = "System.Boolean" } },
     }, { CamType = "System.Int32", DoneSkip = "System.Boolean", InputSkip = "System.Boolean", DispUI = "System.Boolean" })
     class("chainsaw.ClapperboardMediator.PlayWorkTimeline", "chainsaw.ClapperboardMediator.PlayWork", {})
+    -- The requests' cameras: a timeline (type 1) or a movie (type 2) by its number.
+    class("chainsaw.ClapperboardMediator.CameraBase", "System.Object", {}, { RejectTimeline = "System.Boolean" })
+    class("chainsaw.ClapperboardMediator.CameraTimeline", "chainsaw.ClapperboardMediator.CameraBase", {
+        get_CameraType = { 0, function() return 1 end, {}, { ret = "chainsaw.ClapperboardMediator.CameraType" } },
+        get_CameraID = { 0, function(self) return self.__fields.ID end, {}, { ret = "System.Int32" } },
+    }, { ID = "chainsaw.TimelineEventDefine.ID" })
+    class("chainsaw.ClapperboardMediator.CameraMovie", "chainsaw.ClapperboardMediator.CameraBase", {
+        get_CameraType = { 0, function() return 2 end, {}, { ret = "chainsaw.ClapperboardMediator.CameraType" } },
+        get_CameraID = { 0, function(self) return self.__fields.MovieID end, {}, { ret = "System.Int32" } },
+    }, { MovieID = "chainsaw.MovieDefine.ID" })
     local function flag_infos(arr)
         local out = {}
         if arr == nil then return out end
@@ -3167,6 +3205,27 @@ function M.install_world(world, opts)
         local var = g and g.vars[f.index]
         if var ~= nil then set_var(var, true) end
     end
+    -- A camera starts on the screen (procRequest installing its PlayWork in _Plays).
+    local function start_camera(rec)
+        world.played[#world.played + 1] = rec
+        world.current_cutscene = rec
+        rec.work = new("chainsaw.ClapperboardMediator.PlayWorkTimeline", { cam_id = rec.id, play_id = rec.play_id,
+            rec = rec, __fields = { CamType = rec.built, DoneSkip = false, InputSkip = false, DispUI = false } })
+        rec.can_skip = not world.unskippable
+        -- It loads for a few frames, then plays; its start fade holds the EVENT layer dark for
+        -- a few more (world.cutscene_load_frames / cutscene_start_fade_frames, 0 by default).
+        rec.age, rec.load_frames, rec.fade_frames = 0, world.cutscene_load_frames or 0, world.cutscene_start_fade_frames or 0
+        if rec.load_frames + rec.fade_frames > 0 then
+            world.fades[4] = true
+            rec.holds_event_fade = true
+        end
+        world.singletons["chainsaw.ClapperboardMediator"].__fields._Plays =
+            typed_array("chainsaw.ClapperboardMediator.PlayWork", { rec.work })
+        world.gui_event = true
+        for _, fi in ipairs(rec.start_flags) do set_flag_info(fi) end
+    end
+    M.start_camera = start_camera
+    world.queued = {} -- requests procRequest queued behind the camera playing (ReserveWork)
     class("chainsaw.ClapperboardMediator", "System.Object", {
         procPayloadPlay = { 2, function(_, id, p)
             local f = p.__fields
@@ -3177,26 +3236,20 @@ function M.install_world(world, opts)
                 rec.coords = { { kind = c:read_dword(0x20), x = c:read_float(0x30), rot_y = c:read_float(0x40),
                     reset = c:read_byte(0x44) } }
             end
-            world.played[#world.played + 1] = rec
-            world.current_cutscene = rec
             -- On PC a movie request plays the timeline of the same number (world.movie_timelines).
-            local built = (world.movie_timelines and f.CameraType == 2) and 1 or f.CameraType
-            rec.work = new("chainsaw.ClapperboardMediator.PlayWorkTimeline", { cam_id = f.ID, play_id = id, rec = rec,
-                __fields = { CamType = built, DoneSkip = false, InputSkip = false, DispUI = false } })
-            rec.can_skip = not world.unskippable
-            -- It loads for a few frames, then plays; its start fade holds the EVENT layer dark for
-            -- a few more (world.cutscene_load_frames / cutscene_start_fade_frames, 0 by default).
-            rec.age, rec.load_frames, rec.fade_frames = 0, world.cutscene_load_frames or 0, world.cutscene_start_fade_frames or 0
-            if rec.load_frames + rec.fade_frames > 0 then
-                world.fades[4] = true
-                rec.holds_event_fade = true
+            rec.built = (world.movie_timelines and f.CameraType == 2) and 1 or f.CameraType
+            -- procRequest: a timeline requested while a camera plays waits behind it.
+            if world.current_cutscene ~= nil and rec.built == 1 then
+                world.queued[#world.queued + 1] = rec
+            else
+                start_camera(rec)
             end
-            world.singletons["chainsaw.ClapperboardMediator"].__fields._Plays =
-                typed_array("chainsaw.ClapperboardMediator.PlayWork", { rec.work })
-            world.gui_event = true
-            for _, fi in ipairs(rec.start_flags) do set_flag_info(fi) end
-            world.has_done[("%d:%d"):format(built, f.ID)] = true
+            world.has_done[("%d:%d"):format(rec.built, f.ID)] = true
         end, { "System.UInt32", PAYLOAD } },
+        -- setHasDone(CameraBase): that camera is recorded as seen.
+        setHasDone = { 1, function(_, cam)
+            world.has_done[("%d:%d"):format(cam:call("get_CameraType"), cam:call("get_CameraID"))] = true
+        end, { "chainsaw.ClapperboardMediator.CameraBase" } },
         -- ClapperboardMediator.requestEnd(UInt32 playid): that camera ends (a skip stuck on its
         -- fade-out included); its fades stay as they are.
         ["requestEnd(System.UInt32)"] = { 1, function(_, play_id)
@@ -3822,7 +3875,10 @@ function M.start_cutscene(id, opts)
     opts = opts or {}
     local w = M.world
     local camera = opts.camera or 1
-    if w.has_done[("%d:%d"):format(camera, id)] then return 0 end
+    if w.has_done[("%d:%d"):format(camera, id)] then
+        w.refused_requests = (w.refused_requests or 0) + 1 -- setupAndCheck: seen, Option.fireOnFailed
+        return 0
+    end
     local p = new("chainsaw.ClapperboardMediator.PayloadPlay", { __fields = { CameraType = camera, ID = id,
         Screen = opts.screen or 0, StartFlag = flag_info_array(opts.start_flags), EndFlag = flag_info_array(opts.end_flags),
         DataOwnerCode = opts.owner or 0xFFFFFFFF, EndPortrayal = opts.end_portrayal or 0 } })
